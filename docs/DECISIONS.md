@@ -16,3 +16,9 @@ convention; these seed the contract's prescribed directions.
   outputs and deduplication dependencies are preserved regardless of age.
 - **D-006 — In-memory index is rebuilt, never authoritative.** Corrupt
   committed history stops startup; only a provably-torn tail may be discarded.
+- **D-007 — Journaled envelopes carry the commit clock.** The first live
+  restore drill (2026-11-07) caught replay reproducing `finished_at=0`:
+  every replayed terminal run read as finished at the epoch and expired
+  instantly under compaction. `Envelope { run, at, event }` stamps the
+  commit time so replay reproduces real deadlines and expiry. Found by the
+  drill, not by tests — the tests now cover it.
