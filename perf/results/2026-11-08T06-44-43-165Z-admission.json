@@ -1,0 +1,22 @@
+{
+  "machine": {
+    "host": "Vinays-MacBook-Pro-2.local",
+    "platform": "darwin/arm64",
+    "cpu": "Apple M2 Pro",
+    "cores": 12,
+    "mem_gb": 32,
+    "date": "2026-11-08T06:44:43.167Z",
+    "commit": "d89b74a"
+  },
+  "scenario": "admission",
+  "params": {
+    "parallel_submits": 3000,
+    "cmd_capacity": 1024
+  },
+  "http_codes": {
+    "200": 1038,
+    "503": 1962
+  },
+  "verdict": "pass",
+  "note": "over-capacity must refuse (503 reserve / 409), never queue silently"
+}
