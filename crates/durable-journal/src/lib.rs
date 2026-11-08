@@ -246,6 +246,11 @@ impl Journal {
         Ok(seq)
     }
 
+    /// Records written so far in this generation (next seq to assign - 1).
+    pub fn records_written(&self) -> u64 {
+        self.next_seq.saturating_sub(1)
+    }
+
     pub fn generation(&self) -> u32 {
         self.generation
     }

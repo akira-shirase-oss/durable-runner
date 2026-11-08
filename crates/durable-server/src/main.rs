@@ -230,6 +230,13 @@ async fn health() -> Json<serde_json::Value> {
     Json(serde_json::json!({ "ok": true }))
 }
 
+async fn diagnostics(
+    State(app): State<App>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrBody>)> {
+    let d = app.engine.diag().await.map_err(engine_err)?;
+    Ok(Json(serde_json::to_value(d).unwrap_or_default()))
+}
+
 async fn compact(
     State(app): State<App>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrBody>)> {
@@ -285,6 +292,7 @@ async fn main() -> Result<()> {
         .route("/jobs/{id}/cancel", post(cancel))
         .route("/admin/compact", post(compact))
         .route("/admin/backup", post(backup))
+        .route("/admin/diagnostics", get(diagnostics))
         .with_state(app);
     if let Some(ui) = &args.ui_dir {
         router = router.nest_service(

@@ -90,6 +90,9 @@ enum Cmd {
     List {
         reply: oneshot::Sender<Vec<Run>>,
     },
+    Diag {
+        reply: oneshot::Sender<crate::Diagnostics>,
+    },
     Compact {
         reply: oneshot::Sender<Result<u32, EngineError>>,
     },
@@ -172,6 +175,15 @@ impl Engine {
         let (reply, rx) = oneshot::channel();
         self.tx
             .try_send(Cmd::List { reply })
+            .map_err(|_| EngineError::Refused(durable_domain::Refusal::ReserveExhausted))?;
+        rx.await.map_err(|_| EngineError::Stopped)
+    }
+
+    /// Bounded diagnostics — counts by state kind, never rows.
+    pub async fn diag(&self) -> Result<crate::Diagnostics, EngineError> {
+        let (reply, rx) = oneshot::channel();
+        self.tx
+            .try_send(Cmd::Diag { reply })
             .map_err(|_| EngineError::Refused(durable_domain::Refusal::ReserveExhausted))?;
         rx.await.map_err(|_| EngineError::Stopped)
     }
@@ -273,6 +285,9 @@ async fn actor(
                     let mut all: Vec<Run> = core.runs().cloned().collect();
                     all.sort_by_key(|r| r.id.0);
                     let _ = reply.send(all);
+                }
+                Some(Cmd::Diag { reply }) => {
+                    let _ = reply.send(core.diagnostics());
                 }
                 Some(Cmd::Compact { reply }) => {
                     let _ = reply.send(core.compact(wall_ms()));

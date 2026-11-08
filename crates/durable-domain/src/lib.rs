@@ -79,6 +79,20 @@ impl RunState {
             RunState::Done | RunState::Failed { .. } | RunState::Cancelled
         )
     }
+
+    /// The state's family name — diagnostics group by this, not by the
+    /// step/attempt fields (counts stay bounded).
+    pub fn kind(&self) -> &'static str {
+        match self {
+            RunState::Queued { .. } => "queued",
+            RunState::Running { .. } => "running",
+            RunState::RetryWaiting { .. } => "retry_waiting",
+            RunState::Reconciling { .. } => "reconciling",
+            RunState::Done => "done",
+            RunState::Failed { .. } => "failed",
+            RunState::Cancelled => "cancelled",
+        }
+    }
 }
 
 /// One run of a job spec under one operation key.

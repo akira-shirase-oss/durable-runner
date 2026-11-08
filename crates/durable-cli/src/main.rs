@@ -42,6 +42,10 @@ enum Cmd {
         #[arg(long)]
         run: u64,
     },
+    /// List every run in the live index.
+    List,
+    /// Bounded diagnostics: generation, records, runs by state kind.
+    Diag,
     /// Compact the journal into a new generation.
     Compact,
     /// Consistent server-side backup into a destination directory.
@@ -135,6 +139,20 @@ async fn main() -> Result<()> {
             let v = check(
                 client
                     .post(format!("{}/jobs/{run}/cancel", args.server))
+                    .send()
+                    .await?,
+            )
+            .await?;
+            println!("{v}");
+        }
+        Cmd::List => {
+            let v = check(client.get(format!("{}/jobs", args.server)).send().await?).await?;
+            println!("{v}");
+        }
+        Cmd::Diag => {
+            let v = check(
+                client
+                    .get(format!("{}/admin/diagnostics", args.server))
                     .send()
                     .await?,
             )

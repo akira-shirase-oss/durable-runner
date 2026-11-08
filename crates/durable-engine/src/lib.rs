@@ -43,6 +43,16 @@ pub struct Envelope {
     pub event: Event,
 }
 
+/// Bounded diagnostics: aggregate counts only — safe to answer under load.
+#[derive(Debug, Clone, Serialize)]
+pub struct Diagnostics {
+    pub generation: u32,
+    pub records_written: u64,
+    pub live_runs: u64,
+    pub dedup_keys: u64,
+    pub states: std::collections::BTreeMap<&'static str, u64>,
+}
+
 /// The serialized in-memory index — what a compaction snapshot carries.
 /// Live runs, their dedup keys, and the next id; history is not preserved
 /// past a generation boundary — the old generation's journal keeps it.
@@ -304,6 +314,22 @@ impl EngineCore {
 
     pub fn run(&self, id: RunId) -> Option<&Run> {
         self.runs.get(&id)
+    }
+
+    /// Bounded diagnostics: counts, never rows — O(number of states),
+    /// safe to expose on a busy server.
+    pub fn diagnostics(&self) -> Diagnostics {
+        let mut states = std::collections::BTreeMap::new();
+        for r in self.runs.values() {
+            *states.entry(r.state.kind()).or_insert(0u64) += 1;
+        }
+        Diagnostics {
+            generation: self.journal.generation(),
+            records_written: self.journal.records_written(),
+            live_runs: self.runs.len() as u64,
+            dedup_keys: self.by_op.len() as u64,
+            states,
+        }
     }
 
     /// Iterate the live index (used by the list surface; bounded by the
