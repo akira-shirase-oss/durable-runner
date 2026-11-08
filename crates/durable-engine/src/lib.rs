@@ -31,11 +31,13 @@ pub enum EngineError {
     Stopped,
 }
 
-/// A journaled record: which run the event belongs to, plus the event.
-/// Sequencing is the journal's job; the payload is domain data only.
+/// A journaled record: the run, the commit clock value, and the event.
+/// `at` makes replay faithful — deadlines and expiry reproduce the time
+/// the transition actually happened, not the time it was replayed.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Envelope {
     pub run: u64,
+    pub at: Millis,
     pub event: Event,
 }
 
@@ -89,7 +91,7 @@ impl EngineCore {
         for r in durable_journal::replay_dir(&gdir)? {
             let env: Envelope = serde_json::from_slice(&r.payload)?;
             max_run = max_run.max(env.run);
-            core.apply_committed(RunId(env.run), env.event, 0)?;
+            core.apply_committed(RunId(env.run), env.event, env.at)?;
         }
         core.next_run = max_run + 1;
         Ok(core)
@@ -165,6 +167,7 @@ impl EngineCore {
     ) -> Result<Vec<Effect>, EngineError> {
         let payload = serde_json::to_vec(&Envelope {
             run: run.0,
+            at: now,
             event: event.clone(),
         })?;
         self.journal.append(&payload)?; // durable BEFORE applied below
