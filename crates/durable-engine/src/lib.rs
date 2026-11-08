@@ -17,6 +17,8 @@ use std::collections::HashMap;
 use std::path::Path;
 use thiserror::Error;
 
+pub mod shell;
+
 #[derive(Debug, Error)]
 pub enum EngineError {
     #[error(transparent)]
@@ -25,6 +27,8 @@ pub enum EngineError {
     Refused(#[from] Refusal),
     #[error("serialization: {0}")]
     Serde(#[from] serde_json::Error),
+    #[error("engine stopped")]
+    Stopped,
 }
 
 /// A journaled record: which run the event belongs to, plus the event.
@@ -122,6 +126,18 @@ impl EngineCore {
         spec: JobSpec,
         now: Millis,
     ) -> Result<RunId, EngineError> {
+        self.submit_at(key, spec, now, now)
+    }
+
+    /// Submit with a delayed start: the run queues until `not_before`.
+    /// Same durability and dedup contract as `submit`.
+    pub fn submit_at(
+        &mut self,
+        key: OperationKey,
+        spec: JobSpec,
+        not_before: Millis,
+        now: Millis,
+    ) -> Result<RunId, EngineError> {
         if let Some(existing) = self.by_op.get(&key) {
             return Ok(*existing); // duplicate: hand back the original run
         }
@@ -133,7 +149,7 @@ impl EngineCore {
             Event::Accepted {
                 key,
                 spec,
-                not_before: now,
+                not_before,
             },
             now,
         )?;
@@ -224,6 +240,18 @@ impl EngineCore {
 
     pub fn run(&self, id: RunId) -> Option<&Run> {
         self.runs.get(&id)
+    }
+
+    /// Attempts whose deadline passed at `now` — each is a lost reply until
+    /// a reconciler proves otherwise.
+    pub fn expired_attempts(&self, now: Millis) -> Vec<(RunId, StepIndex)> {
+        self.runs
+            .iter()
+            .filter_map(|(id, r)| match &r.state {
+                RunState::Running { step, deadline, .. } if *deadline < now => Some((*id, *step)),
+                _ => None,
+            })
+            .collect()
     }
 
     /// Millisecond clock values the dispatcher should re-arm for.
