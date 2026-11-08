@@ -1,0 +1,11 @@
+{
+  "op_key": "pilot/onboarding-email",
+  "spec": {
+    "version": 1,
+    "steps": [
+      { "name": "prepare", "handler": "step" },
+      { "name": "deliver", "handler": "step" }
+    ],
+    "input_b64": "eyJ1c2VyIjogImFsaWNlIiwgInRlbXBsYXRlIjogIndlbGNvbWUifQ=="
+  }
+}
