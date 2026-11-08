@@ -1,0 +1,52 @@
+{
+  "machine": {
+    "host": "Vinays-MacBook-Pro-2.local",
+    "platform": "darwin/arm64",
+    "cpu": "Apple M2 Pro",
+    "cores": 12,
+    "mem_gb": 32,
+    "date": "2026-11-08T12:46:28.995Z",
+    "commit": "8b10aea"
+  },
+  "scenario": "compact-under-load",
+  "params": {
+    "seconds": 30,
+    "submit_interval_ms": 20
+  },
+  "submitted": 1435,
+  "http_codes": {
+    "200": 1435
+  },
+  "compactions": [
+    {
+      "status": 200,
+      "ms": 23
+    },
+    {
+      "status": 200,
+      "ms": 23
+    },
+    {
+      "status": 200,
+      "ms": 39
+    },
+    {
+      "status": 200,
+      "ms": 31
+    },
+    {
+      "status": 200,
+      "ms": 34
+    },
+    {
+      "status": 200,
+      "ms": 33
+    }
+  ],
+  "runs_after": 1435,
+  "latency_ms": {
+    "p50": 8.346416000000318,
+    "p99": 30.868915999999444
+  },
+  "verdict": "pass"
+}

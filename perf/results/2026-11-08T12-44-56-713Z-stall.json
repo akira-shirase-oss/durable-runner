@@ -1,0 +1,22 @@
+{
+  "machine": {
+    "host": "Vinays-MacBook-Pro-2.local",
+    "platform": "darwin/arm64",
+    "cpu": "Apple M2 Pro",
+    "cores": 12,
+    "mem_gb": 32,
+    "date": "2026-11-08T12:44:56.715Z",
+    "commit": "8b10aea"
+  },
+  "scenario": "stall",
+  "params": {
+    "runs": 15,
+    "handler_stall_ms": 20000,
+    "step_deadline_ms": 2000
+  },
+  "states": {
+    "failed": 15
+  },
+  "verdict": "FAIL",
+  "note": "stall past deadline -> ReplyLost -> probe (handler saw the key) -> reconciled done, never repeated"
+}

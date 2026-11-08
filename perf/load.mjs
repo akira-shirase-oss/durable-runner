@@ -67,8 +67,11 @@ function startHandler(mode, stallMs = 0) {
       let b = ''; req.on('data', c => b += c);
       req.on('end', () => {
         const key = JSON.parse(b || '{}').idem_key || '';
+        // Idempotent semantics: the key is recorded on receipt — the effect
+        // is committed-or-in-flight from the runner's point of view, so a
+        // reconcile probe during the stall finds it and never repeats.
+        seen.add(key);
         const answer = () => {
-          seen.add(key);
           res.writeHead(200, {'content-type':'application/json'});
           res.end(JSON.stringify({ok:true}));
         };

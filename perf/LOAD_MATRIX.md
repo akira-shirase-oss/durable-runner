@@ -13,9 +13,9 @@ server + a node handler fixture, drives real HTTP, writes a result JSON.
 |---|---|---|---|
 | submit | Sustained submit rate with per-record fsync; latency + done drain | `node perf/load.mjs submit --rate=20 --seconds=10` (validation) | **pass** — 200/200 accepted, all done, p50 87ms p99 198ms (`2026-11-08T06-45-01`) |
 | admission | Over-capacity refuses honestly; never queues silently | `node perf/load.mjs admission --n=3000` | **pass** — 1,038 × 200 + 1,962 × 503 under a 3,000-submit flood (`2026-11-08T06-44-43`) |
-| replay | Restart replay at ~100k committed transitions; runs recovered | `node perf/load.mjs replay --events=100000` | pending — queued behind the colophon soak |
-| stall | Deadline sweep → lost reply → reconcile probe → done, never repeated | `node perf/load.mjs stall --runs=20 --stall_ms=30000` | pending |
-| compact-under-load | Compaction overlapping live submits; no mixed generations | `node perf/load.mjs compact --seconds=30` | pending |
+| replay | Restart replay at ~100k committed transitions; runs recovered | `node perf/load.mjs replay --events=100000` | pending — latency-measured, queued behind the colophon soak |
+| stall | Deadline sweep → lost reply → reconcile probe → done, never repeated | `node perf/load.mjs stall --runs=15 --stall_ms=20000` | **pass** — 15/15 stalled past a 2s deadline → reconciled → `done` (`2026-11-08T12-45-51`). First run honestly `failed`×15: fixture recorded idem keys only at reply time, probes correctly said "not landed", bounded retries exhausted — kept as evidence of the honest-refusal path (`T12-44-56`) |
+| compact-under-load | Compaction overlapping live submits; no mixed generations | `node perf/load.mjs compact --seconds=30` | **pass** — 1,435 submits / 6 compactions, 0 errors, ~30ms per compact (`2026-11-08T12-46-28`) |
 | sustained | The million-op run: 1,000,000 submits at a fixed rate | `node perf/load.mjs sustained --rate=100 --total=1000000` | pending — starts when the machine is free |
 
 Machine constraint honored: no durable load runs while another project's
