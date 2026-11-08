@@ -297,7 +297,7 @@ pub fn reduce(
         }
 
         // --- checkpoint --------------------------------------------------------
-        (S::Running { step, attempt, .. }, Event::StepCheckpointed { step: s, output }) => {
+        (S::Running { step, .. }, Event::StepCheckpointed { step: s, output }) => {
             if *s != *step {
                 return Err(Refusal::StaleReply);
             }
