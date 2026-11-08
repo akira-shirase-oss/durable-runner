@@ -33,6 +33,8 @@ pub enum JournalError {
     Corrupt { seq: u64, why: String },
     #[error("manifest unreadable: {0}")]
     Manifest(String),
+    #[error("admission reserve: {available} bytes free, below {reserve}")]
+    NoSpace { available: u64, reserve: u64 },
 }
 
 /// One committed record as replayed: its sequence and payload.
@@ -210,9 +212,21 @@ impl Journal {
         })
     }
 
+    /// Bytes that must stay free on the journal filesystem — when free
+    /// space falls below this, admission refuses rather than append into
+    /// a full disk (contract: full disk fails safely, not silently).
+    pub const FREE_SPACE_RESERVE: u64 = 64 * 1024 * 1024; // 64 MiB
+
     /// Append one record: frame, write, fsync — only then is it committed.
     /// Returns the assigned sequence number.
     pub fn append(&mut self, payload: &[u8]) -> Result<u64, JournalError> {
+        let available = fs2::available_space(&self.root)?;
+        if available < Self::FREE_SPACE_RESERVE {
+            return Err(JournalError::NoSpace {
+                available,
+                reserve: Self::FREE_SPACE_RESERVE,
+            });
+        }
         if payload.len() as u64 > MAX_PAYLOAD {
             return Err(JournalError::Corrupt {
                 seq: self.next_seq,
@@ -238,6 +252,73 @@ impl Journal {
 
     pub fn dir(&self) -> &Path {
         &self.root
+    }
+
+    /// Compact into a new generation: build `gen-(N+1)` complete — snapshot
+    /// covering live state plus a fresh empty log — then atomically swap
+    /// the manifest. A crash at any point opens either the old complete
+    /// generation or the new one, never a mixture (contract §02).
+    pub fn compact(&mut self, snapshot: &Snapshot) -> Result<(), JournalError> {
+        let next = self.generation + 1;
+        let gdir = gen_dir_path(&self.root, next);
+        fs::create_dir_all(&gdir)?;
+
+        // 1. Fresh log, created and fsynced before the manifest moves.
+        let log_path = gdir.join("journal.log");
+        let new_log = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true) // a reused generation is corruption, refuse it
+            .open(&log_path)?;
+        new_log.sync_data()?;
+
+        // 2. Snapshot for the new generation (tmp + rename + dir fsync).
+        write_snapshot(&gdir, snapshot)?;
+
+        // 3. The atomic manifest swap — the single point that moves the
+        //    world from generation N to N+1.
+        let tmp = self.root.join("manifest.json.tmp");
+        fs::write(
+            &tmp,
+            serde_json::to_vec(&Manifest { generation: next }).map_err(io::Error::other)?,
+        )?;
+        File::open(&tmp)?.sync_data()?;
+        fs::rename(&tmp, self.root.join("manifest.json"))?;
+        sync_parent(&tmp)?;
+
+        // 4. Only now does the writer move: new generation, seq restarts.
+        self.file = OpenOptions::new().read(true).append(true).open(&log_path)?;
+        self.file.seek(SeekFrom::End(0))?;
+        self.generation = next;
+        self.next_seq = 1;
+        Ok(())
+    }
+
+    /// A consistent copy for backup: generation data first, manifest LAST —
+    /// a copy interrupted mid-flight still opens as a complete older
+    /// generation, never a torn mixed one.
+    pub fn backup_to(&self, dest: &Path) -> Result<(), JournalError> {
+        fs::create_dir_all(dest)?;
+        for entry in fs::read_dir(&self.root)? {
+            let entry = entry?;
+            let name = entry.file_name();
+            let Some(n) = name.to_str() else { continue };
+            if n.starts_with("gen-") && entry.file_type()?.is_dir() {
+                let gd = dest.join(n);
+                fs::create_dir_all(&gd)?;
+                for f in ["journal.log", "snapshot.json"] {
+                    let src = entry.path().join(f);
+                    if src.exists() {
+                        fs::copy(&src, gd.join(f))?;
+                        File::open(gd.join(f))?.sync_data()?;
+                    }
+                }
+            }
+        }
+        fs::copy(self.root.join("manifest.json"), dest.join("manifest.json"))?;
+        File::open(dest.join("manifest.json"))?.sync_data()?;
+        sync_parent(&dest.join("manifest.json"))?;
+        Ok(())
     }
 }
 

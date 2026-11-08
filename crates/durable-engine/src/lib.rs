@@ -39,6 +39,16 @@ pub struct Envelope {
     pub event: Event,
 }
 
+/// The serialized in-memory index — what a compaction snapshot carries.
+/// Live runs, their dedup keys, and the next id; history is not preserved
+/// past a generation boundary — the old generation's journal keeps it.
+#[derive(Debug, Serialize, Deserialize)]
+struct IndexSnapshot {
+    runs: HashMap<RunId, Run>,
+    by_op: HashMap<OperationKey, RunId>,
+    next_run: u64,
+}
+
 /// The whole runtime index, rebuilt only by replaying the journal through
 /// the reducer — the same fold the live path performs.
 pub struct EngineCore {
@@ -50,13 +60,17 @@ pub struct EngineCore {
     pub retry: RetryPolicy,
 }
 
+/// Terminal runs expire from the live index after this much time — the
+/// journal's older generations still hold their history (contract §05).
+const TERMINAL_EXPIRY_MS: u64 = 7 * 24 * 60 * 60 * 1000;
+
 impl EngineCore {
-    /// Open the journal at `dir` and rebuild every run from committed
-    /// history. Corrupt history fails here — startup never proceeds past it.
+    /// Open the journal at `dir` and rebuild every run: snapshot first if
+    /// the current generation has one, then this generation's records.
+    /// Corrupt history fails here — startup never proceeds past it.
     pub fn open(dir: &Path) -> Result<Self, EngineError> {
         let journal = Journal::open(dir)?;
-        let records =
-            durable_journal::replay_dir(&durable_journal::gen_dir_path(dir, journal.generation()))?;
+        let gdir = durable_journal::gen_dir_path(dir, journal.generation());
         let mut core = Self {
             journal,
             runs: HashMap::new(),
@@ -65,14 +79,50 @@ impl EngineCore {
             limits: Limits::default(),
             retry: RetryPolicy::default(),
         };
-        let mut max_run = 0u64;
-        for r in records {
+        if let Some(snap) = durable_journal::load_snapshot(&gdir)? {
+            let idx: IndexSnapshot = serde_json::from_slice(&snap.payload)?;
+            core.runs = idx.runs;
+            core.by_op = idx.by_op;
+            core.next_run = idx.next_run;
+        }
+        let mut max_run = core.next_run.saturating_sub(1);
+        for r in durable_journal::replay_dir(&gdir)? {
             let env: Envelope = serde_json::from_slice(&r.payload)?;
             max_run = max_run.max(env.run);
             core.apply_committed(RunId(env.run), env.event, 0)?;
         }
         core.next_run = max_run + 1;
         Ok(core)
+    }
+
+    /// Consistent backup: generation data copied first, manifest last —
+    /// a partial copy opens as a complete older generation.
+    pub fn backup_to(&self, dest: &Path) -> Result<(), EngineError> {
+        self.journal.backup_to(dest)?;
+        Ok(())
+    }
+
+    /// Compact: expire 7-day-old terminal runs, snapshot the live index
+    /// into a new generation, atomically swap the manifest. Returns the
+    /// new generation number.
+    pub fn compact(&mut self, now: Millis) -> Result<u32, EngineError> {
+        self.runs.retain(|_, r| {
+            !(r.state.is_terminal()
+                && r.finished_at
+                    .is_some_and(|t| now.saturating_sub(t) > TERMINAL_EXPIRY_MS))
+        });
+        // Dedup keys live only as long as their run — no orphan entries.
+        self.by_op.retain(|_, id| self.runs.contains_key(id));
+        let payload = serde_json::to_vec(&IndexSnapshot {
+            runs: self.runs.clone(),
+            by_op: self.by_op.clone(),
+            next_run: self.next_run,
+        })?;
+        self.journal.compact(&durable_journal::Snapshot {
+            covered_seq: 0,
+            payload,
+        })?;
+        Ok(self.journal.generation())
     }
 
     fn apply_committed(
@@ -98,6 +148,9 @@ impl EngineCore {
         }
         let mut run = self.runs.remove(&run_id).ok_or(Refusal::StaleReply)?;
         let (state, effects) = reduce(&run, &event, now, &self.limits, &self.retry)?;
+        if state.is_terminal() && run.finished_at.is_none() {
+            run.finished_at = Some(now); // the 7-day expiry clock starts
+        }
         run.state = state;
         self.runs.insert(run_id, run);
         Ok(effects)
@@ -381,6 +434,66 @@ mod tests {
         assert!(matches!(
             e2.run(run).unwrap_or_else(|| panic!("run")).state,
             RunState::RetryWaiting { .. }
+        ));
+    }
+
+    #[test]
+    fn compaction_keeps_live_state_across_reopen() {
+        let (d, mut e) = open();
+        let live = e
+            .submit(OperationKey("live".into()), spec(), 0)
+            .unwrap_or_else(|e| panic!("{e}"));
+        let done = e
+            .submit(OperationKey("done".into()), spec(), 0)
+            .unwrap_or_else(|e| panic!("{e}"));
+        e.cancel(done, 5).unwrap_or_else(|e| panic!("{e}"));
+        // At 5ms everything is fresh — compaction preserves all of it.
+        e.compact(10).unwrap_or_else(|e| panic!("{e}"));
+        drop(e);
+        let mut e2 = EngineCore::open(d.path()).unwrap_or_else(|e| panic!("{e}"));
+        assert!(e2.run(live).is_some());
+        assert!(e2.run(done).is_some());
+        // dedup survived compaction: resubmitting returns the same run
+        let again = e2
+            .submit(OperationKey("live".into()), spec(), 20)
+            .unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(again, live);
+    }
+
+    #[test]
+    fn expired_terminal_runs_leave_the_index() {
+        let (d, mut e) = open();
+        let done = e
+            .submit(OperationKey("old".into()), spec(), 0)
+            .unwrap_or_else(|e| panic!("{e}"));
+        e.cancel(done, 1).unwrap_or_else(|e| panic!("{e}"));
+        // 8 days later: past the 7-day expiry — the run leaves the index
+        // and its operation key is free to be used again.
+        let eight_days = 8 * 24 * 60 * 60 * 1000;
+        e.compact(eight_days).unwrap_or_else(|e| panic!("{e}"));
+        drop(e);
+        let mut e2 = EngineCore::open(d.path()).unwrap_or_else(|e| panic!("{e}"));
+        assert!(e2.run(done).is_none(), "expired terminal run must expire");
+        let fresh = e2
+            .submit(OperationKey("old".into()), spec(), eight_days)
+            .unwrap_or_else(|e| panic!("{e}"));
+        assert_ne!(fresh, done);
+    }
+
+    #[test]
+    fn backup_then_open_recovers_everything() {
+        let (_d, mut e) = open();
+        let run = e
+            .submit(OperationKey("k".into()), spec(), 0)
+            .unwrap_or_else(|e| panic!("{e}"));
+        e.cancel(run, 1).unwrap_or_else(|e| panic!("{e}"));
+        let dest = tempfile::tempdir().unwrap_or_else(|e| panic!("{e}"));
+        e.backup_to(dest.path()).unwrap_or_else(|e| panic!("{e}"));
+        drop(e); // release the writer lock on the source
+        let e2 = EngineCore::open(dest.path()).unwrap_or_else(|e| panic!("{e}"));
+        assert!(matches!(
+            e2.run(run).unwrap_or_else(|| panic!("run")).state,
+            RunState::Cancelled
         ));
     }
 }

@@ -88,6 +88,8 @@ pub struct Run {
     pub key: OperationKey,
     pub spec: JobSpec,
     pub state: RunState,
+    /// When the run reached a terminal state — the 7-day expiry clock.
+    pub finished_at: Option<Millis>,
 }
 
 impl Run {
@@ -102,6 +104,7 @@ impl Run {
             state: RunState::Queued {
                 next_run_at: not_before,
             },
+            finished_at: None,
         }
     }
 }
@@ -490,6 +493,7 @@ mod tests {
             key: OperationKey("k".into()),
             spec: spec(),
             state,
+            finished_at: None,
         }
     }
 
