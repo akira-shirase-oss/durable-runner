@@ -1,0 +1,29 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/durable-domain",
+    "crates/durable-journal",
+    "crates/durable-engine",
+    "crates/durable-server",
+    "crates/durable-cli",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+
+[workspace.dependencies]
+thiserror = "2"
+anyhow = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["full"] }
+axum = "0.8"
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+
+[workspace.lints.clippy]
+unwrap_used = "warn"
+expect_used = "warn"
