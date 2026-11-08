@@ -22,3 +22,15 @@ convention; these seed the contract's prescribed directions.
   instantly under compaction. `Envelope { run, at, event }` stamps the
   commit time so replay reproduces real deadlines and expiry. Found by the
   drill, not by tests — the tests now cover it.
+- **D-008 — Admission is where the allowlist bites.** A step naming a handler
+  outside the registry is a spec error refused at submit
+  (`UnregisteredHandler`, HTTP 409), never journaled. A journaled run whose
+  handler leaves the registry later stays queued until registry repair or
+  cancellation — there is nothing to journal because nothing happened.
+  Found via the inspector's first smoke test (2026-11-08): a StepFailed
+  committed for a never-dispatched run reduced to StaleReply *after* the
+  record was appended — a committed event that could not apply — and
+  `apply_committed`'s remove-then-reduce then dropped the run from the
+  index. `commit` now trial-reduces before appending so refusals stay out
+  of the journal, and `apply_committed` uses get/get_mut so a refused event
+  can never lose the run.
