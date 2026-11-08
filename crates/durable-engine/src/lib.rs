@@ -29,6 +29,8 @@ pub enum EngineError {
     Serde(#[from] serde_json::Error),
     #[error("engine stopped")]
     Stopped,
+    #[error("unregistered handler: {0}")]
+    UnregisteredHandler(String),
 }
 
 /// A journaled record: the run, the commit clock value, and the event.
@@ -148,23 +150,29 @@ impl EngineCore {
                 .insert(run_id, Run::accepted(run_id, key, spec, not_before));
             return Ok(vec![]);
         }
-        let mut run = self.runs.remove(&run_id).ok_or(Refusal::StaleReply)?;
-        let (state, effects) = reduce(&run, &event, now, &self.limits, &self.retry)?;
+        let run = self.runs.get(&run_id).ok_or(Refusal::StaleReply)?;
+        let (state, effects) = reduce(run, &event, now, &self.limits, &self.retry)?;
+        let run = self.runs.get_mut(&run_id).ok_or(Refusal::StaleReply)?;
         if state.is_terminal() && run.finished_at.is_none() {
             run.finished_at = Some(now); // the 7-day expiry clock starts
         }
         run.state = state;
-        self.runs.insert(run_id, run);
         Ok(effects)
     }
 
     /// Journal first, then fold — the only path by which state may change.
+    /// Trial-reduce before appending: a refused event must never reach the
+    /// journal, because every committed record has to apply on replay.
     fn commit(
         &mut self,
         run: RunId,
         event: Event,
         now: Millis,
     ) -> Result<Vec<Effect>, EngineError> {
+        if !matches!(event, Event::Accepted { .. }) {
+            let run = self.runs.get(&run).ok_or(Refusal::StaleReply)?;
+            reduce(run, &event, now, &self.limits, &self.retry)?;
+        }
         let payload = serde_json::to_vec(&Envelope {
             run: run.0,
             at: now,
@@ -296,6 +304,12 @@ impl EngineCore {
 
     pub fn run(&self, id: RunId) -> Option<&Run> {
         self.runs.get(&id)
+    }
+
+    /// Iterate the live index (used by the list surface; bounded by the
+    /// index, never by history).
+    pub fn runs(&self) -> impl Iterator<Item = &Run> {
+        self.runs.values()
     }
 
     /// Attempts whose deadline passed at `now` — each is a lost reply until
@@ -481,6 +495,31 @@ mod tests {
             .submit(OperationKey("old".into()), spec(), eight_days)
             .unwrap_or_else(|e| panic!("{e}"));
         assert_ne!(fresh, done);
+    }
+
+    #[test]
+    fn refused_event_neither_journals_nor_loses_the_run() {
+        let (d, mut e) = open();
+        let run = e
+            .submit(OperationKey("k".into()), spec(), 0)
+            .unwrap_or_else(|e| panic!("{e}"));
+        // StepFailed on a run that was never dispatched: refused. Critically,
+        // the refusal must stay out of the journal (every committed record
+        // has to apply on replay) and must not drop the run from the index.
+        let err = e
+            .step_finished(run, StepIndex(0), None, Some("x".into()), 1)
+            .expect_err("a reply for a never-dispatched step is refused");
+        assert!(matches!(err, EngineError::Refused(Refusal::StaleReply)));
+        assert!(
+            e.run(run).is_some(),
+            "a refused event must not lose the run"
+        );
+        drop(e);
+        let e2 = EngineCore::open(d.path()).unwrap_or_else(|e| panic!("{e}"));
+        assert!(matches!(
+            e2.run(run).unwrap_or_else(|| panic!("run")).state,
+            RunState::Queued { .. }
+        ));
     }
 
     #[test]

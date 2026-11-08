@@ -33,6 +33,9 @@ struct Args {
     /// Attempt timeout per step call, ms (bounded by domain limits).
     #[arg(long, default_value_t = 20_000)]
     step_timeout_ms: u64,
+    /// Static inspection UI directory, served at /inspector (optional).
+    #[arg(long)]
+    ui_dir: Option<PathBuf>,
 }
 
 fn parse_handler(s: &str) -> Result<(String, String), String> {
@@ -123,7 +126,7 @@ fn engine_err(e: EngineError) -> (StatusCode, Json<ErrBody>) {
         EngineError::Refused(durable_domain::Refusal::ReserveExhausted) => {
             StatusCode::SERVICE_UNAVAILABLE
         }
-        EngineError::Refused(_) => StatusCode::CONFLICT,
+        EngineError::Refused(_) | EngineError::UnregisteredHandler(_) => StatusCode::CONFLICT,
         _ => StatusCode::INTERNAL_SERVER_ERROR,
     };
     (
@@ -204,6 +207,25 @@ async fn cancel(
     Ok(Json(serde_json::json!({ "cancelled": id })))
 }
 
+async fn list(
+    State(app): State<App>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrBody>)> {
+    let runs = app.engine.list().await.map_err(engine_err)?;
+    let items: Vec<serde_json::Value> = runs
+        .iter()
+        .map(|r| {
+            serde_json::json!({
+                "id": r.id.0,
+                "key": r.key.0,
+                "state": state_name(&r.state),
+                "steps": r.spec.steps.len(),
+                "finished_at": r.finished_at,
+            })
+        })
+        .collect();
+    Ok(Json(serde_json::json!({ "runs": items })))
+}
+
 async fn health() -> Json<serde_json::Value> {
     Json(serde_json::json!({ "ok": true }))
 }
@@ -256,14 +278,22 @@ async fn main() -> Result<()> {
     let engine = spawn(&args.journal, registry, ShellConfig::default())
         .map_err(|e| anyhow::anyhow!("engine open: {e}"))?;
     let app = App { engine };
-    let router = Router::new()
+    let mut router = Router::new()
         .route("/health", get(health))
-        .route("/jobs", post(submit))
+        .route("/jobs", post(submit).get(list))
         .route("/jobs/{id}", get(inspect))
         .route("/jobs/{id}/cancel", post(cancel))
         .route("/admin/compact", post(compact))
         .route("/admin/backup", post(backup))
         .with_state(app);
+    if let Some(ui) = &args.ui_dir {
+        router = router.nest_service(
+            "/inspector",
+            tower_http::services::ServeDir::new(ui)
+                .append_index_html_on_directories(true)
+                .not_found_service(tower_http::services::ServeFile::new(ui.join("index.html"))),
+        );
+    }
     let listener = tokio::net::TcpListener::bind(&args.listen)
         .await
         .with_context(|| format!("bind {}", args.listen))?;

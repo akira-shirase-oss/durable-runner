@@ -87,6 +87,9 @@ enum Cmd {
         run: RunId,
         reply: oneshot::Sender<Option<Run>>,
     },
+    List {
+        reply: oneshot::Sender<Vec<Run>>,
+    },
     Compact {
         reply: oneshot::Sender<Result<u32, EngineError>>,
     },
@@ -163,6 +166,16 @@ impl Engine {
         rx.await.map_err(|_| EngineError::Stopped)?
     }
 
+    /// Every run in the live index (bounded by what the journal holds —
+    /// post-expiry index size, not history).
+    pub async fn list(&self) -> Result<Vec<Run>, EngineError> {
+        let (reply, rx) = oneshot::channel();
+        self.tx
+            .try_send(Cmd::List { reply })
+            .map_err(|_| EngineError::Refused(durable_domain::Refusal::ReserveExhausted))?;
+        rx.await.map_err(|_| EngineError::Stopped)
+    }
+
     pub async fn inspect(&self, run: RunId) -> Result<Option<Run>, EngineError> {
         let (reply, rx) = oneshot::channel();
         self.tx
@@ -235,7 +248,19 @@ async fn actor(
             cmd = rx.recv() => match cmd {
                 Some(Cmd::Submit { key, spec, not_before, reply }) => {
                     let now = wall_ms();
-                    let _ = reply.send(core.submit_at(key, spec, not_before.unwrap_or(now), now));
+                    // Admission is where the allowlist bites: a step naming a
+                    // handler outside the registry is a spec error, refused
+                    // before anything is journaled.
+                    let missing = spec
+                        .steps
+                        .iter()
+                        .find(|s| !registry.contains(&s.handler))
+                        .map(|s| s.handler.clone());
+                    let r = match missing {
+                        Some(name) => Err(EngineError::UnregisteredHandler(name)),
+                        None => core.submit_at(key, spec, not_before.unwrap_or(now), now),
+                    };
+                    let _ = reply.send(r);
                 }
                 Some(Cmd::Cancel { run, reply }) => {
                     let r = core.cancel(run, wall_ms()).map(|_| ());
@@ -243,6 +268,11 @@ async fn actor(
                 }
                 Some(Cmd::Inspect { run, reply }) => {
                     let _ = reply.send(core.run(run).cloned());
+                }
+                Some(Cmd::List { reply }) => {
+                    let mut all: Vec<Run> = core.runs().cloned().collect();
+                    all.sort_by_key(|r| r.id.0);
+                    let _ = reply.send(all);
                 }
                 Some(Cmd::Compact { reply }) => {
                     let _ = reply.send(core.compact(wall_ms()));
@@ -376,9 +406,10 @@ fn tick(core: &mut EngineCore, exec: &mut Exec<'_>) {
             continue;
         };
         if !exec.registry.contains(&name) {
-            // Unregistered handler: a real failure, journaled and retried
-            // like any other — it will exhaust if never fixed.
-            exec.fail(core, run, step, "unregistered handler");
+            // The handler left the registry after this run was accepted:
+            // it stays queued — registry repair or a cancel resolves it.
+            // Refusing an event here would be noise; there is nothing to
+            // journal because nothing happened.
             continue;
         }
         if core.dispatch(run, step, attempt, now).is_err() {
@@ -514,9 +545,33 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn unregistered_handler_refused_at_admission() {
+        let d = tempfile::tempdir().unwrap_or_else(|e| panic!("{e}"));
+        let eng = spawn(
+            d.path(),
+            Registry::default(),
+            ShellConfig {
+                tick_ms: 5,
+                ..Default::default()
+            },
+        )
+        .unwrap_or_else(|e| panic!("{e}"));
+        // The registry is the execution trust boundary: a step naming a
+        // handler it doesn't know is a spec error, refused before the
+        // journal sees anything — no run, no record, nothing to replay.
+        let err = eng
+            .submit(OperationKey("bad".into()), spec("ghost"))
+            .await
+            .expect_err("unregistered handler must be refused");
+        assert!(matches!(err, EngineError::UnregisteredHandler(_)));
+        assert!(eng.list().await.unwrap_or_default().is_empty());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn full_channel_backpressures() {
         let d = tempfile::tempdir().unwrap_or_else(|e| panic!("{e}"));
-        let reg = Registry::default();
+        let mut reg = Registry::default();
+        reg.register("none", Arc::new(Echo));
         let eng = spawn(
             d.path(),
             reg,

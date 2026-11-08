@@ -1,0 +1,16 @@
+# OS and editor files
+.DS_Store
+*.swp
+.idea/
+.vscode/
+
+# Rust
+/target/
+
+# Node / SvelteKit
+node_modules/
+apps/*/build/
+apps/*/.svelte-kit/
+
+# Local data and load artifacts
+/data/
