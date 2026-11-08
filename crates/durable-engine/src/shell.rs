@@ -76,6 +76,7 @@ enum Cmd {
     Submit {
         key: OperationKey,
         spec: JobSpec,
+        not_before: Option<Millis>,
         reply: oneshot::Sender<Result<RunId, EngineError>>,
     },
     Cancel {
@@ -85,6 +86,13 @@ enum Cmd {
     Inspect {
         run: RunId,
         reply: oneshot::Sender<Option<Run>>,
+    },
+    Compact {
+        reply: oneshot::Sender<Result<u32, EngineError>>,
+    },
+    Backup {
+        dest: std::path::PathBuf,
+        reply: oneshot::Sender<Result<(), EngineError>>,
     },
 }
 
@@ -97,9 +105,33 @@ pub struct Engine {
 
 impl Engine {
     pub async fn submit(&self, key: OperationKey, spec: JobSpec) -> Result<RunId, EngineError> {
+        self.submit_inner(key, spec, None).await
+    }
+
+    /// Submit with a delayed start: the run queues until `not_before`.
+    pub async fn submit_at(
+        &self,
+        key: OperationKey,
+        spec: JobSpec,
+        not_before: Millis,
+    ) -> Result<RunId, EngineError> {
+        self.submit_inner(key, spec, Some(not_before)).await
+    }
+
+    async fn submit_inner(
+        &self,
+        key: OperationKey,
+        spec: JobSpec,
+        not_before: Option<Millis>,
+    ) -> Result<RunId, EngineError> {
         let (reply, rx) = oneshot::channel();
         self.tx
-            .try_send(Cmd::Submit { key, spec, reply })
+            .try_send(Cmd::Submit {
+                key,
+                spec,
+                not_before,
+                reply,
+            })
             .map_err(|_| EngineError::Refused(durable_domain::Refusal::ReserveExhausted))?;
         rx.await.map_err(|_| EngineError::Stopped)?
     }
@@ -108,6 +140,25 @@ impl Engine {
         let (reply, rx) = oneshot::channel();
         self.tx
             .try_send(Cmd::Cancel { run, reply })
+            .map_err(|_| EngineError::Refused(durable_domain::Refusal::ReserveExhausted))?;
+        rx.await.map_err(|_| EngineError::Stopped)?
+    }
+
+    /// Compact the journal: snapshot live state into a new generation,
+    /// atomically swap the manifest. Returns the new generation.
+    pub async fn compact(&self) -> Result<u32, EngineError> {
+        let (reply, rx) = oneshot::channel();
+        self.tx
+            .try_send(Cmd::Compact { reply })
+            .map_err(|_| EngineError::Refused(durable_domain::Refusal::ReserveExhausted))?;
+        rx.await.map_err(|_| EngineError::Stopped)?
+    }
+
+    /// Consistent backup of the journal to `dest` (manifest copied last).
+    pub async fn backup_to(&self, dest: std::path::PathBuf) -> Result<(), EngineError> {
+        let (reply, rx) = oneshot::channel();
+        self.tx
+            .try_send(Cmd::Backup { dest, reply })
             .map_err(|_| EngineError::Refused(durable_domain::Refusal::ReserveExhausted))?;
         rx.await.map_err(|_| EngineError::Stopped)?
     }
@@ -182,8 +233,9 @@ async fn actor(
     loop {
         tokio::select! {
             cmd = rx.recv() => match cmd {
-                Some(Cmd::Submit { key, spec, reply }) => {
-                    let _ = reply.send(core.submit(key, spec, wall_ms()));
+                Some(Cmd::Submit { key, spec, not_before, reply }) => {
+                    let now = wall_ms();
+                    let _ = reply.send(core.submit_at(key, spec, not_before.unwrap_or(now), now));
                 }
                 Some(Cmd::Cancel { run, reply }) => {
                     let r = core.cancel(run, wall_ms()).map(|_| ());
@@ -191,6 +243,12 @@ async fn actor(
                 }
                 Some(Cmd::Inspect { run, reply }) => {
                     let _ = reply.send(core.run(run).cloned());
+                }
+                Some(Cmd::Compact { reply }) => {
+                    let _ = reply.send(core.compact(wall_ms()));
+                }
+                Some(Cmd::Backup { dest, reply }) => {
+                    let _ = reply.send(core.backup_to(&dest));
                 }
                 None => return,
             },
