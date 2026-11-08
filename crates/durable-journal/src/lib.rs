@@ -47,7 +47,8 @@ struct Manifest {
     generation: u32,
 }
 
-fn gen_dir(root: &Path, generation: u32) -> PathBuf {
+/// The on-disk directory for a generation under a journal root.
+pub fn gen_dir_path(root: &Path, generation: u32) -> PathBuf {
     root.join(format!("gen-{generation:06}"))
 }
 
@@ -179,7 +180,7 @@ impl Journal {
             Err(e) => return Err(e.into()),
         };
 
-        let gdir = gen_dir(dir, generation);
+        let gdir = gen_dir_path(dir, generation);
         fs::create_dir_all(&gdir)?;
         let log_path = gdir.join("journal.log");
         let mut file = OpenOptions::new()
@@ -302,7 +303,7 @@ mod tests {
             ];
         }
         assert_eq!(seq, [1, 2]);
-        let rs = replay_dir(&gen_dir(dir.path(), 1)).unwrap_or_else(|e| panic!("{e}"));
+        let rs = replay_dir(&gen_dir_path(dir.path(), 1)).unwrap_or_else(|e| panic!("{e}"));
         assert_eq!(rs.len(), 2);
         assert_eq!(rs[0].payload, b"one");
     }
@@ -320,7 +321,7 @@ mod tests {
     #[test]
     fn torn_tail_is_discarded_history_is_kept() {
         let dir = tempfile::tempdir().unwrap_or_else(|e| panic!("{e}"));
-        let log = gen_dir(dir.path(), 1).join("journal.log");
+        let log = gen_dir_path(dir.path(), 1).join("journal.log");
         {
             let mut j = Journal::open(dir.path()).unwrap_or_else(|e| panic!("{e}"));
             j.append(b"committed").unwrap_or_else(|e| panic!("{e}"));
@@ -338,7 +339,7 @@ mod tests {
             let mut j = Journal::open(dir.path()).unwrap_or_else(|e| panic!("{e}"));
             j.append(b"three").unwrap_or_else(|e| panic!("{e}"));
         }
-        let rs = replay_dir(&gen_dir(dir.path(), 1)).unwrap_or_else(|e| panic!("{e}"));
+        let rs = replay_dir(&gen_dir_path(dir.path(), 1)).unwrap_or_else(|e| panic!("{e}"));
         assert_eq!(rs.len(), 3);
         assert_eq!(rs[2].payload, b"three");
     }
@@ -346,7 +347,7 @@ mod tests {
     #[test]
     fn corrupt_committed_history_stops_startup() {
         let dir = tempfile::tempdir().unwrap_or_else(|e| panic!("{e}"));
-        let log = gen_dir(dir.path(), 1).join("journal.log");
+        let log = gen_dir_path(dir.path(), 1).join("journal.log");
         {
             let mut j = Journal::open(dir.path()).unwrap_or_else(|e| panic!("{e}"));
             j.append(b"first").unwrap_or_else(|e| panic!("{e}"));
@@ -370,7 +371,7 @@ mod tests {
     #[test]
     fn sequence_gap_is_corruption() {
         let dir = tempfile::tempdir().unwrap_or_else(|e| panic!("{e}"));
-        let log = gen_dir(dir.path(), 1).join("journal.log");
+        let log = gen_dir_path(dir.path(), 1).join("journal.log");
         fs::create_dir_all(log.parent().unwrap_or_else(|| panic!("parent")))
             .unwrap_or_else(|e| panic!("{e}"));
         fs::write(dir.path().join("manifest.json"), "{\"generation\":1}")

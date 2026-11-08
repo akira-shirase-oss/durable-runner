@@ -38,6 +38,14 @@ dependencies = [
 [[package]]
 name = "durable-engine"
 version = "0.1.0"
+dependencies = [
+ "durable-domain",
+ "durable-journal",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror",
+]
 
 [[package]]
 name = "durable-journal"

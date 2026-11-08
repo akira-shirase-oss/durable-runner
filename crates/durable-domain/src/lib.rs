@@ -90,6 +90,22 @@ pub struct Run {
     pub state: RunState,
 }
 
+impl Run {
+    /// The run as its `Accepted` record creates it: queued for `not_before`.
+    /// The reducer never builds a Run — acceptance is construction, not a
+    /// transition; a second `Accepted` for an existing run is `DuplicateKey`.
+    pub fn accepted(id: RunId, key: OperationKey, spec: JobSpec, not_before: Millis) -> Self {
+        Self {
+            id,
+            key,
+            spec,
+            state: RunState::Queued {
+                next_run_at: not_before,
+            },
+        }
+    }
+}
+
 // ------------------------------------------------------------------- events
 
 /// Every fact the journal may record. The reducer maps (run, event) ->
@@ -97,7 +113,12 @@ pub struct Run {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Event {
     /// Durable acceptance: acknowledged only after the journal fsyncs.
-    Accepted { spec: JobSpec },
+    /// `not_before` supports delayed starts; `key` is the dedup identity.
+    Accepted {
+        key: OperationKey,
+        spec: JobSpec,
+        not_before: Millis,
+    },
     /// A step attempt started; the handler has `deadline` to answer.
     StepDispatched {
         step: StepIndex,
@@ -110,8 +131,9 @@ pub enum Event {
     StepFailed { step: StepIndex },
     /// The handler succeeded but the reply vanished — reconcile before repeat.
     ReplyLost { step: StepIndex },
-    /// Uncertain effect confirmed or safely undone; the step may be retried.
-    Reconciled { step: StepIndex },
+    /// Uncertain effect checked: `effect_found` = the remote call did land
+    /// (advance, never repeat it); `false` = it did not — retry is safe.
+    Reconciled { step: StepIndex, effect_found: bool },
     /// Cancellation requested; honoured only from non-terminal states.
     CancelRequested,
 }
@@ -376,11 +398,48 @@ pub fn reduce(
         }
         (_, Event::ReplyLost { .. }) => Err(Refusal::StaleReply),
 
-        (S::Reconciling { step, attempt, .. }, Event::Reconciled { step: s }) => {
+        (
+            S::Reconciling { step, attempt, .. },
+            Event::Reconciled {
+                step: s,
+                effect_found,
+            },
+        ) => {
             if *s != *step {
                 return Err(Refusal::StaleReply);
             }
-            if *attempt >= retry.max_attempts {
+            if *effect_found {
+                // The vanished reply's remote effect did land — advance with
+                // an empty checkpoint, never repeat the remote call.
+                let output = Vec::new();
+                if (step.0 as usize + 1) < run.spec.steps.len() {
+                    let next = StepIndex(step.0 + 1);
+                    let deadline = now + limits.max_step_deadline_ms;
+                    Ok((
+                        S::Running {
+                            step: next,
+                            attempt: 1,
+                            deadline,
+                        },
+                        vec![
+                            Effect::CommitCheckpoint { step: *s, output },
+                            Effect::DispatchStep {
+                                step: next,
+                                attempt: 1,
+                                deadline,
+                            },
+                        ],
+                    ))
+                } else {
+                    Ok((
+                        S::Done,
+                        vec![
+                            Effect::CommitCheckpoint { step: *s, output },
+                            Effect::Finish,
+                        ],
+                    ))
+                }
+            } else if *attempt >= retry.max_attempts {
                 Ok((S::Failed { step: *step }, vec![Effect::EmitTerminal]))
             } else {
                 let at = retry.next_run_at(now, *attempt, run.id);
@@ -633,7 +692,10 @@ mod tests {
         );
         let (s, _) = reduce(
             &run(s),
-            &Event::Reconciled { step: StepIndex(0) },
+            &Event::Reconciled {
+                step: StepIndex(0),
+                effect_found: false,
+            },
             NOW,
             &l,
             &r,
