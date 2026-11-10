@@ -534,7 +534,8 @@ mod tests {
         // has to apply on replay) and must not drop the run from the index.
         let err = e
             .step_finished(run, StepIndex(0), None, Some("x".into()), 1)
-            .expect_err("a reply for a never-dispatched step is refused");
+            .err()
+            .unwrap_or_else(|| panic!("a reply for a never-dispatched step is refused"));
         assert!(matches!(err, EngineError::Refused(Refusal::StaleReply)));
         assert!(
             e.run(run).is_some(),
