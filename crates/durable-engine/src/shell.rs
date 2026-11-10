@@ -8,7 +8,9 @@
 //! can be de-duplicated on the far side (contract §04, at-least-once).
 
 use crate::{EngineCore, EngineError};
-use durable_domain::{Effect, JobSpec, Millis, OperationKey, Run, RunId, StepIndex, StepSpec};
+use durable_domain::{
+    Effect, JobSpec, Limits, Millis, OperationKey, Run, RunId, RunState, StepIndex, StepSpec,
+};
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::Arc;
@@ -206,6 +208,9 @@ pub struct ShellConfig {
     pub tick_ms: u64,
     /// Command channel capacity (submit back-pressure bound).
     pub cmd_capacity: usize,
+    /// Domain bounds — deadline, payload sizes, attempts. Tests shrink the
+    /// step deadline so crash-recovery paths don't wait 30s.
+    pub limits: Limits,
 }
 
 impl Default for ShellConfig {
@@ -214,6 +219,7 @@ impl Default for ShellConfig {
             max_in_flight: 32,
             tick_ms: 50,
             cmd_capacity: 1024,
+            limits: Limits::default(),
         }
     }
 }
@@ -222,7 +228,8 @@ impl Default for ShellConfig {
 /// returned handle is the only public interface — there is no path to the
 /// journal except through it.
 pub fn spawn(dir: &Path, registry: Registry, cfg: ShellConfig) -> Result<Engine, EngineError> {
-    let core = EngineCore::open(dir)?;
+    let mut core = EngineCore::open(dir)?;
+    core.limits = cfg.limits;
     let (tx, rx) = mpsc::channel::<Cmd>(cfg.cmd_capacity);
     tokio::spawn(actor(core, registry, cfg, rx));
     Ok(Engine { tx })
@@ -253,6 +260,23 @@ async fn actor(
                 live: &mut live,
             }
         };
+    }
+
+    // Crash-window orphans: a run journaled Reconciling whose probe died
+    // with the last process gets a fresh probe. Reconcile verdicts are
+    // idempotent — a run that moved on refuses NothingToReconcile.
+    let orphaned: Vec<(RunId, StepIndex)> = core
+        .runs()
+        .filter_map(|r| match r.state {
+            RunState::Reconciling { step, .. } => Some((r.id, step)),
+            _ => None,
+        })
+        .collect();
+    if !orphaned.is_empty() {
+        let mut ex = exec!();
+        for (run, step) in orphaned {
+            ex.probe(&mut core, run, step);
+        }
     }
 
     loop {
@@ -401,14 +425,15 @@ impl Exec<'_> {
 fn tick(core: &mut EngineCore, exec: &mut Exec<'_>) {
     let now = wall_ms();
     // Deadline sweep: an attempt out past its deadline is a lost reply —
-    // it reconciles, never silently repeats.
+    // it reconciles, never silently repeats. `live` only tracks attempts
+    // this process fired; a run orphaned by a restart has no entry, and
+    // gating on it would strand every crash-surviving Running run.
     for (run, step) in core.expired_attempts(now) {
-        if exec.live.remove(&(run, step)) {
-            let effects = core
-                .step_finished(run, step, None, None, now)
-                .unwrap_or_default();
-            run_effects(core, exec, effects, run);
-        }
+        exec.live.remove(&(run, step));
+        let effects = core
+            .step_finished(run, step, None, None, now)
+            .unwrap_or_default();
+        run_effects(core, exec, effects, run);
     }
     // Dispatch: the journal commits StepDispatched BEFORE the handler is
     // invoked — a crash between the two can only lose a journaled fact.
@@ -484,6 +509,169 @@ mod tests {
         async fn probe(&self, _s: &StepSpec, _k: &str) -> bool {
             true // the remote call did land
         }
+    }
+
+    /// Hangs mid-flight on its first call, answers every later one — the
+    /// shape of a worker killed between dispatch and reply.
+    struct HangOnce {
+        calls: Arc<std::sync::atomic::AtomicUsize>,
+    }
+    #[async_trait::async_trait]
+    impl StepHandler for HangOnce {
+        async fn execute(&self, _s: &StepSpec, _i: &[u8], _k: &str) -> Outcome {
+            if self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+                std::future::pending().await
+            }
+            Outcome::Checkpoint(b"ok".to_vec())
+        }
+        async fn probe(&self, _s: &StepSpec, _k: &str) -> bool {
+            true // reconcile finds the effect landed — never re-fires
+        }
+    }
+
+    /// Reports Lost, then its first probe hangs (in-flight at kill time);
+    /// every later probe answers found.
+    struct LostProbe {
+        probes: Arc<std::sync::atomic::AtomicUsize>,
+    }
+    #[async_trait::async_trait]
+    impl StepHandler for LostProbe {
+        async fn execute(&self, _s: &StepSpec, _i: &[u8], _k: &str) -> Outcome {
+            Outcome::Lost
+        }
+        async fn probe(&self, _s: &StepSpec, _k: &str) -> bool {
+            if self
+                .probes
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+                == 0
+            {
+                std::future::pending().await
+            }
+            true
+        }
+    }
+
+    fn spec1(handler: &str) -> JobSpec {
+        JobSpec {
+            version: 1,
+            input: b"payload".to_vec(),
+            steps: vec![StepSpec {
+                name: "only".into(),
+                handler: handler.into(),
+            }],
+        }
+    }
+
+    fn fast_limits() -> Limits {
+        Limits {
+            max_step_deadline_ms: 100,
+            ..Limits::default()
+        }
+    }
+
+    async fn wait_state(eng: &Engine, run: RunId, kind: &str) -> Run {
+        for _ in 0..500 {
+            if let Some(r) = eng.inspect(run).await.unwrap_or(None) {
+                if r.state.kind() == kind {
+                    return r;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        panic!("run never reached state {kind}");
+    }
+
+    /// kill -9 between dispatch and reply, then restart on the same
+    /// journal: the orphaned Running attempt must reconcile — never sit
+    /// `running` forever, and never blindly re-fire the remote call.
+    #[tokio::test(flavor = "current_thread")]
+    async fn restart_orphaned_running_run_reconciles() {
+        let d = tempfile::tempdir().unwrap_or_else(|e| panic!("{e}"));
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let cfg = ShellConfig {
+            tick_ms: 5,
+            limits: fast_limits(),
+            ..Default::default()
+        };
+        let run;
+        {
+            let mut reg = Registry::default();
+            reg.register(
+                "hang",
+                Arc::new(HangOnce {
+                    calls: calls.clone(),
+                }),
+            );
+            let eng = spawn(d.path(), reg, cfg.clone()).unwrap_or_else(|e| panic!("{e}"));
+            run = eng
+                .submit(OperationKey("orphan-running".into()), spec1("hang"))
+                .await
+                .unwrap_or_else(|e| panic!("{e}"));
+            wait_state(&eng, run, "running").await;
+            drop(eng); // the process dies mid-flight; the journal keeps Running
+            tokio::time::sleep(Duration::from_millis(50)).await; // actor exits, LOCK frees
+        }
+        let mut reg = Registry::default();
+        reg.register(
+            "hang",
+            Arc::new(HangOnce {
+                calls: calls.clone(),
+            }),
+        );
+        let eng = spawn(d.path(), reg, cfg).unwrap_or_else(|e| panic!("{e}"));
+        assert!(matches!(until_done(&eng, run).await, RunState::Done));
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "reconcile must not blindly repeat the remote call"
+        );
+    }
+
+    /// Crash after ReplyLost committed Reconciling but before the probe
+    /// verdict: restart must re-probe, not strand the run in Reconciling.
+    #[tokio::test(flavor = "current_thread")]
+    async fn restart_orphaned_reconciling_run_reprobes() {
+        let d = tempfile::tempdir().unwrap_or_else(|e| panic!("{e}"));
+        let probes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let cfg = ShellConfig {
+            tick_ms: 5,
+            limits: fast_limits(),
+            ..Default::default()
+        };
+        let run;
+        {
+            let mut reg = Registry::default();
+            reg.register(
+                "lostprobe",
+                Arc::new(LostProbe {
+                    probes: probes.clone(),
+                }),
+            );
+            let eng = spawn(d.path(), reg, cfg.clone()).unwrap_or_else(|e| panic!("{e}"));
+            run = eng
+                .submit(
+                    OperationKey("orphan-reconciling".into()),
+                    spec1("lostprobe"),
+                )
+                .await
+                .unwrap_or_else(|e| panic!("{e}"));
+            wait_state(&eng, run, "reconciling").await;
+            drop(eng); // probe#1 hangs forever — the crash window
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        let mut reg = Registry::default();
+        reg.register(
+            "lostprobe",
+            Arc::new(LostProbe {
+                probes: probes.clone(),
+            }),
+        );
+        let eng = spawn(d.path(), reg, cfg).unwrap_or_else(|e| panic!("{e}"));
+        assert!(matches!(until_done(&eng, run).await, RunState::Done));
+        assert!(
+            probes.load(std::sync::atomic::Ordering::SeqCst) >= 2,
+            "restart must issue a fresh reconcile probe"
+        );
     }
 
     fn spec(handler: &str) -> JobSpec {
@@ -577,7 +765,8 @@ mod tests {
         let err = eng
             .submit(OperationKey("bad".into()), spec("ghost"))
             .await
-            .expect_err("unregistered handler must be refused");
+            .err()
+            .unwrap_or_else(|| panic!("unregistered handler must be refused"));
         assert!(matches!(err, EngineError::UnregisteredHandler(_)));
         assert!(eng.list().await.unwrap_or_default().is_empty());
     }
