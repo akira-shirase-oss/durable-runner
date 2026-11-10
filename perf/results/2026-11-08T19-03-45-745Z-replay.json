@@ -1,0 +1,20 @@
+{
+  "machine": {
+    "host": "Vinays-MacBook-Pro-2.local",
+    "platform": "darwin/arm64",
+    "cpu": "Apple M2 Pro",
+    "cores": 12,
+    "mem_gb": 32,
+    "date": "2026-11-08T19:03:45.746Z",
+    "commit": "c36f5c3"
+  },
+  "scenario": "replay",
+  "params": {
+    "target_events": 100000,
+    "runs": 11112,
+    "steps_per_run": 4
+  },
+  "replay_ms": 212,
+  "runs_recovered": 11112,
+  "verdict": "pass"
+}

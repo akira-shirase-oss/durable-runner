@@ -1,0 +1,19 @@
+battery armed: waiting for k6 pid 56547
+manual battery start — concurrent with colophon P6 soak (user-directed overlap; latency numbers are conservative/contended)
+filling ~11112 runs (100008 records)...
+result -> /Users/vinaysandhu/Desktop/Learning/akira-shirase-oss/projects/durable-runner/perf/results/2026-11-08T19-03-45-745Z-replay.json
+result -> /Users/vinaysandhu/Desktop/Learning/akira-shirase-oss/projects/durable-runner/perf/results/2026-11-08T19-04-53-880Z-submit.json
+result -> /Users/vinaysandhu/Desktop/Learning/akira-shirase-oss/projects/durable-runner/perf/results/2026-11-08T19-06-02-011Z-submit.json
+result -> /Users/vinaysandhu/Desktop/Learning/akira-shirase-oss/projects/durable-runner/perf/results/2026-11-08T19-07-10-415Z-submit.json
+100000 sent, 67230 accepted @1004s
+200000 sent, 131768 accepted @2009s
+300000 sent, 195321 accepted @3014s
+400000 sent, 258826 accepted @4021s
+500000 sent, 320859 accepted @5027s
+600000 sent, 382117 accepted @6033s
+700000 sent, 443808 accepted @7040s
+800000 sent, 503349 accepted @8047s
+900000 sent, 561705 accepted @9055s
+1000000 sent, 618461 accepted @10062s
+result -> /Users/vinaysandhu/Desktop/Learning/akira-shirase-oss/projects/durable-runner/perf/results/2026-11-08T21-55-24-131Z-sustained.json
+2026-11-08T21:55:24Z manual battery complete

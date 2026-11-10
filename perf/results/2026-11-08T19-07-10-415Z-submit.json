@@ -1,0 +1,29 @@
+{
+  "machine": {
+    "host": "Vinays-MacBook-Pro-2.local",
+    "platform": "darwin/arm64",
+    "cpu": "Apple M2 Pro",
+    "cores": 12,
+    "mem_gb": 32,
+    "date": "2026-11-08T19:07:10.417Z",
+    "commit": "c36f5c3"
+  },
+  "scenario": "submit",
+  "params": {
+    "rate_per_s": 100,
+    "seconds": 60,
+    "fsync": "per-record (default)"
+  },
+  "sent": 6000,
+  "accepted": 6000,
+  "done_of_last_drain": 3657,
+  "http_codes": {
+    "200": 6000
+  },
+  "latency_ms": {
+    "p50": 526.9324170000036,
+    "p99": 4051.189707999998,
+    "max": 5011.0513749999955
+  },
+  "verdict": "FAIL"
+}
