@@ -1,0 +1,16 @@
+2026-11-10T16:50:24Z armed: waiting for colophon k6 pid 65219
+2026-11-10T17:48:25Z colophon k6 exited — letting result-write flush
+    Finished `release` profile [optimized] target(s) in 0.27s
+2026-11-10T17:49:55Z machine free — solo sustained starting
+100000 sent, 59218 accepted @1009s
+200000 sent, 115337 accepted @2018s
+300000 sent, 167473 accepted @3029s
+400000 sent, 215815 accepted @4042s
+500000 sent, 260030 accepted @5056s
+600000 sent, 304325 accepted @6065s
+700000 sent, 349652 accepted @7074s
+800000 sent, 394377 accepted @8083s
+900000 sent, 438063 accepted @9091s
+1000000 sent, 480891 accepted @10100s
+result -> /Users/vinaysandhu/Desktop/Learning/akira-shirase-oss/projects/durable-runner/perf/results/2026-11-10T20-38-48-041Z-sustained.json
+2026-11-10T20:38:48Z solo sustained done (exit 0)

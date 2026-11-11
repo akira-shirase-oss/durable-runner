@@ -5,7 +5,9 @@
 **Toolchain:** Rust 1.99.1 via rustup proxies · python3 + curl + lsof for the pilot
 **Guide:** `test/durable-runner-TESTING.md`
 **Verdict: PASS with one real bug found and fixed** (`464e908`), plus a lint-gate fix
-(`82ef4f8`) and the owed load battery committed (`1491441`).
+(`82ef4f8`) and the owed load battery committed (`1491441`). **The sustained-load
+ship gate is red — twice, solo included** (§4a): the journal's per-record-fsync
+ceiling is the open problem, not contention.
 
 ---
 
@@ -66,6 +68,35 @@ admission 503s, not lost work), but submit-ack latency under a full journal +
 contention did not meet the gate. That is a real, recorded limitation — flagged for
 the operator doc, not hidden.
 
+### 4a. The solo re-run — contention theory disproven (2026-11-10)
+
+Per the open item above, the sustained scenario re-ran alone: same machine free of
+any other load suite, `sustained --rate=100 --total=1000000`, commit `e193b20`,
+result `perf/results/2026-11-10T20-38-48-041Z-sustained.json`, runner log
+`solo-sustained-runner.log`.
+
+| Metric | Contended (Nov 8) | **Solo (Nov 10)** |
+|---|---|---|
+| sent / accepted | 1,000,000 / 619,480 | 1,000,000 / **481,914** |
+| HTTP 200 / 503 | 619,480 / 380,520 | 481,914 / **518,086** |
+| p50 / p99 / max | 15,453 / 24,362 / 26,019 ms | **7.5 / 29,934 / 34,566 ms** |
+| wall clock | 10,093 s | 10,131 s |
+| journal | 311 MB | 246 MB |
+| verdict | FAIL | **FAIL** |
+
+The solo run is *worse* on acceptance (48.2% vs 61.9%) — the earlier run's higher
+acceptance was the anomaly, not the norm. The 503s are the bounded admission
+control refusing before reserve exhaustion, exactly as designed; nothing
+acknowledged was lost (`done_after_drain` 341,273 runs completed during drain).
+p50 of 7.5 ms shows the fast path is genuinely fast when unsaturated; p99 ~30 s
+shows waiters queue into seconds once the per-record-fsync ceiling (~50–100
+submits/s, between the 50/s pass and 100/s fail on the submit ladder) is crossed.
+
+**Conclusion:** the sustained-load latency gate fails *intrinsically*, not from
+contention. Root-causing the ceiling — fsync batching/group commit, a lower
+declared sustained rate, or admission shaping — is the open work before the ship
+gate can be called green. Evidence kept per the workspace rule.
+
 ## 5. Bug found and fixed — restart-orphaned runs stuck `running` forever
 
 **Reproduction (live):** submit a job to a slow handler, `kill -9` the server
@@ -108,6 +139,7 @@ Clippy clean after; no behavior change.
 | `464e908` | **fix:** restart-orphaned runs reconcile instead of sticking forever (+ 2 regression tests) |
 | `38698ff` | `test/durable-runner-TESTING.md` |
 | `1491441` | load battery evidence: replay/submit/stall/compact/admission/sustained JSONs + runner log |
+| `e193b20` | this report (external testing guide pass) |
 
 ## 8. Verdict
 
@@ -115,7 +147,10 @@ The durability contract holds under every drill the guide defines — acknowledg
 work survives kill-9, compaction, backup and restore; dedup, the handler allowlist,
 and the single-writer lock all refuse correctly. **One real bug was found** (orphaned
 runs never reconciled after restart) and fixed with failing-first regression tests.
-The load battery is committed honestly: replay and compaction are fast, the sustained
-1M-submit run refused 38% at admission and failed its latency gate while contending
-with another suite — evidence kept per the workspace rule, worth a clean solo re-run
-before calling the ship gate fully green.
+The load battery is committed honestly: replay and compaction are fast. The
+sustained 1M-submit gate is **red twice** — contended (38% refused, p99 24.4 s)
+and solo (52% refused, p99 29.9 s) — proving the limit is the journal's
+per-record-fsync throughput ceiling, not external contention. Durability itself
+held throughout: refusals were bounded admission 503s and nothing acknowledged
+was lost. **The ship gate is not green**: root-causing the fsync ceiling (or
+re-scoping the declared sustained rate) is the remaining work.
