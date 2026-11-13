@@ -2,7 +2,7 @@
 
 A background-task runner in Rust. Acknowledged work survives restarts; the
 journal — a framed append-only file store with one writer — is the only
-authority. Contract: `../Project_Guides/04_Durable_Workflow_Runner.docx` (text
+authority. Contract: `../../docs/Project_Guides/04_Durable_Workflow_Runner.docx` (text
 extract in `docs/`).
 
 ## Read first
