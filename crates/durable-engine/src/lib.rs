@@ -236,22 +236,26 @@ impl EngineCore {
     }
 
     /// Every run whose wait has expired at `now` — the dispatch candidates
-    /// as (run, step, next attempt).
+    /// as (run, step, next attempt), longest-waiting first so a per-tick
+    /// dispatch cap cannot starve anyone.
     pub fn due(&self, now: Millis) -> Vec<(RunId, StepIndex, u32)> {
-        self.runs
+        let mut due: Vec<(Millis, RunId, StepIndex, u32)> = self
+            .runs
             .iter()
             .filter_map(|(id, r)| match &r.state {
                 RunState::Queued { next_run_at } if *next_run_at <= now => {
-                    Some((*id, StepIndex(0), 1))
+                    Some((*next_run_at, *id, StepIndex(0), 1))
                 }
                 RunState::RetryWaiting {
                     step,
                     attempt,
                     next_run_at,
-                } if *next_run_at <= now => Some((*id, *step, *attempt + 1)),
+                } if *next_run_at <= now => Some((*next_run_at, *id, *step, *attempt + 1)),
                 _ => None,
             })
-            .collect()
+            .collect();
+        due.sort_unstable_by_key(|(at, id, ..)| (*at, id.0));
+        due.into_iter().map(|(_, id, s, a)| (id, s, a)).collect()
     }
 
     /// Commit a dispatch: record StepDispatched, then the caller may invoke

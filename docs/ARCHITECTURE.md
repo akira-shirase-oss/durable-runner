@@ -25,9 +25,12 @@
 **Submit:** `POST /api/jobs {operation_key, version, input}` → admission check
 (reserve + caps) → journal append → fsync → `202 {run_id}` → dispatch.
 
-**Step:** coordinator claims due step → per-attempt deadline → allowlisted HTTP
-handler → checkpoint record → schedule next step or retry (persisted
-next-run + attempt count) → finish → history becomes terminal.
+**Step:** coordinator takes a concurrency permit (none free → the run stays
+queued) → journals `StepDispatched` with a per-attempt deadline → allowlisted
+HTTP handler → checkpoint record (which is the next step's dispatch; it
+inherits the permit) → schedule next step or retry (persisted next-run +
+attempt count) → finish → history becomes terminal. Dispatch is capped per
+tick; a call past its deadline is cancelled locally and reconciled.
 
 **Recovery:** read manifest → load snapshot → replay journal records in order →
 discard only a provably-torn tail append → rebuild index → serve.

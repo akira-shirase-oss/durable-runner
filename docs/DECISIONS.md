@@ -48,3 +48,18 @@ convention; these seed the contract's prescribed directions.
   a supervisor restarts it and startup replay decides what is durable. A
   failed rollback also poisons. Proven with fault injection (the journal's
   `fault-injection` feature, enabled only by dev-dependencies).
+- **D-010 — A dispatch is journaled only while holding a permit.** Before
+  this, the tick journaled `StepDispatched` for every due run and then
+  tried to take one of the `max_in_flight` permits; without one it
+  silently skipped the call ("the next tick retries" was false). The run
+  sat `Running` until its deadline, reconciled "not found", and burned an
+  attempt. Now the tick takes the permit first and stops dispatching when
+  none is free (the run stays queued: nothing happened, nothing is
+  recorded). A finished attempt or probe hands its permit to the chained
+  step its checkpoint journaled, so no other run can take that capacity in
+  between. Reconcile probes are handler calls and share the same permits
+  (a probe without one waits in a queue, oldest first). The deadline sweep
+  cancels the local call it declares lost, so a stalled handler cannot hold
+  a permit forever (cancelling never undoes a remote effect; the probe
+  decides). Dispatches and expiries are capped per tick
+  (`max_dispatch_per_tick`, default 64), longest-waiting first.
