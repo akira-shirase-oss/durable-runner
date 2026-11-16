@@ -34,3 +34,17 @@ convention; these seed the contract's prescribed directions.
   index. `commit` now trial-reduces before appending so refusals stay out
   of the journal, and `apply_committed` uses get/get_mut so a refused event
   can never lose the run.
+- **D-009 — A failed write rolls back; a failed fsync poisons the writer.**
+  Before this, a failed `write_all` or `sync_data` returned early but left
+  whatever bytes reached the file, and the next append reused the same
+  sequence number behind them: the next startup refused the journal as
+  `Corrupt`. Now the writer tracks the durable length (bytes covered by a
+  successful fsync). A failed write truncates back to it and fsyncs the
+  truncation; the record does not exist and its sequence number is free.
+  A failed fsync is **never retried** — after one, the kernel may have
+  dropped the dirty pages, and a second fsync can succeed for data that is
+  gone — so the writer poisons: every later append, compaction and backup
+  refuses, the engine actor stops, and `durable-server` exits non-zero so
+  a supervisor restarts it and startup replay decides what is durable. A
+  failed rollback also poisons. Proven with fault injection (the journal's
+  `fault-injection` feature, enabled only by dev-dependencies).

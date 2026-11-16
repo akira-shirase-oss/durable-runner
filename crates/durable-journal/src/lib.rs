@@ -17,7 +17,62 @@ use serde::{Deserialize, Serialize};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
+#[cfg(any(test, feature = "fault-injection"))]
+use std::sync::Arc;
 use thiserror::Error;
+
+/// Scripted storage failures for tests. Compiled only for this crate's own
+/// tests or with the `fault-injection` feature, which only dev-dependencies
+/// enable — a release build has no injection points.
+#[cfg(any(test, feature = "fault-injection"))]
+pub mod faults {
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+
+    /// Each armed fault fires once, on the next matching operation.
+    #[derive(Debug, Default)]
+    pub struct Faults {
+        // 0 = disarmed; n = write n-1 bytes of the next write, then fail.
+        partial_write: AtomicU64,
+        fail_sync: AtomicBool,
+        fail_truncate: AtomicBool,
+    }
+
+    impl Faults {
+        /// The next log write puts `bytes` bytes on disk and then fails,
+        /// like a write cut short by ENOSPC or EIO.
+        pub fn fail_next_write_after(&self, bytes: usize) {
+            self.partial_write.store(bytes as u64 + 1, Ordering::SeqCst);
+        }
+        /// The next fsync of the log fails after its write succeeded.
+        pub fn fail_next_sync(&self) {
+            self.fail_sync.store(true, Ordering::SeqCst);
+        }
+        /// The next truncation (the rollback after a failed write) fails.
+        pub fn fail_next_truncate(&self) {
+            self.fail_truncate.store(true, Ordering::SeqCst);
+        }
+        pub(crate) fn take_write(&self) -> Option<usize> {
+            match self.partial_write.swap(0, Ordering::SeqCst) {
+                0 => None,
+                n => Some((n - 1) as usize),
+            }
+        }
+        pub(crate) fn take_sync(&self) -> bool {
+            self.fail_sync.swap(false, Ordering::SeqCst)
+        }
+        pub(crate) fn take_truncate(&self) -> bool {
+            self.fail_truncate.swap(false, Ordering::SeqCst)
+        }
+    }
+}
+
+/// How a journal is opened. `Default` is the production configuration.
+#[derive(Debug, Clone, Default)]
+pub struct JournalOptions {
+    /// Scripted failures (tests only).
+    #[cfg(any(test, feature = "fault-injection"))]
+    pub faults: Option<Arc<faults::Faults>>,
+}
 
 pub const FORMAT_VERSION: u16 = 1;
 const HEADER_LEN: usize = 2 + 4 + 8 + 4;
@@ -35,6 +90,25 @@ pub enum JournalError {
     Manifest(String),
     #[error("admission reserve: {available} bytes free, below {reserve}")]
     NoSpace { available: u64, reserve: u64 },
+    /// A log write failed. The bytes it may have left were cut back to the
+    /// last durable offset (`rolled_back`), so the record does not exist
+    /// and its sequence number is free. If the rollback failed too, the
+    /// writer is poisoned.
+    #[error("journal write failed (rolled back: {rolled_back}): {source}")]
+    WriteFailed {
+        #[source]
+        source: io::Error,
+        rolled_back: bool,
+    },
+    /// A log fsync failed. It is never retried: after a failed fsync the
+    /// kernel may have dropped the dirty pages and a second fsync can
+    /// report success for data that is gone. The writer is poisoned; the
+    /// process must exit and let startup replay decide what is durable.
+    #[error("journal fsync failed; writer poisoned, restart to replay: {0}")]
+    SyncFailed(#[source] io::Error),
+    /// An earlier write or fsync failure poisoned this writer.
+    #[error("journal writer poisoned by an earlier failure; restart to replay")]
+    Poisoned,
 }
 
 /// One committed record as replayed: its sequence and payload.
@@ -143,6 +217,12 @@ pub struct Journal {
     generation: u32,
     file: File,
     next_seq: u64,
+    /// Length of the log covered by successful fsyncs: every byte before
+    /// it is committed, every byte after it is not.
+    durable_len: u64,
+    /// Set by a failed fsync or a failed rollback; refuses every append.
+    poisoned: bool,
+    opts: JournalOptions,
     // Held for the process lifetime; the flock releases when this drops.
     _lock: File,
 }
@@ -152,6 +232,11 @@ impl Journal {
     /// `SecondWriter` if another live writer holds the lock, `Corrupt` on
     /// damaged committed history.
     pub fn open(dir: &Path) -> Result<Self, JournalError> {
+        Self::open_with(dir, JournalOptions::default())
+    }
+
+    /// `open` with explicit options.
+    pub fn open_with(dir: &Path, opts: JournalOptions) -> Result<Self, JournalError> {
         fs::create_dir_all(dir)?;
         let lock_path = dir.join("LOCK");
         let lock_file = OpenOptions::new()
@@ -208,6 +293,9 @@ impl Journal {
             generation,
             file,
             next_seq,
+            durable_len: good_len,
+            poisoned: false,
+            opts,
             _lock: lock_file,
         })
     }
@@ -218,8 +306,13 @@ impl Journal {
     pub const FREE_SPACE_RESERVE: u64 = 64 * 1024 * 1024; // 64 MiB
 
     /// Append one record: frame, write, fsync — only then is it committed.
-    /// Returns the assigned sequence number.
+    /// Returns the assigned sequence number. A failure leaves no record
+    /// behind and consumes no sequence number (see `WriteFailed`,
+    /// `SyncFailed`); a poisoned writer refuses with `Poisoned`.
     pub fn append(&mut self, payload: &[u8]) -> Result<u64, JournalError> {
+        if self.poisoned {
+            return Err(JournalError::Poisoned);
+        }
         let available = fs2::available_space(&self.root)?;
         if available < Self::FREE_SPACE_RESERVE {
             return Err(JournalError::NoSpace {
@@ -239,11 +332,82 @@ impl Journal {
         frame.extend_from_slice(&self.next_seq.to_be_bytes());
         frame.extend_from_slice(&crc(payload).to_be_bytes());
         frame.extend_from_slice(payload);
-        self.file.write_all(&frame)?;
-        self.file.sync_data()?; // the durable point: acks follow this line only
+        self.write_durably(&frame)?;
         let seq = self.next_seq;
         self.next_seq += 1;
         Ok(seq)
+    }
+
+    /// Whether an earlier failure poisoned this writer.
+    pub fn is_poisoned(&self) -> bool {
+        self.poisoned
+    }
+
+    /// Write then fsync `bytes` at the durable offset. On failure the log
+    /// is left exactly at its last durable length, or the writer poisons.
+    fn write_durably(&mut self, bytes: &[u8]) -> Result<(), JournalError> {
+        if let Err(source) = self.write_log(bytes) {
+            // Part of the frame may be on disk. Cut it off so the next
+            // frame, which reuses this sequence number, starts on a clean
+            // boundary. No fsync failed here, so the writer may continue —
+            // unless the rollback itself fails.
+            let rolled_back = self.rollback().is_ok();
+            if !rolled_back {
+                self.poisoned = true;
+            }
+            return Err(JournalError::WriteFailed {
+                source,
+                rolled_back,
+            });
+        }
+        if let Err(e) = self.sync_log() {
+            // Never retry the fsync. Poison first; the rollback is best
+            // effort and nothing is acknowledged on the strength of it — if
+            // it fails, startup replay discards the torn tail or keeps a
+            // complete-but-unacknowledged record (at-least-once, deduped
+            // by operation key).
+            self.poisoned = true;
+            if self.rollback().is_err() {
+                // Already poisoned; the replay rules above cover the file.
+            }
+            return Err(JournalError::SyncFailed(e));
+        }
+        // the durable point: acks follow this line only
+        self.durable_len += bytes.len() as u64;
+        Ok(())
+    }
+
+    /// Truncate the log to its durable length and make that durable.
+    fn rollback(&mut self) -> io::Result<()> {
+        #[cfg(any(test, feature = "fault-injection"))]
+        if self.opts.faults.as_ref().is_some_and(|f| f.take_truncate()) {
+            return Err(io::Error::other("injected truncate failure"));
+        }
+        self.file.set_len(self.durable_len)?;
+        self.file.sync_data()?;
+        // An append-mode handle ignores the position; a read-write one
+        // (first open) needs it moved back.
+        self.file.seek(SeekFrom::Start(self.durable_len))?;
+        Ok(())
+    }
+
+    /// The one place log bytes are written (fault seam for tests).
+    fn write_log(&mut self, bytes: &[u8]) -> io::Result<()> {
+        #[cfg(any(test, feature = "fault-injection"))]
+        if let Some(n) = self.opts.faults.as_ref().and_then(|f| f.take_write()) {
+            self.file.write_all(&bytes[..n.min(bytes.len())])?;
+            return Err(io::Error::other("injected write failure"));
+        }
+        self.file.write_all(bytes)
+    }
+
+    /// The one place the log is fsynced (fault seam for tests).
+    fn sync_log(&mut self) -> io::Result<()> {
+        #[cfg(any(test, feature = "fault-injection"))]
+        if self.opts.faults.as_ref().is_some_and(|f| f.take_sync()) {
+            return Err(io::Error::other("injected fsync failure"));
+        }
+        self.file.sync_data()
     }
 
     /// Records written so far in this generation (next seq to assign - 1).
@@ -264,6 +428,9 @@ impl Journal {
     /// the manifest. A crash at any point opens either the old complete
     /// generation or the new one, never a mixture (contract §02).
     pub fn compact(&mut self, snapshot: &Snapshot) -> Result<(), JournalError> {
+        if self.poisoned {
+            return Err(JournalError::Poisoned);
+        }
         let next = self.generation + 1;
         let gdir = gen_dir_path(&self.root, next);
         fs::create_dir_all(&gdir)?;
@@ -296,6 +463,7 @@ impl Journal {
         self.file.seek(SeekFrom::End(0))?;
         self.generation = next;
         self.next_seq = 1;
+        self.durable_len = 0;
         Ok(())
     }
 
@@ -303,6 +471,9 @@ impl Journal {
     /// a copy interrupted mid-flight still opens as a complete older
     /// generation, never a torn mixed one.
     pub fn backup_to(&self, dest: &Path) -> Result<(), JournalError> {
+        if self.poisoned {
+            return Err(JournalError::Poisoned); // the log may hold an unrolled tail
+        }
         fs::create_dir_all(dest)?;
         for entry in fs::read_dir(&self.root)? {
             let entry = entry?;
@@ -452,6 +623,118 @@ mod tests {
             Err(JournalError::Corrupt { seq: 1, .. }) => {}
             other => panic!("expected Corrupt at seq 1, got {other:?}"),
         }
+    }
+
+    fn open_faulty(dir: &Path) -> (Journal, Arc<faults::Faults>) {
+        let f = Arc::new(faults::Faults::default());
+        let j = Journal::open_with(
+            dir,
+            JournalOptions {
+                faults: Some(f.clone()),
+            },
+        )
+        .unwrap_or_else(|e| panic!("{e}"));
+        (j, f)
+    }
+
+    fn payloads(dir: &Path) -> Vec<(u64, Vec<u8>)> {
+        replay_dir(&gen_dir_path(dir, 1))
+            .unwrap_or_else(|e| panic!("history must replay cleanly: {e}"))
+            .into_iter()
+            .map(|r| (r.seq, r.payload))
+            .collect()
+    }
+
+    /// A write cut short (ENOSPC, EIO) leaves part of a frame on disk.
+    /// Without a rollback the next append lands behind those bytes with the
+    /// same sequence number and the next startup refuses the journal as
+    /// corrupt. The partial bytes must be cut back to the durable offset.
+    #[test]
+    fn partial_write_is_rolled_back_and_history_stays_replayable() {
+        let dir = tempfile::tempdir().unwrap_or_else(|e| panic!("{e}"));
+        {
+            let (mut j, f) = open_faulty(dir.path());
+            assert_eq!(j.append(b"one").unwrap_or_else(|e| panic!("{e}")), 1);
+            f.fail_next_write_after(7); // header half-written
+            assert!(
+                matches!(
+                    j.append(b"two"),
+                    Err(JournalError::WriteFailed {
+                        rolled_back: true,
+                        ..
+                    })
+                ),
+                "a failed write is not a commit"
+            );
+            assert!(!j.is_poisoned(), "a rolled-back write needs no restart");
+            assert_eq!(
+                j.append(b"three").unwrap_or_else(|e| panic!("{e}")),
+                2,
+                "the failed record never consumed a sequence number"
+            );
+        }
+        let rs = payloads(dir.path());
+        assert_eq!(rs, vec![(1, b"one".to_vec()), (2, b"three".to_vec())]);
+        Journal::open(dir.path()).unwrap_or_else(|e| panic!("reopen: {e}"));
+    }
+
+    /// After a failed fsync the kernel may already have dropped the dirty
+    /// pages, so a retried fsync can report success for lost data. The
+    /// writer must refuse every later append (poisoned) so the process
+    /// restarts and replays; the record it could not make durable must not
+    /// share a sequence number with anything written later.
+    #[test]
+    fn failed_fsync_poisons_the_writer_and_replay_stays_clean() {
+        let dir = tempfile::tempdir().unwrap_or_else(|e| panic!("{e}"));
+        {
+            let (mut j, f) = open_faulty(dir.path());
+            j.append(b"one").unwrap_or_else(|e| panic!("{e}"));
+            f.fail_next_sync();
+            assert!(
+                matches!(j.append(b"two"), Err(JournalError::SyncFailed(_))),
+                "an unsynced record is not a commit"
+            );
+            assert!(
+                matches!(j.append(b"three"), Err(JournalError::Poisoned)),
+                "a writer whose fsync failed must refuse further appends"
+            );
+            assert!(j.is_poisoned());
+        }
+        // Restart: replay sees only durable history, and the writer works.
+        assert_eq!(payloads(dir.path()), vec![(1, b"one".to_vec())]);
+        let mut j = Journal::open(dir.path()).unwrap_or_else(|e| panic!("reopen: {e}"));
+        assert_eq!(j.append(b"four").unwrap_or_else(|e| panic!("{e}")), 2);
+    }
+
+    /// If the rollback itself fails the file may still hold partial bytes:
+    /// the writer must poison rather than append behind them.
+    #[test]
+    fn failed_rollback_poisons_the_writer() {
+        let dir = tempfile::tempdir().unwrap_or_else(|e| panic!("{e}"));
+        {
+            let (mut j, f) = open_faulty(dir.path());
+            j.append(b"one").unwrap_or_else(|e| panic!("{e}"));
+            f.fail_next_write_after(5);
+            f.fail_next_truncate();
+            assert!(matches!(
+                j.append(b"two"),
+                Err(JournalError::WriteFailed {
+                    rolled_back: false,
+                    ..
+                })
+            ));
+            assert!(
+                matches!(j.append(b"three"), Err(JournalError::Poisoned)),
+                "partial bytes may remain: appending behind them corrupts history"
+            );
+        }
+        // The partial frame is a torn tail: discarded at reopen, history kept.
+        let mut j = Journal::open(dir.path()).unwrap_or_else(|e| panic!("reopen: {e}"));
+        assert_eq!(j.append(b"four").unwrap_or_else(|e| panic!("{e}")), 2);
+        assert_eq!(
+            payloads(dir.path()),
+            vec![(1, b"one".to_vec()), (2, b"four".to_vec())]
+        );
     }
 
     #[test]

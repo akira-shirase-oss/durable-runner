@@ -71,3 +71,7 @@ state — same run ids, same `finished_at`. Verified live by
   terminal transition, unregistered handler).
 - HTTP 503 — admission reserve: the server is bounded and said so,
   instead of queueing silently.
+- Process exit with `engine stopped: journal writer poisoned` — a journal
+  fsync failed. It is never retried; run the server under a supervisor
+  that restarts on failure (systemd `Restart=on-failure`) and startup
+  replay recovers exactly the durable history.

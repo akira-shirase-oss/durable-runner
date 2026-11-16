@@ -14,6 +14,7 @@ use durable_domain::{JobSpec, Millis, OperationKey, RunId, RunState, StepSpec};
 use durable_engine::shell::{spawn, Engine, Outcome, Registry, ShellConfig, StepHandler};
 use durable_engine::EngineError;
 use serde::{Deserialize, Serialize};
+use std::future::IntoFuture;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -284,6 +285,7 @@ async fn main() -> Result<()> {
     }
     let engine = spawn(&args.journal, registry, ShellConfig::default())
         .map_err(|e| anyhow::anyhow!("engine open: {e}"))?;
+    let stopped = engine.clone();
     let app = App { engine };
     let mut router = Router::new()
         .route("/health", get(health))
@@ -306,6 +308,14 @@ async fn main() -> Result<()> {
         .await
         .with_context(|| format!("bind {}", args.listen))?;
     eprintln!("durable-server listening on {}", args.listen);
-    axum::serve(listener, router).await?;
+    tokio::select! {
+        r = axum::serve(listener, router).into_future() => r?,
+        () = stopped.closed() => {
+            // The journal writer poisoned itself (a failed fsync is never
+            // retried): exit non-zero so the supervisor restarts us and
+            // startup replay decides what is durable.
+            anyhow::bail!("engine stopped: journal writer poisoned; exiting so a restart replays");
+        }
+    }
     Ok(())
 }

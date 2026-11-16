@@ -11,6 +11,7 @@ use crate::{EngineCore, EngineError};
 use durable_domain::{
     Effect, JobSpec, Limits, Millis, OperationKey, Run, RunId, RunState, StepIndex, StepSpec,
 };
+use durable_journal::JournalOptions;
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::Arc;
@@ -112,6 +113,18 @@ pub struct Engine {
 }
 
 impl Engine {
+    /// Enqueue a command without waiting: a full channel is honest
+    /// back-pressure (busy, retry later); a closed one means the actor has
+    /// stopped and nothing will ever answer.
+    fn send(&self, cmd: Cmd) -> Result<(), EngineError> {
+        self.tx.try_send(cmd).map_err(|e| match e {
+            mpsc::error::TrySendError::Full(_) => {
+                EngineError::Refused(durable_domain::Refusal::ReserveExhausted)
+            }
+            mpsc::error::TrySendError::Closed(_) => EngineError::Stopped,
+        })
+    }
+
     pub async fn submit(&self, key: OperationKey, spec: JobSpec) -> Result<RunId, EngineError> {
         self.submit_inner(key, spec, None).await
     }
@@ -133,22 +146,18 @@ impl Engine {
         not_before: Option<Millis>,
     ) -> Result<RunId, EngineError> {
         let (reply, rx) = oneshot::channel();
-        self.tx
-            .try_send(Cmd::Submit {
-                key,
-                spec,
-                not_before,
-                reply,
-            })
-            .map_err(|_| EngineError::Refused(durable_domain::Refusal::ReserveExhausted))?;
+        self.send(Cmd::Submit {
+            key,
+            spec,
+            not_before,
+            reply,
+        })?;
         rx.await.map_err(|_| EngineError::Stopped)?
     }
 
     pub async fn cancel(&self, run: RunId) -> Result<(), EngineError> {
         let (reply, rx) = oneshot::channel();
-        self.tx
-            .try_send(Cmd::Cancel { run, reply })
-            .map_err(|_| EngineError::Refused(durable_domain::Refusal::ReserveExhausted))?;
+        self.send(Cmd::Cancel { run, reply })?;
         rx.await.map_err(|_| EngineError::Stopped)?
     }
 
@@ -156,18 +165,14 @@ impl Engine {
     /// atomically swap the manifest. Returns the new generation.
     pub async fn compact(&self) -> Result<u32, EngineError> {
         let (reply, rx) = oneshot::channel();
-        self.tx
-            .try_send(Cmd::Compact { reply })
-            .map_err(|_| EngineError::Refused(durable_domain::Refusal::ReserveExhausted))?;
+        self.send(Cmd::Compact { reply })?;
         rx.await.map_err(|_| EngineError::Stopped)?
     }
 
     /// Consistent backup of the journal to `dest` (manifest copied last).
     pub async fn backup_to(&self, dest: std::path::PathBuf) -> Result<(), EngineError> {
         let (reply, rx) = oneshot::channel();
-        self.tx
-            .try_send(Cmd::Backup { dest, reply })
-            .map_err(|_| EngineError::Refused(durable_domain::Refusal::ReserveExhausted))?;
+        self.send(Cmd::Backup { dest, reply })?;
         rx.await.map_err(|_| EngineError::Stopped)?
     }
 
@@ -175,26 +180,28 @@ impl Engine {
     /// post-expiry index size, not history).
     pub async fn list(&self) -> Result<Vec<Run>, EngineError> {
         let (reply, rx) = oneshot::channel();
-        self.tx
-            .try_send(Cmd::List { reply })
-            .map_err(|_| EngineError::Refused(durable_domain::Refusal::ReserveExhausted))?;
+        self.send(Cmd::List { reply })?;
         rx.await.map_err(|_| EngineError::Stopped)
     }
 
     /// Bounded diagnostics — counts by state kind, never rows.
     pub async fn diag(&self) -> Result<crate::Diagnostics, EngineError> {
         let (reply, rx) = oneshot::channel();
-        self.tx
-            .try_send(Cmd::Diag { reply })
-            .map_err(|_| EngineError::Refused(durable_domain::Refusal::ReserveExhausted))?;
+        self.send(Cmd::Diag { reply })?;
         rx.await.map_err(|_| EngineError::Stopped)
+    }
+
+    /// Resolves once the actor has stopped: a poisoned journal writer (a
+    /// failed fsync is never retried) or a panic. The server exits on it so
+    /// a supervisor restarts the process and startup replay decides what
+    /// is durable.
+    pub async fn closed(&self) {
+        self.tx.closed().await;
     }
 
     pub async fn inspect(&self, run: RunId) -> Result<Option<Run>, EngineError> {
         let (reply, rx) = oneshot::channel();
-        self.tx
-            .try_send(Cmd::Inspect { run, reply })
-            .map_err(|_| EngineError::Refused(durable_domain::Refusal::ReserveExhausted))?;
+        self.send(Cmd::Inspect { run, reply })?;
         rx.await.map_err(|_| EngineError::Stopped)
     }
 }
@@ -211,6 +218,8 @@ pub struct ShellConfig {
     /// Domain bounds — deadline, payload sizes, attempts. Tests shrink the
     /// step deadline so crash-recovery paths don't wait 30s.
     pub limits: Limits,
+    /// Journal options (tests inject storage faults here).
+    pub journal: JournalOptions,
 }
 
 impl Default for ShellConfig {
@@ -220,6 +229,7 @@ impl Default for ShellConfig {
             tick_ms: 50,
             cmd_capacity: 1024,
             limits: Limits::default(),
+            journal: JournalOptions::default(),
         }
     }
 }
@@ -228,7 +238,7 @@ impl Default for ShellConfig {
 /// returned handle is the only public interface — there is no path to the
 /// journal except through it.
 pub fn spawn(dir: &Path, registry: Registry, cfg: ShellConfig) -> Result<Engine, EngineError> {
-    let mut core = EngineCore::open(dir)?;
+    let mut core = EngineCore::open_with(dir, cfg.journal.clone())?;
     core.limits = cfg.limits;
     let (tx, rx) = mpsc::channel::<Cmd>(cfg.cmd_capacity);
     tokio::spawn(actor(core, registry, cfg, rx));
@@ -280,6 +290,14 @@ async fn actor(
     }
 
     loop {
+        if core.is_poisoned() {
+            // A failed fsync is never retried and memory may now be ahead
+            // of disk: stop. Dropping the core releases the writer lock;
+            // dropping `rx` (on return) wakes `Engine::closed`.
+            eprintln!("durable: journal writer poisoned; engine stopping so a restart replays");
+            drop(core);
+            return;
+        }
         tokio::select! {
             cmd = rx.recv() => match cmd {
                 Some(Cmd::Submit { key, spec, not_before, reply }) => {
@@ -769,6 +787,52 @@ mod tests {
             .unwrap_or_else(|| panic!("unregistered handler must be refused"));
         assert!(matches!(err, EngineError::UnregisteredHandler(_)));
         assert!(eng.list().await.unwrap_or_default().is_empty());
+    }
+
+    /// A failed fsync must stop the engine — never retry it, never keep
+    /// serving on a writer whose memory may be ahead of disk — and the
+    /// restart must replay a clean journal holding only durable records.
+    #[tokio::test(flavor = "current_thread")]
+    async fn fsync_failure_stops_the_engine_and_restart_replays() {
+        use durable_journal::{faults::Faults, JournalError};
+        let d = tempfile::tempdir().unwrap_or_else(|e| panic!("{e}"));
+        let faults = Arc::new(Faults::default());
+        let mut reg = Registry::default();
+        reg.register("echo", Arc::new(Echo));
+        let cfg = ShellConfig {
+            tick_ms: 5,
+            journal: JournalOptions {
+                faults: Some(faults.clone()),
+            },
+            ..Default::default()
+        };
+        let eng = spawn(d.path(), reg, cfg).unwrap_or_else(|e| panic!("{e}"));
+        let a = eng
+            .submit(OperationKey("durable-a".into()), spec("echo"))
+            .await
+            .unwrap_or_else(|e| panic!("{e}"));
+        assert!(matches!(until_done(&eng, a).await, RunState::Done));
+
+        faults.fail_next_sync();
+        let b = eng
+            .submit(OperationKey("unsynced-b".into()), spec("echo"))
+            .await;
+        assert!(
+            matches!(b, Err(EngineError::Journal(JournalError::SyncFailed(_)))),
+            "an unsynced submit is never acknowledged: {b:?}"
+        );
+        tokio::time::timeout(Duration::from_secs(2), eng.closed())
+            .await
+            .unwrap_or_else(|_| panic!("the engine must stop after a failed fsync"));
+        assert!(matches!(eng.inspect(a).await, Err(EngineError::Stopped)));
+
+        // Restart: replay succeeds and holds exactly the durable history.
+        let core = EngineCore::open(d.path()).unwrap_or_else(|e| panic!("replay: {e}"));
+        assert!(matches!(
+            core.run(a).unwrap_or_else(|| panic!("run a")).state,
+            RunState::Done
+        ));
+        assert_eq!(core.runs().count(), 1, "the unsynced run must not appear");
     }
 
     #[tokio::test(flavor = "current_thread")]

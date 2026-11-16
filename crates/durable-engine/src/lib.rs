@@ -11,7 +11,7 @@ use durable_domain::{
     reduce, Effect, Event, JobSpec, Limits, Millis, OperationKey, Refusal, RetryPolicy, Run, RunId,
     RunState, StepIndex,
 };
-use durable_journal::{Journal, JournalError};
+use durable_journal::{Journal, JournalError, JournalOptions};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::Path;
@@ -83,7 +83,12 @@ impl EngineCore {
     /// the current generation has one, then this generation's records.
     /// Corrupt history fails here — startup never proceeds past it.
     pub fn open(dir: &Path) -> Result<Self, EngineError> {
-        let journal = Journal::open(dir)?;
+        Self::open_with(dir, JournalOptions::default())
+    }
+
+    /// `open` with explicit journal options.
+    pub fn open_with(dir: &Path, opts: JournalOptions) -> Result<Self, EngineError> {
+        let journal = Journal::open_with(dir, opts)?;
         let gdir = durable_journal::gen_dir_path(dir, journal.generation());
         let mut core = Self {
             journal,
@@ -310,6 +315,12 @@ impl EngineCore {
     /// Cancellation is an honest transition, not an undo.
     pub fn cancel(&mut self, run: RunId, now: Millis) -> Result<Vec<Effect>, EngineError> {
         self.commit(run, Event::CancelRequested, now)
+    }
+
+    /// A poisoned journal writer refuses every commit: the process must
+    /// stop and let startup replay decide what is durable.
+    pub fn is_poisoned(&self) -> bool {
+        self.journal.is_poisoned()
     }
 
     pub fn run(&self, id: RunId) -> Option<&Run> {
