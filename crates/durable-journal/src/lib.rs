@@ -199,6 +199,11 @@ struct Manifest {
     generation: u32,
 }
 
+/// The generation number of a `gen-NNNNNN` directory name.
+fn parse_gen(name: &std::ffi::OsStr) -> Option<u32> {
+    name.to_str()?.strip_prefix("gen-")?.parse().ok()
+}
+
 /// The on-disk directory for a generation under a journal root.
 pub fn gen_dir_path(root: &Path, generation: u32) -> PathBuf {
     root.join(format!("gen-{generation:06}"))
@@ -598,7 +603,46 @@ impl Journal {
         self.generation = next;
         self.next_seq = 1;
         self.durable_len = 0;
+
+        // 5. Retention: the new generation and its directory entries are
+        //    durable and the manifest names it, so every older generation
+        //    is superseded. Delete them. A crash part-way leaves leftovers
+        //    the next compaction removes; a deletion error never undoes the
+        //    compaction — it shows up as `stale_generations`.
+        self.prune_superseded();
         Ok(())
+    }
+
+    /// Delete every generation directory older than the current one.
+    fn prune_superseded(&self) {
+        let Ok(entries) = fs::read_dir(&self.root) else {
+            return;
+        };
+        let mut removed = false;
+        for entry in entries.flatten() {
+            let older = parse_gen(&entry.file_name()).is_some_and(|g| g < self.generation);
+            if older && fs::remove_dir_all(entry.path()).is_ok() {
+                removed = true;
+            }
+        }
+        if removed {
+            // Best effort: make the removals durable too.
+            if File::open(&self.root).and_then(|d| d.sync_data()).is_err() {
+                // Leftovers after a crash are removed by the next compaction.
+            }
+        }
+    }
+
+    /// Generation directories other than the current one still on disk —
+    /// 0 when retention is keeping up.
+    pub fn stale_generations(&self) -> Result<u32, JournalError> {
+        let mut n = 0;
+        for entry in fs::read_dir(&self.root)? {
+            if parse_gen(&entry?.file_name()).is_some_and(|g| g != self.generation) {
+                n += 1;
+            }
+        }
+        Ok(n)
     }
 
     /// A consistent copy for backup into `dest`, which must not exist yet
@@ -972,9 +1016,15 @@ mod tests {
         // Space returns: everything works again, history is intact.
         free.store(1 << 20, SeqCst);
         assert!(j.space_ok());
+        assert_eq!(
+            payloads(dir.path()).len(),
+            2,
+            "no refused write left a record"
+        );
         j.compact(&big).unwrap_or_else(|e| panic!("{e}"));
         j.backup_to(&dest).unwrap_or_else(|e| panic!("{e}"));
-        assert_eq!(payloads(dir.path()).len(), 2);
+        assert_eq!(j.generation(), 2);
+        assert!(dest.join("gen-000002/snapshot.json").exists());
     }
 
     /// A batch is consecutive frames with contiguous sequence numbers,
@@ -1016,6 +1066,38 @@ mod tests {
         }
         let got: Vec<Vec<u8>> = payloads(dir.path()).into_iter().map(|(_, p)| p).collect();
         assert_eq!(got, [&b"a"[..], b"b", b"c", b"d", b"e"].map(<[u8]>::to_vec));
+    }
+
+    fn gen_dirs(dir: &Path) -> Vec<String> {
+        let mut v: Vec<String> = fs::read_dir(dir)
+            .unwrap_or_else(|e| panic!("{e}"))
+            .filter_map(|e| e.ok())
+            .filter_map(|e| e.file_name().into_string().ok())
+            .filter(|n| n.starts_with("gen-"))
+            .collect();
+        v.sort();
+        v
+    }
+
+    /// Retention: once a compaction's new generation is current and
+    /// durable, every older generation is superseded and deleted — the
+    /// disk holds one generation, not every one ever written.
+    #[test]
+    fn compaction_deletes_superseded_generations() {
+        let dir = tempfile::tempdir().unwrap_or_else(|e| panic!("{e}"));
+        let mut j = Journal::open(dir.path()).unwrap_or_else(|e| panic!("{e}"));
+        let snap = || Snapshot {
+            covered_seq: 0,
+            payload: b"state".to_vec(),
+        };
+        j.append(b"one").unwrap_or_else(|e| panic!("{e}"));
+        j.compact(&snap()).unwrap_or_else(|e| panic!("{e}"));
+        j.append(b"two").unwrap_or_else(|e| panic!("{e}"));
+        j.compact(&snap()).unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(gen_dirs(dir.path()), vec!["gen-000003".to_string()]);
+        drop(j);
+        let j = Journal::open(dir.path()).unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(j.generation(), 3);
     }
 
     #[test]

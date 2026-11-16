@@ -48,6 +48,10 @@ struct Args {
     /// compaction and backup refuse unless what they write fits above it.
     #[arg(long, default_value_t = durable_journal::DEFAULT_RESERVE_BYTES)]
     reserve_bytes: u64,
+    /// Compact (expire week-old terminal runs, delete superseded
+    /// generations) every N seconds; 0 = only on request.
+    #[arg(long, default_value_t = 3600)]
+    compact_every_secs: u64,
 }
 
 /// The environment variable holding the API key. Read from the
@@ -571,6 +575,8 @@ async fn main() -> Result<()> {
             reserve_bytes: args.reserve_bytes,
             ..Default::default()
         },
+        compact_every: (args.compact_every_secs > 0)
+            .then(|| Duration::from_secs(args.compact_every_secs)),
         ..Default::default()
     };
     let mut registry = Registry::default();

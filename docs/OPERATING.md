@@ -26,6 +26,12 @@ target/release/durable-server \
 
 - **Reserve.** `--reserve-bytes N` (default 64 MiB) must stay free on the
   journal filesystem; see "What honest looks like" for the 503s.
+- **Retention.** The server compacts every `--compact-every-secs` (default
+  3600; 0 = only `durable compact`): terminal runs older than seven days
+  leave the index and every superseded `gen-*` directory is deleted, so the
+  journal directory holds one generation. `GET /admin/diagnostics` reports
+  `stale_generations` (0 unless a delete failed; the next compaction
+  retries it).
 - **API key.** The server refuses to start without `DURABLE_API_KEY` (read
   from the environment, never argv). Every mutating and admin route —
   `POST /jobs`, `POST /jobs/{id}/cancel`, `POST /admin/compact`,

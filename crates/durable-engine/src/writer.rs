@@ -63,6 +63,8 @@ pub struct WriterStatus {
     pub records_written: u64,
     pub batches: u64,
     pub largest_batch: u64,
+    /// Superseded generation directories still on disk (retention lag).
+    pub stale_generations: u32,
     /// Set once a write or fsync failed; the writer has stopped.
     pub failed: Option<Arc<JournalError>>,
 }
@@ -102,6 +104,7 @@ pub(crate) fn spawn(journal: Journal, cfg: GroupCommit) -> std::io::Result<Write
     let (status_tx, status) = watch::channel(WriterStatus {
         generation: journal.generation(),
         records_written: journal.records_written(),
+        stale_generations: journal.stale_generations().unwrap_or(0),
         ..WriterStatus::default()
     });
     let thread = std::thread::Builder::new()
@@ -151,6 +154,9 @@ fn run(
                 if r.is_ok() {
                     st.generation = journal.generation();
                     st.records_written = 0;
+                }
+                if let Ok(n) = journal.stale_generations() {
+                    st.stale_generations = n;
                 }
                 let _ = reply.send(r); // the actor may have stopped meanwhile
             }

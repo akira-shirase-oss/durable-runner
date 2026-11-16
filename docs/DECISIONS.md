@@ -185,3 +185,17 @@ convention; these seed the contract's prescribed directions.
   here: the two O(N) index scans per tick (time-ordered due and deadline
   queues), and the load battery has **not** been re-run. No throughput
   claim is made until it is.
+- **D-016 — Retention deletes superseded generations, on a schedule.**
+  Compaction wrote a new generation but never removed the old ones, and
+  ran only when someone asked, so the "7-day expiry" never reclaimed a
+  byte. A workspace could not honestly be deleted while every old
+  generation stayed on disk. Now, once the new generation and its
+  directory entries are durable and the manifest names it, every older
+  `gen-*` directory is deleted. A crash part-way leaves leftovers the next
+  compaction removes; a failed delete never undoes the compaction and
+  shows as `stale_generations`. The server compacts hourly by default
+  (`--compact-every-secs`, 0 = off); a scheduled compaction that fails
+  (e.g. `no_space`) is counted in diagnostics. The step-by-step history of
+  expired runs is gone with their generation. Only the current state of
+  retained runs is kept (in the snapshot), which is all `inspect` ever
+  showed.

@@ -79,11 +79,15 @@ pub struct Diagnostics {
     /// Group commits written (one write + one fsync each) and the largest.
     pub journal_batches: u64,
     pub largest_batch: u64,
+    /// Superseded generations still on disk; retention deletes them after
+    /// each successful compaction, so this stays 0 unless a delete failed.
+    pub stale_generations: u32,
 }
 
 /// The serialized in-memory index — what a compaction snapshot carries.
-/// Live runs, their dedup keys, and the next id; history is not preserved
-/// past a generation boundary — the old generation's journal keeps it.
+/// Live runs, their dedup keys, and the next id. Superseded generations are
+/// deleted after a compaction (retention), so this snapshot plus the new
+/// generation's records are the whole durable state.
 #[derive(Debug, Serialize, Deserialize)]
 struct IndexSnapshot {
     // Ordered by id so listing can page; serialises exactly like the
@@ -156,8 +160,9 @@ pub struct EngineCore {
     pub retry: RetryPolicy,
 }
 
-/// Terminal runs expire from the live index after this much time — the
-/// journal's older generations still hold their history (contract §05).
+/// Terminal runs expire from the index after this much time (contract §05);
+/// the compaction that expires them also deletes the superseded generations
+/// that held their records.
 const TERMINAL_EXPIRY_MS: u64 = 7 * 24 * 60 * 60 * 1000;
 
 impl EngineCore {
@@ -560,15 +565,23 @@ impl EngineCore {
         for r in self.runs.values() {
             *states.entry(r.state.kind()).or_insert(0u64) += 1;
         }
-        let (generation, records_written, journal_batches, largest_batch) = match &self.log {
-            Log::Direct(j) => (j.generation(), j.records_written(), 0, 0),
-            Log::Piped(p) => (
-                p.status.generation,
-                p.status.records_written,
-                p.status.batches,
-                p.status.largest_batch,
-            ),
-        };
+        let (generation, records_written, journal_batches, largest_batch, stale_generations) =
+            match &self.log {
+                Log::Direct(j) => (
+                    j.generation(),
+                    j.records_written(),
+                    0,
+                    0,
+                    j.stale_generations().unwrap_or(0),
+                ),
+                Log::Piped(p) => (
+                    p.status.generation,
+                    p.status.records_written,
+                    p.status.batches,
+                    p.status.largest_batch,
+                    p.status.stale_generations,
+                ),
+            };
         Diagnostics {
             generation,
             records_written,
@@ -579,6 +592,7 @@ impl EngineCore {
             errors: std::collections::BTreeMap::new(),
             journal_batches,
             largest_batch,
+            stale_generations,
         }
     }
 

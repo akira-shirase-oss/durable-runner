@@ -46,7 +46,9 @@ discard only a provably-torn tail append → rebuild index → serve.
 
 **Compaction:** write the new generation to a new directory → fsync → swap the
 manifest atomically → open old or new complete generation, never mixed → expire
-terminal history after 7 days while preserving live state and dedup deps.
+terminal history after 7 days while preserving live state and dedup deps →
+delete every superseded `gen-*` directory (retention). Runs hourly by default
+(`--compact-every-secs`) and on `POST /admin/compact`.
 
 ## HTTP surface
 

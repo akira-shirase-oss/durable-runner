@@ -282,6 +282,9 @@ pub struct ShellConfig {
     /// new commands (they then wait in, and are refused by, the bounded
     /// command channel).
     pub max_outbox_records: usize,
+    /// Compact on this schedule (expiring 7-day-old terminal runs and
+    /// deleting superseded generations); `None` = only on request.
+    pub compact_every: Option<Duration>,
 }
 
 impl Default for ShellConfig {
@@ -295,6 +298,7 @@ impl Default for ShellConfig {
             journal: JournalOptions::default(),
             group_commit: GroupCommit::default(),
             max_outbox_records: 16 * 1024,
+            compact_every: Some(Duration::from_secs(60 * 60)),
         }
     }
 }
@@ -572,10 +576,47 @@ impl Pipeline {
 }
 
 /// A compaction handed to the writer, finished only when it reports back.
+/// `reply` is `None` for a scheduled compaction (nobody to answer: its
+/// outcome is counted instead).
 struct PendingCompaction {
     done: oneshot::Receiver<Result<u32, JournalError>>,
     expired: Vec<RunId>,
-    reply: oneshot::Sender<Result<u32, EngineError>>,
+    reply: Option<CompactReply>,
+}
+
+type CompactReply = oneshot::Sender<Result<u32, EngineError>>;
+
+/// Plan a compaction and queue it behind every record committed so far —
+/// the snapshot never covers a record the log lacks.
+fn start_compaction(
+    core: &mut EngineCore,
+    pipe: &mut Pipeline,
+    reply: Option<CompactReply>,
+) -> Result<PendingCompaction, (EngineError, Option<CompactReply>)> {
+    let plan = match core.plan_compaction(wall_ms()) {
+        Ok(p) => p,
+        Err(e) => return Err((e, reply)),
+    };
+    pipe.collect(core);
+    let (done_tx, done) = oneshot::channel();
+    pipe.outbound.push_back(WriterMsg::Compact {
+        snapshot: plan.snapshot,
+        reply: done_tx,
+    });
+    Ok(PendingCompaction {
+        done,
+        expired: plan.expired,
+        reply,
+    })
+}
+
+async fn scheduled(timer: &mut Option<tokio::time::Interval>) {
+    match timer {
+        Some(t) => {
+            t.tick().await;
+        }
+        None => std::future::pending().await,
+    }
 }
 
 async fn compaction_done(
@@ -607,6 +648,12 @@ async fn actor(
         cfg.group_commit.max_batch_records,
     );
     let mut pending_compaction: Option<PendingCompaction> = None;
+    // First run one period after start, then every period.
+    let mut compactor = cfg.compact_every.map(|every| {
+        let mut t = tokio::time::interval_at(tokio::time::Instant::now() + every, every);
+        t.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        t
+    });
     // Set when the writer is gone without reporting a failure (it panicked).
     let mut writer_lost = false;
 
@@ -657,8 +704,8 @@ async fn actor(
                 "durable: journal commit failed ({err}); engine stopping so a restart replays"
             );
             pipe.fail_held(&err);
-            if let Some(c) = pending_compaction.take() {
-                let _ = c.reply.send(Err(EngineError::CommitFailed(err.clone())));
+            if let Some(reply) = pending_compaction.take().and_then(|c| c.reply) {
+                let _ = reply.send(Err(EngineError::CommitFailed(err.clone())));
             }
             pipe.shutdown().await;
             return;
@@ -710,24 +757,12 @@ async fn actor(
                             durable_domain::Refusal::ReserveExhausted,
                         )));
                     } else {
-                        match core.plan_compaction(wall_ms()) {
-                            Err(e) => {
-                                let _ = reply.send(Err(e));
-                            }
-                            Ok(plan) => {
-                                // Behind every record committed so far: the
-                                // snapshot never covers a record the log lacks.
-                                pipe.collect(&mut core);
-                                let (done_tx, done) = oneshot::channel();
-                                pipe.outbound.push_back(WriterMsg::Compact {
-                                    snapshot: plan.snapshot,
-                                    reply: done_tx,
-                                });
-                                pending_compaction = Some(PendingCompaction {
-                                    done,
-                                    expired: plan.expired,
-                                    reply,
-                                });
+                        match start_compaction(&mut core, &mut pipe, Some(reply)) {
+                            Ok(p) => pending_compaction = Some(p),
+                            Err((e, reply)) => {
+                                if let Some(reply) = reply {
+                                    let _ = reply.send(Err(e));
+                                }
                             }
                         }
                     }
@@ -768,14 +803,20 @@ async fn actor(
                             core.finish_compaction(&c.expired);
                             Ok(generation)
                         }
-                        Ok(Err(e)) => {
-                            let e = EngineError::Journal(e);
-                            mon.returned(&e);
-                            Err(e)
-                        }
+                        Ok(Err(e)) => Err(EngineError::Journal(e)),
                         Err(_) => Err(EngineError::Stopped),
                     };
-                    let _ = c.reply.send(answer);
+                    match (c.reply, answer) {
+                        (Some(reply), answer) => {
+                            if let Err(e) = &answer {
+                                mon.returned(e);
+                            }
+                            let _ = reply.send(answer);
+                        }
+                        // Scheduled: nobody to answer, so a failure is counted.
+                        (None, Err(e)) => mon.handled(&e),
+                        (None, Ok(_)) => {}
+                    }
                 }
             }
             changed = status.changed() => match changed {
@@ -791,6 +832,15 @@ async fn actor(
             _ = ticker.tick() => {
                 let mut ex = exec!();
                 tick(&mut core, &mut ex);
+            }
+            () = scheduled(&mut compactor) => {
+                // Retention on a schedule; skipped while one is running.
+                if pending_compaction.is_none() {
+                    match start_compaction(&mut core, &mut pipe, None) {
+                        Ok(p) => pending_compaction = Some(p),
+                        Err((e, _)) => mon.handled(&e),
+                    }
+                }
             }
         }
         pipe.collect(&mut core);
@@ -1962,6 +2012,45 @@ mod tests {
             took < Duration::from_secs(1),
             "but only for max_wait: {took:?}"
         );
+    }
+
+    /// Retention on a schedule: compaction runs by itself, and the
+    /// superseded generation is gone from disk afterwards.
+    #[tokio::test(flavor = "current_thread")]
+    async fn scheduled_compaction_runs_and_prunes_old_generations() {
+        let d = tempfile::tempdir().unwrap_or_else(|e| panic!("{e}"));
+        let cfg = ShellConfig {
+            tick_ms: 5,
+            compact_every: Some(Duration::from_millis(60)),
+            ..Default::default()
+        };
+        let eng = spawn(d.path(), echo_registry(), cfg).unwrap_or_else(|e| panic!("{e}"));
+        let run = eng
+            .submit(OperationKey("retained".into()), spec("echo"))
+            .await
+            .unwrap_or_else(|e| panic!("{e}"));
+        assert!(matches!(until_done(&eng, run).await, RunState::Done));
+        let mut diag = bounded(eng.diag()).await.unwrap_or_else(|e| panic!("{e}"));
+        for _ in 0..100 {
+            if diag.generation >= 2 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            diag = bounded(eng.diag()).await.unwrap_or_else(|e| panic!("{e}"));
+        }
+        assert!(
+            diag.generation >= 2,
+            "no scheduled compaction ran: {diag:?}"
+        );
+        assert_eq!(diag.stale_generations, 0, "{diag:?}");
+        let gens: Vec<String> = std::fs::read_dir(d.path())
+            .unwrap_or_else(|e| panic!("{e}"))
+            .filter_map(|e| e.ok()?.file_name().into_string().ok())
+            .filter(|n| n.starts_with("gen-"))
+            .collect();
+        assert_eq!(gens.len(), 1, "one generation on disk: {gens:?}");
+        // The fresh run (not 7 days old) survived the compaction.
+        assert!(bounded(eng.inspect(run)).await.unwrap_or(None).is_some());
     }
 
     /// A failed fsync must stop the engine — never retry it, never keep
