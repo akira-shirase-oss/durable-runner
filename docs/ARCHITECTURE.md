@@ -45,6 +45,7 @@ terminal history after 7 days while preserving live state and dedup deps.
 | Route | Auth | Purpose |
 |---|---|---|
 | `GET /health` | open | liveness |
+| `GET /ready` | open | readiness: 503 `no_space` / `engine_stopped` |
 | `GET /jobs`, `GET /jobs/{id}` | open | list / inspect runs |
 | `POST /jobs` | API key | submit (dedup by `op_key`) |
 | `POST /jobs/{id}/cancel` | API key | cancel (stops scheduling, never undoes) |

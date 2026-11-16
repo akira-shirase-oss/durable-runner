@@ -43,6 +43,11 @@ struct Args {
     /// disabled. Created at startup if missing.
     #[arg(long)]
     backup_root: Option<PathBuf>,
+    /// Bytes that must stay free on the journal filesystem. Below it,
+    /// submits are refused 503 `no_space`, `/ready` is false, and
+    /// compaction and backup refuse unless what they write fits above it.
+    #[arg(long, default_value_t = durable_journal::DEFAULT_RESERVE_BYTES)]
+    reserve_bytes: u64,
 }
 
 /// The environment variable holding the API key. Read from the
@@ -221,6 +226,7 @@ impl IntoResponse for ApiError {
 impl From<EngineError> for ApiError {
     fn from(e: EngineError) -> Self {
         use durable_domain::Refusal;
+        use durable_journal::JournalError as J;
         match &e {
             EngineError::Refused(Refusal::ReserveExhausted) => Self::new(
                 StatusCode::SERVICE_UNAVAILABLE,
@@ -236,6 +242,28 @@ impl From<EngineError> for ApiError {
                 "engine_stopped",
                 "the engine has stopped; the server is restarting",
             ),
+            EngineError::Journal(J::NoSpace { .. }) => Self::new(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "no_space",
+                "free disk space is below the reserve; retry later with the same op_key",
+            ),
+            EngineError::Journal(J::WriteFailed { source, .. })
+                if source.kind() == std::io::ErrorKind::StorageFull =>
+            {
+                Self::new(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "no_space",
+                    "the disk filled during the write; nothing was committed",
+                )
+            }
+            EngineError::Journal(J::WriteFailed { .. } | J::SyncFailed(_) | J::Poisoned) => {
+                eprintln!("durable-server: journal unavailable: {e}");
+                Self::new(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "journal_unavailable",
+                    "the journal could not commit; nothing was acknowledged, retry with the same op_key",
+                )
+            }
             EngineError::Journal(_) | EngineError::Serde(_) => {
                 eprintln!("durable-server: internal error: {e}");
                 Self::new(
@@ -328,8 +356,25 @@ async fn list(State(app): State<App>) -> Result<Json<serde_json::Value>, ApiErro
     Ok(Json(serde_json::json!({ "runs": items })))
 }
 
+/// Liveness: the process answers.
 async fn health() -> Json<serde_json::Value> {
     Json(serde_json::json!({ "ok": true }))
+}
+
+/// Readiness: should this server get new work now? False (503) while free
+/// space is below the reserve or once the engine has stopped.
+async fn ready(State(app): State<App>) -> Response {
+    let r = app.engine.readiness();
+    let status = if r.ready {
+        StatusCode::OK
+    } else {
+        StatusCode::SERVICE_UNAVAILABLE
+    };
+    (
+        status,
+        Json(serde_json::json!({ "ready": r.ready, "code": r.reason })),
+    )
+        .into_response()
 }
 
 async fn diagnostics(
@@ -407,12 +452,13 @@ fn base64_decode(s: &str) -> Result<Vec<u8>, String> {
         .map_err(|e| e.to_string())
 }
 
-/// Every route. Reads (`/health`, `GET /jobs`, `GET /jobs/{id}`, the
+/// Every route. Reads (`/health`, `/ready`, `GET /jobs`, `GET /jobs/{id}`, the
 /// inspector) are open; every mutating and admin handler takes
 /// `Authorized`, so it is unreachable without the API key.
 fn router(app: App, ui_dir: Option<&Path>) -> Router {
     let mut router = Router::new()
         .route("/health", get(health))
+        .route("/ready", get(ready))
         .route("/jobs", post(submit).get(list))
         .route("/jobs/{id}", get(inspect))
         .route("/jobs/{id}/cancel", post(cancel))
@@ -473,8 +519,15 @@ async fn main() -> Result<()> {
             }),
         );
     }
-    let engine = spawn(&args.journal, registry, ShellConfig::default())
-        .map_err(|e| anyhow::anyhow!("engine open: {e}"))?;
+    let cfg = ShellConfig {
+        journal: durable_journal::JournalOptions {
+            reserve_bytes: args.reserve_bytes,
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let engine =
+        spawn(&args.journal, registry, cfg).map_err(|e| anyhow::anyhow!("engine open: {e}"))?;
     let stopped = engine.clone();
     let app = App {
         engine,
@@ -524,12 +577,28 @@ mod tests {
     }
 
     fn harness(with_backup_root: bool) -> Harness {
+        harness_with(with_backup_root, None)
+    }
+
+    /// `free`: an injected free-space probe over a tiny 4 KiB reserve.
+    fn harness_with(
+        with_backup_root: bool,
+        free: Option<Arc<std::sync::atomic::AtomicU64>>,
+    ) -> Harness {
         let journal = tempfile::tempdir().unwrap_or_else(|e| panic!("{e}"));
         let backups = tempfile::tempdir().unwrap_or_else(|e| panic!("{e}"));
         let mut reg = Registry::default();
         reg.register("step", Arc::new(Echo));
+        let mut opts = durable_journal::JournalOptions::default();
+        if let Some(free) = free {
+            opts.reserve_bytes = 4096;
+            opts.space = durable_journal::SpaceProbe::new(move |_| {
+                Ok(free.load(std::sync::atomic::Ordering::SeqCst))
+            });
+        }
         let cfg = ShellConfig {
             tick_ms: 5,
+            journal: opts,
             ..Default::default()
         };
         let engine = spawn(journal.path(), reg, cfg).unwrap_or_else(|e| panic!("{e}"));
@@ -716,6 +785,84 @@ mod tests {
         .await;
         assert_eq!(status, StatusCode::FORBIDDEN);
         assert_eq!(v["code"], "backups_disabled");
+    }
+
+    /// A full disk is a 503 with the stable code `no_space` on every write
+    /// route (submit, compact, backup), readiness flips false, and both
+    /// recover when space returns.
+    #[tokio::test]
+    async fn full_disk_is_503_no_space_and_readiness_false() {
+        use std::sync::atomic::{AtomicU64, Ordering::SeqCst};
+        let free = Arc::new(AtomicU64::new(1 << 20));
+        let h = harness_with(true, Some(free.clone()));
+        let (status, v) = call(&h.router, "GET", "/ready", None, None).await;
+        assert_eq!((status, v["ready"].clone()), (StatusCode::OK, json!(true)));
+        let (status, _) = call(
+            &h.router,
+            "POST",
+            "/jobs",
+            Some(KEY),
+            Some(submit_body("a")),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+
+        free.store(100, SeqCst); // far below the 4 KiB reserve
+        let (status, v) = call(
+            &h.router,
+            "POST",
+            "/jobs",
+            Some(KEY),
+            Some(submit_body("b")),
+        )
+        .await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{v}");
+        assert_eq!(v["code"], "no_space");
+        let (status, v) = call(&h.router, "GET", "/ready", None, None).await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            (v["ready"].clone(), v["code"].clone()),
+            (json!(false), json!("no_space"))
+        );
+        let (status, v) = call(&h.router, "POST", "/admin/compact", Some(KEY), None).await;
+        assert_eq!(
+            (status, v["code"].clone()),
+            (StatusCode::SERVICE_UNAVAILABLE, json!("no_space"))
+        );
+        let (status, v) = call(
+            &h.router,
+            "POST",
+            "/admin/backup",
+            Some(KEY),
+            Some(json!({ "name": "full" })),
+        )
+        .await;
+        assert_eq!(
+            (status, v["code"].clone()),
+            (StatusCode::SERVICE_UNAVAILABLE, json!("no_space"))
+        );
+        assert!(!h.backups.path().join("root/full").exists());
+
+        free.store(1 << 20, SeqCst);
+        let mut ready = false;
+        for _ in 0..100 {
+            let (status, _) = call(&h.router, "GET", "/ready", None, None).await;
+            if status == StatusCode::OK {
+                ready = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert!(ready, "readiness recovers once space returns");
+        let (status, v) = call(
+            &h.router,
+            "POST",
+            "/jobs",
+            Some(KEY),
+            Some(submit_body("b")),
+        )
+        .await;
+        assert_eq!((status, v["run_id"].clone()), (StatusCode::OK, json!(2)));
     }
 
     #[test]

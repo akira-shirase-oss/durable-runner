@@ -66,12 +66,58 @@ pub mod faults {
     }
 }
 
+/// Default bytes that must stay free on the journal filesystem.
+pub const DEFAULT_RESERVE_BYTES: u64 = 64 * 1024 * 1024; // 64 MiB
+
+/// Reports free bytes on the filesystem holding a path. Production uses
+/// `statvfs` (via `fs2`); tests inject a value to emulate a full disk.
+#[derive(Clone)]
+pub struct SpaceProbe(std::sync::Arc<ProbeFn>);
+
+type ProbeFn = dyn Fn(&Path) -> io::Result<u64> + Send + Sync;
+
+impl SpaceProbe {
+    pub fn new(f: impl Fn(&Path) -> io::Result<u64> + Send + Sync + 'static) -> Self {
+        Self(std::sync::Arc::new(f))
+    }
+    pub fn available(&self, path: &Path) -> io::Result<u64> {
+        (self.0)(path)
+    }
+}
+
+impl Default for SpaceProbe {
+    fn default() -> Self {
+        Self::new(|p| fs2::available_space(p))
+    }
+}
+
+impl std::fmt::Debug for SpaceProbe {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("SpaceProbe")
+    }
+}
+
 /// How a journal is opened. `Default` is the production configuration.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct JournalOptions {
+    /// Every write — appends, compaction snapshots, backups — refuses with
+    /// `NoSpace` rather than leave fewer than this many bytes free.
+    pub reserve_bytes: u64,
+    pub space: SpaceProbe,
     /// Scripted failures (tests only).
     #[cfg(any(test, feature = "fault-injection"))]
     pub faults: Option<Arc<faults::Faults>>,
+}
+
+impl Default for JournalOptions {
+    fn default() -> Self {
+        Self {
+            reserve_bytes: DEFAULT_RESERVE_BYTES,
+            space: SpaceProbe::default(),
+            #[cfg(any(test, feature = "fault-injection"))]
+            faults: None,
+        }
+    }
 }
 
 pub const FORMAT_VERSION: u16 = 1;
@@ -303,10 +349,24 @@ impl Journal {
         })
     }
 
-    /// Bytes that must stay free on the journal filesystem — when free
-    /// space falls below this, admission refuses rather than append into
-    /// a full disk (contract: full disk fails safely, not silently).
-    pub const FREE_SPACE_RESERVE: u64 = 64 * 1024 * 1024; // 64 MiB
+    /// Refuse with `NoSpace` unless `need` more bytes fit on the
+    /// filesystem holding `path` with the reserve still free afterwards
+    /// (contract: full disk fails admission safely, not silently).
+    fn ensure_space(&self, path: &Path, need: u64) -> Result<u64, JournalError> {
+        let available = self.opts.space.available(path)?;
+        let reserve = self.opts.reserve_bytes;
+        if available < reserve.saturating_add(need) {
+            return Err(JournalError::NoSpace { available, reserve });
+        }
+        Ok(available)
+    }
+
+    /// Whether the journal filesystem currently has its reserve free —
+    /// the readiness signal. A probe error counts as "no" (unknown is not
+    /// ready).
+    pub fn space_ok(&self) -> bool {
+        self.ensure_space(&self.root, 0).is_ok()
+    }
 
     /// Append one record: frame, write, fsync — only then is it committed.
     /// Returns the assigned sequence number. A failure leaves no record
@@ -316,13 +376,7 @@ impl Journal {
         if self.poisoned {
             return Err(JournalError::Poisoned);
         }
-        let available = fs2::available_space(&self.root)?;
-        if available < Self::FREE_SPACE_RESERVE {
-            return Err(JournalError::NoSpace {
-                available,
-                reserve: Self::FREE_SPACE_RESERVE,
-            });
-        }
+        self.ensure_space(&self.root, (HEADER_LEN + payload.len()) as u64)?;
         if payload.len() as u64 > MAX_PAYLOAD {
             return Err(JournalError::Corrupt {
                 seq: self.next_seq,
@@ -434,6 +488,10 @@ impl Journal {
         if self.poisoned {
             return Err(JournalError::Poisoned);
         }
+        // The new generation's snapshot must fit with the reserve intact —
+        // checked before anything is written, so a refusal leaves no trace.
+        let snapshot_bytes = serde_json::to_vec(snapshot).map_err(io::Error::other)?;
+        self.ensure_space(&self.root, snapshot_bytes.len() as u64)?;
         let next = self.generation + 1;
         let gdir = gen_dir_path(&self.root, next);
         fs::create_dir_all(&gdir)?;
@@ -448,7 +506,7 @@ impl Journal {
         new_log.sync_data()?;
 
         // 2. Snapshot for the new generation (tmp + rename + dir fsync).
-        write_snapshot(&gdir, snapshot)?;
+        write_snapshot_bytes(&gdir, &snapshot_bytes)?;
 
         // 3. The atomic manifest swap — the single point that moves the
         //    world from generation N to N+1.
@@ -478,6 +536,9 @@ impl Journal {
         if self.poisoned {
             return Err(JournalError::Poisoned); // the log may hold an unrolled tail
         }
+        // The copy must fit on the destination with the reserve intact.
+        let parent = dest.parent().unwrap_or(dest);
+        self.ensure_space(parent, self.backup_bytes()?)?;
         // A fresh directory only: copying into an existing one could mix
         // generations from two backups. `create_dir` is the atomic check.
         match fs::create_dir(dest) {
@@ -510,6 +571,31 @@ impl Journal {
     }
 }
 
+impl Journal {
+    /// Bytes a backup copies: every generation's log and snapshot plus the
+    /// manifest.
+    fn backup_bytes(&self) -> Result<u64, JournalError> {
+        let mut total = fs::metadata(self.root.join("manifest.json"))?.len();
+        for entry in fs::read_dir(&self.root)? {
+            let entry = entry?;
+            let is_gen = entry
+                .file_name()
+                .to_str()
+                .is_some_and(|n| n.starts_with("gen-"));
+            if is_gen && entry.file_type()?.is_dir() {
+                for f in ["journal.log", "snapshot.json"] {
+                    match fs::metadata(entry.path().join(f)) {
+                        Ok(m) => total += m.len(),
+                        Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+                        Err(e) => return Err(e.into()),
+                    }
+                }
+            }
+        }
+        Ok(total)
+    }
+}
+
 /// A snapshot accelerates replay: the engine may persist reduced state here
 /// and then only journal records after `covered_seq` need replaying. It is a
 /// cache, never authority — replay without it must yield the same state.
@@ -521,8 +607,12 @@ pub struct Snapshot {
 
 /// Atomically write the generation's snapshot (tmp + rename + dir fsync).
 pub fn write_snapshot(dir: &Path, snap: &Snapshot) -> Result<(), JournalError> {
+    write_snapshot_bytes(dir, &serde_json::to_vec(snap).map_err(io::Error::other)?)
+}
+
+fn write_snapshot_bytes(dir: &Path, bytes: &[u8]) -> Result<(), JournalError> {
     let tmp = dir.join("snapshot.json.tmp");
-    fs::write(&tmp, serde_json::to_vec(snap).map_err(io::Error::other)?)?;
+    fs::write(&tmp, bytes)?;
     File::open(&tmp)?.sync_data()?;
     fs::rename(&tmp, dir.join("snapshot.json"))?;
     sync_parent(&tmp)?;
@@ -643,6 +733,7 @@ mod tests {
             dir,
             JournalOptions {
                 faults: Some(f.clone()),
+                ..JournalOptions::default()
             },
         )
         .unwrap_or_else(|e| panic!("{e}"));
@@ -747,6 +838,70 @@ mod tests {
             payloads(dir.path()),
             vec![(1, b"one".to_vec()), (2, b"four".to_vec())]
         );
+    }
+
+    /// A disk that is "full" by a tiny reserve: an injected probe reports
+    /// a fixed number of free bytes.
+    fn open_with_free(dir: &Path, free: Arc<std::sync::atomic::AtomicU64>) -> Journal {
+        Journal::open_with(
+            dir,
+            JournalOptions {
+                reserve_bytes: 4096,
+                space: SpaceProbe::new(move |_| Ok(free.load(std::sync::atomic::Ordering::SeqCst))),
+                ..JournalOptions::default()
+            },
+        )
+        .unwrap_or_else(|e| panic!("{e}"))
+    }
+
+    /// Appends, compaction and backup all keep the reserve: each refuses
+    /// with `NoSpace` before writing anything when what it would write
+    /// does not fit above the reserve.
+    #[test]
+    fn appends_compaction_and_backup_respect_the_reserve() {
+        use std::sync::atomic::{AtomicU64, Ordering::SeqCst};
+        let dir = tempfile::tempdir().unwrap_or_else(|e| panic!("{e}"));
+        let free = Arc::new(AtomicU64::new(1 << 20));
+        let mut j = open_with_free(dir.path(), free.clone());
+        j.append(b"one").unwrap_or_else(|e| panic!("{e}"));
+        assert!(j.space_ok());
+
+        // 64 bytes of headroom: a small record fits, a big snapshot or a
+        // backup of the whole journal does not.
+        free.store(4096 + 64, SeqCst);
+        j.append(b"two").unwrap_or_else(|e| panic!("{e}"));
+        let big = Snapshot {
+            covered_seq: 0,
+            payload: vec![7; 512],
+        };
+        assert!(matches!(j.compact(&big), Err(JournalError::NoSpace { .. })));
+        assert!(
+            !gen_dir_path(dir.path(), 2).exists(),
+            "a refused compaction leaves no partial generation"
+        );
+        assert_eq!(j.generation(), 1);
+        free.store(4096 + 16, SeqCst);
+        let dest = dir.path().join("backup");
+        assert!(matches!(
+            j.backup_to(&dest),
+            Err(JournalError::NoSpace { .. })
+        ));
+        assert!(!dest.exists(), "a refused backup leaves nothing behind");
+
+        // Below the reserve nothing is appended and readiness says so.
+        free.store(4000, SeqCst);
+        assert!(!j.space_ok());
+        assert!(matches!(
+            j.append(b"three"),
+            Err(JournalError::NoSpace { .. })
+        ));
+
+        // Space returns: everything works again, history is intact.
+        free.store(1 << 20, SeqCst);
+        assert!(j.space_ok());
+        j.compact(&big).unwrap_or_else(|e| panic!("{e}"));
+        j.backup_to(&dest).unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(payloads(dir.path()).len(), 2);
     }
 
     #[test]

@@ -12,8 +12,9 @@ use durable_domain::{
     Effect, JobSpec, Limits, Millis, OperationKey, Run, RunId, RunState, StepIndex, StepSpec,
 };
 use durable_journal::JournalOptions;
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::sync::{mpsc, oneshot, OwnedSemaphorePermit, Semaphore};
@@ -110,6 +111,22 @@ enum Cmd {
 #[derive(Clone)]
 pub struct Engine {
     tx: mpsc::Sender<Cmd>,
+    health: Arc<Health>,
+}
+
+/// State the actor publishes for readiness, readable without a round trip
+/// through the (possibly full) command channel.
+#[derive(Debug, Default)]
+struct Health {
+    space_low: AtomicBool,
+}
+
+/// Whether the engine should receive new work now, and if not, why.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Readiness {
+    pub ready: bool,
+    /// A stable code: `engine_stopped` or `no_space`.
+    pub reason: Option<&'static str>,
 }
 
 impl Engine {
@@ -191,6 +208,22 @@ impl Engine {
         rx.await.map_err(|_| EngineError::Stopped)
     }
 
+    /// Readiness: false once the actor has stopped or while free space is
+    /// below the journal reserve (submits would be refused `NoSpace`).
+    pub fn readiness(&self) -> Readiness {
+        let reason = if self.tx.is_closed() {
+            Some("engine_stopped")
+        } else if self.health.space_low.load(Ordering::SeqCst) {
+            Some("no_space")
+        } else {
+            None
+        };
+        Readiness {
+            ready: reason.is_none(),
+            reason,
+        }
+    }
+
     /// Resolves once the actor has stopped: a poisoned journal writer (a
     /// failed fsync is never retried) or a panic. The server exits on it so
     /// a supervisor restarts the process and startup replay decides what
@@ -246,8 +279,77 @@ pub fn spawn(dir: &Path, registry: Registry, cfg: ShellConfig) -> Result<Engine,
     let mut core = EngineCore::open_with(dir, cfg.journal.clone())?;
     core.limits = cfg.limits;
     let (tx, rx) = mpsc::channel::<Cmd>(cfg.cmd_capacity);
-    tokio::spawn(actor(core, registry, cfg, rx));
-    Ok(Engine { tx })
+    let health = Arc::new(Health::default());
+    health.space_low.store(!core.space_ok(), Ordering::SeqCst);
+    let mon = Monitor {
+        health: health.clone(),
+        errors: BTreeMap::new(),
+    };
+    tokio::spawn(actor(core, registry, cfg, rx, mon));
+    Ok(Engine { tx, health })
+}
+
+/// Errors the runtime handles itself — a handler outcome or a deadline
+/// expiry that could not be journaled has no caller to answer — are
+/// counted by kind (exposed in diagnostics) and drive readiness. Nothing
+/// is dropped silently.
+struct Monitor {
+    health: Arc<Health>,
+    errors: BTreeMap<&'static str, u64>,
+}
+
+impl Monitor {
+    fn kind(e: &EngineError) -> &'static str {
+        use durable_journal::JournalError as J;
+        match e {
+            EngineError::Refused(_) => "stale_event",
+            EngineError::Journal(J::NoSpace { .. }) => "no_space",
+            EngineError::Journal(J::WriteFailed { .. }) => "journal_write_failed",
+            EngineError::Journal(J::SyncFailed(_) | J::Poisoned) => "journal_poisoned",
+            _ => "internal",
+        }
+    }
+
+    /// Record the free-space state; log only on a transition.
+    fn space(&mut self, ok: bool) {
+        let was_low = self.health.space_low.swap(!ok, Ordering::SeqCst);
+        if was_low == ok {
+            if ok {
+                eprintln!("durable: free space back above the reserve; admitting work");
+            } else {
+                eprintln!(
+                    "durable: free space below the reserve; refusing new work (503 no_space)"
+                );
+            }
+        }
+    }
+
+    /// An error answered to a caller: it is theirs to handle, but a full
+    /// disk still flips readiness.
+    fn returned(&mut self, e: &EngineError) {
+        if Self::kind(e) == "no_space" {
+            self.space(false);
+        }
+    }
+
+    /// An error with no caller: count it, log anything unexpected.
+    fn handled(&mut self, e: &EngineError) {
+        let kind = Self::kind(e);
+        *self.errors.entry(kind).or_insert(0) += 1;
+        match kind {
+            "no_space" => self.space(false),
+            // A late reply for a run that moved on is expected, not news.
+            "stale_event" => {}
+            _ => eprintln!("durable: {kind}: {e}"),
+        }
+    }
+
+    fn effects(&mut self, r: Result<Vec<Effect>, EngineError>) -> Vec<Effect> {
+        r.unwrap_or_else(|e| {
+            self.handled(&e);
+            Vec::new()
+        })
+    }
 }
 
 /// An attempt's result comes back with the permit it ran under, so a
@@ -261,6 +363,7 @@ async fn actor(
     registry: Registry,
     cfg: ShellConfig,
     mut rx: mpsc::Receiver<Cmd>,
+    mut mon: Monitor,
 ) {
     let mut ticker = tokio::time::interval(Duration::from_millis(cfg.tick_ms));
     let mut attempts: JoinSet<AttemptJoin> = JoinSet::new();
@@ -279,6 +382,7 @@ async fn actor(
                 live: &mut live,
                 waiting_probes: &mut waiting_probes,
                 per_tick: cfg.max_dispatch_per_tick,
+                mon: &mut mon,
             }
         };
     }
@@ -325,10 +429,16 @@ async fn actor(
                         Some(name) => Err(EngineError::UnregisteredHandler(name)),
                         None => core.submit_at(key, spec, not_before.unwrap_or(now), now),
                     };
-                    let _ = reply.send(r);
+                    if let Err(e) = &r {
+                        mon.returned(e);
+                    }
+                    let _ = reply.send(r); // a caller that went away still got its commit
                 }
                 Some(Cmd::Cancel { run, reply }) => {
                     let r = core.cancel(run, wall_ms()).map(|_| ());
+                    if let Err(e) = &r {
+                        mon.returned(e);
+                    }
                     let _ = reply.send(r);
                 }
                 Some(Cmd::Inspect { run, reply }) => {
@@ -340,13 +450,23 @@ async fn actor(
                     let _ = reply.send(all);
                 }
                 Some(Cmd::Diag { reply }) => {
-                    let _ = reply.send(core.diagnostics());
+                    let mut d = core.diagnostics();
+                    d.errors = mon.errors.clone();
+                    let _ = reply.send(d);
                 }
                 Some(Cmd::Compact { reply }) => {
-                    let _ = reply.send(core.compact(wall_ms()));
+                    let r = core.compact(wall_ms());
+                    if let Err(e) = &r {
+                        mon.returned(e);
+                    }
+                    let _ = reply.send(r);
                 }
                 Some(Cmd::Backup { dest, reply }) => {
-                    let _ = reply.send(core.backup_to(&dest));
+                    let r = core.backup_to(&dest);
+                    if let Err(e) = &r {
+                        mon.returned(e);
+                    }
+                    let _ = reply.send(r);
                 }
                 None => return,
             },
@@ -357,14 +477,15 @@ async fn actor(
                     Outcome::Failed => (None, Some("failed".to_string())),
                     Outcome::Lost => (None, None),
                 };
-                let effects = core.step_finished(run, step, out, fail, wall_ms())
-                    .unwrap_or_default();
                 let mut ex = exec!();
+                // Not journaled (e.g. NoSpace): counted; the run stays
+                // Running and its deadline sweep reconciles the effect.
+                let effects = ex.mon.effects(core.step_finished(run, step, out, fail, wall_ms()));
                 run_effects(&mut core, &mut ex, effects, run, Some(permit));
             }
             Some(Ok((run, step, found, permit))) = probes.join_next() => {
-                let effects = core.reconciled(run, step, found, wall_ms()).unwrap_or_default();
                 let mut ex = exec!();
+                let effects = ex.mon.effects(core.reconciled(run, step, found, wall_ms()));
                 run_effects(&mut core, &mut ex, effects, run, Some(permit));
             }
             _ = ticker.tick() => {
@@ -408,6 +529,7 @@ struct Exec<'a> {
     live: &'a mut HashMap<(RunId, StepIndex), AbortHandle>,
     waiting_probes: &'a mut ProbeQueue,
     per_tick: usize,
+    mon: &'a mut Monitor,
 }
 
 impl Exec<'_> {
@@ -439,9 +561,9 @@ impl Exec<'_> {
 
     /// Fail a step's attempt (journaled; retry/terminal decided by domain).
     fn fail(&mut self, core: &mut EngineCore, run: RunId, step: StepIndex, why: &str) {
-        let effects = core
-            .step_finished(run, step, None, Some(why.to_string()), wall_ms())
-            .unwrap_or_default();
+        let effects =
+            self.mon
+                .effects(core.step_finished(run, step, None, Some(why.to_string()), wall_ms()));
         run_effects(core, self, effects, run, None);
     }
 
@@ -472,9 +594,9 @@ impl Exec<'_> {
         let Some(handler) = self.registry.get(&sspec.handler) else {
             // Cannot probe an unregistered handler — reconcile as not-found
             // rather than leave the run stuck.
-            let effects = core
-                .reconciled(run, step, false, wall_ms())
-                .unwrap_or_default();
+            let effects = self
+                .mon
+                .effects(core.reconciled(run, step, false, wall_ms()));
             run_effects(core, self, effects, run, Some(permit));
             return;
         };
@@ -492,6 +614,14 @@ impl Exec<'_> {
 /// free the run stays queued (nothing happened, nothing is recorded).
 fn tick(core: &mut EngineCore, exec: &mut Exec<'_>) {
     let now = wall_ms();
+    // Below the reserve nothing new can be journaled: no expiry, no
+    // dispatch (a call whose outcome cannot be recorded is not started).
+    // In-flight work waits; readiness reports `no_space`.
+    let space_ok = core.space_ok();
+    exec.mon.space(space_ok);
+    if !space_ok {
+        return;
+    }
     // Deadline sweep: an attempt out past its deadline is a lost reply —
     // it reconciles, never silently repeats. `live` only tracks attempts
     // this process fired; a run orphaned by a restart has no entry, and
@@ -500,9 +630,9 @@ fn tick(core: &mut EngineCore, exec: &mut Exec<'_>) {
         if let Some(call) = exec.live.remove(&(run, step)) {
             call.abort(); // frees its permit; the remote effect is reconciled
         }
-        let effects = core
-            .step_finished(run, step, None, None, now)
-            .unwrap_or_default();
+        let effects = exec
+            .mon
+            .effects(core.step_finished(run, step, None, None, now));
         run_effects(core, exec, effects, run, None);
     }
     // Probes that found no permit when their run started reconciling.
@@ -535,8 +665,9 @@ fn tick(core: &mut EngineCore, exec: &mut Exec<'_>) {
         let Ok(permit) = exec.sem.clone().try_acquire_owned() else {
             break; // at capacity: the rest stay queued for a later tick
         };
-        if core.dispatch(run, step, attempt, now).is_err() {
-            continue; // a stale claim — the run moved on; the permit returns
+        if let Err(e) = core.dispatch(run, step, attempt, now) {
+            exec.mon.handled(&e); // stale claim or no space; the permit returns
+            continue;
         }
         exec.fire(core, run, step, permit);
     }
@@ -985,6 +1116,10 @@ mod tests {
         let sem = Arc::new(Semaphore::new(10));
         let (mut attempts, mut probes) = (JoinSet::new(), JoinSet::new());
         let (mut live, mut waiting) = (HashMap::new(), ProbeQueue::default());
+        let mut mon = Monitor {
+            health: Arc::default(),
+            errors: BTreeMap::new(),
+        };
         let mut ex = Exec {
             registry: &reg,
             sem: sem.clone(),
@@ -993,6 +1128,7 @@ mod tests {
             live: &mut live,
             waiting_probes: &mut waiting,
             per_tick: 3,
+            mon: &mut mon,
         };
         let running = |c: &EngineCore| {
             c.runs()
@@ -1091,6 +1227,82 @@ mod tests {
         );
     }
 
+    /// Waits for the gate, then succeeds; its probe finds the effect.
+    struct GateThenFound(Arc<Semaphore>);
+    #[async_trait::async_trait]
+    impl StepHandler for GateThenFound {
+        async fn execute(&self, _s: &StepSpec, _i: &[u8], _k: &str) -> Outcome {
+            match self.0.acquire().await {
+                Ok(p) => {
+                    p.forget();
+                    Outcome::Checkpoint(b"ok".to_vec())
+                }
+                Err(_) => Outcome::Failed,
+            }
+        }
+        async fn probe(&self, _s: &StepSpec, _k: &str) -> bool {
+            true
+        }
+    }
+
+    /// A handler outcome that arrives while the disk is below the reserve
+    /// cannot be journaled. It used to vanish into `unwrap_or_default()`;
+    /// now it is counted, readiness flips, and once space returns the run
+    /// reconciles (the probe finds the effect) instead of repeating it.
+    #[tokio::test(flavor = "current_thread")]
+    async fn outcome_during_full_disk_is_counted_then_reconciled() {
+        use std::sync::atomic::{AtomicU64, Ordering::SeqCst};
+        let d = tempfile::tempdir().unwrap_or_else(|e| panic!("{e}"));
+        let free = Arc::new(AtomicU64::new(1 << 20));
+        let gate = Arc::new(Semaphore::new(0));
+        let mut reg = Registry::default();
+        reg.register("gated", Arc::new(GateThenFound(gate.clone())));
+        let probe_free = free.clone();
+        let cfg = ShellConfig {
+            tick_ms: 5,
+            limits: fast_limits(),
+            journal: JournalOptions {
+                reserve_bytes: 4096,
+                space: durable_journal::SpaceProbe::new(move |_| Ok(probe_free.load(SeqCst))),
+                ..JournalOptions::default()
+            },
+            ..Default::default()
+        };
+        let eng = spawn(d.path(), reg, cfg).unwrap_or_else(|e| panic!("{e}"));
+        assert!(eng.readiness().ready);
+        let run = eng
+            .submit(OperationKey("full-disk".into()), spec1("gated"))
+            .await
+            .unwrap_or_else(|e| panic!("{e}"));
+        wait_state(&eng, run, "running").await;
+
+        free.store(100, SeqCst); // the disk fills while the call is in flight
+        gate.add_permits(1); // the handler answers — its checkpoint cannot be journaled
+        tokio::time::sleep(Duration::from_millis(40)).await;
+        let diag = eng.diag().await.unwrap_or_else(|e| panic!("{e}"));
+        assert!(
+            diag.errors.get("no_space").copied().unwrap_or(0) >= 1,
+            "an outcome that could not be journaled is counted: {:?}",
+            diag.errors
+        );
+        assert!(!diag.space_ok);
+        assert_eq!(
+            eng.readiness(),
+            Readiness {
+                ready: false,
+                reason: Some("no_space")
+            }
+        );
+        assert!(matches!(
+            eng.inspect(run).await.unwrap_or(None).map(|r| r.state),
+            Some(RunState::Running { .. })
+        ));
+
+        free.store(1 << 20, SeqCst);
+        assert!(matches!(until_done(&eng, run).await, RunState::Done));
+        assert!(eng.readiness().ready);
+    }
+
     /// A failed fsync must stop the engine — never retry it, never keep
     /// serving on a writer whose memory may be ahead of disk — and the
     /// restart must replay a clean journal holding only durable records.
@@ -1105,6 +1317,7 @@ mod tests {
             tick_ms: 5,
             journal: JournalOptions {
                 faults: Some(faults.clone()),
+                ..JournalOptions::default()
             },
             ..Default::default()
         };

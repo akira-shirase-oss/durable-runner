@@ -78,3 +78,21 @@ convention; these seed the contract's prescribed directions.
   into (`create_dir` is the atomic check). The pilot generates a random
   key per run and now restores with `durable-cli restore` into a separate
   directory before starting the second server.
+- **D-012 — A full disk is a 503 and a not-ready server, never a 500 or
+  a silent drop.** `NoSpace` used to surface as a 500, `/health` was
+  always ok, compaction and backup ignored the reserve, and the runtime
+  discarded commit errors with `unwrap_or_default()` (a handler outcome
+  that could not be journaled simply vanished). Now: the reserve is
+  configurable (`--reserve-bytes`) and every journal write — append,
+  compaction snapshot, backup copy — refuses with `NoSpace` unless what it
+  writes fits with the reserve still free, checked before anything is
+  written. Compaction is all-or-nothing (expiry is applied to memory only
+  after the new generation is durable). The server maps `NoSpace` (and a
+  write that hit ENOSPC) to `503 {"code":"no_space"}`; `GET /ready` is
+  false while space is low or the engine has stopped. The tick does no
+  journal work below the reserve, so no handler is called whose outcome
+  could not be recorded; errors with no caller are counted by kind in
+  diagnostics and logged on transitions. One threshold for every write
+  keeps the rule explainable; an emergency floor below the reserve for
+  in-flight work is a possible refinement, not built. A refused submit no
+  longer consumes a run id.

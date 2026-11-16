@@ -51,6 +51,12 @@ pub struct Diagnostics {
     pub live_runs: u64,
     pub dedup_keys: u64,
     pub states: std::collections::BTreeMap<&'static str, u64>,
+    /// Whether the journal filesystem has its reserve free.
+    pub space_ok: bool,
+    /// Commit failures the runtime handled instead of answering a caller
+    /// (a handler outcome that could not be journaled, a stale reply),
+    /// by kind — counted, never silently dropped.
+    pub errors: std::collections::BTreeMap<&'static str, u64>,
 }
 
 /// The serialized in-memory index — what a compaction snapshot carries.
@@ -124,24 +130,46 @@ impl EngineCore {
     /// Compact: expire 7-day-old terminal runs, snapshot the live index
     /// into a new generation, atomically swap the manifest. Returns the
     /// new generation number.
+    ///
+    /// All or nothing: expiry is applied to the live index only after the
+    /// new generation is durable, so a refused compaction (`NoSpace`)
+    /// leaves memory and disk agreeing.
     pub fn compact(&mut self, now: Millis) -> Result<u32, EngineError> {
-        self.runs.retain(|_, r| {
-            !(r.state.is_terminal()
-                && r.finished_at
-                    .is_some_and(|t| now.saturating_sub(t) > TERMINAL_EXPIRY_MS))
-        });
+        let runs: HashMap<RunId, Run> = self
+            .runs
+            .iter()
+            .filter(|(_, r)| {
+                !(r.state.is_terminal()
+                    && r.finished_at
+                        .is_some_and(|t| now.saturating_sub(t) > TERMINAL_EXPIRY_MS))
+            })
+            .map(|(id, r)| (*id, r.clone()))
+            .collect();
         // Dedup keys live only as long as their run — no orphan entries.
-        self.by_op.retain(|_, id| self.runs.contains_key(id));
-        let payload = serde_json::to_vec(&IndexSnapshot {
-            runs: self.runs.clone(),
-            by_op: self.by_op.clone(),
+        let by_op: HashMap<OperationKey, RunId> = self
+            .by_op
+            .iter()
+            .filter(|(_, id)| runs.contains_key(id))
+            .map(|(k, id)| (k.clone(), *id))
+            .collect();
+        let idx = IndexSnapshot {
+            runs,
+            by_op,
             next_run: self.next_run,
-        })?;
+        };
+        let payload = serde_json::to_vec(&idx)?;
         self.journal.compact(&durable_journal::Snapshot {
             covered_seq: 0,
             payload,
         })?;
+        self.runs = idx.runs;
+        self.by_op = idx.by_op;
         Ok(self.journal.generation())
+    }
+
+    /// Whether the journal filesystem has its reserve free (readiness).
+    pub fn space_ok(&self) -> bool {
+        self.journal.space_ok()
     }
 
     fn apply_committed(
@@ -222,7 +250,6 @@ impl EngineCore {
         }
         self.limits.admits(&spec)?; // limits refuse before anything is written
         let run = RunId(self.next_run);
-        self.next_run += 1;
         self.commit(
             run,
             Event::Accepted {
@@ -232,6 +259,7 @@ impl EngineCore {
             },
             now,
         )?;
+        self.next_run += 1; // only a committed acceptance consumes an id
         Ok(run)
     }
 
@@ -344,6 +372,8 @@ impl EngineCore {
             live_runs: self.runs.len() as u64,
             dedup_keys: self.by_op.len() as u64,
             states,
+            space_ok: self.journal.space_ok(),
+            errors: std::collections::BTreeMap::new(),
         }
     }
 
@@ -536,6 +566,44 @@ mod tests {
             .submit(OperationKey("old".into()), spec(), eight_days)
             .unwrap_or_else(|e| panic!("{e}"));
         assert_ne!(fresh, done);
+    }
+
+    /// A compaction refused for space changes nothing: the old generation
+    /// stays current and expiry is not applied to the live index (memory
+    /// and disk keep agreeing). With space it proceeds and expires.
+    #[test]
+    fn refused_compaction_changes_nothing() {
+        use std::sync::atomic::{AtomicU64, Ordering::SeqCst};
+        use std::sync::Arc;
+        let d = tempfile::tempdir().unwrap_or_else(|e| panic!("{e}"));
+        let free = Arc::new(AtomicU64::new(1 << 20));
+        let probe_free = free.clone();
+        let opts = JournalOptions {
+            reserve_bytes: 4096,
+            space: durable_journal::SpaceProbe::new(move |_| Ok(probe_free.load(SeqCst))),
+            ..JournalOptions::default()
+        };
+        let mut e = EngineCore::open_with(d.path(), opts).unwrap_or_else(|e| panic!("{e}"));
+        let old = e
+            .submit(OperationKey("old".into()), spec(), 0)
+            .unwrap_or_else(|e| panic!("{e}"));
+        e.cancel(old, 1).unwrap_or_else(|e| panic!("{e}"));
+        let eight_days = 8 * 24 * 60 * 60 * 1000;
+
+        free.store(4096 + 32, SeqCst); // room for a record, not a snapshot
+        assert!(matches!(
+            e.compact(eight_days),
+            Err(EngineError::Journal(JournalError::NoSpace { .. }))
+        ));
+        assert_eq!(e.diagnostics().generation, 1);
+        assert!(
+            e.run(old).is_some(),
+            "expiry applies only with the new generation"
+        );
+
+        free.store(1 << 20, SeqCst);
+        assert_eq!(e.compact(eight_days).unwrap_or_else(|e| panic!("{e}")), 2);
+        assert!(e.run(old).is_none());
     }
 
     #[test]
