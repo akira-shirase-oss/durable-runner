@@ -7,14 +7,16 @@
 //! carries the same key `{operation_key}/{step}`, so a repeating remote call
 //! can be de-duplicated on the far side (contract §04, at-least-once).
 
+use crate::writer::{self, GroupCommit, Writer, WriterMsg};
 use crate::{EngineCore, EngineError};
 use durable_domain::{
     Effect, JobSpec, Limits, Millis, OperationKey, Run, RunId, RunState, StepIndex, StepSpec,
 };
-use durable_journal::JournalOptions;
+use durable_journal::{JournalError, JournalOptions};
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{SyncSender, TrySendError};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::sync::{mpsc, oneshot, OwnedSemaphorePermit, Semaphore};
@@ -274,6 +276,12 @@ pub struct ShellConfig {
     pub limits: Limits,
     /// Journal options (tests inject storage faults here).
     pub journal: JournalOptions,
+    /// Group-commit bounds for the writer thread.
+    pub group_commit: GroupCommit,
+    /// Records the actor may hold for the writer before it stops taking
+    /// new commands (they then wait in, and are refused by, the bounded
+    /// command channel).
+    pub max_outbox_records: usize,
 }
 
 impl Default for ShellConfig {
@@ -285,16 +293,23 @@ impl Default for ShellConfig {
             cmd_capacity: 1024,
             limits: Limits::default(),
             journal: JournalOptions::default(),
+            group_commit: GroupCommit::default(),
+            max_outbox_records: 16 * 1024,
         }
     }
 }
 
-/// Open the journal, replay to rebuild, then spawn the actor task. The
-/// returned handle is the only public interface — there is no path to the
-/// journal except through it.
+/// Open the journal, replay to rebuild, hand the journal to the
+/// group-commit writer thread, then spawn the actor task. The returned
+/// handle is the only public interface — there is no path to the journal
+/// except through it.
 pub fn spawn(dir: &Path, registry: Registry, cfg: ShellConfig) -> Result<Engine, EngineError> {
     let mut core = EngineCore::open_with(dir, cfg.journal.clone())?;
     core.limits = cfg.limits;
+    let (core, journal) = core.into_piped();
+    let journal = journal.ok_or(EngineError::Piped)?;
+    let writer = writer::spawn(journal, cfg.group_commit.clone())
+        .map_err(|e| EngineError::Journal(JournalError::Io(e)))?;
     let (tx, rx) = mpsc::channel::<Cmd>(cfg.cmd_capacity);
     let health = Arc::new(Health::default());
     health.space_low.store(!core.space_ok(), Ordering::SeqCst);
@@ -302,7 +317,7 @@ pub fn spawn(dir: &Path, registry: Registry, cfg: ShellConfig) -> Result<Engine,
         health: health.clone(),
         errors: BTreeMap::new(),
     };
-    tokio::spawn(actor(core, registry, cfg, rx, mon));
+    tokio::spawn(actor(core, registry, cfg, rx, mon, writer));
     Ok(Engine { tx, health })
 }
 
@@ -317,12 +332,18 @@ struct Monitor {
 
 impl Monitor {
     fn kind(e: &EngineError) -> &'static str {
-        use durable_journal::JournalError as J;
+        fn journal(e: &JournalError) -> &'static str {
+            match e {
+                JournalError::NoSpace { .. } => "no_space",
+                JournalError::WriteFailed { .. } => "journal_write_failed",
+                JournalError::SyncFailed(_) | JournalError::Poisoned => "journal_poisoned",
+                _ => "internal",
+            }
+        }
         match e {
             EngineError::Refused(_) => "stale_event",
-            EngineError::Journal(J::NoSpace { .. }) => "no_space",
-            EngineError::Journal(J::WriteFailed { .. }) => "journal_write_failed",
-            EngineError::Journal(J::SyncFailed(_) | J::Poisoned) => "journal_poisoned",
+            EngineError::Journal(j) => journal(j),
+            EngineError::CommitFailed(j) => journal(j),
             _ => "internal",
         }
     }
@@ -375,12 +396,204 @@ impl Monitor {
 type AttemptJoin = (RunId, StepIndex, Outcome, OwnedSemaphorePermit);
 type ProbeJoin = (RunId, StepIndex, bool, OwnedSemaphorePermit);
 
+/// Sends a held answer: `None` once durable, `Some(err)` if the commit failed.
+type HeldReply = Box<dyn FnOnce(Option<&Arc<JournalError>>) + Send>;
+
+/// Something a record decided that may not leave the process until the
+/// fsync covering that record has returned (D-014 rule a).
+enum Held {
+    /// An answer to a caller. `Some(err)`: the commit failed — the caller
+    /// gets `CommitFailed` (or, for a read, the engine stops).
+    Reply(HeldReply),
+    Fire {
+        run: RunId,
+        step: StepIndex,
+        permit: OwnedSemaphorePermit,
+    },
+    Probe {
+        run: RunId,
+        step: StepIndex,
+        permit: OwnedSemaphorePermit,
+    },
+}
+
+/// The actor's side of group commit: records waiting for the writer,
+/// what has been sent and made durable, and everything held until then.
+struct Pipeline {
+    tx: Option<SyncSender<WriterMsg>>,
+    thread: Option<std::thread::JoinHandle<()>>,
+    /// Messages not yet handed to the writer, in commit order.
+    outbound: VecDeque<WriterMsg>,
+    outbound_records: usize,
+    /// Commit index of the last record handed to the writer.
+    sent_upto: u64,
+    /// Commit index the writer has reported durable.
+    durable: u64,
+    held: VecDeque<(u64, Held)>,
+    max_batch: usize,
+}
+
+impl Pipeline {
+    fn new(
+        writer: Option<(SyncSender<WriterMsg>, std::thread::JoinHandle<()>)>,
+        max_batch: usize,
+    ) -> Self {
+        let (tx, thread) = match writer {
+            Some((tx, t)) => (Some(tx), Some(t)),
+            None => (None, None),
+        };
+        Self {
+            tx,
+            thread,
+            outbound: VecDeque::new(),
+            outbound_records: 0,
+            sent_upto: 0,
+            durable: 0,
+            held: VecDeque::new(),
+            max_batch: max_batch.max(1),
+        }
+    }
+
+    /// Move the core's newly committed records into the outbound queue,
+    /// merging into the last append so the writer sees few, large
+    /// messages (each at most `max_batch` records).
+    fn collect(&mut self, core: &mut EngineCore) {
+        while let Some((records, upto)) = core.take_batch(self.max_batch) {
+            self.outbound_records += records.len();
+            match self.outbound.back_mut() {
+                Some(WriterMsg::Append {
+                    records: queued,
+                    upto: u,
+                }) if queued.len() + records.len() <= self.max_batch => {
+                    queued.extend(records);
+                    *u = upto;
+                }
+                _ => self.outbound.push_back(WriterMsg::Append { records, upto }),
+            }
+        }
+    }
+
+    /// Hand queued messages to the writer, but only once everything sent
+    /// before is durable: one batch is in flight while the next one
+    /// accumulates (that is the group commit). False if the writer is gone.
+    fn flush(&mut self) -> bool {
+        if self.sent_upto > self.durable || self.outbound.is_empty() {
+            return true;
+        }
+        let Some(tx) = &self.tx else { return true };
+        while let Some(msg) = self.outbound.pop_front() {
+            let n = msg.records();
+            let upto = match &msg {
+                WriterMsg::Append { upto, .. } => Some(*upto),
+                _ => None,
+            };
+            match tx.try_send(msg) {
+                Ok(()) => {
+                    self.outbound_records -= n;
+                    if let Some(u) = upto {
+                        self.sent_upto = u;
+                    }
+                }
+                Err(TrySendError::Full(m)) => {
+                    self.outbound.push_front(m);
+                    break; // the writer reports when it frees up
+                }
+                Err(TrySendError::Disconnected(_)) => return false,
+            }
+        }
+        true
+    }
+
+    /// Records decided but not yet handed to the writer.
+    fn backlog(&self, core: &EngineCore) -> usize {
+        self.outbound_records + core.pending_records()
+    }
+
+    /// Answer a caller once `needs` is durable.
+    fn answer<T: Send + 'static>(
+        &mut self,
+        needs: u64,
+        tx: oneshot::Sender<Result<T, EngineError>>,
+        value: Result<T, EngineError>,
+    ) {
+        if needs <= self.durable {
+            let _ = tx.send(value); // a caller that went away still got its commit
+            return;
+        }
+        self.held.push_back((
+            needs,
+            Held::Reply(Box::new(move |failed| {
+                let _ = tx.send(match failed {
+                    None => value,
+                    Some(e) => Err(EngineError::CommitFailed(e.clone())),
+                });
+            })),
+        ));
+    }
+
+    /// Answer a read once everything it reflects is durable — a read never
+    /// shows state a crash could take back. On failure the caller sees the
+    /// engine stop.
+    fn answer_read<T: Send + 'static>(&mut self, needs: u64, tx: oneshot::Sender<T>, value: T) {
+        if needs <= self.durable {
+            let _ = tx.send(value);
+            return;
+        }
+        self.held.push_back((
+            needs,
+            Held::Reply(Box::new(move |failed| {
+                if failed.is_none() {
+                    let _ = tx.send(value);
+                }
+            })),
+        ));
+    }
+
+    /// The writer failed: everything still held fails — callers get
+    /// `CommitFailed`, held handler calls and probes never happen.
+    fn fail_held(&mut self, err: &Arc<JournalError>) {
+        while let Some((_, h)) = self.held.pop_front() {
+            if let Held::Reply(f) = h {
+                f(Some(err));
+            }
+        }
+    }
+
+    /// Stop the writer and wait for it to release the journal.
+    async fn shutdown(&mut self) {
+        self.outbound.clear();
+        self.tx = None; // the writer's recv fails once the sender is gone
+        if let Some(t) = self.thread.take() {
+            if tokio::task::spawn_blocking(move || t.join()).await.is_err() {
+                eprintln!("durable: journal writer thread could not be joined");
+            }
+        }
+    }
+}
+
+/// A compaction handed to the writer, finished only when it reports back.
+struct PendingCompaction {
+    done: oneshot::Receiver<Result<u32, JournalError>>,
+    expired: Vec<RunId>,
+    reply: oneshot::Sender<Result<u32, EngineError>>,
+}
+
+async fn compaction_done(
+    p: &mut Option<PendingCompaction>,
+) -> Result<Result<u32, JournalError>, oneshot::error::RecvError> {
+    match p {
+        Some(c) => (&mut c.done).await,
+        None => std::future::pending().await,
+    }
+}
+
 async fn actor(
     mut core: EngineCore,
     registry: Registry,
     cfg: ShellConfig,
     mut rx: mpsc::Receiver<Cmd>,
     mut mon: Monitor,
+    writer: Writer,
 ) {
     let mut ticker = tokio::time::interval(Duration::from_millis(cfg.tick_ms));
     let mut attempts: JoinSet<AttemptJoin> = JoinSet::new();
@@ -388,6 +601,14 @@ async fn actor(
     let mut live: HashMap<(RunId, StepIndex), AbortHandle> = HashMap::new();
     let mut waiting_probes = ProbeQueue::default();
     let sem = Arc::new(Semaphore::new(cfg.max_in_flight));
+    let mut status = writer.status;
+    let mut pipe = Pipeline::new(
+        Some((writer.tx, writer.thread)),
+        cfg.group_commit.max_batch_records,
+    );
+    let mut pending_compaction: Option<PendingCompaction> = None;
+    // Set when the writer is gone without reporting a failure (it panicked).
+    let mut writer_lost = false;
 
     macro_rules! exec {
         () => {
@@ -400,6 +621,7 @@ async fn actor(
                 waiting_probes: &mut waiting_probes,
                 per_tick: cfg.max_dispatch_per_tick,
                 mon: &mut mon,
+                pipe: &mut pipe,
             }
         };
     }
@@ -422,16 +644,28 @@ async fn actor(
     }
 
     loop {
-        if core.is_poisoned() {
-            // A failed fsync is never retried and memory may now be ahead
-            // of disk: stop. Dropping the core releases the writer lock;
-            // dropping `rx` (on return) wakes `Engine::closed`.
-            eprintln!("durable: journal writer poisoned; engine stopping so a restart replays");
-            drop(core);
+        if core.is_poisoned() || writer_lost {
+            // A write or fsync failed (never retried) or the writer died:
+            // memory is ahead of disk. Fail everything still held, stop the
+            // writer, and exit so a restart replays what is durable.
+            let err = status
+                .borrow()
+                .failed
+                .clone()
+                .unwrap_or_else(|| Arc::new(JournalError::Poisoned));
+            eprintln!(
+                "durable: journal commit failed ({err}); engine stopping so a restart replays"
+            );
+            pipe.fail_held(&err);
+            if let Some(c) = pending_compaction.take() {
+                let _ = c.reply.send(Err(EngineError::CommitFailed(err.clone())));
+            }
+            pipe.shutdown().await;
             return;
         }
+        let accepting = pipe.backlog(&core) < cfg.max_outbox_records;
         tokio::select! {
-            cmd = rx.recv() => match cmd {
+            cmd = rx.recv(), if accepting => match cmd {
                 Some(Cmd::Submit { key, spec, not_before, reply }) => {
                     let now = wall_ms();
                     // Admission is where the allowlist bites: a step naming a
@@ -449,42 +683,63 @@ async fn actor(
                     if let Err(e) = &r {
                         mon.returned(e);
                     }
-                    let _ = reply.send(r); // a caller that went away still got its commit
+                    pipe.answer(core.last_index(), reply, r);
                 }
                 Some(Cmd::Cancel { run, reply }) => {
                     let r = core.cancel(run, wall_ms()).map(|_| ());
                     if let Err(e) = &r {
                         mon.returned(e);
                     }
-                    let _ = reply.send(r);
+                    pipe.answer(core.last_index(), reply, r);
                 }
                 Some(Cmd::Inspect { run, reply }) => {
-                    let _ = reply.send(core.run(run).cloned());
+                    pipe.answer_read(core.last_index(), reply, core.run(run).cloned());
                 }
                 Some(Cmd::List { after, limit, reply }) => {
                     let (runs, next_after) = core.page(after, limit);
-                    let _ = reply.send(RunPage { runs, next_after });
+                    pipe.answer_read(core.last_index(), reply, RunPage { runs, next_after });
                 }
                 Some(Cmd::Diag { reply }) => {
                     let mut d = core.diagnostics();
                     d.errors = mon.errors.clone();
-                    let _ = reply.send(d);
+                    pipe.answer_read(core.last_index(), reply, d);
                 }
                 Some(Cmd::Compact { reply }) => {
-                    let r = core.compact(wall_ms());
-                    if let Err(e) = &r {
-                        mon.returned(e);
+                    if pending_compaction.is_some() {
+                        let _ = reply.send(Err(EngineError::Refused(
+                            durable_domain::Refusal::ReserveExhausted,
+                        )));
+                    } else {
+                        match core.plan_compaction(wall_ms()) {
+                            Err(e) => {
+                                let _ = reply.send(Err(e));
+                            }
+                            Ok(plan) => {
+                                // Behind every record committed so far: the
+                                // snapshot never covers a record the log lacks.
+                                pipe.collect(&mut core);
+                                let (done_tx, done) = oneshot::channel();
+                                pipe.outbound.push_back(WriterMsg::Compact {
+                                    snapshot: plan.snapshot,
+                                    reply: done_tx,
+                                });
+                                pending_compaction = Some(PendingCompaction {
+                                    done,
+                                    expired: plan.expired,
+                                    reply,
+                                });
+                            }
+                        }
                     }
-                    let _ = reply.send(r);
                 }
                 Some(Cmd::Backup { dest, reply }) => {
-                    let r = core.backup_to(&dest);
-                    if let Err(e) = &r {
-                        mon.returned(e);
-                    }
-                    let _ = reply.send(r);
+                    pipe.collect(&mut core);
+                    pipe.outbound.push_back(WriterMsg::Backup { dest, reply });
                 }
-                None => return,
+                None => {
+                    pipe.shutdown().await;
+                    return;
+                }
             },
             Some(Ok((run, step, outcome, permit))) = attempts.join_next() => {
                 live.remove(&(run, step));
@@ -504,10 +759,62 @@ async fn actor(
                 let effects = ex.mon.effects(core.reconciled(run, step, found, wall_ms()));
                 run_effects(&mut core, &mut ex, effects, run, Some(permit));
             }
+            r = compaction_done(&mut pending_compaction) => {
+                if let Some(c) = pending_compaction.take() {
+                    let answer = match r {
+                        Ok(Ok(generation)) => {
+                            // The new generation is durable: only now does
+                            // expiry reach the live index (all or nothing).
+                            core.finish_compaction(&c.expired);
+                            Ok(generation)
+                        }
+                        Ok(Err(e)) => {
+                            let e = EngineError::Journal(e);
+                            mon.returned(&e);
+                            Err(e)
+                        }
+                        Err(_) => Err(EngineError::Stopped),
+                    };
+                    let _ = c.reply.send(answer);
+                }
+            }
+            changed = status.changed() => match changed {
+                Ok(()) => {
+                    let st = status.borrow_and_update().clone();
+                    core.observe(&st);
+                    pipe.durable = st.durable;
+                    let mut ex = exec!();
+                    release(&mut core, &mut ex);
+                }
+                Err(_) => writer_lost = true,
+            },
             _ = ticker.tick() => {
                 let mut ex = exec!();
                 tick(&mut core, &mut ex);
             }
+        }
+        pipe.collect(&mut core);
+        if !pipe.flush() {
+            writer_lost = true;
+        }
+    }
+}
+
+/// Release everything held whose records are now durable, in order.
+fn release(core: &mut EngineCore, ex: &mut Exec<'_>) {
+    while ex
+        .pipe
+        .held
+        .front()
+        .is_some_and(|(needs, _)| *needs <= ex.pipe.durable)
+    {
+        let Some((_, held)) = ex.pipe.held.pop_front() else {
+            break;
+        };
+        match held {
+            Held::Reply(answer) => answer(None),
+            Held::Fire { run, step, permit } => ex.start_attempt(core, run, step, permit),
+            Held::Probe { run, step, permit } => ex.start_probe(core, run, step, permit),
         }
     }
 }
@@ -546,12 +853,13 @@ struct Exec<'a> {
     waiting_probes: &'a mut ProbeQueue,
     per_tick: usize,
     mon: &'a mut Monitor,
+    pipe: &'a mut Pipeline,
 }
 
 impl Exec<'_> {
     /// Invoke a step's handler for the run's current attempt under
-    /// `permit`. The journal commit that made it `Running` already
-    /// happened, and it happened only because this permit was held.
+    /// `permit` — once the record that made it `Running` (committed only
+    /// because this permit was held) is durable. Until then it is held.
     fn fire(
         &mut self,
         core: &EngineCore,
@@ -559,7 +867,30 @@ impl Exec<'_> {
         step: StepIndex,
         permit: OwnedSemaphorePermit,
     ) {
+        let needs = core.last_index();
+        if needs <= self.pipe.durable {
+            self.start_attempt(core, run, step, permit);
+        } else {
+            self.pipe
+                .held
+                .push_back((needs, Held::Fire { run, step, permit }));
+        }
+    }
+
+    /// The call itself, for a run still `Running` this step (a cancel
+    /// committed while the dispatch was held means no call: the permit
+    /// returns).
+    fn start_attempt(
+        &mut self,
+        core: &EngineCore,
+        run: RunId,
+        step: StepIndex,
+        permit: OwnedSemaphorePermit,
+    ) {
         let Some(r) = core.run(run) else { return };
+        if !matches!(r.state, RunState::Running { step: s, .. } if s == step) {
+            return;
+        }
         let Some(sspec) = r.spec.steps.get(step.0 as usize).cloned() else {
             return;
         };
@@ -593,7 +924,26 @@ impl Exec<'_> {
         }
     }
 
+    /// A probe is a handler call too: held until the record that made the
+    /// run `Reconciling` is durable.
     fn probe_with(
+        &mut self,
+        core: &mut EngineCore,
+        run: RunId,
+        step: StepIndex,
+        permit: OwnedSemaphorePermit,
+    ) {
+        let needs = core.last_index();
+        if needs <= self.pipe.durable {
+            self.start_probe(core, run, step, permit);
+        } else {
+            self.pipe
+                .held
+                .push_back((needs, Held::Probe { run, step, permit }));
+        }
+    }
+
+    fn start_probe(
         &mut self,
         core: &mut EngineCore,
         run: RunId,
@@ -1142,6 +1492,8 @@ mod tests {
             health: Arc::default(),
             errors: BTreeMap::new(),
         };
+        // Direct-mode core: every commit is durable when it returns.
+        let mut pipe = Pipeline::new(None, 1024);
         let mut ex = Exec {
             registry: &reg,
             sem: sem.clone(),
@@ -1151,6 +1503,7 @@ mod tests {
             waiting_probes: &mut waiting,
             per_tick: 3,
             mon: &mut mon,
+            pipe: &mut pipe,
         };
         let running = |c: &EngineCore| {
             c.runs()
@@ -1325,6 +1678,292 @@ mod tests {
         assert!(eng.readiness().ready);
     }
 
+    // ---- group commit (D-014 rules, D-015) --------------------------------
+
+    use durable_journal::faults::Faults;
+
+    /// A start time no tick reaches: runs stay queued, so the journal holds
+    /// exactly one Accepted record per submit.
+    const FAR: Millis = u64::MAX / 4;
+
+    fn piped(faults: &Arc<Faults>, group_commit: GroupCommit) -> ShellConfig {
+        ShellConfig {
+            tick_ms: 5,
+            journal: JournalOptions {
+                faults: Some(faults.clone()),
+                ..JournalOptions::default()
+            },
+            group_commit,
+            ..Default::default()
+        }
+    }
+
+    fn echo_registry() -> Registry {
+        let mut reg = Registry::default();
+        reg.register("echo", Arc::new(Echo));
+        reg
+    }
+
+    /// Submit `n` delayed runs concurrently; their handles.
+    fn submit_many(
+        eng: &Engine,
+        prefix: &str,
+        n: usize,
+    ) -> Vec<tokio::task::JoinHandle<Result<RunId, EngineError>>> {
+        (0..n)
+            .map(|i| {
+                let e = eng.clone();
+                let key = OperationKey(format!("{prefix}-{i}"));
+                tokio::spawn(async move { e.submit_at(key, spec("echo"), FAR).await })
+            })
+            .collect()
+    }
+
+    /// Await `f` for at most 5 s: a rule violation fails, it never hangs.
+    async fn bounded<T>(f: impl std::future::Future<Output = T>) -> T {
+        tokio::time::timeout(Duration::from_secs(5), f)
+            .await
+            .unwrap_or_else(|_| panic!("no answer within 5 s"))
+    }
+
+    async fn join_all(
+        hs: Vec<tokio::task::JoinHandle<Result<RunId, EngineError>>>,
+    ) -> Vec<Result<RunId, EngineError>> {
+        // Bounded: a waiter that never hears back is a failed rule, not a hang.
+        let mut out = Vec::new();
+        for h in hs {
+            let r = tokio::time::timeout(Duration::from_secs(5), h)
+                .await
+                .unwrap_or_else(|_| panic!("a waiter never got an answer"));
+            out.push(r.unwrap_or_else(|e| panic!("{e}")));
+        }
+        out
+    }
+
+    /// Rule (a): while the fsync covering a record is outstanding, nothing
+    /// that record decided leaves the process — not the submit's ack, not
+    /// a read that would show it, not the handler call it dispatches.
+    #[tokio::test(flavor = "current_thread")]
+    async fn nothing_escapes_before_the_covering_fsync() {
+        use std::sync::atomic::Ordering::SeqCst;
+        let d = tempfile::tempdir().unwrap_or_else(|e| panic!("{e}"));
+        let faults = Arc::new(Faults::default());
+        let h = Gated::default();
+        h.gate.add_permits(64); // answers at once when called
+        let mut reg = Registry::default();
+        reg.register("gated", Arc::new(h.clone()));
+        let eng = spawn(d.path(), reg, piped(&faults, GroupCommit::default()))
+            .unwrap_or_else(|e| panic!("{e}"));
+
+        faults.hold_syncs();
+        let e = eng.clone();
+        let submit =
+            tokio::spawn(
+                async move { e.submit(OperationKey("held".into()), spec1("gated")).await },
+            );
+        tokio::time::sleep(Duration::from_millis(30)).await; // its record is in the writer
+        let e = eng.clone();
+        let read = tokio::spawn(async move { e.inspect(RunId(1)).await });
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(!submit.is_finished(), "no ack before the covering fsync");
+        assert!(
+            !read.is_finished(),
+            "no read of a record that is not durable"
+        );
+        assert_eq!(
+            h.calls.load(SeqCst),
+            0,
+            "no handler call before the covering fsync"
+        );
+
+        faults.release_syncs();
+        let run = bounded(submit)
+            .await
+            .unwrap_or_else(|e| panic!("{e}"))
+            .unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(run, RunId(1));
+        let seen = bounded(read)
+            .await
+            .unwrap_or_else(|e| panic!("{e}"))
+            .unwrap_or_else(|e| panic!("{e}"));
+        assert!(seen.is_some(), "the held read answers once durable");
+        assert!(matches!(until_done(&eng, run).await, RunState::Done));
+        assert_eq!(h.calls.load(SeqCst), 1);
+    }
+
+    /// Rule (b): commits that queue up behind an fsync share the next one,
+    /// and the journal still holds contiguous sequence numbers in commit
+    /// order (replay refuses any gap).
+    #[tokio::test(flavor = "current_thread")]
+    async fn queued_commits_share_one_fsync_with_contiguous_sequence() {
+        let d = tempfile::tempdir().unwrap_or_else(|e| panic!("{e}"));
+        let faults = Arc::new(Faults::default());
+        let eng = spawn(
+            d.path(),
+            echo_registry(),
+            piped(&faults, GroupCommit::default()),
+        )
+        .unwrap_or_else(|e| panic!("{e}"));
+        faults.hold_syncs();
+        let first = submit_many(&eng, "first", 1);
+        tokio::time::sleep(Duration::from_millis(30)).await; // batch 1 is in its fsync
+        let rest = submit_many(&eng, "queued", 50);
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(
+            rest.iter().all(|h| !h.is_finished()),
+            "none acked before durable"
+        );
+        faults.release_syncs();
+        let mut ids: Vec<u64> = join_all(first)
+            .await
+            .into_iter()
+            .chain(join_all(rest).await)
+            .map(|r| r.unwrap_or_else(|e| panic!("{e}")).0)
+            .collect();
+        ids.sort_unstable();
+        assert_eq!(ids, (1..=51).collect::<Vec<u64>>());
+        let syncs = faults.sync_calls();
+        assert!(
+            syncs <= 3,
+            "51 commits took {syncs} fsyncs: they must share them"
+        );
+        let diag = bounded(eng.diag()).await.unwrap_or_else(|e| panic!("{e}"));
+        assert!(diag.largest_batch >= 50, "batch sizes: {diag:?}");
+
+        drop(eng);
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let records = durable_journal::replay_dir(&durable_journal::gen_dir_path(d.path(), 1))
+            .unwrap_or_else(|e| panic!("contiguous history replays: {e}"));
+        let seqs: Vec<u64> = records.iter().map(|r| r.seq).collect();
+        assert_eq!(seqs, (1..=51).collect::<Vec<u64>>());
+    }
+
+    /// Rule (c): a failed group fsync fails every waiter in the batch and
+    /// every later one, is never retried, and the restart replays a clean
+    /// journal without any of them.
+    #[tokio::test(flavor = "current_thread")]
+    async fn failed_group_fsync_fails_every_waiter_and_is_never_retried() {
+        let d = tempfile::tempdir().unwrap_or_else(|e| panic!("{e}"));
+        let faults = Arc::new(Faults::default());
+        let eng = spawn(
+            d.path(),
+            echo_registry(),
+            piped(&faults, GroupCommit::default()),
+        )
+        .unwrap_or_else(|e| panic!("{e}"));
+        faults.hold_syncs();
+        let first = submit_many(&eng, "doomed", 1);
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        let rest = submit_many(&eng, "behind", 10);
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        faults.fail_next_sync(); // the fsync now blocked fails when released
+        faults.release_syncs();
+        for r in join_all(first)
+            .await
+            .into_iter()
+            .chain(join_all(rest).await)
+        {
+            assert!(
+                matches!(&r, Err(EngineError::CommitFailed(e)) if matches!(**e, JournalError::SyncFailed(_))),
+                "every waiter fails with the commit failure: {r:?}"
+            );
+        }
+        assert_eq!(faults.sync_calls(), 1, "the failed fsync is never retried");
+        tokio::time::timeout(Duration::from_secs(2), eng.closed())
+            .await
+            .unwrap_or_else(|_| panic!("the engine stops: memory is ahead of disk"));
+        let core = EngineCore::open(d.path()).unwrap_or_else(|e| panic!("replay: {e}"));
+        assert_eq!(
+            core.runs().count(),
+            0,
+            "nothing unacknowledged survives as a run"
+        );
+    }
+
+    /// Rule (c) for a failed write: rolled back, the batch fails, and the
+    /// engine stops (memory already reflects the records).
+    #[tokio::test(flavor = "current_thread")]
+    async fn failed_group_write_fails_the_batch_and_stops() {
+        let d = tempfile::tempdir().unwrap_or_else(|e| panic!("{e}"));
+        let faults = Arc::new(Faults::default());
+        let eng = spawn(
+            d.path(),
+            echo_registry(),
+            piped(&faults, GroupCommit::default()),
+        )
+        .unwrap_or_else(|e| panic!("{e}"));
+        faults.fail_next_write_after(5);
+        let r = bounded(eng.submit_at(OperationKey("torn".into()), spec("echo"), FAR)).await;
+        assert!(
+            matches!(&r, Err(EngineError::CommitFailed(e)) if matches!(**e, JournalError::WriteFailed { rolled_back: true, .. })),
+            "{r:?}"
+        );
+        tokio::time::timeout(Duration::from_secs(2), eng.closed())
+            .await
+            .unwrap_or_else(|_| panic!("the engine stops after a failed write"));
+        let core = EngineCore::open(d.path()).unwrap_or_else(|e| panic!("replay: {e}"));
+        assert_eq!(core.runs().count(), 0);
+    }
+
+    /// Rule (d): batches never exceed `max_batch_records`.
+    #[tokio::test(flavor = "current_thread")]
+    async fn group_commit_batches_are_bounded() {
+        let d = tempfile::tempdir().unwrap_or_else(|e| panic!("{e}"));
+        let faults = Arc::new(Faults::default());
+        let gc = GroupCommit {
+            max_batch_records: 4,
+            ..GroupCommit::default()
+        };
+        let eng =
+            spawn(d.path(), echo_registry(), piped(&faults, gc)).unwrap_or_else(|e| panic!("{e}"));
+        faults.hold_syncs();
+        let first = submit_many(&eng, "b0", 1);
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        let rest = submit_many(&eng, "b", 20);
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        faults.release_syncs();
+        for r in join_all(first)
+            .await
+            .into_iter()
+            .chain(join_all(rest).await)
+        {
+            r.unwrap_or_else(|e| panic!("{e}"));
+        }
+        let diag = bounded(eng.diag()).await.unwrap_or_else(|e| panic!("{e}"));
+        assert!(diag.largest_batch <= 4, "{diag:?}");
+        assert!(
+            diag.journal_batches >= 6,
+            "21 records in batches of <= 4: {diag:?}"
+        );
+    }
+
+    /// Rule (d): the writer's wait for more records is bounded — a lone
+    /// commit is written after `max_wait`, not held for a full batch.
+    #[tokio::test(flavor = "current_thread")]
+    async fn group_commit_wait_is_bounded() {
+        let d = tempfile::tempdir().unwrap_or_else(|e| panic!("{e}"));
+        let faults = Arc::new(Faults::default());
+        let gc = GroupCommit {
+            max_wait: Duration::from_millis(40),
+            ..GroupCommit::default()
+        };
+        let eng =
+            spawn(d.path(), echo_registry(), piped(&faults, gc)).unwrap_or_else(|e| panic!("{e}"));
+        let t0 = std::time::Instant::now();
+        bounded(eng.submit_at(OperationKey("lone".into()), spec("echo"), FAR))
+            .await
+            .unwrap_or_else(|e| panic!("{e}"));
+        let took = t0.elapsed();
+        assert!(
+            took >= Duration::from_millis(35),
+            "the writer lingered: {took:?}"
+        );
+        assert!(
+            took < Duration::from_secs(1),
+            "but only for max_wait: {took:?}"
+        );
+    }
+
     /// A failed fsync must stop the engine — never retry it, never keep
     /// serving on a writer whose memory may be ahead of disk — and the
     /// restart must replay a clean journal holding only durable records.
@@ -1355,7 +1994,7 @@ mod tests {
             .submit(OperationKey("unsynced-b".into()), spec("echo"))
             .await;
         assert!(
-            matches!(b, Err(EngineError::Journal(JournalError::SyncFailed(_)))),
+            matches!(&b, Err(EngineError::CommitFailed(e)) if matches!(**e, JournalError::SyncFailed(_))),
             "an unsynced submit is never acknowledged: {b:?}"
         );
         tokio::time::timeout(Duration::from_secs(2), eng.closed())

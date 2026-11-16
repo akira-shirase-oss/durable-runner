@@ -27,6 +27,7 @@ use thiserror::Error;
 #[cfg(any(test, feature = "fault-injection"))]
 pub mod faults {
     use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+    use std::sync::{Condvar, Mutex, PoisonError};
 
     /// Each armed fault fires once, on the next matching operation.
     #[derive(Debug, Default)]
@@ -35,9 +36,35 @@ pub mod faults {
         partial_write: AtomicU64,
         fail_sync: AtomicBool,
         fail_truncate: AtomicBool,
+        sync_calls: AtomicU64,
+        held: Mutex<bool>,
+        released: Condvar,
     }
 
     impl Faults {
+        /// Every log fsync blocks until `release_syncs` — lets a test
+        /// observe what the process does while a commit is not yet durable.
+        pub fn hold_syncs(&self) {
+            *self.held.lock().unwrap_or_else(PoisonError::into_inner) = true;
+        }
+        pub fn release_syncs(&self) {
+            *self.held.lock().unwrap_or_else(PoisonError::into_inner) = false;
+            self.released.notify_all();
+        }
+        /// How many times the log was fsynced (rollbacks excluded).
+        pub fn sync_calls(&self) -> u64 {
+            self.sync_calls.load(Ordering::SeqCst)
+        }
+        pub(crate) fn before_sync(&self) {
+            let mut held = self.held.lock().unwrap_or_else(PoisonError::into_inner);
+            while *held {
+                held = self
+                    .released
+                    .wait(held)
+                    .unwrap_or_else(PoisonError::into_inner);
+            }
+            self.sync_calls.fetch_add(1, Ordering::SeqCst);
+        }
         /// The next log write puts `bytes` bytes on disk and then fails,
         /// like a write cut short by ENOSPC or EIO.
         pub fn fail_next_write_after(&self, bytes: usize) {
@@ -395,6 +422,49 @@ impl Journal {
         Ok(seq)
     }
 
+    /// Group commit: append consecutive records as one write and one
+    /// fsync. Sequence numbers are contiguous and assigned in order; the
+    /// last one is returned. The failure rules are `append`'s (D-009): a
+    /// failed write is rolled back, a failed fsync poisons, and no record
+    /// of the batch is committed or consumes a sequence number.
+    ///
+    /// No reserve check here: the caller admitted these records against
+    /// its last free-space reading, and the reserve absorbs the difference
+    /// (a real ENOSPC still fails the write safely).
+    pub fn append_batch(&mut self, payloads: &[Vec<u8>]) -> Result<u64, JournalError> {
+        if self.poisoned {
+            return Err(JournalError::Poisoned);
+        }
+        let total: usize = payloads.iter().map(|p| HEADER_LEN + p.len()).sum();
+        let mut bytes = Vec::with_capacity(total);
+        let mut seq = self.next_seq;
+        for payload in payloads {
+            if payload.len() as u64 > MAX_PAYLOAD {
+                return Err(JournalError::Corrupt {
+                    seq,
+                    why: "payload over cap".into(),
+                });
+            }
+            bytes.extend_from_slice(&FORMAT_VERSION.to_be_bytes());
+            bytes.extend_from_slice(&(payload.len() as u32).to_be_bytes());
+            bytes.extend_from_slice(&seq.to_be_bytes());
+            bytes.extend_from_slice(&crc(payload).to_be_bytes());
+            bytes.extend_from_slice(payload);
+            seq += 1;
+        }
+        if payloads.is_empty() {
+            return Ok(self.next_seq.saturating_sub(1));
+        }
+        self.write_durably(&bytes)?;
+        self.next_seq = seq;
+        Ok(seq - 1)
+    }
+
+    /// The options this journal was opened with.
+    pub fn options(&self) -> &JournalOptions {
+        &self.opts
+    }
+
     /// Whether an earlier failure poisoned this writer.
     pub fn is_poisoned(&self) -> bool {
         self.poisoned
@@ -461,8 +531,11 @@ impl Journal {
     /// The one place the log is fsynced (fault seam for tests).
     fn sync_log(&mut self) -> io::Result<()> {
         #[cfg(any(test, feature = "fault-injection"))]
-        if self.opts.faults.as_ref().is_some_and(|f| f.take_sync()) {
-            return Err(io::Error::other("injected fsync failure"));
+        if let Some(f) = self.opts.faults.as_ref() {
+            f.before_sync();
+            if f.take_sync() {
+                return Err(io::Error::other("injected fsync failure"));
+            }
         }
         self.file.sync_data()
     }
@@ -902,6 +975,47 @@ mod tests {
         j.compact(&big).unwrap_or_else(|e| panic!("{e}"));
         j.backup_to(&dest).unwrap_or_else(|e| panic!("{e}"));
         assert_eq!(payloads(dir.path()).len(), 2);
+    }
+
+    /// A batch is consecutive frames with contiguous sequence numbers,
+    /// written and fsynced once; a failed batch commits none of them and
+    /// consumes no sequence numbers.
+    #[test]
+    fn batch_appends_are_contiguous_and_all_or_nothing() {
+        let dir = tempfile::tempdir().unwrap_or_else(|e| panic!("{e}"));
+        {
+            let (mut j, f) = open_faulty(dir.path());
+            assert_eq!(j.append(b"a").unwrap_or_else(|e| panic!("{e}")), 1);
+            let batch = vec![b"b".to_vec(), b"c".to_vec(), b"d".to_vec()];
+            assert_eq!(j.append_batch(&batch).unwrap_or_else(|e| panic!("{e}")), 4);
+            assert_eq!(f.sync_calls(), 2, "one fsync per batch");
+            f.fail_next_write_after(30); // inside the second frame
+            assert!(matches!(
+                j.append_batch(&[b"x".to_vec(), b"y".to_vec()]),
+                Err(JournalError::WriteFailed {
+                    rolled_back: true,
+                    ..
+                })
+            ));
+            assert_eq!(
+                j.append_batch(&[b"e".to_vec()])
+                    .unwrap_or_else(|e| panic!("{e}")),
+                5
+            );
+            f.fail_next_sync();
+            assert!(matches!(
+                j.append_batch(&[b"z".to_vec()]),
+                Err(JournalError::SyncFailed(_))
+            ));
+            let syncs = f.sync_calls();
+            assert!(matches!(
+                j.append_batch(&[b"w".to_vec()]),
+                Err(JournalError::Poisoned)
+            ));
+            assert_eq!(f.sync_calls(), syncs, "a failed fsync is never retried");
+        }
+        let got: Vec<Vec<u8>> = payloads(dir.path()).into_iter().map(|(_, p)| p).collect();
+        assert_eq!(got, [&b"a"[..], b"b", b"c", b"d", b"e"].map(<[u8]>::to_vec));
     }
 
     #[test]

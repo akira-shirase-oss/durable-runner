@@ -158,3 +158,30 @@ convention; these seed the contract's prescribed directions.
   crash mid-batch loses only records nobody was told about. (e)
   Compaction and backup run in commit order behind earlier appends, so a
   snapshot never covers a record the log does not have.
+- **D-015 — Group commit on a dedicated writer thread.** The load gate's
+  root cause: every record was written and fsynced on its own, on the
+  async actor's thread, so throughput was one fsync per record and the
+  actor stalled for each. Now one OS thread owns the journal file. The
+  actor applies each record in memory when it decides it (so later
+  decisions see it) and queues it; the writer writes everything queued as
+  consecutive frames with one fsync, and reports the highest commit index
+  that fsync covers. Exactly one batch is in flight; the next accumulates
+  behind it. Every D-014 rule holds and has its own test: acks, read
+  answers, handler calls and probes are held until the covering fsync,
+  so memory may run ahead of disk but nothing escapes it; sequence
+  numbers stay contiguous; a failed write or fsync fails every waiter in
+  the batch and after it (`CommitFailed`, HTTP 503
+  `journal_unavailable`), is never retried, and stops the writer, the
+  actor and the server process so replay rebuilds memory. Batches are
+  bounded (`max_batch_records` 1024, `max_batch_bytes` 4 MiB, `max_wait`
+  0 by default), and so is the actor's outbox (`max_outbox_records`
+  16384; beyond it commands wait in the bounded command channel and are
+  refused `busy`). Compaction and backup run on the writer in commit
+  order; compaction expiry reaches memory only when the writer confirms.
+  This changes D-009 in one respect: a rolled-back write used to let the
+  writer continue. With group commit, memory already reflects the
+  batch's records, so a failed write now also exits and replays. The
+  free-space admission check stays per record, as in D-012. Not done
+  here: the two O(N) index scans per tick (time-ordered due and deadline
+  queues), and the load battery has **not** been re-run. No throughput
+  claim is made until it is.

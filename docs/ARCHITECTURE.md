@@ -23,8 +23,16 @@
 ## Paths
 
 **Submit:** `POST /jobs {op_key, spec: {version, steps, input_b64}}` (API key)
-→ admission check (allowlist, reserve, caps) → journal append → fsync →
-`200 {run_id}` → dispatch.
+→ admission check (allowlist, reserve, caps) → record applied in memory and
+queued → the writer thread's group commit (one write + one fsync for
+everything queued) → `200 {run_id}` → dispatch. Acks, reads and handler
+calls wait for the fsync that covers their record (D-014, D-015).
+
+**Writer:** a dedicated OS thread owns `journal.log`. The actor never
+writes or fsyncs; it hands the writer bounded batches, one in flight at a
+time, and learns the durable commit index back. Compaction and backup run
+on the same thread, in commit order. A failed write or fsync stops the
+writer, the actor and the process; startup replay recovers.
 
 **Step:** coordinator takes a concurrency permit (none free → the run stays
 queued) → journals `StepDispatched` with a per-attempt deadline → allowlisted
