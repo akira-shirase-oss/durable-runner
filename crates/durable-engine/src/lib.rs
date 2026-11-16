@@ -27,6 +27,7 @@ use std::sync::Arc;
 use thiserror::Error;
 
 pub mod shell;
+pub mod snapshot;
 pub mod writer;
 
 #[derive(Debug, Error)]
@@ -50,6 +51,11 @@ pub enum EngineError {
     /// journal (a programming error, never a client one).
     #[error("operation unavailable while the group-commit writer owns the journal")]
     Piped,
+    /// The snapshot a compaction would write exceeds the configured budget:
+    /// refused before anything is written (raise the budget, or bound the
+    /// index with the admission limits).
+    #[error("snapshot would be {bytes} bytes, over the {budget}-byte budget")]
+    SnapshotOverBudget { bytes: u64, budget: u64 },
 }
 
 /// A journaled record: the run, the commit clock value, and the event.
@@ -68,6 +74,10 @@ pub struct Diagnostics {
     pub generation: u32,
     pub records_written: u64,
     pub live_runs: u64,
+    /// Non-terminal runs (bounded by `max_live_runs`) and the index's
+    /// approximate bytes (bounded by `max_index_bytes`).
+    pub active_runs: u64,
+    pub index_bytes: u64,
     pub dedup_keys: u64,
     pub states: std::collections::BTreeMap<&'static str, u64>,
     /// Whether the journal filesystem has its reserve free.
@@ -79,19 +89,19 @@ pub struct Diagnostics {
     /// Group commits written (one write + one fsync each) and the largest.
     pub journal_batches: u64,
     pub largest_batch: u64,
+    /// Payload bytes in the largest batch (bounded by `max_batch_bytes`
+    /// unless a single record is larger).
+    pub largest_batch_bytes: u64,
     /// Superseded generations still on disk; retention deletes them after
     /// each successful compaction, so this stays 0 unless a delete failed.
     pub stale_generations: u32,
 }
 
-/// The serialized in-memory index — what a compaction snapshot carries.
-/// Live runs, their dedup keys, and the next id. Superseded generations are
-/// deleted after a compaction (retention), so this snapshot plus the new
-/// generation's records are the whole durable state.
-#[derive(Debug, Serialize, Deserialize)]
-struct IndexSnapshot {
-    // Ordered by id so listing can page; serialises exactly like the
-    // HashMap it replaced (a JSON object keyed by id), so old snapshots load.
+/// The index as snapshots before D-021 carried it (JSON, inputs as number
+/// arrays). Read only, so journals compacted by older builds still open;
+/// every new snapshot is the binary `snapshot::encode` format.
+#[derive(Debug, Deserialize)]
+struct LegacyIndex {
     runs: BTreeMap<RunId, Run>,
     by_op: HashMap<OperationKey, RunId>,
     next_run: u64,
@@ -107,6 +117,8 @@ enum Log {
 /// to be handed to the writer, plus the writer's last reported state.
 struct Pipe {
     pending: VecDeque<Vec<u8>>,
+    /// Payload bytes in `pending`.
+    pending_bytes: usize,
     /// Commit index (this process) of the newest queued record.
     last_index: u64,
     root: PathBuf,
@@ -122,7 +134,10 @@ impl Pipe {
         if self.status.failed.is_some() {
             return Err(JournalError::Poisoned);
         }
-        let available = self.space.available(&self.root)?;
+        let available = self
+            .space
+            .available(&self.root)
+            .map_err(JournalError::SpaceProbe)?;
         let need = 18 + payload.len() as u64; // frame header + payload
         if available < self.reserve.saturating_add(need) {
             return Err(JournalError::NoSpace {
@@ -130,6 +145,7 @@ impl Pipe {
                 reserve: self.reserve,
             });
         }
+        self.pending_bytes += payload.len();
         self.pending.push_back(payload);
         self.last_index += 1;
         Ok(())
@@ -142,10 +158,43 @@ impl Pipe {
     }
 }
 
+/// What a list shows of a run: never its spec or input, so a page costs
+/// the listed fields, not up to 64 KiB of input per run.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RunSummary {
+    pub id: RunId,
+    pub key: OperationKey,
+    pub state: RunState,
+    pub steps: usize,
+    pub finished_at: Option<Millis>,
+}
+
+impl RunSummary {
+    fn of(r: &Run) -> Self {
+        Self {
+            id: r.id,
+            key: r.key.clone(),
+            state: r.state.clone(),
+            steps: r.spec.steps.len(),
+            finished_at: r.finished_at,
+        }
+    }
+}
+
+/// Records handed to the writer together, with their payload bytes and
+/// the commit index of the last one.
+pub struct Batch {
+    pub records: Vec<Vec<u8>>,
+    pub bytes: usize,
+    pub upto: u64,
+}
+
 /// A compaction worked out against the live index but not yet applied:
-/// the snapshot for the new generation and the runs it expires.
+/// a consistent view of the runs it keeps (pointers, not copies), the exact
+/// size of their encoding, and the runs it expires.
 pub struct CompactionPlan {
-    pub snapshot: durable_journal::Snapshot,
+    pub view: snapshot::View,
+    pub bytes: u64,
     pub expired: Vec<RunId>,
 }
 
@@ -153,9 +202,15 @@ pub struct CompactionPlan {
 /// the reducer — the same fold the live path performs.
 pub struct EngineCore {
     log: Log,
-    runs: BTreeMap<RunId, Run>,
+    /// Copy-on-write per run: a compaction's view shares these, and a run
+    /// is copied only if it changes while that view is alive.
+    runs: BTreeMap<RunId, Arc<Run>>,
     by_op: HashMap<OperationKey, RunId>,
     next_run: u64,
+    /// Non-terminal runs and the index's approximate bytes, kept current
+    /// so admission is O(1).
+    live: usize,
+    index_bytes: u64,
     pub limits: Limits,
     pub retry: RetryPolicy,
 }
@@ -182,14 +237,29 @@ impl EngineCore {
             runs: BTreeMap::new(),
             by_op: HashMap::new(),
             next_run: 1,
+            live: 0,
+            index_bytes: 0,
             limits: Limits::default(),
             retry: RetryPolicy::default(),
         };
         if let Some(snap) = durable_journal::load_snapshot(&gdir)? {
-            let idx: IndexSnapshot = serde_json::from_slice(&snap.payload)?;
-            core.runs = idx.runs;
-            core.by_op = idx.by_op;
-            core.next_run = idx.next_run;
+            if snap.payload.starts_with(snapshot::MAGIC) {
+                let (next_run, runs) =
+                    snapshot::decode(&snap.payload).map_err(JournalError::CorruptSnapshot)?;
+                // Dedup keys are exactly the retained runs' keys.
+                core.by_op = runs.values().map(|r| (r.key.clone(), r.id)).collect();
+                core.runs = runs;
+                core.next_run = next_run;
+            } else {
+                let idx: LegacyIndex = serde_json::from_slice(&snap.payload)?;
+                core.runs = idx
+                    .runs
+                    .into_iter()
+                    .map(|(id, r)| (id, Arc::new(r)))
+                    .collect();
+                core.by_op = idx.by_op;
+                core.next_run = idx.next_run;
+            }
         }
         let mut max_run = core.next_run.saturating_sub(1);
         for r in durable_journal::replay_dir(&gdir)? {
@@ -198,6 +268,7 @@ impl EngineCore {
             core.apply_committed(RunId(env.run), env.event, env.at)?;
         }
         core.next_run = max_run + 1;
+        core.recount();
         Ok(core)
     }
 
@@ -209,6 +280,7 @@ impl EngineCore {
             &mut self.log,
             Log::Piped(Pipe {
                 pending: VecDeque::new(),
+                pending_bytes: 0,
                 last_index: 0,
                 root: PathBuf::new(),
                 space: SpaceProbe::default(),
@@ -251,19 +323,48 @@ impl EngineCore {
         }
     }
 
-    /// Up to `max` queued records, oldest first, with the commit index of
-    /// the last one — the unit handed to the writer.
-    pub fn take_batch(&mut self, max: usize) -> Option<(Vec<Vec<u8>>, u64)> {
+    /// Payload bytes queued for the writer and not yet handed over.
+    pub fn pending_bytes(&self) -> usize {
+        match &self.log {
+            Log::Direct(_) => 0,
+            Log::Piped(p) => p.pending_bytes,
+        }
+    }
+
+    /// Queued records, oldest first, up to `max_records` and `max_bytes`
+    /// (always at least one, so a single oversized record still moves),
+    /// with their total bytes and the commit index of the last one — the
+    /// unit handed to the writer.
+    pub fn take_batch(&mut self, max_records: usize, max_bytes: usize) -> Option<Batch> {
         let Log::Piped(p) = &mut self.log else {
             return None;
         };
-        if p.pending.is_empty() {
+        let mut records = Vec::new();
+        let mut bytes = 0usize;
+        while let Some(next) = p.pending.front() {
+            let fits = records.len() < max_records.max(1) && bytes + next.len() <= max_bytes;
+            if !records.is_empty() && !fits {
+                break;
+            }
+            let Some(rec) = p.pending.pop_front() else {
+                break;
+            };
+            bytes += rec.len();
+            records.push(rec);
+            if records.len() >= max_records.max(1) {
+                break;
+            }
+        }
+        if records.is_empty() {
             return None;
         }
-        let n = max.max(1).min(p.pending.len());
-        let records: Vec<Vec<u8>> = p.pending.drain(..n).collect();
+        p.pending_bytes -= bytes;
         let upto = p.last_index - p.pending.len() as u64;
-        Some((records, upto))
+        Some(Batch {
+            records,
+            bytes,
+            upto,
+        })
     }
 
     /// Take in the writer's latest report (generation, counts, failure).
@@ -298,29 +399,22 @@ impl EngineCore {
             })
             .map(|r| r.id)
             .collect();
-        let runs: BTreeMap<RunId, Run> = self
-            .runs
-            .iter()
-            .filter(|(id, _)| !expired.contains(id))
-            .map(|(id, r)| (*id, r.clone()))
-            .collect();
-        // Dedup keys live only as long as their run — no orphan entries.
-        let by_op: HashMap<OperationKey, RunId> = self
-            .by_op
-            .iter()
-            .filter(|(_, id)| runs.contains_key(id))
-            .map(|(k, id)| (k.clone(), *id))
-            .collect();
-        let payload = serde_json::to_vec(&IndexSnapshot {
-            runs,
-            by_op,
+        let gone: std::collections::HashSet<RunId> = expired.iter().copied().collect();
+        // A pointer per retained run: nothing is copied or encoded here, on
+        // the actor; the writer encodes the view while the actor moves on.
+        let view = snapshot::View {
             next_run: self.next_run,
-        })?;
+            runs: self
+                .runs
+                .iter()
+                .filter(|(id, _)| !gone.contains(id))
+                .map(|(_, r)| Arc::clone(r))
+                .collect(),
+        };
+        let bytes = snapshot::encoded_len(&view);
         Ok(CompactionPlan {
-            snapshot: durable_journal::Snapshot {
-                covered_seq: 0,
-                payload,
-            },
+            view,
+            bytes,
             expired,
         })
     }
@@ -329,11 +423,28 @@ impl EngineCore {
     pub fn finish_compaction(&mut self, expired: &[RunId]) {
         for id in expired {
             if let Some(run) = self.runs.remove(id) {
+                self.index_bytes = self
+                    .index_bytes
+                    .saturating_sub(Limits::run_bytes(&run.key, &run.spec));
                 if self.by_op.get(&run.key) == Some(id) {
                     self.by_op.remove(&run.key);
                 }
             }
         }
+    }
+
+    /// Recompute the admission counters from the index (after replay).
+    fn recount(&mut self) {
+        self.live = self
+            .runs
+            .values()
+            .filter(|r| !r.state.is_terminal())
+            .count();
+        self.index_bytes = self
+            .runs
+            .values()
+            .map(|r| Limits::run_bytes(&r.key, &r.spec))
+            .sum();
     }
 
     /// Compact (direct mode): expire 7-day-old terminal runs, snapshot the
@@ -344,7 +455,7 @@ impl EngineCore {
         let Log::Direct(journal) = &mut self.log else {
             return Err(EngineError::Piped);
         };
-        journal.compact(&plan.snapshot)?;
+        journal.compact_with(0, plan.bytes, |w| snapshot::encode(&plan.view, w))?;
         let generation = journal.generation();
         self.finish_compaction(&plan.expired);
         Ok(generation)
@@ -375,15 +486,23 @@ impl EngineCore {
                 return Err(Refusal::DuplicateKey.into());
             }
             self.by_op.insert(key.clone(), run_id);
-            self.runs
-                .insert(run_id, Run::accepted(run_id, key, spec, not_before));
+            self.live += 1;
+            self.index_bytes += Limits::run_bytes(&key, &spec);
+            self.runs.insert(
+                run_id,
+                Arc::new(Run::accepted(run_id, key, spec, not_before)),
+            );
             return Ok(vec![]);
         }
         let run = self.runs.get(&run_id).ok_or(Refusal::StaleReply)?;
         let (state, effects) = reduce(run, &event, now, &self.limits, &self.retry)?;
-        let run = self.runs.get_mut(&run_id).ok_or(Refusal::StaleReply)?;
+        // Copies the run only if a compaction's view still shares it.
+        let run = Arc::make_mut(self.runs.get_mut(&run_id).ok_or(Refusal::StaleReply)?);
         if state.is_terminal() && run.finished_at.is_none() {
             run.finished_at = Some(now); // the 7-day expiry clock starts
+        }
+        if state.is_terminal() && !run.state.is_terminal() {
+            self.live = self.live.saturating_sub(1);
         }
         run.state = state;
         Ok(effects)
@@ -440,11 +559,20 @@ impl EngineCore {
         not_before: Millis,
         now: Millis,
     ) -> Result<RunId, EngineError> {
-        self.limits.admits_key(&key)?;
+        // Dedup first: a run accepted under an older (larger) key bound
+        // must still return itself. The bound refuses new keys only.
         if let Some(existing) = self.by_op.get(&key) {
             return Ok(*existing); // duplicate: hand back the original run
         }
+        self.limits.admits_key(&key)?;
         self.limits.admits(&spec)?; // limits refuse before anything is written
+                                    // Capacity: a bounded index, refused explicitly (contract: "cap
+                                    // memory and disk; reject overload explicitly").
+        if self.live >= self.limits.max_live_runs
+            || self.index_bytes + Limits::run_bytes(&key, &spec) > self.limits.max_index_bytes
+        {
+            return Err(Refusal::AtCapacity.into());
+        }
         let run = RunId(self.next_run);
         self.commit(
             run,
@@ -555,7 +683,7 @@ impl EngineCore {
     }
 
     pub fn run(&self, id: RunId) -> Option<&Run> {
-        self.runs.get(&id)
+        self.runs.get(&id).map(|r| &**r)
     }
 
     /// Bounded diagnostics: counts, never rows — O(number of states),
@@ -565,33 +693,38 @@ impl EngineCore {
         for r in self.runs.values() {
             *states.entry(r.state.kind()).or_insert(0u64) += 1;
         }
-        let (generation, records_written, journal_batches, largest_batch, stale_generations) =
-            match &self.log {
-                Log::Direct(j) => (
-                    j.generation(),
-                    j.records_written(),
-                    0,
-                    0,
-                    j.stale_generations().unwrap_or(0),
-                ),
-                Log::Piped(p) => (
-                    p.status.generation,
-                    p.status.records_written,
+        let (generation, records_written, stale_generations, batches) = match &self.log {
+            Log::Direct(j) => (
+                j.generation(),
+                j.records_written(),
+                j.stale_generations().unwrap_or(0),
+                (0, 0, 0),
+            ),
+            Log::Piped(p) => (
+                p.status.generation,
+                p.status.records_written,
+                p.status.stale_generations,
+                (
                     p.status.batches,
                     p.status.largest_batch,
-                    p.status.stale_generations,
+                    p.status.largest_batch_bytes,
                 ),
-            };
+            ),
+        };
+        let (journal_batches, largest_batch, largest_batch_bytes) = batches;
         Diagnostics {
             generation,
             records_written,
             live_runs: self.runs.len() as u64,
+            active_runs: self.live as u64,
+            index_bytes: self.index_bytes,
             dedup_keys: self.by_op.len() as u64,
             states,
             space_ok: self.space_ok(),
             errors: std::collections::BTreeMap::new(),
             journal_batches,
             largest_batch,
+            largest_batch_bytes,
             stale_generations,
         }
     }
@@ -599,15 +732,19 @@ impl EngineCore {
     /// Iterate the live index in id order (bounded by the index, never by
     /// history).
     pub fn runs(&self) -> impl Iterator<Item = &Run> {
-        self.runs.values()
+        self.runs.values().map(|r| &**r)
     }
 
     /// One page of the live index: up to `limit` runs with id > `after`,
     /// in id order, plus the cursor for the next page (if any).
-    pub fn page(&self, after: Option<RunId>, limit: usize) -> (Vec<Run>, Option<RunId>) {
+    pub fn page(&self, after: Option<RunId>, limit: usize) -> (Vec<RunSummary>, Option<RunId>) {
         let start = after.map_or(Bound::Unbounded, Bound::Excluded);
         let mut it = self.runs.range((start, Bound::Unbounded));
-        let page: Vec<Run> = it.by_ref().take(limit).map(|(_, r)| r.clone()).collect();
+        let page: Vec<RunSummary> = it
+            .by_ref()
+            .take(limit)
+            .map(|(_, r)| RunSummary::of(r))
+            .collect();
         let next = match (page.last(), it.next()) {
             (Some(last), Some(_)) => Some(last.id),
             _ => None,
@@ -625,6 +762,27 @@ impl EngineCore {
                 _ => None,
             })
             .collect()
+    }
+
+    /// One page newest first: up to `limit` runs with id < `before` (all
+    /// when `None`), ids descending, plus the cursor for the next page.
+    pub fn page_newest(
+        &self,
+        before: Option<RunId>,
+        limit: usize,
+    ) -> (Vec<RunSummary>, Option<RunId>) {
+        let end = before.map_or(Bound::Unbounded, Bound::Excluded);
+        let mut it = self.runs.range((Bound::Unbounded, end)).rev();
+        let page: Vec<RunSummary> = it
+            .by_ref()
+            .take(limit)
+            .map(|(_, r)| RunSummary::of(r))
+            .collect();
+        let next = match (page.last(), it.next()) {
+            (Some(last), Some(_)) => Some(last.id),
+            _ => None,
+        };
+        (page, next)
     }
 
     /// Millisecond clock values the dispatcher should re-arm for.
@@ -931,6 +1089,202 @@ mod tests {
             assert_eq!(gens, 1, "step {step}: leftovers are cleaned up");
             assert!(e.run(live).is_some());
         }
+    }
+
+    /// The review's crash sequence: a compaction fails at its manifest
+    /// swap, then the next compaction is killed while building its new
+    /// generation. That used to delete the live generation (10 of 10 runs
+    /// lost). Now the first failure poisons the journal, the second
+    /// compaction is refused without touching the disk, and every run
+    /// survives the restart.
+    #[test]
+    fn failed_swap_then_crashed_compaction_loses_nothing() {
+        use durable_journal::faults::Faults;
+        use std::sync::Arc;
+        let d = tempfile::tempdir().unwrap_or_else(|e| panic!("{e}"));
+        let faults = Arc::new(Faults::default());
+        let opts = JournalOptions {
+            faults: Some(faults.clone()),
+            ..JournalOptions::default()
+        };
+        let mut ids = Vec::new();
+        {
+            let mut e = EngineCore::open_with(d.path(), opts).unwrap_or_else(|e| panic!("{e}"));
+            for i in 0..10 {
+                ids.push(
+                    e.submit(OperationKey(format!("r2-{i}")), spec(), 0)
+                        .unwrap_or_else(|e| panic!("{e}")),
+                );
+            }
+            faults.crash_compaction_at(3);
+            assert!(e.compact(1).is_err());
+            faults.crash_compaction_at(1);
+            assert!(e.compact(2).is_err());
+        }
+        let e = EngineCore::open(d.path()).unwrap_or_else(|e| panic!("restart: {e}"));
+        for id in ids {
+            assert!(e.run(id).is_some(), "{id:?} lost");
+        }
+    }
+
+    /// Review finding 3: the snapshot was the index JSON-encoded (inputs as
+    /// number arrays), then JSON-encoded again as a number array — about
+    /// 12 times the raw input. It must stay close to the raw size.
+    #[test]
+    fn snapshot_is_compact() {
+        let (d, mut e) = open();
+        let input: Vec<u8> = (0..1024).map(|i| (i % 251) as u8).collect();
+        for i in 0..200 {
+            let mut s = spec();
+            s.input = input.clone();
+            e.submit(OperationKey(format!("compact-{i}")), s, 0)
+                .unwrap_or_else(|e| panic!("{e}"));
+        }
+        let generation = e.compact(1).unwrap_or_else(|e| panic!("{e}"));
+        let gdir = durable_journal::gen_dir_path(d.path(), generation);
+        let bytes: u64 = std::fs::read_dir(&gdir)
+            .unwrap_or_else(|e| panic!("{e}"))
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_string_lossy().starts_with("snapshot"))
+            .filter_map(|e| e.metadata().ok())
+            .map(|m| m.len())
+            .sum();
+        let raw = 200 * 1024;
+        assert!(
+            bytes <= raw + raw / 4,
+            "snapshot is {bytes} bytes for {raw} bytes of input"
+        );
+        drop(e);
+        let e = EngineCore::open(d.path()).unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(e.runs().count(), 200);
+        assert!(e.runs().all(|r| r.spec.input == input));
+    }
+
+    /// Journals compacted by builds before D-021 carry a JSON
+    /// `snapshot.json`; they must still open.
+    #[test]
+    fn legacy_json_snapshot_still_opens() {
+        #[derive(Serialize)]
+        struct OldIndex {
+            runs: BTreeMap<RunId, Run>,
+            by_op: HashMap<OperationKey, RunId>,
+            next_run: u64,
+        }
+        let d = tempfile::tempdir().unwrap_or_else(|e| panic!("{e}"));
+        let run = Run::accepted(RunId(7), OperationKey("legacy".into()), spec(), 0);
+        let payload = serde_json::to_vec(&OldIndex {
+            runs: BTreeMap::from([(RunId(7), run)]),
+            by_op: HashMap::from([(OperationKey("legacy".into()), RunId(7))]),
+            next_run: 8,
+        })
+        .unwrap_or_else(|e| panic!("{e}"));
+        let g2 = durable_journal::gen_dir_path(d.path(), 2);
+        std::fs::create_dir_all(&g2).unwrap_or_else(|e| panic!("{e}"));
+        std::fs::write(g2.join("journal.log"), b"").unwrap_or_else(|e| panic!("{e}"));
+        let snap = durable_journal::Snapshot {
+            covered_seq: 0,
+            payload,
+        };
+        std::fs::write(
+            g2.join("snapshot.json"),
+            serde_json::to_vec(&snap).unwrap_or_else(|e| panic!("{e}")),
+        )
+        .unwrap_or_else(|e| panic!("{e}"));
+        std::fs::write(d.path().join("manifest.json"), "{\"generation\":2}")
+            .unwrap_or_else(|e| panic!("{e}"));
+        let mut e = EngineCore::open(d.path()).unwrap_or_else(|e| panic!("{e}"));
+        assert!(e.run(RunId(7)).is_some());
+        let again = e
+            .submit(OperationKey("legacy".into()), spec(), 1)
+            .unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(again, RunId(7), "dedup survives the format change");
+        // The next compaction rewrites it in the binary format.
+        e.compact(2).unwrap_or_else(|e| panic!("{e}"));
+        assert!(durable_journal::gen_dir_path(d.path(), 3)
+            .join("snapshot.bin")
+            .exists());
+    }
+
+    /// The compaction view is consistent: a run changed after the plan was
+    /// taken is copied, and the view still holds the state as planned.
+    #[test]
+    fn compaction_view_is_unchanged_by_later_commits() {
+        let (_d, mut e) = open();
+        let run = e
+            .submit(OperationKey("cow".into()), spec(), 0)
+            .unwrap_or_else(|e| panic!("{e}"));
+        let plan = e.plan_compaction(1).unwrap_or_else(|e| panic!("{e}"));
+        e.cancel(run, 2).unwrap_or_else(|e| panic!("{e}"));
+        assert!(matches!(
+            e.run(run).map(|r| &r.state),
+            Some(RunState::Cancelled)
+        ));
+        let mut bytes = Vec::new();
+        snapshot::encode(&plan.view, &mut bytes).unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(bytes.len() as u64, plan.bytes);
+        let (_, runs) = snapshot::decode(&bytes).unwrap_or_else(|e| panic!("{e}"));
+        assert!(matches!(
+            runs.get(&run).map(|r| &r.state),
+            Some(RunState::Queued { .. })
+        ));
+    }
+
+    /// Review finding 7: nothing bounded live runs, and accepted submits
+    /// could outrun dispatch indefinitely. Beyond `max_live_runs` (or the
+    /// index byte bound) a submit is refused `AtCapacity` before anything
+    /// is journaled; finishing a run frees room.
+    #[test]
+    fn admission_is_bounded_by_live_runs_and_index_bytes() {
+        let (_d, mut e) = open();
+        e.limits.max_live_runs = 3;
+        let ids: Vec<RunId> = (0..3)
+            .map(|i| {
+                e.submit(OperationKey(format!("cap-{i}")), spec(), 0)
+                    .unwrap_or_else(|e| panic!("{e}"))
+            })
+            .collect();
+        let written = e.diagnostics().records_written;
+        assert!(matches!(
+            e.submit(OperationKey("cap-4".into()), spec(), 0),
+            Err(EngineError::Refused(Refusal::AtCapacity))
+        ));
+        assert_eq!(
+            e.diagnostics().records_written,
+            written,
+            "nothing journaled"
+        );
+        e.cancel(ids[0], 1).unwrap_or_else(|e| panic!("{e}"));
+        e.submit(OperationKey("cap-4".into()), spec(), 2)
+            .unwrap_or_else(|e| panic!("a finished run frees room: {e}"));
+
+        e.limits.max_live_runs = usize::MAX;
+        e.limits.max_index_bytes = e.diagnostics().index_bytes; // already full
+        assert!(matches!(
+            e.submit(OperationKey("bytes".into()), spec(), 3),
+            Err(EngineError::Refused(Refusal::AtCapacity))
+        ));
+    }
+
+    /// Review finding 15(b): a run accepted with a key over today's bound
+    /// (journaled before the bound, or under a larger one) must still
+    /// deduplicate. The key bound applies to new keys only.
+    #[test]
+    fn existing_over_long_key_still_deduplicates() {
+        let (_d, mut e) = open();
+        e.limits.max_key_bytes = 1024;
+        let long = OperationKey("k".repeat(300));
+        let id = e
+            .submit(long.clone(), spec(), 0)
+            .unwrap_or_else(|e| panic!("{e}"));
+        e.limits.max_key_bytes = 256; // the bound tightens (an upgrade)
+        let again = e
+            .submit(long, spec(), 1)
+            .unwrap_or_else(|e| panic!("dedup must still find the original run: {e}"));
+        assert_eq!(again, id);
+        assert!(matches!(
+            e.submit(OperationKey("n".repeat(300)), spec(), 2),
+            Err(EngineError::Refused(Refusal::OverLimits))
+        ));
     }
 
     #[test]

@@ -201,6 +201,8 @@ pub enum Refusal {
     NothingToReconcile,
     #[error("admission reserve exhausted")]
     ReserveExhausted,
+    #[error("at capacity: live-run or index-byte bound reached")]
+    AtCapacity,
 }
 
 // -------------------------------------------------------------------- limits
@@ -217,6 +219,12 @@ pub struct Limits {
     pub max_key_bytes: usize,
     /// Step and handler names.
     pub max_name_bytes: usize,
+    /// Non-terminal runs the index may hold; submits beyond it are refused
+    /// `AtCapacity` (dispatch drains them at a bounded rate).
+    pub max_live_runs: usize,
+    /// Approximate bytes of every retained run (terminal ones stay seven
+    /// days with their inputs); submits that would pass it are refused.
+    pub max_index_bytes: u64,
 }
 
 impl Default for Limits {
@@ -229,6 +237,8 @@ impl Default for Limits {
             max_step_deadline_ms: 30_000,
             max_key_bytes: 256,
             max_name_bytes: 128,
+            max_live_runs: 100_000,
+            max_index_bytes: 1024 * 1024 * 1024,
         }
     }
 }
@@ -248,6 +258,17 @@ impl Limits {
             return Err(Refusal::OverLimits);
         }
         Ok(())
+    }
+
+    /// The bytes a run with this key and spec costs the index (an
+    /// approximation: payloads plus a fixed overhead per run and step).
+    pub fn run_bytes(key: &OperationKey, spec: &JobSpec) -> u64 {
+        let steps: usize = spec
+            .steps
+            .iter()
+            .map(|s| 48 + s.name.len() + s.handler.len())
+            .sum();
+        (160 + key.0.len() + spec.input.len() + steps) as u64
     }
 
     /// An operation key is non-empty, at most `max_key_bytes`, and free of

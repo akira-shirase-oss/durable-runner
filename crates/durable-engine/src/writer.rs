@@ -12,17 +12,19 @@
 //!   fsync is never retried, the log is rolled back to its durable length
 //!   when possible (`Journal::append_batch`), the writer stops, and the
 //!   process exits so replay rebuilds memory, which is already ahead of disk;
-//! - batches are bounded in records and bytes, and the wait for more
-//!   records is bounded by `max_wait`;
-//! - compaction and backup run here, in queue order behind earlier appends.
+//! - batches are bounded in records and bytes; the writer never waits for
+//!   more — batching comes from records queuing while the previous fsync
+//!   runs (D-026);
+//! - compaction and backup run here, in queue order behind earlier appends;
+//!   a compaction that fails at or after its manifest swap poisons the
+//!   journal and stops the writer exactly like a failed append (D-019).
 
 use crate::EngineError;
-use durable_journal::{Journal, JournalError, Snapshot};
+use durable_journal::{Journal, JournalError};
 use std::path::PathBuf;
-use std::sync::mpsc::{self, Receiver, SyncSender, TryRecvError};
+use std::sync::mpsc::{self, Receiver, SyncSender};
 use std::sync::Arc;
 use std::thread::JoinHandle;
-use std::time::{Duration, Instant};
 use tokio::sync::{oneshot, watch};
 
 /// Messages the writer can hold before the actor keeps work in its own
@@ -37,10 +39,6 @@ pub struct GroupCommit {
     /// Most payload bytes in one write + fsync (a single message may
     /// exceed it only if one record does).
     pub max_batch_bytes: usize,
-    /// How long the writer waits for more records after the first before
-    /// writing. Zero: write what is waiting; batching then comes from the
-    /// records that queue up while the previous fsync runs.
-    pub max_wait: Duration,
 }
 
 impl Default for GroupCommit {
@@ -48,7 +46,6 @@ impl Default for GroupCommit {
         Self {
             max_batch_records: 1024,
             max_batch_bytes: 4 * 1024 * 1024,
-            max_wait: Duration::ZERO,
         }
     }
 }
@@ -63,6 +60,7 @@ pub struct WriterStatus {
     pub records_written: u64,
     pub batches: u64,
     pub largest_batch: u64,
+    pub largest_batch_bytes: u64,
     /// Superseded generation directories still on disk (retention lag).
     pub stale_generations: u32,
     /// Set once a write or fsync failed; the writer has stopped.
@@ -70,10 +68,17 @@ pub struct WriterStatus {
 }
 
 pub(crate) enum WriterMsg {
-    /// Consecutive records; `upto` is the commit index of the last one.
-    Append { records: Vec<Vec<u8>>, upto: u64 },
+    /// Consecutive records (`bytes` of payload); `upto` is the commit
+    /// index of the last one.
+    Append {
+        records: Vec<Vec<u8>>,
+        bytes: usize,
+        upto: u64,
+    },
+    /// Encode `view` (exactly `bytes`) straight into the new generation.
     Compact {
-        snapshot: Snapshot,
+        view: crate::snapshot::View,
+        bytes: u64,
         reply: oneshot::Sender<Result<u32, JournalError>>,
     },
     Backup {
@@ -86,6 +91,12 @@ impl WriterMsg {
     pub(crate) fn records(&self) -> usize {
         match self {
             WriterMsg::Append { records, .. } => records.len(),
+            _ => 0,
+        }
+    }
+    pub(crate) fn bytes(&self) -> usize {
+        match self {
+            WriterMsg::Append { bytes, .. } => *bytes,
             _ => 0,
         }
     }
@@ -130,8 +141,12 @@ fn run(
             },
         };
         match msg {
-            WriterMsg::Append { records, upto } => {
-                let (batch, upto, next) = gather(&rx, records, upto, &cfg);
+            WriterMsg::Append {
+                records,
+                bytes,
+                upto,
+            } => {
+                let (batch, bytes, upto, next) = gather(&rx, records, bytes, upto, &cfg);
                 carry = next;
                 match journal.append_batch(&batch) {
                     Ok(_) => {
@@ -139,6 +154,7 @@ fn run(
                         st.records_written = journal.records_written();
                         st.batches += 1;
                         st.largest_batch = st.largest_batch.max(batch.len() as u64);
+                        st.largest_batch_bytes = st.largest_batch_bytes.max(bytes as u64);
                     }
                     Err(e) => {
                         // Every waiter in this batch, and every later one,
@@ -149,16 +165,35 @@ fn run(
                     }
                 }
             }
-            WriterMsg::Compact { snapshot, reply } => {
-                let r = journal.compact(&snapshot).map(|()| journal.generation());
-                if r.is_ok() {
-                    st.generation = journal.generation();
-                    st.records_written = 0;
+            WriterMsg::Compact { view, bytes, reply } => {
+                // Streamed: memory stays a buffer, not the snapshot's size.
+                let r = journal
+                    .compact_with(0, bytes, |w| crate::snapshot::encode(&view, w))
+                    .map(|()| journal.generation());
+                drop(view); // release the shared runs promptly
+                match r {
+                    Ok(generation) => {
+                        st.generation = generation;
+                        st.records_written = 0;
+                        if let Ok(n) = journal.stale_generations() {
+                            st.stale_generations = n;
+                        }
+                        let _ = reply.send(Ok(generation));
+                    }
+                    // Failed at or after the manifest swap: the journal is
+                    // poisoned. Same rule as a failed append — stop, so the
+                    // actor fails every waiter and the process exits.
+                    Err(e) if journal.is_poisoned() => {
+                        let _ = reply.send(Err(JournalError::Poisoned));
+                        st.failed = Some(Arc::new(e));
+                        status.send_replace(st);
+                        return;
+                    }
+                    // Failed before the swap: nothing moved, carry on.
+                    Err(e) => {
+                        let _ = reply.send(Err(e)); // the actor may have stopped meanwhile
+                    }
                 }
-                if let Ok(n) = journal.stale_generations() {
-                    st.stale_generations = n;
-                }
-                let _ = reply.send(r); // the actor may have stopped meanwhile
             }
             WriterMsg::Backup { dest, reply } => {
                 let _ = reply.send(journal.backup_to(&dest).map_err(EngineError::from));
@@ -170,46 +205,36 @@ fn run(
     }
 }
 
-/// Extend a batch with appends already waiting (or arriving within
-/// `max_wait`), never past the record and byte bounds. A message that does
-/// not fit, or a control message, is handed back to run next.
+/// Extend a batch with appends already waiting, never past the record and
+/// byte bounds and never waiting for more. A message that does not fit, or
+/// a control message, is handed back to run next.
 fn gather(
     rx: &Receiver<WriterMsg>,
     mut batch: Vec<Vec<u8>>,
+    mut bytes: usize,
     mut upto: u64,
     cfg: &GroupCommit,
-) -> (Vec<Vec<u8>>, u64, Option<WriterMsg>) {
-    let mut bytes: usize = batch.iter().map(Vec::len).sum();
-    let deadline = Instant::now() + cfg.max_wait;
+) -> (Vec<Vec<u8>>, usize, u64, Option<WriterMsg>) {
     loop {
         if batch.len() >= cfg.max_batch_records || bytes >= cfg.max_batch_bytes {
-            return (batch, upto, None);
+            return (batch, bytes, upto, None);
         }
-        let next = match rx.try_recv() {
-            Ok(m) => m,
-            Err(TryRecvError::Disconnected) => return (batch, upto, None),
-            Err(TryRecvError::Empty) => {
-                let left = deadline.saturating_duration_since(Instant::now());
-                if left.is_zero() {
-                    return (batch, upto, None);
-                }
-                match rx.recv_timeout(left) {
-                    Ok(m) => m,
-                    Err(_) => return (batch, upto, None),
-                }
-            }
+        let Ok(next) = rx.try_recv() else {
+            return (batch, bytes, upto, None);
         };
         match next {
-            WriterMsg::Append { records, upto: u }
-                if batch.len() + records.len() <= cfg.max_batch_records
-                    && bytes + records.iter().map(Vec::len).sum::<usize>()
-                        <= cfg.max_batch_bytes =>
+            WriterMsg::Append {
+                records,
+                bytes: b,
+                upto: u,
+            } if batch.len() + records.len() <= cfg.max_batch_records
+                && bytes + b <= cfg.max_batch_bytes =>
             {
-                bytes += records.iter().map(Vec::len).sum::<usize>();
+                bytes += b;
                 batch.extend(records);
                 upto = u;
             }
-            other => return (batch, upto, Some(other)),
+            other => return (batch, bytes, upto, Some(other)),
         }
     }
 }

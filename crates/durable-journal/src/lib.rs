@@ -5,7 +5,7 @@
 //! <dir>/LOCK                      exclusive writer lock (flock, non-blocking)
 //! <dir>/manifest.json             { "generation": N }
 //! <dir>/gen-00000N/journal.log    append-only framed records
-//! <dir>/gen-00000N/snapshot.json  optional checkpoint (accelerator only)
+//! <dir>/gen-00000N/snapshot.bin   checksummed checkpoint written by compaction
 //! ```
 //!
 //! Frame: `[version u16][len u32][seq u64][crc32 u32][payload len]` — big
@@ -41,6 +41,8 @@ pub mod faults {
         released: Condvar,
         // 0 = disarmed; n = the process "dies" at compaction step n.
         compaction_crash: AtomicU64,
+        dir_syncs: Mutex<Vec<std::path::PathBuf>>,
+        backup_crash: AtomicBool,
     }
 
     impl Faults {
@@ -53,11 +55,11 @@ pub mod faults {
             *self.held.lock().unwrap_or_else(PoisonError::into_inner) = false;
             self.released.notify_all();
         }
-        /// The next compaction stops dead at `step` — 1: the new
-        /// generation's log exists; 2: its snapshot is written; 3: the
-        /// manifest names it (old generations not yet deleted) — as if the
-        /// process were killed there. Drop the journal and reopen to see
-        /// what a restart finds.
+        /// The next compaction fails at `step` — 1: the new generation's
+        /// log exists; 2: its snapshot is written; 3: the manifest has just
+        /// been renamed to name it (its directory fsync not yet done). Drop
+        /// the journal to model a crash there, or keep running to model an
+        /// I/O error there.
         pub fn crash_compaction_at(&self, step: u64) {
             self.compaction_crash.store(step, Ordering::SeqCst);
         }
@@ -70,6 +72,27 @@ pub mod faults {
                 return Err(std::io::Error::other("injected crash during compaction"));
             }
             Ok(())
+        }
+        /// The next backup stops dead after copying the generation data,
+        /// before its manifest — what a kill -9 mid-backup leaves.
+        pub fn crash_next_backup(&self) {
+            self.backup_crash.store(true, Ordering::SeqCst);
+        }
+        pub(crate) fn take_backup_crash(&self) -> bool {
+            self.backup_crash.swap(false, Ordering::SeqCst)
+        }
+        /// Directories fsynced at open, in order.
+        pub fn dir_syncs(&self) -> Vec<std::path::PathBuf> {
+            self.dir_syncs
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .clone()
+        }
+        pub(crate) fn record_dir_sync(&self, dir: &std::path::Path) {
+            self.dir_syncs
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .push(dir.to_path_buf());
         }
         /// How many times the log was fsynced (rollbacks excluded).
         pub fn sync_calls(&self) -> u64 {
@@ -202,6 +225,26 @@ pub enum JournalError {
     /// An earlier write or fsync failure poisoned this writer.
     #[error("journal writer poisoned by an earlier failure; restart to replay")]
     Poisoned,
+    /// Compaction failed at or after its manifest swap: the manifest may
+    /// already name the new generation while this writer still points at
+    /// the old one, so continuing would acknowledge records no restart
+    /// replays. The writer is poisoned; restart opens what the manifest
+    /// durably names.
+    #[error("compaction failed at its manifest swap; writer poisoned, restart to replay: {0}")]
+    ManifestSwapFailed(#[source] io::Error),
+    /// The durable manifest does not name the generation this writer is
+    /// on: something moved it underneath. Nothing is deleted or written;
+    /// the writer is poisoned and a restart opens what the manifest names.
+    #[error("manifest names generation {on_disk}, writer is on {in_memory}; poisoned, restart to replay")]
+    ManifestMismatch { on_disk: u32, in_memory: u32 },
+    /// The free-space probe could not answer, so nothing was written
+    /// (unknown free space is treated as not enough).
+    #[error("free space unknown: {0}")]
+    SpaceProbe(#[source] io::Error),
+    /// The snapshot (the only authority for compacted state) failed its
+    /// checksum or framing: startup stops rather than trust it.
+    #[error("snapshot is damaged: {0}")]
+    CorruptSnapshot(String),
     /// A backup never merges into an existing directory.
     #[error("backup destination already exists")]
     BackupExists,
@@ -217,6 +260,17 @@ pub struct Record {
 #[derive(Debug, Serialize, Deserialize)]
 struct Manifest {
     generation: u32,
+}
+
+/// The generation the durable manifest names (`None` if there is none).
+fn read_manifest(root: &Path) -> Result<Option<u32>, JournalError> {
+    match fs::read_to_string(root.join("manifest.json")) {
+        Ok(text) => serde_json::from_str::<Manifest>(&text)
+            .map(|m| Some(m.generation))
+            .map_err(|e| JournalError::Manifest(e.to_string())),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e.into()),
+    }
 }
 
 /// The generation number of a `gen-NNNNNN` directory name.
@@ -338,7 +392,18 @@ impl Journal {
 
     /// `open` with explicit options.
     pub fn open_with(dir: &Path, opts: JournalOptions) -> Result<Self, JournalError> {
+        // Directory entries created here are fsynced before the first
+        // append can be acknowledged (D-025): a new file or directory is
+        // durable only once the directory holding its entry is.
+        let root_existed = dir.exists();
         fs::create_dir_all(dir)?;
+        if !root_existed {
+            let parent = dir
+                .parent()
+                .filter(|p| !p.as_os_str().is_empty())
+                .unwrap_or(Path::new("."));
+            sync_dir(&opts, parent)?;
+        }
         let lock_path = dir.join("LOCK");
         let lock_file = OpenOptions::new()
             .read(true)
@@ -362,21 +427,29 @@ impl Journal {
                 fs::write(&tmp, serde_json::to_string(&m).map_err(io::Error::other)?)?;
                 File::open(&tmp)?.sync_data()?;
                 fs::rename(&tmp, &manifest_path)?;
-                sync_parent(&manifest_path)?;
+                sync_dir(&opts, dir)?;
                 1
             }
             Err(e) => return Err(e.into()),
         };
 
         let gdir = gen_dir_path(dir, generation);
+        let gen_existed = gdir.exists();
         fs::create_dir_all(&gdir)?;
         let log_path = gdir.join("journal.log");
+        let log_existed = log_path.exists();
         let mut file = OpenOptions::new()
             .read(true)
             .write(true)
             .create(true)
             .truncate(false)
             .open(&log_path)?;
+        if !log_existed {
+            sync_dir(&opts, &gdir)?; // journal.log's entry
+        }
+        if !gen_existed {
+            sync_dir(&opts, dir)?; // the generation directory's entry
+        }
 
         // Replay: verify committed history, then truncate a torn tail only.
         let records = replay(&mut file)?;
@@ -405,7 +478,11 @@ impl Journal {
     /// filesystem holding `path` with the reserve still free afterwards
     /// (contract: full disk fails admission safely, not silently).
     fn ensure_space(&self, path: &Path, need: u64) -> Result<u64, JournalError> {
-        let available = self.opts.space.available(path)?;
+        let available = self
+            .opts
+            .space
+            .available(path)
+            .map_err(JournalError::SpaceProbe)?;
         let reserve = self.opts.reserve_bytes;
         if available < reserve.saturating_add(need) {
             return Err(JournalError::NoSpace { available, reserve });
@@ -592,18 +669,42 @@ impl Journal {
     /// the manifest. A crash at any point opens either the old complete
     /// generation or the new one, never a mixture (contract §02).
     pub fn compact(&mut self, snapshot: &Snapshot) -> Result<(), JournalError> {
+        let payload = &snapshot.payload;
+        self.compact_with(snapshot.covered_seq, payload.len() as u64, |w| {
+            w.write_all(payload)
+        })
+    }
+
+    /// `compact`, with the snapshot payload streamed by `write` (exactly
+    /// `payload_len` bytes) straight into the new generation's checksummed
+    /// `snapshot.bin` — the caller never needs the whole payload in memory.
+    pub fn compact_with(
+        &mut self,
+        covered_seq: u64,
+        payload_len: u64,
+        write: impl FnOnce(&mut dyn Write) -> io::Result<()>,
+    ) -> Result<(), JournalError> {
         if self.poisoned {
             return Err(JournalError::Poisoned);
         }
         // The new generation's snapshot must fit with the reserve intact —
         // checked before anything is written, so a refusal leaves no trace.
-        let snapshot_bytes = serde_json::to_vec(snapshot).map_err(io::Error::other)?;
-        self.ensure_space(&self.root, snapshot_bytes.len() as u64)?;
+        self.ensure_space(&self.root, SNAPSHOT_HEADER_LEN + payload_len)?;
         let next = self.generation + 1;
         let gdir = gen_dir_path(&self.root, next);
         // A `gen-(N+1)` already on disk is what a compaction killed before
-        // its manifest swap left behind. The manifest still names N, so it
-        // was never authority: remove it rather than refuse every later
+        // its manifest swap left behind — but only if the *durable*
+        // manifest still names N. Check the file, never assume from memory:
+        // if it names anything else, `gen-(N+1)` may be the live generation.
+        let on_disk = read_manifest(&self.root)?;
+        if on_disk != Some(self.generation) {
+            self.poisoned = true;
+            return Err(JournalError::ManifestMismatch {
+                on_disk: on_disk.unwrap_or(0),
+                in_memory: self.generation,
+            });
+        }
+        // Not authority, so remove it rather than refuse every later
         // compaction (`create_new` below would fail on its log).
         match fs::remove_dir_all(&gdir) {
             Ok(()) => {}
@@ -612,9 +713,11 @@ impl Journal {
         }
         fs::create_dir_all(&gdir)?;
 
-        // 1. Fresh log, created and fsynced before the manifest moves.
+        // 1. Fresh log, created and fsynced before the manifest moves. This
+        //    handle becomes the writer's file after the swap, so nothing
+        //    has to be opened past the point of no return.
         let log_path = gdir.join("journal.log");
-        let new_log = OpenOptions::new()
+        let mut new_log = OpenOptions::new()
             .read(true)
             .write(true)
             .create_new(true) // a reused generation is corruption, refuse it
@@ -623,24 +726,31 @@ impl Journal {
         self.compaction_step(1)?;
 
         // 2. Snapshot for the new generation (tmp + rename + dir fsync).
-        write_snapshot_bytes(&gdir, &snapshot_bytes)?;
+        write_snapshot_stream(&gdir, covered_seq, payload_len, write)?;
         self.compaction_step(2)?;
 
         // 3. The atomic manifest swap — the single point that moves the
-        //    world from generation N to N+1.
+        //    world from generation N to N+1, and the point of no return.
+        //    From the rename on, an error leaves the manifest possibly
+        //    naming N+1 while this writer points at N: poison, never
+        //    continue (appends would go where no restart looks).
         let tmp = self.root.join("manifest.json.tmp");
         fs::write(
             &tmp,
             serde_json::to_vec(&Manifest { generation: next }).map_err(io::Error::other)?,
         )?;
         File::open(&tmp)?.sync_data()?;
-        fs::rename(&tmp, self.root.join("manifest.json"))?;
-        sync_parent(&tmp)?;
-        self.compaction_step(3)?;
+        let swapped = fs::rename(&tmp, self.root.join("manifest.json"))
+            .and_then(|()| self.compaction_step(3))
+            .and_then(|()| sync_parent(&tmp))
+            .and_then(|()| new_log.seek(SeekFrom::End(0)).map(|_| ()));
+        if let Err(e) = swapped {
+            self.poisoned = true;
+            return Err(JournalError::ManifestSwapFailed(e));
+        }
 
         // 4. Only now does the writer move: new generation, seq restarts.
-        self.file = OpenOptions::new().read(true).append(true).open(&log_path)?;
-        self.file.seek(SeekFrom::End(0))?;
+        self.file = new_log;
         self.generation = next;
         self.next_seq = 1;
         self.durable_len = 0;
@@ -687,7 +797,8 @@ impl Journal {
     }
 
     /// A consistent copy for backup into `dest`, which must not exist yet
-    /// (its parent must): generation data first, manifest LAST —
+    /// (its parent must), made in `.<name>.partial` and renamed into place
+    /// when complete: generation data first, manifest LAST —
     /// a copy interrupted mid-flight still opens as a complete older
     /// generation, never a torn mixed one.
     pub fn backup_to(&self, dest: &Path) -> Result<(), JournalError> {
@@ -695,36 +806,69 @@ impl Journal {
             return Err(JournalError::Poisoned); // the log may hold an unrolled tail
         }
         // The copy must fit on the destination with the reserve intact.
-        let parent = dest.parent().unwrap_or(dest);
+        let parent = dest
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .unwrap_or(Path::new("."));
+        let name = dest
+            .file_name()
+            .and_then(|n| n.to_str())
+            .ok_or_else(|| io::Error::other("backup destination has no usable name"))?;
         self.ensure_space(parent, self.backup_bytes()?)?;
-        // A fresh directory only: copying into an existing one could mix
-        // generations from two backups. `create_dir` is the atomic check.
-        match fs::create_dir(dest) {
+        // A fresh name only: copying into an existing backup could mix
+        // generations from two of them.
+        if fs::symlink_metadata(dest).is_ok() {
+            return Err(JournalError::BackupExists);
+        }
+        // Copy into a hidden partial directory and rename it into place only
+        // when complete, so the name never holds a half backup (a kill -9
+        // mid-copy leaves `.<name>.partial`, which the next attempt — or
+        // `sweep_partial_backups` at startup — removes; it was never valid).
+        let partial = parent.join(format!(".{name}{PARTIAL_SUFFIX}"));
+        match fs::remove_dir_all(&partial) {
             Ok(()) => {}
-            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
-                return Err(JournalError::BackupExists)
-            }
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
             Err(e) => return Err(e.into()),
         }
+        fs::create_dir(&partial)?;
         for entry in fs::read_dir(&self.root)? {
             let entry = entry?;
-            let name = entry.file_name();
-            let Some(n) = name.to_str() else { continue };
+            let gname = entry.file_name();
+            let Some(n) = gname.to_str() else { continue };
             if n.starts_with("gen-") && entry.file_type()?.is_dir() {
-                let gd = dest.join(n);
+                let gd = partial.join(n);
                 fs::create_dir_all(&gd)?;
-                for f in ["journal.log", "snapshot.json"] {
+                for f in SNAPSHOT_FILES {
                     let src = entry.path().join(f);
                     if src.exists() {
                         fs::copy(&src, gd.join(f))?;
                         File::open(gd.join(f))?.sync_data()?;
                     }
                 }
+                File::open(&gd)?.sync_data()?;
             }
         }
-        fs::copy(self.root.join("manifest.json"), dest.join("manifest.json"))?;
-        File::open(dest.join("manifest.json"))?.sync_data()?;
-        sync_parent(&dest.join("manifest.json"))?;
+        #[cfg(any(test, feature = "fault-injection"))]
+        if self
+            .opts
+            .faults
+            .as_ref()
+            .is_some_and(|f| f.take_backup_crash())
+        {
+            return Err(io::Error::other("injected crash during backup").into());
+        }
+        // Manifest last: even the partial copy opens as one generation.
+        fs::copy(
+            self.root.join("manifest.json"),
+            partial.join("manifest.json"),
+        )?;
+        File::open(partial.join("manifest.json"))?.sync_data()?;
+        File::open(&partial)?.sync_data()?;
+        if fs::symlink_metadata(dest).is_ok() {
+            return Err(JournalError::BackupExists); // appeared meanwhile
+        }
+        fs::rename(&partial, dest)?;
+        File::open(parent)?.sync_data()?;
         Ok(())
     }
 }
@@ -741,7 +885,7 @@ impl Journal {
                 .to_str()
                 .is_some_and(|n| n.starts_with("gen-"));
             if is_gen && entry.file_type()?.is_dir() {
-                for f in ["journal.log", "snapshot.json"] {
+                for f in SNAPSHOT_FILES {
                     match fs::metadata(entry.path().join(f)) {
                         Ok(m) => total += m.len(),
                         Err(e) if e.kind() == io::ErrorKind::NotFound => {}
@@ -763,30 +907,146 @@ pub struct Snapshot {
     pub payload: Vec<u8>,
 }
 
-/// Atomically write the generation's snapshot (tmp + rename + dir fsync).
-pub fn write_snapshot(dir: &Path, snap: &Snapshot) -> Result<(), JournalError> {
-    write_snapshot_bytes(dir, &serde_json::to_vec(snap).map_err(io::Error::other)?)
+/// Suffix of a backup still being copied (hidden: `.<name>.partial`).
+const PARTIAL_SUFFIX: &str = ".partial";
+
+/// Remove backups that were interrupted mid-copy (`.<name>.partial`)
+/// under `root`; returns how many. They were never complete, and a
+/// finished backup never carries the suffix.
+pub fn sweep_partial_backups(root: &Path) -> Result<usize, JournalError> {
+    let mut removed = 0;
+    for entry in fs::read_dir(root)? {
+        let entry = entry?;
+        let name = entry.file_name();
+        let partial = name
+            .to_str()
+            .is_some_and(|n| n.starts_with('.') && n.ends_with(PARTIAL_SUFFIX));
+        if partial && entry.file_type()?.is_dir() {
+            fs::remove_dir_all(entry.path())?;
+            removed += 1;
+        }
+    }
+    Ok(removed)
 }
 
-fn write_snapshot_bytes(dir: &Path, bytes: &[u8]) -> Result<(), JournalError> {
-    let tmp = dir.join("snapshot.json.tmp");
-    fs::write(&tmp, bytes)?;
-    File::open(&tmp)?.sync_data()?;
-    fs::rename(&tmp, dir.join("snapshot.json"))?;
+/// Files a generation directory may hold (backup copies exactly these).
+const SNAPSHOT_FILES: [&str; 3] = ["journal.log", "snapshot.bin", "snapshot.json"];
+
+/// `snapshot.bin`: `[magic 8][covered_seq u64][payload_len u64][crc32 u32]
+/// [payload]`, big-endian. The magic carries the frame version. The snapshot
+/// is the only authority for compacted state, so its checksum is checked on
+/// every load; a mismatch stops startup.
+const SNAPSHOT_MAGIC: &[u8; 8] = b"DRSNAP\x00\x02";
+const SNAPSHOT_HEADER_LEN: u64 = 8 + 8 + 8 + 4;
+
+/// Counts and checksums what passes through to the file.
+struct Checked<W> {
+    inner: W,
+    crc: crc32fast::Hasher,
+    len: u64,
+}
+
+impl<W: Write> Write for Checked<W> {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        let n = self.inner.write(buf)?;
+        self.crc.update(&buf[..n]);
+        self.len += n as u64;
+        Ok(n)
+    }
+    fn flush(&mut self) -> io::Result<()> {
+        self.inner.flush()
+    }
+}
+
+/// Atomically write the generation's snapshot (tmp + rename + dir fsync).
+pub fn write_snapshot(dir: &Path, snap: &Snapshot) -> Result<(), JournalError> {
+    let payload = &snap.payload;
+    write_snapshot_stream(dir, snap.covered_seq, payload.len() as u64, |w| {
+        w.write_all(payload)
+    })
+}
+
+fn write_snapshot_stream(
+    dir: &Path,
+    covered_seq: u64,
+    payload_len: u64,
+    write: impl FnOnce(&mut dyn Write) -> io::Result<()>,
+) -> Result<(), JournalError> {
+    let tmp = dir.join("snapshot.bin.tmp");
+    let mut file = File::create(&tmp)?;
+    file.write_all(&[0u8; SNAPSHOT_HEADER_LEN as usize])?; // patched below
+    let (len, crc) = {
+        let mut out = Checked {
+            inner: io::BufWriter::with_capacity(256 * 1024, &mut file),
+            crc: crc32fast::Hasher::new(),
+            len: 0,
+        };
+        write(&mut out)?;
+        let Checked { inner, crc, len } = out;
+        inner.into_inner().map_err(io::IntoInnerError::into_error)?;
+        (len, crc.finalize())
+    };
+    if len != payload_len {
+        return Err(JournalError::CorruptSnapshot(format!(
+            "encoder wrote {len} bytes, promised {payload_len}"
+        )));
+    }
+    let mut header = Vec::with_capacity(SNAPSHOT_HEADER_LEN as usize);
+    header.extend_from_slice(SNAPSHOT_MAGIC);
+    header.extend_from_slice(&covered_seq.to_be_bytes());
+    header.extend_from_slice(&len.to_be_bytes());
+    header.extend_from_slice(&crc.to_be_bytes());
+    file.seek(SeekFrom::Start(0))?;
+    file.write_all(&header)?;
+    file.sync_data()?;
+    drop(file);
+    fs::rename(&tmp, dir.join("snapshot.bin"))?;
     sync_parent(&tmp)?;
     Ok(())
 }
 
-/// Load the generation's snapshot if one exists.
+/// Load the generation's snapshot if one exists, verified. A legacy
+/// `snapshot.json` (no checksum) from before D-021 is still read.
 pub fn load_snapshot(dir: &Path) -> Result<Option<Snapshot>, JournalError> {
-    let p = dir.join("snapshot.json");
-    match fs::read(&p) {
+    match fs::read(dir.join("snapshot.bin")) {
+        Ok(bytes) => return decode_snapshot(&bytes).map(Some),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e.into()),
+    }
+    match fs::read(dir.join("snapshot.json")) {
         Ok(bytes) => serde_json::from_slice(&bytes)
             .map(Some)
-            .map_err(|e| JournalError::Manifest(format!("snapshot: {e}"))),
+            .map_err(|e| JournalError::CorruptSnapshot(format!("legacy snapshot: {e}"))),
         Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
         Err(e) => Err(e.into()),
     }
+}
+
+fn decode_snapshot(bytes: &[u8]) -> Result<Snapshot, JournalError> {
+    let bad = |why: &str| JournalError::CorruptSnapshot(why.to_string());
+    let header = bytes
+        .get(..SNAPSHOT_HEADER_LEN as usize)
+        .ok_or_else(|| bad("shorter than its header"))?;
+    if &header[..8] != SNAPSHOT_MAGIC {
+        return Err(bad("unknown magic or frame version"));
+    }
+    let word = |r: std::ops::Range<usize>| -> u64 {
+        header[r]
+            .iter()
+            .fold(0u64, |acc, b| (acc << 8) | u64::from(*b))
+    };
+    let (covered_seq, len, want) = (word(8..16), word(16..24), word(24..28) as u32);
+    let payload = &bytes[SNAPSHOT_HEADER_LEN as usize..];
+    if payload.len() as u64 != len {
+        return Err(bad("payload length does not match its header"));
+    }
+    if crc(payload) != want {
+        return Err(bad("checksum mismatch"));
+    }
+    Ok(Snapshot {
+        covered_seq,
+        payload: payload.to_vec(),
+    })
 }
 
 /// Replay only records after `from_seq` (used with a snapshot).
@@ -795,6 +1055,15 @@ pub fn replay_dir_from(dir: &Path, from_seq: u64) -> Result<Vec<Record>, Journal
         .into_iter()
         .filter(|r| r.seq > from_seq)
         .collect())
+}
+
+/// fsync a directory, so the entries created in it are durable.
+fn sync_dir(_opts: &JournalOptions, dir: &Path) -> io::Result<()> {
+    #[cfg(any(test, feature = "fault-injection"))]
+    if let Some(f) = _opts.faults.as_ref() {
+        f.record_dir_sync(dir);
+    }
+    File::open(dir)?.sync_data()
 }
 
 fn sync_parent(path: &Path) -> io::Result<()> {
@@ -1065,7 +1334,7 @@ mod tests {
         j.compact(&big).unwrap_or_else(|e| panic!("{e}"));
         j.backup_to(&dest).unwrap_or_else(|e| panic!("{e}"));
         assert_eq!(j.generation(), 2);
-        assert!(dest.join("gen-000002/snapshot.json").exists());
+        assert!(dest.join("gen-000002/snapshot.bin").exists());
     }
 
     /// A batch is consecutive frames with contiguous sequence numbers,
@@ -1139,6 +1408,137 @@ mod tests {
         drop(j);
         let j = Journal::open(dir.path()).unwrap_or_else(|e| panic!("{e}"));
         assert_eq!(j.generation(), 3);
+    }
+
+    /// Review finding (high): the leftover cleanup used to delete
+    /// `gen-(N+1)` on the strength of the in-memory generation alone. If the
+    /// durable manifest already names N+1, that directory is the live
+    /// generation. The cleanup must check the manifest on disk, refuse, and
+    /// leave it untouched.
+    #[test]
+    fn leftover_cleanup_never_deletes_the_generation_the_manifest_names() {
+        let dir = tempfile::tempdir().unwrap_or_else(|e| panic!("{e}"));
+        let mut j = Journal::open(dir.path()).unwrap_or_else(|e| panic!("{e}"));
+        j.append(b"one").unwrap_or_else(|e| panic!("{e}"));
+        // The durable manifest moves to generation 2 behind this writer's
+        // back (what a failed swap used to leave), with real content.
+        let g2 = gen_dir_path(dir.path(), 2);
+        fs::create_dir_all(&g2).unwrap_or_else(|e| panic!("{e}"));
+        fs::write(g2.join("journal.log"), b"").unwrap_or_else(|e| panic!("{e}"));
+        write_snapshot(
+            &g2,
+            &Snapshot {
+                covered_seq: 0,
+                payload: b"the live state".to_vec(),
+            },
+        )
+        .unwrap_or_else(|e| panic!("{e}"));
+        fs::write(dir.path().join("manifest.json"), "{\"generation\":2}")
+            .unwrap_or_else(|e| panic!("{e}"));
+
+        let snap = Snapshot {
+            covered_seq: 0,
+            payload: b"stale".to_vec(),
+        };
+        assert!(
+            j.compact(&snap).is_err(),
+            "memory and manifest disagree: refuse"
+        );
+        assert!(j.is_poisoned(), "and never write again");
+        let kept = load_snapshot(&g2)
+            .unwrap_or_else(|e| panic!("{e}"))
+            .unwrap_or_else(|| panic!("the live generation's snapshot was deleted"));
+        assert_eq!(kept.payload, b"the live state");
+    }
+
+    /// The snapshot is the only authority for compacted state, so it is
+    /// checksummed: a damaged one stops startup instead of being trusted.
+    #[test]
+    fn damaged_snapshot_is_refused_not_trusted() {
+        let dir = tempfile::tempdir().unwrap_or_else(|e| panic!("{e}"));
+        let mut j = Journal::open(dir.path()).unwrap_or_else(|e| panic!("{e}"));
+        let snap = Snapshot {
+            covered_seq: 0,
+            payload: vec![7u8; 4096],
+        };
+        j.compact(&snap).unwrap_or_else(|e| panic!("{e}"));
+        drop(j);
+        let file = gen_dir_path(dir.path(), 2).join("snapshot.bin");
+        let mut bytes = fs::read(&file).unwrap_or_else(|e| panic!("binary snapshot: {e}"));
+        let last = bytes.len() - 1;
+        bytes[last] ^= 0x01; // one flipped bit in the payload
+        fs::write(&file, &bytes).unwrap_or_else(|e| panic!("{e}"));
+        assert!(
+            matches!(
+                load_snapshot(&gen_dir_path(dir.path(), 2)),
+                Err(JournalError::CorruptSnapshot(_))
+            ),
+            "a damaged snapshot must not load"
+        );
+    }
+
+    /// Review finding 8 (D-014's named gap): on first open the new
+    /// generation directory and its `journal.log` were created but their
+    /// directory entries never fsynced, so under power loss jobs
+    /// acknowledged before the first compaction could vanish with the
+    /// entry. Both directories must be fsynced before the first append.
+    #[test]
+    fn first_open_makes_its_directory_entries_durable() {
+        let dir = tempfile::tempdir().unwrap_or_else(|e| panic!("{e}"));
+        let root = dir.path().join("journal");
+        let (_j, f) = open_faulty(&root);
+        let synced = f.dir_syncs();
+        let gdir = gen_dir_path(&root, 1);
+        assert!(
+            synced.contains(&gdir),
+            "gen-000001 (holding journal.log's entry) not fsynced: {synced:?}"
+        );
+        let last_root = synced.iter().rposition(|p| *p == root);
+        let gen_created = synced.iter().position(|p| *p == gdir);
+        assert!(
+            matches!((last_root, gen_created), (Some(r), Some(g)) if r > g),
+            "the root (holding gen-000001's entry) must be fsynced after the generation exists: {synced:?}"
+        );
+    }
+
+    /// Review finding 12: a backup killed mid-copy left a directory with no
+    /// manifest under the backup's name, forever (later attempts got
+    /// `BackupExists`). A backup's name must appear only once it is
+    /// complete, and an interrupted one must leave the name free.
+    #[test]
+    fn interrupted_backup_leaves_no_half_backup_and_the_name_free() {
+        let dir = tempfile::tempdir().unwrap_or_else(|e| panic!("{e}"));
+        let out = tempfile::tempdir().unwrap_or_else(|e| panic!("{e}"));
+        let (mut j, f) = open_faulty(dir.path());
+        j.append(b"one").unwrap_or_else(|e| panic!("{e}"));
+        let dest = out.path().join("nightly");
+        f.crash_next_backup();
+        assert!(j.backup_to(&dest).is_err());
+        assert!(!dest.exists(), "a half backup sits under the name");
+        j.backup_to(&dest)
+            .unwrap_or_else(|e| panic!("the name stays free for a retry: {e}"));
+        assert!(dest.join("manifest.json").exists());
+        let leftovers: Vec<_> = fs::read_dir(out.path())
+            .unwrap_or_else(|e| panic!("{e}"))
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name())
+            .collect();
+        assert_eq!(leftovers, vec![std::ffi::OsString::from("nightly")]);
+    }
+
+    #[test]
+    fn partial_backups_are_swept_and_finished_ones_kept() {
+        let out = tempfile::tempdir().unwrap_or_else(|e| panic!("{e}"));
+        for d in [".t0.partial", ".t1.partial", "nightly", ".keep"] {
+            fs::create_dir(out.path().join(d)).unwrap_or_else(|e| panic!("{e}"));
+        }
+        assert_eq!(
+            sweep_partial_backups(out.path()).unwrap_or_else(|e| panic!("{e}")),
+            2
+        );
+        assert!(out.path().join("nightly").exists());
+        assert!(out.path().join(".keep").exists());
+        assert!(!out.path().join(".t0.partial").exists());
     }
 
     #[test]

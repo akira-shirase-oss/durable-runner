@@ -12,7 +12,7 @@ use axum::{
 };
 use clap::Parser;
 use durable_domain::{JobSpec, Millis, OperationKey, RunId, RunState, StepSpec};
-use durable_engine::shell::{spawn, Engine, Outcome, Registry, ShellConfig, StepHandler};
+use durable_engine::shell::{spawn, Engine, Order, Outcome, Registry, ShellConfig, StepHandler};
 use durable_engine::EngineError;
 use serde::Deserialize;
 use std::future::IntoFuture;
@@ -52,6 +52,25 @@ struct Args {
     /// generations) every N seconds; 0 (the default) = only on request.
     #[arg(long, default_value_t = 0)]
     compact_every_secs: u64,
+    /// Refuse a compaction whose snapshot would exceed this many bytes
+    /// (409 `snapshot_over_budget`) instead of writing it.
+    #[arg(long, default_value_t = 2 * 1024 * 1024 * 1024)]
+    max_snapshot_bytes: u64,
+    /// Non-terminal runs admitted at once; beyond it submits are 503
+    /// `at_capacity`.
+    #[arg(long, default_value_t = 100_000)]
+    max_live_runs: usize,
+    /// Approximate bytes of all retained runs; beyond it submits are 503
+    /// `at_capacity`.
+    #[arg(long, default_value_t = 1024 * 1024 * 1024)]
+    max_index_bytes: u64,
+    /// Handler calls (attempts and probes) in flight at once.
+    #[arg(long, default_value_t = 32)]
+    max_in_flight: usize,
+    /// Dispatches per scheduler tick (ticks every 50 ms, so the first-step
+    /// dispatch rate is at most 20 × this per second).
+    #[arg(long, default_value_t = 64)]
+    max_dispatch_per_tick: usize,
 }
 
 /// The environment variable holding the API key. Read from the
@@ -188,11 +207,16 @@ impl FromRequestParts<App> for Authorized {
     type Rejection = ApiError;
 
     async fn from_request_parts(parts: &mut Parts, app: &App) -> Result<Self, Self::Rejection> {
+        // `<scheme> <token>`; the scheme is case-insensitive (RFC 9110
+        // §11.1) and surrounding whitespace is ignored.
         let presented = parts
             .headers
             .get(header::AUTHORIZATION)
             .and_then(|v| v.to_str().ok())
-            .and_then(|v| v.strip_prefix("Bearer "));
+            .and_then(|v| v.trim().split_once(char::is_whitespace))
+            .and_then(|(scheme, token)| {
+                scheme.eq_ignore_ascii_case("bearer").then(|| token.trim())
+            });
         match presented {
             Some(key) if app.api_key.verify(key) => Ok(Authorized),
             _ => Err(ApiError::new(
@@ -200,6 +224,57 @@ impl FromRequestParts<App> for Authorized {
                 "unauthorized",
                 "missing or invalid API key (Authorization: Bearer <key>)",
             )),
+        }
+    }
+}
+
+/// `Query` whose rejection is the JSON error envelope.
+struct Q<T>(T);
+
+impl<T: serde::de::DeserializeOwned, S: Send + Sync> FromRequestParts<S> for Q<T> {
+    type Rejection = ApiError;
+
+    async fn from_request_parts(parts: &mut Parts, state: &S) -> Result<Self, Self::Rejection> {
+        Query::<T>::from_request_parts(parts, state)
+            .await
+            .map(|Query(v)| Q(v))
+            .map_err(|r| ApiError::new(StatusCode::BAD_REQUEST, "bad_query", r.body_text()))
+    }
+}
+
+/// `Path` whose rejection is the JSON error envelope.
+struct P<T>(T);
+
+impl<T: serde::de::DeserializeOwned + Send, S: Send + Sync> FromRequestParts<S> for P<T> {
+    type Rejection = ApiError;
+
+    async fn from_request_parts(parts: &mut Parts, state: &S) -> Result<Self, Self::Rejection> {
+        AxPath::<T>::from_request_parts(parts, state)
+            .await
+            .map(|AxPath(v)| P(v))
+            .map_err(|r| ApiError::new(StatusCode::BAD_REQUEST, "bad_path", r.body_text()))
+    }
+}
+
+/// `Json` whose rejection is the JSON error envelope (keeping axum's
+/// status: 400 malformed, 413 too large, 415 wrong type, 422 wrong shape).
+struct J<T>(T);
+
+impl<T: serde::de::DeserializeOwned, S: Send + Sync> axum::extract::FromRequest<S> for J<T> {
+    type Rejection = ApiError;
+
+    async fn from_request(req: axum::extract::Request, state: &S) -> Result<Self, Self::Rejection> {
+        match Json::<T>::from_request(req, state).await {
+            Ok(Json(v)) => Ok(J(v)),
+            Err(r) => {
+                let status = r.status();
+                let code = match status {
+                    StatusCode::PAYLOAD_TOO_LARGE => "body_too_large",
+                    StatusCode::UNSUPPORTED_MEDIA_TYPE => "bad_content_type",
+                    _ => "bad_body",
+                };
+                Err(ApiError::new(status, code, r.body_text()))
+            }
         }
     }
 }
@@ -262,6 +337,17 @@ impl From<EngineError> for ApiError {
                 "busy",
                 "the server is at capacity; retry with the same op_key",
             ),
+            EngineError::Refused(Refusal::AtCapacity) => Self::new(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "at_capacity",
+                "the runner holds as many runs as it is configured to; retry later with the same op_key",
+            ),
+            EngineError::Refused(Refusal::OverLimits) => Self::new(
+                StatusCode::CONFLICT,
+                "over_limits",
+                "job spec over limits (op_key 1-256 bytes without control characters, \
+                 names 1-128 bytes, input 64 KiB, at most 64 steps)",
+            ),
             EngineError::Refused(r) => Self::new(StatusCode::CONFLICT, "refused", r.to_string()),
             EngineError::UnregisteredHandler(_) => {
                 Self::new(StatusCode::CONFLICT, "unregistered_handler", e.to_string())
@@ -275,6 +361,9 @@ impl From<EngineError> for ApiError {
             // failed after: either way nothing was acknowledged.
             EngineError::Journal(j) => Self::journal(j, &e),
             EngineError::CommitFailed(j) => Self::journal(j, &e),
+            EngineError::SnapshotOverBudget { .. } => {
+                Self::new(StatusCode::CONFLICT, "snapshot_over_budget", e.to_string())
+            }
             EngineError::Serde(_) | EngineError::Piped => Self::internal(&e),
         }
     }
@@ -289,6 +378,20 @@ impl ApiError {
                 "no_space",
                 "free disk space is below the reserve; retry later with the same op_key",
             ),
+            // A real ENOSPC after the reserve check (compaction, backup).
+            J::Io(source) if source.kind() == std::io::ErrorKind::StorageFull => Self::new(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "no_space",
+                "the disk filled during the operation; nothing was committed",
+            ),
+            J::SpaceProbe(_) => {
+                eprintln!("durable-server: free-space probe failed: {e}");
+                Self::new(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "unavailable",
+                    "free disk space could not be read; nothing was written, retry later",
+                )
+            }
             J::WriteFailed { source, .. } if source.kind() == std::io::ErrorKind::StorageFull => {
                 Self::new(
                     StatusCode::SERVICE_UNAVAILABLE,
@@ -296,7 +399,11 @@ impl ApiError {
                     "the disk filled during the write; nothing was committed",
                 )
             }
-            J::WriteFailed { .. } | J::SyncFailed(_) | J::Poisoned => {
+            J::WriteFailed { .. }
+            | J::SyncFailed(_)
+            | J::Poisoned
+            | J::ManifestSwapFailed(_)
+            | J::ManifestMismatch { .. } => {
                 eprintln!("durable-server: journal unavailable: {e}");
                 Self::new(
                     StatusCode::SERVICE_UNAVAILABLE,
@@ -321,7 +428,7 @@ impl ApiError {
 async fn submit(
     _: Authorized,
     State(app): State<App>,
-    Json(req): Json<SubmitReq>,
+    J(req): J<SubmitReq>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let input = base64_decode(&req.spec.input_b64)
         .map_err(|m| ApiError::new(StatusCode::BAD_REQUEST, "bad_input", m))?;
@@ -356,7 +463,7 @@ fn state_name(s: &RunState) -> String {
 
 async fn inspect(
     State(app): State<App>,
-    AxPath(id): AxPath<u64>,
+    P(id): P<u64>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let run = app
         .engine
@@ -375,7 +482,7 @@ async fn inspect(
 async fn cancel(
     _: Authorized,
     State(app): State<App>,
-    AxPath(id): AxPath<u64>,
+    P(id): P<u64>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     app.engine.cancel(RunId(id)).await?;
     Ok(Json(serde_json::json!({ "cancelled": id })))
@@ -383,20 +490,42 @@ async fn cancel(
 
 #[derive(Deserialize)]
 struct ListQuery {
+    /// `asc` (default): oldest first, continue with `after`.
+    /// `desc`: newest first, continue with `before`.
+    order: Option<String>,
     /// Return runs with id greater than this (the previous `next_after`).
     after: Option<u64>,
+    /// Newest first: runs with id less than this (the previous `next_before`).
+    before: Option<u64>,
     /// Page size: default 100, clamped to 1..=1000.
     limit: Option<usize>,
 }
 
 async fn list(
     State(app): State<App>,
-    Query(q): Query<ListQuery>,
+    Q(q): Q<ListQuery>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let page = app
-        .engine
-        .list(q.after.map(RunId), q.limit.unwrap_or(100))
-        .await?;
+    let newest = match q.order.as_deref() {
+        None | Some("asc") => false,
+        Some("desc") => true,
+        Some(_) => {
+            return Err(ApiError::new(
+                StatusCode::BAD_REQUEST,
+                "bad_query",
+                "order must be asc or desc",
+            ))
+        }
+    };
+    let order = if newest {
+        Order::Newest {
+            before: q.before.map(RunId),
+        }
+    } else {
+        Order::Oldest {
+            after: q.after.map(RunId),
+        }
+    };
+    let page = app.engine.list_in(order, q.limit.unwrap_or(100)).await?;
     let items: Vec<serde_json::Value> = page
         .runs
         .iter()
@@ -405,15 +534,15 @@ async fn list(
                 "id": r.id.0,
                 "key": r.key.0,
                 "state": state_name(&r.state),
-                "steps": r.spec.steps.len(),
+                "steps": r.steps,
                 "finished_at": r.finished_at,
             })
         })
         .collect();
-    Ok(Json(serde_json::json!({
-        "runs": items,
-        "next_after": page.next_after.map(|id| id.0),
-    })))
+    let cursor = if newest { "next_before" } else { "next_after" };
+    let mut body = serde_json::json!({ "runs": items });
+    body[cursor] = serde_json::json!(page.next.map(|id| id.0));
+    Ok(Json(body))
 }
 
 /// Liveness: the process answers.
@@ -482,7 +611,7 @@ fn backup_dest(root: &Path, name: &str) -> Result<PathBuf, ApiError> {
 async fn backup(
     _: Authorized,
     State(app): State<App>,
-    Json(req): Json<BackupReq>,
+    J(req): J<BackupReq>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let Some(root) = app.backup_root.as_deref() else {
         return Err(ApiError::new(
@@ -558,6 +687,12 @@ fn prepare_backup_root(dir: &Path) -> Result<Arc<Path>> {
         .with_context(|| format!("create backup root {}", dir.display()))?;
     let canonical = std::fs::canonicalize(dir)
         .with_context(|| format!("resolve backup root {}", dir.display()))?;
+    // A backup interrupted by a crash left `.<name>.partial`: never valid.
+    let swept = durable_journal::sweep_partial_backups(&canonical)
+        .map_err(|e| anyhow::anyhow!("sweep partial backups: {e}"))?;
+    if swept > 0 {
+        eprintln!("durable-server: removed {swept} interrupted backup(s) from the backup root");
+    }
     Ok(Arc::from(canonical))
 }
 
@@ -577,6 +712,14 @@ async fn main() -> Result<()> {
         },
         compact_every: (args.compact_every_secs > 0)
             .then(|| Duration::from_secs(args.compact_every_secs)),
+        max_snapshot_bytes: args.max_snapshot_bytes,
+        max_in_flight: args.max_in_flight.max(1),
+        max_dispatch_per_tick: args.max_dispatch_per_tick.max(1),
+        limits: durable_domain::Limits {
+            max_live_runs: args.max_live_runs,
+            max_index_bytes: args.max_index_bytes,
+            ..durable_domain::Limits::default()
+        },
         ..Default::default()
     };
     let mut registry = Registry::default();
@@ -969,6 +1112,52 @@ mod tests {
         );
     }
 
+    /// Newest first, for the inspector: `order=desc` pages down from the
+    /// newest run with a `before` cursor and `next_before`.
+    #[tokio::test]
+    async fn list_pages_newest_first() {
+        let h = harness(false);
+        for i in 0..5 {
+            let (status, _) = call(
+                &h.router,
+                "POST",
+                "/jobs",
+                Some(KEY),
+                Some(submit_body(&format!("desc-{i}"))),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK);
+        }
+        let ids = |v: &Value| -> Vec<u64> {
+            v["runs"]
+                .as_array()
+                .unwrap_or_else(|| panic!("runs array: {v}"))
+                .iter()
+                .filter_map(|r| r["id"].as_u64())
+                .collect()
+        };
+        let (_, v) = call(&h.router, "GET", "/jobs?order=desc&limit=2", None, None).await;
+        assert_eq!((ids(&v), v["next_before"].clone()), (vec![5, 4], json!(4)));
+        let (_, v) = call(
+            &h.router,
+            "GET",
+            "/jobs?order=desc&before=4&limit=2",
+            None,
+            None,
+        )
+        .await;
+        assert_eq!((ids(&v), v["next_before"].clone()), (vec![3, 2], json!(2)));
+        let (_, v) = call(
+            &h.router,
+            "GET",
+            "/jobs?order=desc&before=2&limit=2",
+            None,
+            None,
+        )
+        .await;
+        assert_eq!((ids(&v), v["next_before"].clone()), (vec![1], Value::Null));
+    }
+
     /// Request bodies are capped well below axum's 2 MB default: a submit
     /// can never legitimately exceed the input limit plus its spec.
     #[tokio::test]
@@ -1072,6 +1261,160 @@ mod tests {
         assert_eq!(
             args.compact_every_secs, 0,
             "scheduled compaction must be opt-in"
+        );
+    }
+
+    #[test]
+    fn capacity_refusal_is_503_at_capacity() {
+        let e = ApiError::from(EngineError::Refused(durable_domain::Refusal::AtCapacity));
+        assert_eq!(
+            (e.status, e.code),
+            (StatusCode::SERVICE_UNAVAILABLE, "at_capacity")
+        );
+    }
+
+    #[test]
+    fn startup_sweeps_interrupted_backups() {
+        let root = tempfile::tempdir().unwrap_or_else(|e| panic!("{e}"));
+        std::fs::create_dir(root.path().join(".b1.partial")).unwrap_or_else(|e| panic!("{e}"));
+        std::fs::create_dir(root.path().join("b0")).unwrap_or_else(|e| panic!("{e}"));
+        prepare_backup_root(root.path()).unwrap_or_else(|e| panic!("{e}"));
+        assert!(!root.path().join(".b1.partial").exists());
+        assert!(root.path().join("b0").exists());
+    }
+
+    /// Review finding 13: a real ENOSPC inside compaction or backup (after
+    /// the reserve check) is an `Io` error, and was a 500.
+    #[test]
+    fn storage_full_io_error_is_503_no_space() {
+        let e = ApiError::from(EngineError::Journal(durable_journal::JournalError::Io(
+            std::io::Error::from(std::io::ErrorKind::StorageFull),
+        )));
+        assert_eq!(
+            (e.status, e.code),
+            (StatusCode::SERVICE_UNAVAILABLE, "no_space")
+        );
+    }
+
+    /// A free-space probe that cannot answer (statvfs failing) refuses the
+    /// submit as unavailable, not a 500.
+    #[tokio::test]
+    async fn failing_space_probe_is_503_not_500() {
+        let journal = tempfile::tempdir().unwrap_or_else(|e| panic!("{e}"));
+        let mut reg = Registry::default();
+        reg.register("step", Arc::new(Echo));
+        let fail = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let probe_fail = fail.clone();
+        let cfg = ShellConfig {
+            tick_ms: 5,
+            journal: durable_journal::JournalOptions {
+                space: durable_journal::SpaceProbe::new(move |_| {
+                    if probe_fail.load(std::sync::atomic::Ordering::SeqCst) {
+                        Err(std::io::Error::other("statvfs failed"))
+                    } else {
+                        Ok(u64::MAX)
+                    }
+                }),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let engine = spawn(journal.path(), reg, cfg).unwrap_or_else(|e| panic!("{e}"));
+        let r = router(
+            App {
+                engine,
+                api_key: ApiKey::new(KEY),
+                backup_root: None,
+            },
+            None,
+        );
+        fail.store(true, std::sync::atomic::Ordering::SeqCst);
+        let (status, v) = call(&r, "POST", "/jobs", Some(KEY), Some(submit_body("p"))).await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{v}");
+    }
+
+    /// Auth schemes are case-insensitive (RFC 9110 §11.1), and the token
+    /// may be surrounded by extra whitespace.
+    #[tokio::test]
+    async fn bearer_scheme_is_case_insensitive() {
+        let h = harness(false);
+        for (i, header) in [format!("bearer {KEY}"), format!("BEARER   {KEY} ")]
+            .into_iter()
+            .enumerate()
+        {
+            let req = axum::http::Request::builder()
+                .method("POST")
+                .uri("/jobs")
+                .header("authorization", header)
+                .header("content-type", "application/json")
+                .body(Body::from(submit_body(&format!("case-{i}")).to_string()))
+                .unwrap_or_else(|e| panic!("{e}"));
+            let res = h
+                .router
+                .clone()
+                .oneshot(req)
+                .await
+                .unwrap_or_else(|e| panic!("{e}"));
+            assert_eq!(res.status(), StatusCode::OK, "header variant {i}");
+        }
+    }
+
+    /// Bad query strings and bodies answer in the one error envelope, not
+    /// axum's plain-text rejections.
+    #[tokio::test]
+    async fn rejections_use_the_json_envelope() {
+        let h = harness(false);
+        let (status, v) = call(&h.router, "GET", "/jobs?limit=-1", None, None).await;
+        assert_eq!(
+            (status, v["code"].clone()),
+            (StatusCode::BAD_REQUEST, json!("bad_query"))
+        );
+        let (status, v) = call(&h.router, "GET", "/jobs?after=abc", None, None).await;
+        assert_eq!(
+            (status, v["code"].clone()),
+            (StatusCode::BAD_REQUEST, json!("bad_query"))
+        );
+        let req = axum::http::Request::builder()
+            .method("POST")
+            .uri("/jobs")
+            .header("authorization", format!("Bearer {KEY}"))
+            .header("content-type", "application/json")
+            .body(Body::from("{not json"))
+            .unwrap_or_else(|e| panic!("{e}"));
+        let res = h
+            .router
+            .clone()
+            .oneshot(req)
+            .await
+            .unwrap_or_else(|e| panic!("{e}"));
+        let status = res.status();
+        let bytes = res
+            .into_body()
+            .collect()
+            .await
+            .unwrap_or_else(|e| panic!("{e}"))
+            .to_bytes();
+        let v: Value = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
+        assert_eq!(
+            (status, v["code"].clone()),
+            (StatusCode::BAD_REQUEST, json!("bad_body"))
+        );
+    }
+
+    #[tokio::test]
+    async fn over_long_key_is_refused_with_a_stable_code() {
+        let h = harness(false);
+        let (status, v) = call(
+            &h.router,
+            "POST",
+            "/jobs",
+            Some(KEY),
+            Some(submit_body(&"k".repeat(300))),
+        )
+        .await;
+        assert_eq!(
+            (status, v["code"].clone()),
+            (StatusCode::CONFLICT, json!("over_limits"))
         );
     }
 

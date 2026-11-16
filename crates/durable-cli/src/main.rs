@@ -45,8 +45,14 @@ enum Cmd {
         #[arg(long)]
         run: u64,
     },
-    /// List one page of the live index (ids ascending).
+    /// List one page of the live index (ids ascending, or newest first).
     List {
+        /// Newest first; continue with `--before <next_before>`.
+        #[arg(long)]
+        newest: bool,
+        /// Newest first: start before this run id.
+        #[arg(long)]
+        before: Option<u64>,
         /// Start after this run id (the previous page's `next_after`).
         #[arg(long)]
         after: Option<u64>,
@@ -163,8 +169,19 @@ async fn main() -> Result<()> {
             .await?;
             println!("{v}");
         }
-        Cmd::List { after, limit } => {
+        Cmd::List {
+            newest,
+            before,
+            after,
+            limit,
+        } => {
             let mut q: Vec<(&str, String)> = Vec::new();
+            if newest || before.is_some() {
+                q.push(("order", "desc".into()));
+            }
+            if let Some(b) = before {
+                q.push(("before", b.to_string()));
+            }
             if let Some(a) = after {
                 q.push(("after", a.to_string()));
             }

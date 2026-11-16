@@ -3,16 +3,21 @@
 	import { listRuns, cancelRun, loadApiKey, saveApiKey, type RunItem } from '../lib/api';
 
 	let runs = $state<RunItem[]>([]);
-	let more = $state(false);
+	// Newest first. `cursor` is the `before` of the page on screen (null =
+	// the newest page); `trail` holds the cursors of the newer pages so
+	// "newer" can step back; `older` is the next page's cursor.
+	let cursor = $state<number | null>(null);
+	let trail = $state<(number | null)[]>([]);
+	let older = $state<number | null>(null);
 	let apiKey = $state('');
 	let error = $state<string | null>(null);
 	let timer: ReturnType<typeof setInterval> | null = null;
 
 	async function refresh() {
 		try {
-			const page = await listRuns();
+			const page = await listRuns(cursor);
 			runs = page.runs;
-			more = page.next_after !== null;
+			older = page.next_before;
 			error = null;
 		} catch (e) {
 			error = e instanceof Error ? e.message : String(e);
@@ -26,6 +31,20 @@
 		} catch (e) {
 			error = e instanceof Error ? e.message : String(e);
 		}
+	}
+
+	async function showOlder() {
+		if (older === null) return;
+		trail = [...trail, cursor];
+		cursor = older;
+		await refresh();
+	}
+
+	async function showNewer() {
+		if (trail.length === 0) return;
+		cursor = trail.at(-1) ?? null;
+		trail = trail.slice(0, -1);
+		await refresh();
 	}
 
 	function cancellable(state: string): boolean {
@@ -81,9 +100,11 @@
 				{/each}
 			</tbody>
 		</table>
-		{#if more}
-			<p class="empty">showing the first {runs.length} runs; use <code>durable list --after</code> for more</p>
-		{/if}
+		<nav class="pager">
+			<button class="nav" onclick={showNewer} disabled={trail.length === 0}>&larr; newer</button>
+			<span class="empty">page {trail.length + 1}, newest first</span>
+			<button class="nav" onclick={showOlder} disabled={older === null}>older &rarr;</button>
+		</nav>
 	{/if}
 </main>
 
@@ -174,5 +195,21 @@
 	}
 	button:hover {
 		border-color: #f85149;
+	}
+	.pager {
+		display: flex;
+		justify-content: space-between;
+		align-items: center;
+		margin-top: 1rem;
+	}
+	button.nav {
+		color: #c9d1d9;
+	}
+	button.nav:hover:enabled {
+		border-color: #8b949e;
+	}
+	button:disabled {
+		opacity: 0.4;
+		cursor: default;
 	}
 </style>

@@ -121,9 +121,9 @@ convention; these seed the contract's prescribed directions.
   carry to Linux. Assumed: a *successful* fsync makes every byte written to
   that file before it durable. Not assumed: that unsynced bytes reach disk
   in order or whole, that a file's length and its data persist together,
-  or that a failed fsync can be retried. Known gap (not built): directory
-  entries are fsynced for manifest and snapshot renames, but not for the
-  generation directory and `journal.log` created on first open.
+  or that a failed fsync can be retried. Directory entries are fsynced for
+  manifest and snapshot renames and, since D-025, for the generation
+  directory and `journal.log` created on first open.
 
   *The boundaries of one record.*
   1. **Before the write.** Nothing is on disk. A crash loses only the
@@ -173,8 +173,8 @@ convention; these seed the contract's prescribed directions.
   the batch and after it (`CommitFailed`, HTTP 503
   `journal_unavailable`), is never retried, and stops the writer, the
   actor and the server process so replay rebuilds memory. Batches are
-  bounded (`max_batch_records` 1024, `max_batch_bytes` 4 MiB, `max_wait`
-  0 by default), and so is the actor's outbox (`max_outbox_records`
+  bounded (`max_batch_records` 1024, `max_batch_bytes` 4 MiB; `max_wait`
+  was removed by D-026), and so is the actor's outbox (`max_outbox_records`
   16384; beyond it commands wait in the bounded command channel and are
   refused `busy`). Compaction and backup run on the writer in commit
   order; compaction expiry reaches memory only when the writer confirms.
@@ -219,4 +219,138 @@ convention; these seed the contract's prescribed directions.
   reachable with no operator action. `--compact-every-secs` now defaults
   to 0 (off) and `ShellConfig::compact_every` to `None`. Operators who
   schedule it opt in. The default can be revisited once compaction is
-  cheap (D-020) and its error path is fatal (D-019).
+  cheap (D-021) and its error path is fatal (D-019).
+- **D-019 — A compaction error from the manifest swap onward is fatal.**
+  D-009/D-015 made failed appends stop the process, but compaction's
+  error path was left out. Independent review reproduced the loss on the
+  release binary with a real EACCES: the manifest was renamed to name
+  N+1, the following directory fsync failed, and `compact` returned an
+  error with the writer still pointing at N. The writer and actor treated
+  that as an ordinary failed compaction, kept appending to N and
+  acknowledged 30 jobs; the restart opened N+1 and all 30 were gone,
+  while `/ready` stayed 200. Now everything the writer needs after the
+  swap (the new log handle, created with `create_new`) is opened before
+  it, so nothing can fail past the point of no return except the rename
+  itself and the directory fsync. Any error from the rename onward
+  poisons the journal (`ManifestSwapFailed`). The writer stops exactly
+  as for a failed append: every waiter fails, the server exits non-zero,
+  and restart opens whatever the manifest durably names. A compaction
+  failing before the swap is still an ordinary error: nothing moved, and
+  the engine carries on. Proven on a running engine at each step by fault
+  injection, with a real EACCES at engine level, and at process level
+  against the real binary. D-017's crash-only test could not show this,
+  because dropping the journal turned the error into a crash.
+- **D-020 — The leftover cleanup checks the durable manifest first.**
+  D-017 removed `gen-(N+1)` before a compaction on the strength of the
+  in-memory generation N. When memory and the manifest disagreed (as
+  D-019's bug left them), that directory was the live generation: review
+  showed a later crashed compaction losing 10 of 10 runs. `compact` now
+  reads `manifest.json` from disk and removes `gen-(N+1)` only if the
+  manifest names N. Otherwise it deletes nothing, poisons the writer
+  (`ManifestMismatch`), and lets the restart open what the manifest
+  names. D-019 makes the disagreement unreachable inside one process;
+  this check stops the cleanup from assuming it.
+- **D-021 — Compaction: a binary, checksummed snapshot built from a
+  pointer view, not by the actor.** Review measured compaction at 100,000
+  runs with 1 KiB inputs. The snapshot was 1.2 GB because inputs were
+  JSON number arrays inside a payload JSON-encoded again as a number
+  array. The whole index was cloned and encoded on the actor, so a submit
+  waited 6-7 s, and peak RSS was about 1.4 GB. Now:
+  - The index holds `Arc<Run>`, and a run is copied only when it changes
+    while a view shares it (`Arc::make_mut`). Planning a compaction is a
+    pointer per retained run.
+  - The writer thread streams that view through an explicit binary
+    encoding (`snapshot.rs`, `DRIX` v1, a bounds-checked decoder that
+    refuses anything malformed) into `snapshot.bin`, framed with a magic,
+    a length and a CRC-32. Its memory is a buffer, not the snapshot's
+    size.
+  - The snapshot is the only authority for compacted state, so a damaged
+    one now stops startup. This closes the "snapshot has no checksum"
+    gap. A legacy `snapshot.json` from older builds still loads, and the
+    next compaction rewrites it.
+  - The exact encoded size is checked against a byte budget
+    (`--max-snapshot-bytes`, default 2 GiB; over it is 409
+    `snapshot_over_budget`, nothing written) and the disk reserve before
+    anything is written.
+
+  Measured with the same probe, A/B on a busy laptop (load 25-79; see
+  `perf/results/2026-11-16T17-25-00Z-compaction-cost.json`):
+
+  | | before | after |
+  |---|---|---|
+  | snapshot | 1,104 MiB | 103 MiB |
+  | compaction | 2.4-2.5 s | 0.10-0.17 s |
+  | submit issued during it | ~2.0 s | 82-159 ms |
+  | restart | 4.1 s | 0.06-0.08 s |
+  | peak RSS | 1.8 GiB | 0.46 GiB |
+
+  Not done: the writer still writes the snapshot inline, so appends queue
+  behind it for as long as the write and fsync take, which still grows
+  with the index. The next step is to write the snapshot on a helper
+  thread and copy the records appended meanwhile into the new
+  generation's log before the swap. Until that is built, scheduled
+  compaction stays off by default (D-018).
+- **D-022 — Batches and the outbox are bounded in bytes, not only
+  records.** D-014(d) and D-015 claimed byte-bounded batches, but the
+  actor merged up to `max_batch_records` records into one message with no
+  byte check, and the writer took the first message whole. Review put
+  40 records of 120 KB in one write under a 16 KiB bound; at the defaults
+  one batch could reach about 235 MB, and the 16,384-record outbox about
+  3.8 GB. Now `take_batch` and the actor's merge stop at
+  `max_batch_bytes` as well as `max_batch_records` (a single record
+  larger than the bound still moves, alone). The writer's gather keeps to
+  both bounds. The actor stops taking commands once its backlog reaches
+  `max_outbox_bytes` (64 MiB) or `max_outbox_records`. The bounded
+  command channel then refuses submits as `busy` rather than buffering.
+  Diagnostics report `largest_batch_bytes`.
+- **D-023 — Reads are projected and isolated from writes.** `GET /jobs`
+  is open (D-011) and went through the writers' command queue. Each page
+  also cloned whole runs, inputs of up to 64 KiB included, only to emit
+  five fields. Review measured 16 paging clients raising submit p99 from
+  24 to 541 ms. Now a page is built from `RunSummary` (id, key, state,
+  step count, finished_at) inside the actor, and reads travel on their
+  own bounded channel (`read_capacity`, 256). A read burst can fill it
+  and be refused busy, but it can no longer take a slot a submit or
+  cancel needs. Rate limiting open reads remains a requirement before any
+  non-loopback exposure.
+- **D-024 — Admission is bounded by live runs and index bytes.** Nothing
+  bounded how many runs, or how many bytes of them, the index held.
+  Inputs stay in memory at least seven days. Group commit made the index
+  fill about 15 times faster, and first-step dispatch is capped by
+  construction (64 per 50 ms tick, 1,280/s), so accepted submits could
+  outrun dispatch indefinitely. The contract says "cap memory and disk;
+  reject overload explicitly". `Limits` gains `max_live_runs` (100,000
+  non-terminal runs) and `max_index_bytes` (1 GiB, an approximation:
+  payloads plus a fixed per-run and per-step overhead). The core keeps
+  both counts current, so the check is O(1), and refuses past them with
+  `AtCapacity` (503 `at_capacity`) before journaling; finishing or
+  expiring runs frees room. Duplicate submits still return their
+  original run. The server exposes `--max-live-runs`,
+  `--max-index-bytes`, `--max-in-flight` and `--max-dispatch-per-tick`.
+  Diagnostics report `active_runs` and `index_bytes`.
+- **D-025 — First open makes its directory entries durable.** D-014
+  named the gap: the manifest's rename was fsynced, but `gen-000001/`
+  and its `journal.log`, created on first open, never had their directory
+  entries fsynced. Under the power-loss model, jobs acknowledged before
+  the first compaction could vanish with the entry. `Journal::open` now
+  fsyncs the directory holding each entry it creates before returning:
+  the root's parent (if it created the root), the root (manifest),
+  `gen-000001/` (`journal.log`) and the root again (`gen-000001/`).
+- **D-026 — No writer linger.** `GroupCommit::max_wait` let the writer
+  wait for more records before writing, but the actor sends nothing while
+  a batch is in flight (that is what makes the next batch accumulate), so
+  the writer waited with nothing to collect. Review: `max_wait` 200 ms
+  with 51 records ready gave 2 batches in 400 ms. It only ever added
+  latency, and a test (`group_commit_wait_is_bounded`) enshrined that
+  penalty. The knob and that test are removed. The writer gathers what
+  is already queued, within the record and byte bounds, and writes it.
+- **D-027 — A backup's name appears only when it is complete.** A
+  `kill -9` during a backup left a directory with no manifest under the
+  backup's name, forever: the name was taken (`409 backup_exists`), it
+  used space, nothing reported it, and `restore` correctly refused it.
+  Review left three such directories in 15 kills. A backup is now copied
+  into a hidden `.<name>.partial` (valid backup names cannot start with
+  `.`), manifest last, then fsynced and renamed into place, and the
+  parent directory is fsynced. The next attempt at that name removes a
+  stale partial first. The server sweeps every `.*.partial` from the
+  backup root at startup.

@@ -89,18 +89,6 @@ enum Cmd {
         run: RunId,
         reply: oneshot::Sender<Result<(), EngineError>>,
     },
-    Inspect {
-        run: RunId,
-        reply: oneshot::Sender<Option<Run>>,
-    },
-    List {
-        after: Option<RunId>,
-        limit: usize,
-        reply: oneshot::Sender<RunPage>,
-    },
-    Diag {
-        reply: oneshot::Sender<crate::Diagnostics>,
-    },
     Compact {
         reply: oneshot::Sender<Result<u32, EngineError>>,
     },
@@ -110,11 +98,30 @@ enum Cmd {
     },
 }
 
-/// Handle to the running engine. Cheap to clone; the channel capacity is
-/// the submitter back-pressure bound — a full channel refuses honestly.
+/// Reads travel on their own bounded channel: a burst of (open,
+/// unauthenticated) reads can fill it and be refused busy, but can never
+/// take a slot a submit or cancel needs.
+enum Read {
+    Inspect {
+        run: RunId,
+        reply: oneshot::Sender<Option<Run>>,
+    },
+    List {
+        order: Order,
+        limit: usize,
+        reply: oneshot::Sender<RunPage>,
+    },
+    Diag {
+        reply: oneshot::Sender<crate::Diagnostics>,
+    },
+}
+
+/// Handle to the running engine. Cheap to clone; the channel capacities
+/// are the back-pressure bounds — a full channel refuses honestly.
 #[derive(Clone)]
 pub struct Engine {
     tx: mpsc::Sender<Cmd>,
+    read_tx: mpsc::Sender<Read>,
     health: Arc<Health>,
 }
 
@@ -128,12 +135,22 @@ struct Health {
 /// The most runs one list call returns, whatever the caller asks for.
 pub const MAX_PAGE: usize = 1000;
 
+/// Which end a list page starts from, with its cursor.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Order {
+    /// Ids ascending, after the cursor (oldest first).
+    Oldest { after: Option<RunId> },
+    /// Ids descending, before the cursor (newest first).
+    Newest { before: Option<RunId> },
+}
+
 /// A page of runs and the cursor for the next one.
 #[derive(Debug, Clone, Default)]
 pub struct RunPage {
-    pub runs: Vec<Run>,
-    /// Pass as `after` to continue; `None` on the last page.
-    pub next_after: Option<RunId>,
+    pub runs: Vec<crate::RunSummary>,
+    /// The cursor for the next page in the same order (`after` when oldest
+    /// first, `before` when newest first); `None` on the last page.
+    pub next: Option<RunId>,
 }
 
 /// Whether the engine should receive new work now, and if not, why.
@@ -150,6 +167,15 @@ impl Engine {
     /// stopped and nothing will ever answer.
     fn send(&self, cmd: Cmd) -> Result<(), EngineError> {
         self.tx.try_send(cmd).map_err(|e| match e {
+            mpsc::error::TrySendError::Full(_) => {
+                EngineError::Refused(durable_domain::Refusal::ReserveExhausted)
+            }
+            mpsc::error::TrySendError::Closed(_) => EngineError::Stopped,
+        })
+    }
+
+    fn send_read(&self, read: Read) -> Result<(), EngineError> {
+        self.read_tx.try_send(read).map_err(|e| match e {
             mpsc::error::TrySendError::Full(_) => {
                 EngineError::Refused(durable_domain::Refusal::ReserveExhausted)
             }
@@ -211,9 +237,14 @@ impl Engine {
     /// One page of the live index in id order: at most
     /// `min(limit, MAX_PAGE)` runs with id > `after`.
     pub async fn list(&self, after: Option<RunId>, limit: usize) -> Result<RunPage, EngineError> {
+        self.list_in(Order::Oldest { after }, limit).await
+    }
+
+    /// One page in either order, at most `min(limit, MAX_PAGE)` runs.
+    pub async fn list_in(&self, order: Order, limit: usize) -> Result<RunPage, EngineError> {
         let (reply, rx) = oneshot::channel();
-        self.send(Cmd::List {
-            after,
+        self.send_read(Read::List {
+            order,
             limit: limit.clamp(1, MAX_PAGE),
             reply,
         })?;
@@ -223,7 +254,7 @@ impl Engine {
     /// Bounded diagnostics — counts by state kind, never rows.
     pub async fn diag(&self) -> Result<crate::Diagnostics, EngineError> {
         let (reply, rx) = oneshot::channel();
-        self.send(Cmd::Diag { reply })?;
+        self.send_read(Read::Diag { reply })?;
         rx.await.map_err(|_| EngineError::Stopped)
     }
 
@@ -253,7 +284,7 @@ impl Engine {
 
     pub async fn inspect(&self, run: RunId) -> Result<Option<Run>, EngineError> {
         let (reply, rx) = oneshot::channel();
-        self.send(Cmd::Inspect { run, reply })?;
+        self.send_read(Read::Inspect { run, reply })?;
         rx.await.map_err(|_| EngineError::Stopped)
     }
 }
@@ -271,6 +302,9 @@ pub struct ShellConfig {
     pub tick_ms: u64,
     /// Command channel capacity (submit back-pressure bound).
     pub cmd_capacity: usize,
+    /// Read channel capacity (inspect/list/diagnostics), separate so reads
+    /// cannot crowd out writes.
+    pub read_capacity: usize,
     /// Domain bounds — deadline, payload sizes, attempts. Tests shrink the
     /// step deadline so crash-recovery paths don't wait 30s.
     pub limits: Limits,
@@ -282,6 +316,11 @@ pub struct ShellConfig {
     /// new commands (they then wait in, and are refused by, the bounded
     /// command channel).
     pub max_outbox_records: usize,
+    /// The same bound in payload bytes.
+    pub max_outbox_bytes: usize,
+    /// Refuse a compaction whose snapshot would exceed this many bytes
+    /// (`SnapshotOverBudget`) instead of writing it.
+    pub max_snapshot_bytes: u64,
     /// Compact on this schedule (expiring 7-day-old terminal runs and
     /// deleting superseded generations); `None` (the default) = only on
     /// request.
@@ -295,10 +334,13 @@ impl Default for ShellConfig {
             max_dispatch_per_tick: 64,
             tick_ms: 50,
             cmd_capacity: 1024,
+            read_capacity: 256,
             limits: Limits::default(),
             journal: JournalOptions::default(),
             group_commit: GroupCommit::default(),
             max_outbox_records: 16 * 1024,
+            max_outbox_bytes: 64 * 1024 * 1024,
+            max_snapshot_bytes: 2 * 1024 * 1024 * 1024,
             // Off until compaction is cheap and its error path is fatal
             // (D-018): an operator schedules it explicitly.
             compact_every: None,
@@ -318,14 +360,19 @@ pub fn spawn(dir: &Path, registry: Registry, cfg: ShellConfig) -> Result<Engine,
     let writer = writer::spawn(journal, cfg.group_commit.clone())
         .map_err(|e| EngineError::Journal(JournalError::Io(e)))?;
     let (tx, rx) = mpsc::channel::<Cmd>(cfg.cmd_capacity);
+    let (read_tx, read_rx) = mpsc::channel::<Read>(cfg.read_capacity.max(1));
     let health = Arc::new(Health::default());
     health.space_low.store(!core.space_ok(), Ordering::SeqCst);
     let mon = Monitor {
         health: health.clone(),
         errors: BTreeMap::new(),
     };
-    tokio::spawn(actor(core, registry, cfg, rx, mon, writer));
-    Ok(Engine { tx, health })
+    tokio::spawn(actor(core, registry, cfg, (rx, read_rx), mon, writer));
+    Ok(Engine {
+        tx,
+        read_tx,
+        health,
+    })
 }
 
 /// Errors the runtime handles itself — a handler outcome or a deadline
@@ -342,13 +389,18 @@ impl Monitor {
         fn journal(e: &JournalError) -> &'static str {
             match e {
                 JournalError::NoSpace { .. } => "no_space",
+                JournalError::SpaceProbe(_) => "space_unknown",
                 JournalError::WriteFailed { .. } => "journal_write_failed",
-                JournalError::SyncFailed(_) | JournalError::Poisoned => "journal_poisoned",
+                JournalError::SyncFailed(_)
+                | JournalError::Poisoned
+                | JournalError::ManifestSwapFailed(_)
+                | JournalError::ManifestMismatch { .. } => "journal_poisoned",
                 _ => "internal",
             }
         }
         match e {
             EngineError::Refused(_) => "stale_event",
+            EngineError::SnapshotOverBudget { .. } => "snapshot_over_budget",
             EngineError::Journal(j) => journal(j),
             EngineError::CommitFailed(j) => journal(j),
             _ => "internal",
@@ -432,18 +484,21 @@ struct Pipeline {
     /// Messages not yet handed to the writer, in commit order.
     outbound: VecDeque<WriterMsg>,
     outbound_records: usize,
+    outbound_bytes: usize,
     /// Commit index of the last record handed to the writer.
     sent_upto: u64,
     /// Commit index the writer has reported durable.
     durable: u64,
     held: VecDeque<(u64, Held)>,
     max_batch: usize,
+    max_batch_bytes: usize,
 }
 
 impl Pipeline {
     fn new(
         writer: Option<(SyncSender<WriterMsg>, std::thread::JoinHandle<()>)>,
         max_batch: usize,
+        max_batch_bytes: usize,
     ) -> Self {
         let (tx, thread) = match writer {
             Some((tx, t)) => (Some(tx), Some(t)),
@@ -454,28 +509,39 @@ impl Pipeline {
             thread,
             outbound: VecDeque::new(),
             outbound_records: 0,
+            outbound_bytes: 0,
             sent_upto: 0,
             durable: 0,
             held: VecDeque::new(),
             max_batch: max_batch.max(1),
+            max_batch_bytes,
         }
     }
 
     /// Move the core's newly committed records into the outbound queue,
     /// merging into the last append so the writer sees few, large
-    /// messages (each at most `max_batch` records).
+    /// messages — each within `max_batch` records and `max_batch_bytes`.
     fn collect(&mut self, core: &mut EngineCore) {
-        while let Some((records, upto)) = core.take_batch(self.max_batch) {
-            self.outbound_records += records.len();
+        while let Some(b) = core.take_batch(self.max_batch, self.max_batch_bytes) {
+            self.outbound_records += b.records.len();
+            self.outbound_bytes += b.bytes;
             match self.outbound.back_mut() {
                 Some(WriterMsg::Append {
                     records: queued,
+                    bytes,
                     upto: u,
-                }) if queued.len() + records.len() <= self.max_batch => {
-                    queued.extend(records);
-                    *u = upto;
+                }) if queued.len() + b.records.len() <= self.max_batch
+                    && *bytes + b.bytes <= self.max_batch_bytes =>
+                {
+                    queued.extend(b.records);
+                    *bytes += b.bytes;
+                    *u = b.upto;
                 }
-                _ => self.outbound.push_back(WriterMsg::Append { records, upto }),
+                _ => self.outbound.push_back(WriterMsg::Append {
+                    records: b.records,
+                    bytes: b.bytes,
+                    upto: b.upto,
+                }),
             }
         }
     }
@@ -489,7 +555,7 @@ impl Pipeline {
         }
         let Some(tx) = &self.tx else { return true };
         while let Some(msg) = self.outbound.pop_front() {
-            let n = msg.records();
+            let (n, nb) = (msg.records(), msg.bytes());
             let upto = match &msg {
                 WriterMsg::Append { upto, .. } => Some(*upto),
                 _ => None,
@@ -497,6 +563,7 @@ impl Pipeline {
             match tx.try_send(msg) {
                 Ok(()) => {
                     self.outbound_records -= n;
+                    self.outbound_bytes -= nb;
                     if let Some(u) = upto {
                         self.sent_upto = u;
                     }
@@ -511,9 +578,12 @@ impl Pipeline {
         true
     }
 
-    /// Records decided but not yet handed to the writer.
-    fn backlog(&self, core: &EngineCore) -> usize {
-        self.outbound_records + core.pending_records()
+    /// Records and payload bytes decided but not yet handed to the writer.
+    fn backlog(&self, core: &EngineCore) -> (usize, usize) {
+        (
+            self.outbound_records + core.pending_records(),
+            self.outbound_bytes + core.pending_bytes(),
+        )
     }
 
     /// Answer a caller once `needs` is durable.
@@ -594,16 +664,25 @@ type CompactReply = oneshot::Sender<Result<u32, EngineError>>;
 fn start_compaction(
     core: &mut EngineCore,
     pipe: &mut Pipeline,
+    budget: u64,
     reply: Option<CompactReply>,
 ) -> Result<PendingCompaction, (EngineError, Option<CompactReply>)> {
     let plan = match core.plan_compaction(wall_ms()) {
         Ok(p) => p,
         Err(e) => return Err((e, reply)),
     };
+    if plan.bytes > budget {
+        let e = EngineError::SnapshotOverBudget {
+            bytes: plan.bytes,
+            budget,
+        };
+        return Err((e, reply));
+    }
     pipe.collect(core);
     let (done_tx, done) = oneshot::channel();
     pipe.outbound.push_back(WriterMsg::Compact {
-        snapshot: plan.snapshot,
+        view: plan.view,
+        bytes: plan.bytes,
         reply: done_tx,
     });
     Ok(PendingCompaction {
@@ -635,7 +714,7 @@ async fn actor(
     mut core: EngineCore,
     registry: Registry,
     cfg: ShellConfig,
-    mut rx: mpsc::Receiver<Cmd>,
+    (mut rx, mut read_rx): (mpsc::Receiver<Cmd>, mpsc::Receiver<Read>),
     mut mon: Monitor,
     writer: Writer,
 ) {
@@ -649,6 +728,7 @@ async fn actor(
     let mut pipe = Pipeline::new(
         Some((writer.tx, writer.thread)),
         cfg.group_commit.max_batch_records,
+        cfg.group_commit.max_batch_bytes,
     );
     let mut pending_compaction: Option<PendingCompaction> = None;
     // First run one period after start, then every period.
@@ -713,7 +793,9 @@ async fn actor(
             pipe.shutdown().await;
             return;
         }
-        let accepting = pipe.backlog(&core) < cfg.max_outbox_records;
+        let (backlog_records, backlog_bytes) = pipe.backlog(&core);
+        let accepting =
+            backlog_records < cfg.max_outbox_records && backlog_bytes < cfg.max_outbox_bytes;
         tokio::select! {
             cmd = rx.recv(), if accepting => match cmd {
                 Some(Cmd::Submit { key, spec, not_before, reply }) => {
@@ -742,25 +824,13 @@ async fn actor(
                     }
                     pipe.answer(core.last_index(), reply, r);
                 }
-                Some(Cmd::Inspect { run, reply }) => {
-                    pipe.answer_read(core.last_index(), reply, core.run(run).cloned());
-                }
-                Some(Cmd::List { after, limit, reply }) => {
-                    let (runs, next_after) = core.page(after, limit);
-                    pipe.answer_read(core.last_index(), reply, RunPage { runs, next_after });
-                }
-                Some(Cmd::Diag { reply }) => {
-                    let mut d = core.diagnostics();
-                    d.errors = mon.errors.clone();
-                    pipe.answer_read(core.last_index(), reply, d);
-                }
                 Some(Cmd::Compact { reply }) => {
                     if pending_compaction.is_some() {
                         let _ = reply.send(Err(EngineError::Refused(
                             durable_domain::Refusal::ReserveExhausted,
                         )));
                     } else {
-                        match start_compaction(&mut core, &mut pipe, Some(reply)) {
+                        match start_compaction(&mut core, &mut pipe, cfg.max_snapshot_bytes, Some(reply)) {
                             Ok(p) => pending_compaction = Some(p),
                             Err((e, reply)) => {
                                 if let Some(reply) = reply {
@@ -774,6 +844,28 @@ async fn actor(
                     pipe.collect(&mut core);
                     pipe.outbound.push_back(WriterMsg::Backup { dest, reply });
                 }
+                None => {
+                    pipe.shutdown().await;
+                    return;
+                }
+            },
+            read = read_rx.recv() => match read {
+                Some(Read::Inspect { run, reply }) => {
+                    pipe.answer_read(core.last_index(), reply, core.run(run).cloned());
+                }
+                Some(Read::List { order, limit, reply }) => {
+                    let (runs, next) = match order {
+                        Order::Oldest { after } => core.page(after, limit),
+                        Order::Newest { before } => core.page_newest(before, limit),
+                    };
+                    pipe.answer_read(core.last_index(), reply, RunPage { runs, next });
+                }
+                Some(Read::Diag { reply }) => {
+                    let mut d = core.diagnostics();
+                    d.errors = mon.errors.clone();
+                    pipe.answer_read(core.last_index(), reply, d);
+                }
+                // Every handle is gone (the command channel closes with it).
                 None => {
                     pipe.shutdown().await;
                     return;
@@ -839,7 +931,7 @@ async fn actor(
             () = scheduled(&mut compactor) => {
                 // Retention on a schedule; skipped while one is running.
                 if pending_compaction.is_none() {
-                    match start_compaction(&mut core, &mut pipe, None) {
+                    match start_compaction(&mut core, &mut pipe, cfg.max_snapshot_bytes, None) {
                         Ok(p) => pending_compaction = Some(p),
                         Err((e, _)) => mon.handled(&e),
                     }
@@ -1546,7 +1638,7 @@ mod tests {
             errors: BTreeMap::new(),
         };
         // Direct-mode core: every commit is durable when it returns.
-        let mut pipe = Pipeline::new(None, 1024);
+        let mut pipe = Pipeline::new(None, 1024, usize::MAX);
         let mut ex = Exec {
             registry: &reg,
             sem: sem.clone(),
@@ -1844,6 +1936,65 @@ mod tests {
         assert_eq!(h.calls.load(SeqCst), 1);
     }
 
+    /// Answers Lost once its gate opens; counts its probes (which find the
+    /// effect).
+    #[derive(Clone)]
+    struct LostAfterGate {
+        gate: Arc<Semaphore>,
+        probes: Arc<std::sync::atomic::AtomicUsize>,
+    }
+    #[async_trait::async_trait]
+    impl StepHandler for LostAfterGate {
+        async fn execute(&self, _s: &StepSpec, _i: &[u8], _k: &str) -> Outcome {
+            match self.gate.acquire().await {
+                Ok(p) => {
+                    p.forget();
+                    Outcome::Lost
+                }
+                Err(_) => Outcome::Failed,
+            }
+        }
+        async fn probe(&self, _s: &StepSpec, _k: &str) -> bool {
+            self.probes
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            true
+        }
+    }
+
+    /// Rule (a) for probes: a reconcile probe is a handler call, so it may
+    /// not start until the record that made the run `Reconciling`
+    /// (`ReplyLost`) is durable. Review: making probes start immediately
+    /// passed every test.
+    #[tokio::test(flavor = "current_thread")]
+    async fn no_probe_before_the_reply_lost_record_is_durable() {
+        use std::sync::atomic::Ordering::SeqCst;
+        let d = tempfile::tempdir().unwrap_or_else(|e| panic!("{e}"));
+        let faults = Arc::new(Faults::default());
+        let h = LostAfterGate {
+            gate: Arc::new(Semaphore::new(0)),
+            probes: Arc::default(),
+        };
+        let mut reg = Registry::default();
+        reg.register("lost", Arc::new(h.clone()));
+        let eng = spawn(d.path(), reg, piped(&faults, GroupCommit::default()))
+            .unwrap_or_else(|e| panic!("{e}"));
+        let run = bounded(eng.submit(OperationKey("probe-hold".into()), spec1("lost")))
+            .await
+            .unwrap_or_else(|e| panic!("{e}"));
+        wait_state(&eng, run, "running").await; // dispatched and durable
+        faults.hold_syncs();
+        h.gate.add_permits(1); // the handler answers Lost -> ReplyLost queued
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(
+            h.probes.load(SeqCst),
+            0,
+            "a probe started before ReplyLost was durable"
+        );
+        faults.release_syncs();
+        assert!(matches!(until_done(&eng, run).await, RunState::Done));
+        assert!(h.probes.load(SeqCst) >= 1);
+    }
+
     /// Rule (b): commits that queue up behind an fsync share the next one,
     /// and the journal still holds contiguous sequence numbers in commit
     /// order (replay refuses any gap).
@@ -1990,33 +2141,6 @@ mod tests {
         );
     }
 
-    /// Rule (d): the writer's wait for more records is bounded — a lone
-    /// commit is written after `max_wait`, not held for a full batch.
-    #[tokio::test(flavor = "current_thread")]
-    async fn group_commit_wait_is_bounded() {
-        let d = tempfile::tempdir().unwrap_or_else(|e| panic!("{e}"));
-        let faults = Arc::new(Faults::default());
-        let gc = GroupCommit {
-            max_wait: Duration::from_millis(40),
-            ..GroupCommit::default()
-        };
-        let eng =
-            spawn(d.path(), echo_registry(), piped(&faults, gc)).unwrap_or_else(|e| panic!("{e}"));
-        let t0 = std::time::Instant::now();
-        bounded(eng.submit_at(OperationKey("lone".into()), spec("echo"), FAR))
-            .await
-            .unwrap_or_else(|e| panic!("{e}"));
-        let took = t0.elapsed();
-        assert!(
-            took >= Duration::from_millis(35),
-            "the writer lingered: {took:?}"
-        );
-        assert!(
-            took < Duration::from_secs(1),
-            "but only for max_wait: {took:?}"
-        );
-    }
-
     /// Retention on a schedule: compaction runs by itself, and the
     /// superseded generation is gone from disk afterwards.
     #[tokio::test(flavor = "current_thread")]
@@ -2046,14 +2170,21 @@ mod tests {
             "no scheduled compaction ran: {diag:?}"
         );
         assert_eq!(diag.stale_generations, 0, "{diag:?}");
+        // The fresh run (not 7 days old) survived the compaction.
+        assert!(bounded(eng.inspect(run)).await.unwrap_or(None).is_some());
+        // Stop the schedule before looking at the directory: a 60 ms
+        // schedule can be mid-compaction (gen-(N+1) created, gen-N not yet
+        // pruned). The writer finishes what it holds before it releases
+        // the lock, so once the journal reopens the directory is settled.
+        drop(eng);
+        let core = reopen(d.path()).await;
         let gens: Vec<String> = std::fs::read_dir(d.path())
             .unwrap_or_else(|e| panic!("{e}"))
             .filter_map(|e| e.ok()?.file_name().into_string().ok())
             .filter(|n| n.starts_with("gen-"))
             .collect();
         assert_eq!(gens.len(), 1, "one generation on disk: {gens:?}");
-        // The fresh run (not 7 days old) survived the compaction.
-        assert!(bounded(eng.inspect(run)).await.unwrap_or(None).is_some());
+        assert!(core.run(run).is_some());
     }
 
     /// Compaction is expensive (it snapshots the whole index) and its
@@ -2061,6 +2192,400 @@ mod tests {
     #[test]
     fn scheduled_compaction_is_off_by_default() {
         assert!(ShellConfig::default().compact_every.is_none());
+    }
+
+    /// Reopen once the stopped engine's writer has released the lock.
+    async fn reopen(dir: &Path) -> EngineCore {
+        for _ in 0..300 {
+            match EngineCore::open(dir) {
+                Ok(c) => return c,
+                Err(EngineError::Journal(JournalError::SecondWriter)) => {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+                Err(e) => panic!("restart must replay: {e}"),
+            }
+        }
+        panic!("the stopped engine never released the journal");
+    }
+
+    /// Submit `n` delayed runs one by one; the ids that were acknowledged.
+    async fn submit_acked(eng: &Engine, prefix: &str, n: usize) -> Vec<RunId> {
+        let mut acked = Vec::new();
+        for i in 0..n {
+            let r =
+                bounded(eng.submit_at(OperationKey(format!("{prefix}-{i}")), spec("echo"), FAR))
+                    .await;
+            if let Ok(id) = r {
+                acked.push(id);
+            }
+        }
+        acked
+    }
+
+    /// Review finding (high): an error at or after the manifest swap used
+    /// to leave the writer appending to the generation the manifest no
+    /// longer names — every job acknowledged afterwards was lost on
+    /// restart. Whatever compaction step fails on a *running* engine, no
+    /// acknowledged job may be lost: before the swap the engine carries on,
+    /// from the swap onward it stops and the restart replays.
+    #[tokio::test(flavor = "current_thread")]
+    async fn compaction_error_at_any_step_loses_no_acknowledged_job() {
+        for step in 1..=3u64 {
+            let d = tempfile::tempdir().unwrap_or_else(|e| panic!("{e}"));
+            let faults = Arc::new(Faults::default());
+            let eng = spawn(
+                d.path(),
+                echo_registry(),
+                piped(&faults, GroupCommit::default()),
+            )
+            .unwrap_or_else(|e| panic!("{e}"));
+            let mut acked = submit_acked(&eng, "pre", 5).await;
+            assert_eq!(acked.len(), 5);
+            faults.crash_compaction_at(step);
+            assert!(
+                bounded(eng.compact()).await.is_err(),
+                "step {step}: injected error"
+            );
+            let after = submit_acked(&eng, "post", 10).await;
+            if step >= 3 {
+                assert!(
+                    after.is_empty(),
+                    "step {step}: nothing may be acked once the manifest moved"
+                );
+                bounded(eng.closed()).await;
+            } else {
+                assert_eq!(
+                    after.len(),
+                    10,
+                    "step {step}: before the swap the engine carries on"
+                );
+            }
+            acked.extend(after);
+            drop(eng);
+            let core = reopen(d.path()).await;
+            for id in &acked {
+                assert!(
+                    core.run(*id).is_some(),
+                    "step {step}: acknowledged {id:?} lost on restart"
+                );
+            }
+        }
+    }
+
+    /// The same with a real OS error: a journal root the process can write
+    /// into but not open for reading makes the post-rename directory fsync
+    /// fail (EACCES), as the reviewer reproduced on the release binary.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "current_thread")]
+    async fn real_io_error_after_manifest_swap_stops_the_engine() {
+        use std::os::unix::fs::PermissionsExt;
+        struct Restore<'a>(&'a Path);
+        impl Drop for Restore<'_> {
+            fn drop(&mut self) {
+                let _ = std::fs::set_permissions(self.0, std::fs::Permissions::from_mode(0o700));
+            }
+        }
+        let d = tempfile::tempdir().unwrap_or_else(|e| panic!("{e}"));
+        let eng = spawn(
+            d.path(),
+            echo_registry(),
+            ShellConfig {
+                tick_ms: 5,
+                ..Default::default()
+            },
+        )
+        .unwrap_or_else(|e| panic!("{e}"));
+        let mut acked = submit_acked(&eng, "pre", 3).await;
+        let guard = Restore(d.path());
+        std::fs::set_permissions(d.path(), std::fs::Permissions::from_mode(0o300))
+            .unwrap_or_else(|e| panic!("{e}"));
+        if std::fs::File::open(d.path()).is_ok() {
+            eprintln!("skipped: this user ignores directory permissions");
+            return;
+        }
+        assert!(bounded(eng.compact()).await.is_err());
+        let after = submit_acked(&eng, "post", 30).await;
+        drop(guard);
+        assert!(
+            after.is_empty(),
+            "{} submits acked after the failed swap",
+            after.len()
+        );
+        acked.extend(after);
+        bounded(eng.closed()).await;
+        drop(eng);
+        let core = reopen(d.path()).await;
+        for id in &acked {
+            assert!(
+                core.run(*id).is_some(),
+                "acknowledged {id:?} lost on restart"
+            );
+        }
+    }
+
+    /// Compaction cost probe (review finding 3): the contract's 1 KiB
+    /// inputs at `PROBE_RUNS` retained runs. Ignored by default; run it in
+    /// release mode under `/usr/bin/time -l` for peak RSS:
+    /// `PROBE_RUNS=100000 PROBE_INPUT=1024 cargo test --release -p durable-engine -- --ignored compaction_cost_probe --nocapture`
+    #[tokio::test(flavor = "current_thread")]
+    #[ignore = "measurement probe: run explicitly, in release mode"]
+    async fn compaction_cost_probe() {
+        let env = |k: &str, d: usize| {
+            std::env::var(k)
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(d)
+        };
+        let (runs, input) = (env("PROBE_RUNS", 100_000), env("PROBE_INPUT", 1024));
+        let d = tempfile::tempdir().unwrap_or_else(|e| panic!("{e}"));
+        let cfg = ShellConfig {
+            cmd_capacity: 4096,
+            max_outbox_records: 1 << 20,
+            // The probe holds every run queued on purpose.
+            limits: Limits {
+                max_live_runs: usize::MAX,
+                max_index_bytes: u64::MAX,
+                ..Limits::default()
+            },
+            ..Default::default()
+        };
+        let eng = spawn(d.path(), echo_registry(), cfg).unwrap_or_else(|e| panic!("{e}"));
+        let payload: Vec<u8> = (0..input).map(|i| (i % 251) as u8).collect();
+        let job = move || JobSpec {
+            version: 1,
+            input: payload.clone(),
+            steps: vec![StepSpec {
+                name: "a".into(),
+                handler: "echo".into(),
+            }],
+        };
+        let t = std::time::Instant::now();
+        let mut next = 0;
+        while next < runs {
+            let mut hs = Vec::new();
+            for _ in 0..512.min(runs - next) {
+                let (e, k, s) = (eng.clone(), OperationKey(format!("probe-{next}")), job());
+                hs.push(tokio::spawn(async move { e.submit_at(k, s, FAR).await }));
+                next += 1;
+            }
+            for h in hs {
+                h.await
+                    .unwrap_or_else(|e| panic!("{e}"))
+                    .unwrap_or_else(|e| panic!("{e}"));
+            }
+        }
+        let fill = t.elapsed();
+        let t = std::time::Instant::now();
+        eng.submit_at(OperationKey("idle".into()), job(), FAR)
+            .await
+            .unwrap_or_else(|e| panic!("{e}"));
+        let idle = t.elapsed();
+        let e2 = eng.clone();
+        let t0 = std::time::Instant::now();
+        let compaction = tokio::spawn(async move { (e2.compact().await, t0.elapsed()) });
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        let t = std::time::Instant::now();
+        eng.submit_at(OperationKey("during".into()), job(), FAR)
+            .await
+            .unwrap_or_else(|e| panic!("{e}"));
+        let during = t.elapsed();
+        let (r, compact_took) = compaction.await.unwrap_or_else(|e| panic!("{e}"));
+        let generation = r.unwrap_or_else(|e| panic!("{e}"));
+        let gdir = durable_journal::gen_dir_path(d.path(), generation);
+        let snapshot_bytes: u64 = std::fs::read_dir(&gdir)
+            .unwrap_or_else(|e| panic!("{e}"))
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_string_lossy().starts_with("snapshot"))
+            .filter_map(|e| e.metadata().ok())
+            .map(|m| m.len())
+            .sum();
+        drop(eng);
+        let mut reopen_took = Duration::ZERO;
+        for _ in 0..3000 {
+            let t = std::time::Instant::now();
+            match EngineCore::open(d.path()) {
+                Ok(c) => {
+                    reopen_took = t.elapsed();
+                    assert_eq!(c.runs().count(), runs + 2);
+                    break;
+                }
+                Err(EngineError::Journal(JournalError::SecondWriter)) => {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+                Err(e) => panic!("{e}"),
+            }
+        }
+        println!(
+            "PROBE runs={runs} input={input} fill_s={:.2} idle_submit_ms={:.1} compact_s={:.2} \
+             submit_during_compaction_ms={:.1} snapshot_mib={:.1} reopen_s={:.2}",
+            fill.as_secs_f64(),
+            idle.as_secs_f64() * 1e3,
+            compact_took.as_secs_f64(),
+            during.as_secs_f64() * 1e3,
+            snapshot_bytes as f64 / (1024.0 * 1024.0),
+            reopen_took.as_secs_f64(),
+        );
+    }
+
+    /// A compaction whose snapshot would exceed the byte budget is refused
+    /// with a stable error before anything is written, and the engine
+    /// carries on.
+    #[tokio::test(flavor = "current_thread")]
+    async fn compaction_over_the_snapshot_budget_is_refused() {
+        let d = tempfile::tempdir().unwrap_or_else(|e| panic!("{e}"));
+        let cfg = ShellConfig {
+            tick_ms: 5,
+            max_snapshot_bytes: 1024,
+            ..Default::default()
+        };
+        let eng = spawn(d.path(), echo_registry(), cfg).unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(submit_acked(&eng, "budget", 20).await.len(), 20);
+        let r = bounded(eng.compact()).await;
+        assert!(
+            matches!(r, Err(EngineError::SnapshotOverBudget { budget: 1024, .. })),
+            "{r:?}"
+        );
+        assert!(
+            !durable_journal::gen_dir_path(d.path(), 2).exists(),
+            "nothing written"
+        );
+        assert_eq!(
+            submit_acked(&eng, "after", 1).await.len(),
+            1,
+            "the engine carries on"
+        );
+    }
+
+    /// Submit delayed runs with `input` bytes each, concurrently.
+    fn submit_sized(
+        eng: &Engine,
+        prefix: &str,
+        n: usize,
+        input: usize,
+    ) -> Vec<tokio::task::JoinHandle<Result<RunId, EngineError>>> {
+        (0..n)
+            .map(|i| {
+                let e = eng.clone();
+                let key = OperationKey(format!("{prefix}-{i}"));
+                let mut s = spec("echo");
+                s.input = vec![b'x'; input];
+                tokio::spawn(async move { e.submit_at(key, s, FAR).await })
+            })
+            .collect()
+    }
+
+    /// Review finding 4: batches were bounded only in records, so
+    /// `max_batch_bytes` bounded nothing (40 records of 120 KB went in one
+    /// write). With a 16 KiB bound and ~3 KB records, 41 commits need at
+    /// least 8 writes + fsyncs.
+    #[tokio::test(flavor = "current_thread")]
+    async fn group_commit_batches_are_bounded_in_bytes() {
+        let d = tempfile::tempdir().unwrap_or_else(|e| panic!("{e}"));
+        let faults = Arc::new(Faults::default());
+        let gc = GroupCommit {
+            max_batch_bytes: 16 * 1024,
+            ..GroupCommit::default()
+        };
+        let eng =
+            spawn(d.path(), echo_registry(), piped(&faults, gc)).unwrap_or_else(|e| panic!("{e}"));
+        faults.hold_syncs();
+        let first = submit_sized(&eng, "b0", 1, 1024);
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        let rest = submit_sized(&eng, "b", 40, 1024);
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        faults.release_syncs();
+        for r in join_all(first)
+            .await
+            .into_iter()
+            .chain(join_all(rest).await)
+        {
+            r.unwrap_or_else(|e| panic!("{e}"));
+        }
+        let syncs = faults.sync_calls();
+        assert!(
+            syncs >= 8,
+            "41 records of ~3 KB in {syncs} fsyncs under a 16 KiB bound"
+        );
+    }
+
+    /// The actor's outbox is bounded in bytes too: once it holds
+    /// `max_outbox_bytes` it stops taking commands, the bounded command
+    /// channel fills, and further submits are refused busy instead of
+    /// buffered without limit while the writer is slow.
+    #[tokio::test(flavor = "current_thread")]
+    async fn outbox_is_bounded_in_bytes() {
+        let d = tempfile::tempdir().unwrap_or_else(|e| panic!("{e}"));
+        let faults = Arc::new(Faults::default());
+        let cfg = ShellConfig {
+            cmd_capacity: 2,
+            max_outbox_bytes: 32 * 1024,
+            ..piped(&faults, GroupCommit::default())
+        };
+        let eng = spawn(d.path(), echo_registry(), cfg).unwrap_or_else(|e| panic!("{e}"));
+        faults.hold_syncs();
+        let first = submit_sized(&eng, "o-first", 1, 1024);
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        let mut handles = Vec::new();
+        for i in 0..100 {
+            handles.extend(submit_sized(&eng, &format!("o{i}"), 1, 1024));
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let (done, waiting): (Vec<_>, Vec<_>) = handles.into_iter().partition(|h| h.is_finished());
+        let busy = join_all(done)
+            .await
+            .into_iter()
+            .filter(|r| {
+                matches!(
+                    r,
+                    Err(EngineError::Refused(
+                        durable_domain::Refusal::ReserveExhausted
+                    ))
+                )
+            })
+            .count();
+        assert!(
+            busy >= 80,
+            "only {busy} of 100 refused: the outbox kept buffering"
+        );
+        faults.release_syncs();
+        for r in join_all(first)
+            .await
+            .into_iter()
+            .chain(join_all(waiting).await)
+        {
+            r.unwrap_or_else(|e| panic!("held submits complete: {e}"));
+        }
+    }
+
+    /// Review finding 5: open reads shared the writers' bounded command
+    /// queue, so a burst of unauthenticated `GET /jobs` could crowd an
+    /// authenticated submit out (refused busy). Reads have their own bound.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_read_burst_cannot_crowd_out_a_submit() {
+        let d = tempfile::tempdir().unwrap_or_else(|e| panic!("{e}"));
+        let cfg = ShellConfig {
+            tick_ms: 5,
+            cmd_capacity: 4,
+            ..Default::default()
+        };
+        let eng = spawn(d.path(), echo_registry(), cfg).unwrap_or_else(|e| panic!("{e}"));
+        let reads: Vec<_> = (0..200)
+            .map(|_| {
+                let e = eng.clone();
+                tokio::spawn(async move { e.list(None, MAX_PAGE).await.map(|p| p.runs.len()) })
+            })
+            .collect();
+        let e = eng.clone();
+        let submit = tokio::spawn(async move {
+            e.submit_at(OperationKey("writer".into()), spec("echo"), FAR)
+                .await
+        });
+        let r = bounded(submit).await.unwrap_or_else(|e| panic!("{e}"));
+        assert!(r.is_ok(), "the submit was crowded out by reads: {r:?}");
+        for h in reads {
+            let _ = bounded(h).await; // reads may be refused busy; never the submit
+        }
     }
 
     /// A failed fsync must stop the engine — never retry it, never keep
