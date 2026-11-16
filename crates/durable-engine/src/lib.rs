@@ -231,7 +231,8 @@ impl EngineCore {
     /// `open` with explicit journal options.
     pub fn open_with(dir: &Path, opts: JournalOptions) -> Result<Self, EngineError> {
         let journal = Journal::open_with(dir, opts)?;
-        let gdir = durable_journal::gen_dir_path(dir, journal.generation());
+        let generation = journal.generation();
+        let gdir = durable_journal::gen_dir_path(dir, generation);
         let mut core = Self {
             log: Log::Direct(journal),
             runs: BTreeMap::new(),
@@ -267,6 +268,16 @@ impl EngineCore {
                     core.by_op = idx.by_op;
                     core.next_run = idx.next_run;
                 }
+            }
+            // Only compaction makes a generation above 1, and it writes the
+            // snapshot before the manifest names it: a missing one is
+            // damage, never "empty state" (D-029).
+            None if generation > 1 => {
+                return Err(JournalError::CorruptSnapshot(format!(
+                    "generation {generation} has no snapshot; every compacted generation \
+                     must have one (restore from a backup)"
+                ))
+                .into());
             }
             None => {}
         }
@@ -1306,6 +1317,30 @@ mod tests {
             e.submit(OperationKey("n".repeat(300)), spec(), 2),
             Err(EngineError::Refused(Refusal::OverLimits))
         ));
+    }
+
+    /// Review S2: a compacted generation whose snapshot is missing (a
+    /// deletion, a partial copy, filesystem damage — no crash can cause
+    /// it) used to start as empty state: every run gone, run ids reused,
+    /// every op_key re-executing. It must stop startup instead.
+    #[test]
+    fn missing_snapshot_of_a_compacted_generation_stops_startup() {
+        let (d, mut e) = open();
+        for i in 0..50 {
+            e.submit(OperationKey(format!("s2-{i}")), spec(), 0)
+                .unwrap_or_else(|e| panic!("{e}"));
+        }
+        let generation = e.compact(1).unwrap_or_else(|e| panic!("{e}"));
+        drop(e);
+        let snap = durable_journal::gen_dir_path(d.path(), generation).join("snapshot.bin");
+        std::fs::remove_file(&snap).unwrap_or_else(|e| panic!("{e}"));
+        match EngineCore::open(d.path()) {
+            Err(EngineError::Journal(JournalError::CorruptSnapshot(why))) => {
+                assert!(why.contains("no snapshot"), "{why}");
+            }
+            Err(e) => panic!("wrong error: {e}"),
+            Ok(c) => panic!("started with {} of 50 runs", c.runs().count()),
+        }
     }
 
     #[test]

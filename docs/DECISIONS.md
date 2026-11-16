@@ -380,3 +380,13 @@ convention; these seed the contract's prescribed directions.
 
   Restart memory is now the index itself, about 1.3 KB per queued 1 KiB
   run. The default index bound is sized against that in D-030.
+- **D-029 — A compacted generation without its snapshot stops startup.**
+  A generation above 1 whose `snapshot.bin` (and legacy `snapshot.json`)
+  was missing used to open as empty state, silently: every compacted run
+  vanished, run ids restarted at 1, and every op_key would re-execute. No
+  crash causes this, because compaction writes and fsyncs the snapshot
+  before the manifest names the generation; it takes a deletion, a
+  partial copy, or filesystem damage. D-021 already treats a damaged
+  snapshot as fatal, and now a missing one is too
+  (`snapshot is damaged: generation N has no snapshot`): restore from a
+  backup.
