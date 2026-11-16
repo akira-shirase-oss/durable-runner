@@ -173,8 +173,8 @@ convention; these seed the contract's prescribed directions.
   the batch and after it (`CommitFailed`, HTTP 503
   `journal_unavailable`), is never retried, and stops the writer, the
   actor and the server process so replay rebuilds memory. Batches are
-  bounded (`max_batch_records` 1024, `max_batch_bytes` 4 MiB, `max_wait`
-  0 by default), and so is the actor's outbox (`max_outbox_records`
+  bounded (`max_batch_records` 1024, `max_batch_bytes` 4 MiB; `max_wait`
+  was removed by D-026), and so is the actor's outbox (`max_outbox_records`
   16384; beyond it commands wait in the bounded command channel and are
   refused `busy`). Compaction and backup run on the writer in commit
   order; compaction expiry reaches memory only when the writer confirms.
@@ -336,3 +336,11 @@ convention; these seed the contract's prescribed directions.
   fsyncs the directory holding each entry it creates before returning:
   the root's parent (if it created the root), the root (manifest),
   `gen-000001/` (`journal.log`) and the root again (`gen-000001/`).
+- **D-026 — No writer linger.** `GroupCommit::max_wait` let the writer
+  wait for more records before writing, but the actor sends nothing while
+  a batch is in flight (that is what makes the next batch accumulate), so
+  the writer waited with nothing to collect. Review: `max_wait` 200 ms
+  with 51 records ready gave 2 batches in 400 ms. It only ever added
+  latency, and a test (`group_commit_wait_is_bounded`) enshrined that
+  penalty. The knob and that test are removed. The writer gathers what
+  is already queued, within the record and byte bounds, and writes it.

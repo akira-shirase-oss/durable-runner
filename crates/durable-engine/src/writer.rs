@@ -12,8 +12,9 @@
 //!   fsync is never retried, the log is rolled back to its durable length
 //!   when possible (`Journal::append_batch`), the writer stops, and the
 //!   process exits so replay rebuilds memory, which is already ahead of disk;
-//! - batches are bounded in records and bytes, and the wait for more
-//!   records is bounded by `max_wait`;
+//! - batches are bounded in records and bytes; the writer never waits for
+//!   more — batching comes from records queuing while the previous fsync
+//!   runs (D-026);
 //! - compaction and backup run here, in queue order behind earlier appends;
 //!   a compaction that fails at or after its manifest swap poisons the
 //!   journal and stops the writer exactly like a failed append (D-019).
@@ -21,10 +22,9 @@
 use crate::EngineError;
 use durable_journal::{Journal, JournalError};
 use std::path::PathBuf;
-use std::sync::mpsc::{self, Receiver, SyncSender, TryRecvError};
+use std::sync::mpsc::{self, Receiver, SyncSender};
 use std::sync::Arc;
 use std::thread::JoinHandle;
-use std::time::{Duration, Instant};
 use tokio::sync::{oneshot, watch};
 
 /// Messages the writer can hold before the actor keeps work in its own
@@ -39,10 +39,6 @@ pub struct GroupCommit {
     /// Most payload bytes in one write + fsync (a single message may
     /// exceed it only if one record does).
     pub max_batch_bytes: usize,
-    /// How long the writer waits for more records after the first before
-    /// writing. Zero: write what is waiting; batching then comes from the
-    /// records that queue up while the previous fsync runs.
-    pub max_wait: Duration,
 }
 
 impl Default for GroupCommit {
@@ -50,7 +46,6 @@ impl Default for GroupCommit {
         Self {
             max_batch_records: 1024,
             max_batch_bytes: 4 * 1024 * 1024,
-            max_wait: Duration::ZERO,
         }
     }
 }
@@ -210,9 +205,9 @@ fn run(
     }
 }
 
-/// Extend a batch with appends already waiting (or arriving within
-/// `max_wait`), never past the record and byte bounds. A message that does
-/// not fit, or a control message, is handed back to run next.
+/// Extend a batch with appends already waiting, never past the record and
+/// byte bounds and never waiting for more. A message that does not fit, or
+/// a control message, is handed back to run next.
 fn gather(
     rx: &Receiver<WriterMsg>,
     mut batch: Vec<Vec<u8>>,
@@ -220,24 +215,12 @@ fn gather(
     mut upto: u64,
     cfg: &GroupCommit,
 ) -> (Vec<Vec<u8>>, usize, u64, Option<WriterMsg>) {
-    let deadline = Instant::now() + cfg.max_wait;
     loop {
         if batch.len() >= cfg.max_batch_records || bytes >= cfg.max_batch_bytes {
             return (batch, bytes, upto, None);
         }
-        let next = match rx.try_recv() {
-            Ok(m) => m,
-            Err(TryRecvError::Disconnected) => return (batch, bytes, upto, None),
-            Err(TryRecvError::Empty) => {
-                let left = deadline.saturating_duration_since(Instant::now());
-                if left.is_zero() {
-                    return (batch, bytes, upto, None);
-                }
-                match rx.recv_timeout(left) {
-                    Ok(m) => m,
-                    Err(_) => return (batch, bytes, upto, None),
-                }
-            }
+        let Ok(next) = rx.try_recv() else {
+            return (batch, bytes, upto, None);
         };
         match next {
             WriterMsg::Append {

@@ -2081,33 +2081,6 @@ mod tests {
         );
     }
 
-    /// Rule (d): the writer's wait for more records is bounded — a lone
-    /// commit is written after `max_wait`, not held for a full batch.
-    #[tokio::test(flavor = "current_thread")]
-    async fn group_commit_wait_is_bounded() {
-        let d = tempfile::tempdir().unwrap_or_else(|e| panic!("{e}"));
-        let faults = Arc::new(Faults::default());
-        let gc = GroupCommit {
-            max_wait: Duration::from_millis(40),
-            ..GroupCommit::default()
-        };
-        let eng =
-            spawn(d.path(), echo_registry(), piped(&faults, gc)).unwrap_or_else(|e| panic!("{e}"));
-        let t0 = std::time::Instant::now();
-        bounded(eng.submit_at(OperationKey("lone".into()), spec("echo"), FAR))
-            .await
-            .unwrap_or_else(|e| panic!("{e}"));
-        let took = t0.elapsed();
-        assert!(
-            took >= Duration::from_millis(35),
-            "the writer lingered: {took:?}"
-        );
-        assert!(
-            took < Duration::from_secs(1),
-            "but only for max_wait: {took:?}"
-        );
-    }
-
     /// Retention on a schedule: compaction runs by itself, and the
     /// superseded generation is gone from disk afterwards.
     #[tokio::test(flavor = "current_thread")]
