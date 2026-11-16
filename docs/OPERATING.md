@@ -86,7 +86,9 @@ larger than 256 KiB fails the attempt (it is read only up to the limit).
 
 A backup name is a plain name (`[A-Za-z0-9_.-]`, up to 64, not starting
 with `.`): the server writes only `<backup-root>/<name>` and refuses an
-existing name rather than merge into it.
+existing name rather than merge into it. A backup appears under its name
+only once complete; an interrupted one is a hidden `.<name>.partial` that
+the next attempt or the next server start removes.
 
 `--op-key` is the dedup contract: resubmitting the same key returns the
 same run id, nothing re-executes. Cancel stops scheduling — it never

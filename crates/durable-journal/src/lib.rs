@@ -42,6 +42,7 @@ pub mod faults {
         // 0 = disarmed; n = the process "dies" at compaction step n.
         compaction_crash: AtomicU64,
         dir_syncs: Mutex<Vec<std::path::PathBuf>>,
+        backup_crash: AtomicBool,
     }
 
     impl Faults {
@@ -71,6 +72,14 @@ pub mod faults {
                 return Err(std::io::Error::other("injected crash during compaction"));
             }
             Ok(())
+        }
+        /// The next backup stops dead after copying the generation data,
+        /// before its manifest — what a kill -9 mid-backup leaves.
+        pub fn crash_next_backup(&self) {
+            self.backup_crash.store(true, Ordering::SeqCst);
+        }
+        pub(crate) fn take_backup_crash(&self) -> bool {
+            self.backup_crash.swap(false, Ordering::SeqCst)
         }
         /// Directories fsynced at open, in order.
         pub fn dir_syncs(&self) -> Vec<std::path::PathBuf> {
@@ -780,7 +789,8 @@ impl Journal {
     }
 
     /// A consistent copy for backup into `dest`, which must not exist yet
-    /// (its parent must): generation data first, manifest LAST —
+    /// (its parent must), made in `.<name>.partial` and renamed into place
+    /// when complete: generation data first, manifest LAST —
     /// a copy interrupted mid-flight still opens as a complete older
     /// generation, never a torn mixed one.
     pub fn backup_to(&self, dest: &Path) -> Result<(), JournalError> {
@@ -788,23 +798,37 @@ impl Journal {
             return Err(JournalError::Poisoned); // the log may hold an unrolled tail
         }
         // The copy must fit on the destination with the reserve intact.
-        let parent = dest.parent().unwrap_or(dest);
+        let parent = dest
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .unwrap_or(Path::new("."));
+        let name = dest
+            .file_name()
+            .and_then(|n| n.to_str())
+            .ok_or_else(|| io::Error::other("backup destination has no usable name"))?;
         self.ensure_space(parent, self.backup_bytes()?)?;
-        // A fresh directory only: copying into an existing one could mix
-        // generations from two backups. `create_dir` is the atomic check.
-        match fs::create_dir(dest) {
+        // A fresh name only: copying into an existing backup could mix
+        // generations from two of them.
+        if fs::symlink_metadata(dest).is_ok() {
+            return Err(JournalError::BackupExists);
+        }
+        // Copy into a hidden partial directory and rename it into place only
+        // when complete, so the name never holds a half backup (a kill -9
+        // mid-copy leaves `.<name>.partial`, which the next attempt — or
+        // `sweep_partial_backups` at startup — removes; it was never valid).
+        let partial = parent.join(format!(".{name}{PARTIAL_SUFFIX}"));
+        match fs::remove_dir_all(&partial) {
             Ok(()) => {}
-            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
-                return Err(JournalError::BackupExists)
-            }
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
             Err(e) => return Err(e.into()),
         }
+        fs::create_dir(&partial)?;
         for entry in fs::read_dir(&self.root)? {
             let entry = entry?;
-            let name = entry.file_name();
-            let Some(n) = name.to_str() else { continue };
+            let gname = entry.file_name();
+            let Some(n) = gname.to_str() else { continue };
             if n.starts_with("gen-") && entry.file_type()?.is_dir() {
-                let gd = dest.join(n);
+                let gd = partial.join(n);
                 fs::create_dir_all(&gd)?;
                 for f in SNAPSHOT_FILES {
                     let src = entry.path().join(f);
@@ -813,11 +837,30 @@ impl Journal {
                         File::open(gd.join(f))?.sync_data()?;
                     }
                 }
+                File::open(&gd)?.sync_data()?;
             }
         }
-        fs::copy(self.root.join("manifest.json"), dest.join("manifest.json"))?;
-        File::open(dest.join("manifest.json"))?.sync_data()?;
-        sync_parent(&dest.join("manifest.json"))?;
+        #[cfg(any(test, feature = "fault-injection"))]
+        if self
+            .opts
+            .faults
+            .as_ref()
+            .is_some_and(|f| f.take_backup_crash())
+        {
+            return Err(io::Error::other("injected crash during backup").into());
+        }
+        // Manifest last: even the partial copy opens as one generation.
+        fs::copy(
+            self.root.join("manifest.json"),
+            partial.join("manifest.json"),
+        )?;
+        File::open(partial.join("manifest.json"))?.sync_data()?;
+        File::open(&partial)?.sync_data()?;
+        if fs::symlink_metadata(dest).is_ok() {
+            return Err(JournalError::BackupExists); // appeared meanwhile
+        }
+        fs::rename(&partial, dest)?;
+        File::open(parent)?.sync_data()?;
         Ok(())
     }
 }
@@ -854,6 +897,28 @@ impl Journal {
 pub struct Snapshot {
     pub covered_seq: u64,
     pub payload: Vec<u8>,
+}
+
+/// Suffix of a backup still being copied (hidden: `.<name>.partial`).
+const PARTIAL_SUFFIX: &str = ".partial";
+
+/// Remove backups that were interrupted mid-copy (`.<name>.partial`)
+/// under `root`; returns how many. They were never complete, and a
+/// finished backup never carries the suffix.
+pub fn sweep_partial_backups(root: &Path) -> Result<usize, JournalError> {
+    let mut removed = 0;
+    for entry in fs::read_dir(root)? {
+        let entry = entry?;
+        let name = entry.file_name();
+        let partial = name
+            .to_str()
+            .is_some_and(|n| n.starts_with('.') && n.ends_with(PARTIAL_SUFFIX));
+        if partial && entry.file_type()?.is_dir() {
+            fs::remove_dir_all(entry.path())?;
+            removed += 1;
+        }
+    }
+    Ok(removed)
 }
 
 /// Files a generation directory may hold (backup copies exactly these).
@@ -1426,6 +1491,46 @@ mod tests {
             matches!((last_root, gen_created), (Some(r), Some(g)) if r > g),
             "the root (holding gen-000001's entry) must be fsynced after the generation exists: {synced:?}"
         );
+    }
+
+    /// Review finding 12: a backup killed mid-copy left a directory with no
+    /// manifest under the backup's name, forever (later attempts got
+    /// `BackupExists`). A backup's name must appear only once it is
+    /// complete, and an interrupted one must leave the name free.
+    #[test]
+    fn interrupted_backup_leaves_no_half_backup_and_the_name_free() {
+        let dir = tempfile::tempdir().unwrap_or_else(|e| panic!("{e}"));
+        let out = tempfile::tempdir().unwrap_or_else(|e| panic!("{e}"));
+        let (mut j, f) = open_faulty(dir.path());
+        j.append(b"one").unwrap_or_else(|e| panic!("{e}"));
+        let dest = out.path().join("nightly");
+        f.crash_next_backup();
+        assert!(j.backup_to(&dest).is_err());
+        assert!(!dest.exists(), "a half backup sits under the name");
+        j.backup_to(&dest)
+            .unwrap_or_else(|e| panic!("the name stays free for a retry: {e}"));
+        assert!(dest.join("manifest.json").exists());
+        let leftovers: Vec<_> = fs::read_dir(out.path())
+            .unwrap_or_else(|e| panic!("{e}"))
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name())
+            .collect();
+        assert_eq!(leftovers, vec![std::ffi::OsString::from("nightly")]);
+    }
+
+    #[test]
+    fn partial_backups_are_swept_and_finished_ones_kept() {
+        let out = tempfile::tempdir().unwrap_or_else(|e| panic!("{e}"));
+        for d in [".t0.partial", ".t1.partial", "nightly", ".keep"] {
+            fs::create_dir(out.path().join(d)).unwrap_or_else(|e| panic!("{e}"));
+        }
+        assert_eq!(
+            sweep_partial_backups(out.path()).unwrap_or_else(|e| panic!("{e}")),
+            2
+        );
+        assert!(out.path().join("nightly").exists());
+        assert!(out.path().join(".keep").exists());
+        assert!(!out.path().join(".t0.partial").exists());
     }
 
     #[test]

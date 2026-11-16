@@ -344,3 +344,13 @@ convention; these seed the contract's prescribed directions.
   latency, and a test (`group_commit_wait_is_bounded`) enshrined that
   penalty. The knob and that test are removed. The writer gathers what
   is already queued, within the record and byte bounds, and writes it.
+- **D-027 — A backup's name appears only when it is complete.** A
+  `kill -9` during a backup left a directory with no manifest under the
+  backup's name, forever: the name was taken (`409 backup_exists`), it
+  used space, nothing reported it, and `restore` correctly refused it.
+  Review left three such directories in 15 kills. A backup is now copied
+  into a hidden `.<name>.partial` (valid backup names cannot start with
+  `.`), manifest last, then fsynced and renamed into place, and the
+  parent directory is fsynced. The next attempt at that name removes a
+  stale partial first. The server sweeps every `.*.partial` from the
+  backup root at startup.

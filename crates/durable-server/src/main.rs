@@ -611,6 +611,12 @@ fn prepare_backup_root(dir: &Path) -> Result<Arc<Path>> {
         .with_context(|| format!("create backup root {}", dir.display()))?;
     let canonical = std::fs::canonicalize(dir)
         .with_context(|| format!("resolve backup root {}", dir.display()))?;
+    // A backup interrupted by a crash left `.<name>.partial`: never valid.
+    let swept = durable_journal::sweep_partial_backups(&canonical)
+        .map_err(|e| anyhow::anyhow!("sweep partial backups: {e}"))?;
+    if swept > 0 {
+        eprintln!("durable-server: removed {swept} interrupted backup(s) from the backup root");
+    }
     Ok(Arc::from(canonical))
 }
 
@@ -1189,6 +1195,16 @@ mod tests {
             (e.status, e.code),
             (StatusCode::SERVICE_UNAVAILABLE, "at_capacity")
         );
+    }
+
+    #[test]
+    fn startup_sweeps_interrupted_backups() {
+        let root = tempfile::tempdir().unwrap_or_else(|e| panic!("{e}"));
+        std::fs::create_dir(root.path().join(".b1.partial")).unwrap_or_else(|e| panic!("{e}"));
+        std::fs::create_dir(root.path().join("b0")).unwrap_or_else(|e| panic!("{e}"));
+        prepare_backup_root(root.path()).unwrap_or_else(|e| panic!("{e}"));
+        assert!(!root.path().join(".b1.partial").exists());
+        assert!(root.path().join("b0").exists());
     }
 
     #[test]
