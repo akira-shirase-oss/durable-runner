@@ -242,30 +242,43 @@ impl EngineCore {
             limits: Limits::default(),
             retry: RetryPolicy::default(),
         };
-        if let Some(snap) = durable_journal::load_snapshot(&gdir)? {
-            if snap.payload.starts_with(snapshot::MAGIC) {
+        match durable_journal::open_snapshot(&gdir)? {
+            // Streamed: the index is decoded straight from a buffered reader
+            // and the checksum verified before the result is used (D-028).
+            Some(durable_journal::SnapshotSource::Binary(mut r)) => {
+                let len = r.remaining();
                 let (next_run, runs) =
-                    snapshot::decode(&snap.payload).map_err(JournalError::CorruptSnapshot)?;
-                // Dedup keys are exactly the retained runs' keys.
-                core.by_op = runs.values().map(|r| (r.key.clone(), r.id)).collect();
-                core.runs = runs;
-                core.next_run = next_run;
-            } else {
-                let idx: LegacyIndex = serde_json::from_slice(&snap.payload)?;
-                core.runs = idx
-                    .runs
-                    .into_iter()
-                    .map(|(id, r)| (id, Arc::new(r)))
-                    .collect();
-                core.by_op = idx.by_op;
-                core.next_run = idx.next_run;
+                    snapshot::decode_from(&mut r, len).map_err(JournalError::CorruptSnapshot)?;
+                r.finish()?;
+                core.install(next_run, runs);
             }
+            Some(durable_journal::SnapshotSource::Legacy(snap)) => {
+                if snap.payload.starts_with(snapshot::MAGIC) {
+                    let (next_run, runs) =
+                        snapshot::decode(&snap.payload).map_err(JournalError::CorruptSnapshot)?;
+                    core.install(next_run, runs);
+                } else {
+                    let idx: LegacyIndex = serde_json::from_slice(&snap.payload)?;
+                    core.runs = idx
+                        .runs
+                        .into_iter()
+                        .map(|(id, r)| (id, Arc::new(r)))
+                        .collect();
+                    core.by_op = idx.by_op;
+                    core.next_run = idx.next_run;
+                }
+            }
+            None => {}
         }
+        // One record at a time: restart memory is the index, not the log.
         let mut max_run = core.next_run.saturating_sub(1);
-        for r in durable_journal::replay_dir(&gdir)? {
-            let env: Envelope = serde_json::from_slice(&r.payload)?;
-            max_run = max_run.max(env.run);
-            core.apply_committed(RunId(env.run), env.event, env.at)?;
+        if let Some(records) = durable_journal::records(&gdir)? {
+            for r in records {
+                let r = r?;
+                let env: Envelope = serde_json::from_slice(&r.payload)?;
+                max_run = max_run.max(env.run);
+                core.apply_committed(RunId(env.run), env.event, env.at)?;
+            }
         }
         core.next_run = max_run + 1;
         core.recount();
@@ -431,6 +444,14 @@ impl EngineCore {
                 }
             }
         }
+    }
+
+    /// Take a decoded snapshot as the index; dedup keys are exactly the
+    /// retained runs' keys.
+    fn install(&mut self, next_run: u64, runs: BTreeMap<RunId, Arc<Run>>) {
+        self.by_op = runs.values().map(|r| (r.key.clone(), r.id)).collect();
+        self.runs = runs;
+        self.next_run = next_run;
     }
 
     /// Recompute the admission counters from the index (after replay).

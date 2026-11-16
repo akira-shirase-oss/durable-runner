@@ -1,0 +1,101 @@
+{
+  "machine": {
+    "host": "maintainer laptop",
+    "platform": "darwin/arm64",
+    "cpu": "Apple M2 Pro",
+    "cores": 12,
+    "mem_gb": 32,
+    "date": "2026-11-16",
+    "note": "shared machine; load average recorded per run; development observation, not capacity"
+  },
+  "scenario": "restart-memory (review S1)",
+  "method": "restart_probe_fill fills PROBE_DIR with queued runs (1 KiB inputs, delayed start) and optionally compacts; restart_probe_open runs EngineCore::open in a separate process under /usr/bin/time -l (max resident set = restart peak)",
+  "commits": {
+    "before": "3da25ef (whole-file snapshot read + payload copy; journal replay collected into a Vec) + probes",
+    "after": "streamed snapshot decode and per-record replay (this commit)"
+  },
+  "runs": [
+    {
+      "variant": "before",
+      "runs": 100000,
+      "compacted": true,
+      "snapshot_mib": 104,
+      "log_mib": 0,
+      "load_1m": 28.3,
+      "restart_peak_rss_mib": 342,
+      "open_s": 0.08
+    },
+    {
+      "variant": "before",
+      "runs": 100000,
+      "compacted": false,
+      "snapshot_mib": 0,
+      "log_mib": 381,
+      "load_1m": 28.3,
+      "restart_peak_rss_mib": 547,
+      "open_s": 2.21
+    },
+    {
+      "variant": "before",
+      "runs": 800000,
+      "compacted": true,
+      "snapshot_mib": 833,
+      "log_mib": 0,
+      "load_1m": 22.0,
+      "restart_peak_rss_mib": 2716,
+      "open_s": 0.56
+    },
+    {
+      "variant": "before",
+      "runs": 800000,
+      "compacted": false,
+      "snapshot_mib": 0,
+      "log_mib": 2946,
+      "load_1m": 16.3,
+      "restart_peak_rss_mib": 4334,
+      "open_s": 11.62
+    },
+    {
+      "variant": "after",
+      "runs": 100000,
+      "compacted": true,
+      "snapshot_mib": 113,
+      "log_mib": 0,
+      "load_1m": 11.1,
+      "restart_peak_rss_mib": 135,
+      "open_s": 0.06
+    },
+    {
+      "variant": "after",
+      "runs": 100000,
+      "compacted": false,
+      "snapshot_mib": 0,
+      "log_mib": 379,
+      "load_1m": 11.1,
+      "restart_peak_rss_mib": 153,
+      "open_s": 1.11
+    },
+    {
+      "variant": "after",
+      "runs": 800000,
+      "compacted": true,
+      "snapshot_mib": 830,
+      "log_mib": 0,
+      "load_1m": 8.9,
+      "restart_peak_rss_mib": 1057,
+      "open_s": 0.51
+    },
+    {
+      "variant": "after",
+      "runs": 800000,
+      "compacted": false,
+      "snapshot_mib": 0,
+      "log_mib": 2945,
+      "load_1m": 8.6,
+      "restart_peak_rss_mib": 1200,
+      "open_s": 9.55
+    }
+  ],
+  "reading": "Restart memory was the snapshot twice and then the index (compacted), or every journal record and then the index (uncompacted, the default since compaction is off). Now it is the index plus a buffer: about 1.3 KB of RSS per queued 1 KiB run, which is 2.6x less at 800k from a snapshot and 3.6x less from a journal. Snapshot sizes differ by du rounding; the format did not change.",
+  "verdict": "improvement measured; no capacity claim"
+}

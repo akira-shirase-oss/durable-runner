@@ -2603,6 +2603,73 @@ mod tests {
         }
     }
 
+    /// Restart-memory probe, part 1 (review S1): fill `PROBE_DIR` with
+    /// `PROBE_RUNS` queued runs of `PROBE_INPUT` bytes, compacting at the
+    /// end if `PROBE_COMPACT=1`. Part 2 (`restart_probe_open`) runs in a
+    /// separate process so `/usr/bin/time -l` sees only the restart.
+    #[tokio::test(flavor = "current_thread")]
+    #[ignore = "measurement probe: run explicitly, in release mode"]
+    async fn restart_probe_fill() {
+        let var = |k: &str| std::env::var(k).ok();
+        let dir =
+            std::path::PathBuf::from(var("PROBE_DIR").unwrap_or_else(|| panic!("set PROBE_DIR")));
+        let runs: usize = var("PROBE_RUNS")
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(100_000);
+        let input: usize = var("PROBE_INPUT")
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(1024);
+        let compact = var("PROBE_COMPACT").as_deref() == Some("1");
+        let limits = Limits {
+            max_live_runs: usize::MAX,
+            max_index_bytes: u64::MAX,
+            ..Limits::default()
+        };
+        let cfg = ShellConfig {
+            cmd_capacity: 4096,
+            max_outbox_records: 1 << 20,
+            limits,
+            ..Default::default()
+        };
+        let eng = spawn(&dir, echo_registry(), cfg).unwrap_or_else(|e| panic!("{e}"));
+        let payload: Vec<u8> = (0..input).map(|i| (i * 7 % 251) as u8).collect();
+        let mut next = 0;
+        while next < runs {
+            let mut hs = Vec::new();
+            for _ in 0..512.min(runs - next) {
+                let e = eng.clone();
+                let mut s = spec1("echo");
+                s.input = payload.clone();
+                let k = OperationKey(format!("restart-{next}"));
+                hs.push(tokio::spawn(async move { e.submit_at(k, s, FAR).await }));
+                next += 1;
+            }
+            for h in hs {
+                h.await
+                    .unwrap_or_else(|e| panic!("{e}"))
+                    .unwrap_or_else(|e| panic!("{e}"));
+            }
+        }
+        if compact {
+            eng.compact().await.unwrap_or_else(|e| panic!("{e}"));
+        }
+        println!("FILLED runs={runs} input={input} compacted={compact}");
+    }
+
+    /// Restart-memory probe, part 2: open `PROBE_DIR` (replay) and report.
+    #[test]
+    #[ignore = "measurement probe: run explicitly, in release mode"]
+    fn restart_probe_open() {
+        let dir = std::env::var("PROBE_DIR").unwrap_or_else(|_| panic!("set PROBE_DIR"));
+        let t = std::time::Instant::now();
+        let core = EngineCore::open(Path::new(&dir)).unwrap_or_else(|e| panic!("{e}"));
+        println!(
+            "OPENED runs={} open_s={:.2}",
+            core.runs().count(),
+            t.elapsed().as_secs_f64()
+        );
+    }
+
     /// A failed fsync must stop the engine — never retry it, never keep
     /// serving on a writer whose memory may be ahead of disk — and the
     /// restart must replay a clean journal holding only durable records.

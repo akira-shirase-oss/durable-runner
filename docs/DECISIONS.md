@@ -354,3 +354,29 @@ convention; these seed the contract's prescribed directions.
   parent directory is fsynced. The next attempt at that name removes a
   stale partial first. The server sweeps every `.*.partial` from the
   backup root at startup.
+- **D-028 — Restart streams the snapshot and the journal.** Every poison
+  exit (D-009, D-015, D-019) recovers by restarting, so restart must fit
+  the host. `load_snapshot` read the whole `snapshot.bin`, then copied
+  its payload, then decoded the index while the copy was alive. Review
+  measured 2.7 GB at 800k runs. Journal replay collected every record
+  into a `Vec` before applying any of them, and with compaction off by
+  default (D-018) that is the common path: 4.3 GB at 800k. Now:
+  - The snapshot is decoded straight from a buffered reader with a
+    running CRC. `SnapshotReader::finish` verifies the checksum before
+    the decoded index is used, and a length that disagrees with the
+    header is refused before reading.
+  - The decoder bounds every allocation by the bytes left.
+  - `Journal::open` verifies the log frame by frame with one reused
+    buffer.
+  - The engine replays through `records()`, one record at a time.
+
+  Measured restart peak RSS in a separate process (load 9-28,
+  `perf/results/2026-11-16T18-40-00Z-restart-memory.json`):
+
+  | 1 KiB runs | from snapshot | from journal |
+  |---|---|---|
+  | 100k | 342 -> 135 MiB | 547 -> 153 MiB |
+  | 800k | 2,716 -> 1,057 MiB | 4,334 -> 1,200 MiB |
+
+  Restart memory is now the index itself, about 1.3 KB per queued 1 KiB
+  run. The default index bound is sized against that in D-030.

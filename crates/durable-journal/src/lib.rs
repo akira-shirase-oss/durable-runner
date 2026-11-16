@@ -292,40 +292,69 @@ fn crc(payload: &[u8]) -> u32 {
 /// Replay every committed record in a generation's journal.log, in order.
 /// A torn tail (the file ends inside a frame) is discarded; anything else
 /// wrong — bad version, bad checksum, a sequence gap, a truncated non-tail
-/// frame — is corruption and stops the caller.
+/// frame — is corruption and stops the caller. Collects everything; for a
+/// bounded-memory pass use `records`.
 pub fn replay_dir(dir: &Path) -> Result<Vec<Record>, JournalError> {
-    let log = dir.join("journal.log");
-    if !log.exists() {
-        return Ok(Vec::new());
+    match records(dir)? {
+        Some(rs) => rs.collect(),
+        None => Ok(Vec::new()),
     }
-    let mut f = File::open(&log)?;
-    replay(&mut f)
 }
 
-fn replay(f: &mut File) -> Result<Vec<Record>, JournalError> {
-    let file_len = f.metadata()?.len();
-    let mut records = Vec::new();
-    let mut pos = 0u64;
-    let mut expected_seq = 1u64;
-    loop {
-        if pos == file_len {
-            return Ok(records);
-        }
-        // Torn tail: fewer than HEADER_LEN bytes remain.
-        if file_len - pos < HEADER_LEN as u64 {
-            return Ok(records);
+/// The committed records of a generation's journal.log, one at a time
+/// (`None` if there is no log). Memory stays one record plus a buffer, not
+/// the whole history — restart replays through this (D-028).
+pub fn records(dir: &Path) -> Result<Option<Records>, JournalError> {
+    match File::open(dir.join("journal.log")) {
+        Ok(f) => Ok(Some(Records::new(f)?)),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e.into()),
+    }
+}
+
+/// A streaming frame reader with replay's rules: a demonstrably torn tail
+/// ends it; any other damage is `Corrupt`.
+pub struct Records {
+    r: io::BufReader<File>,
+    file_len: u64,
+    /// End of the last good frame.
+    pos: u64,
+    expected_seq: u64,
+    done: bool,
+}
+
+impl Records {
+    fn new(f: File) -> io::Result<Self> {
+        let file_len = f.metadata()?.len();
+        Ok(Self {
+            r: io::BufReader::with_capacity(256 * 1024, f),
+            file_len,
+            pos: 0,
+            expected_seq: 1,
+            done: false,
+        })
+    }
+
+    /// Bytes covered by the good frames read so far.
+    pub fn good_len(&self) -> u64 {
+        self.pos
+    }
+
+    /// Read the next committed frame's payload into `buf`; its sequence
+    /// number, or `None` at the end (or at a torn tail).
+    fn advance(&mut self, buf: &mut Vec<u8>) -> Result<Option<u64>, JournalError> {
+        if self.done || self.pos == self.file_len || self.file_len - self.pos < HEADER_LEN as u64 {
+            self.done = true; // the end, or a torn tail: fewer than HEADER_LEN bytes
+            return Ok(None);
         }
         let mut hdr = [0u8; HEADER_LEN];
-        f.read_exact(&mut hdr)?;
-        let version =
-            u16::from_be_bytes(hdr[0..2].try_into().map_err(|_| io::Error::other("hdr"))?);
-        let len = u32::from_be_bytes(hdr[2..6].try_into().map_err(|_| io::Error::other("hdr"))?);
-        let seq = u64::from_be_bytes(hdr[6..14].try_into().map_err(|_| io::Error::other("hdr"))?);
-        let want_crc = u32::from_be_bytes(
-            hdr[14..18]
-                .try_into()
-                .map_err(|_| io::Error::other("hdr"))?,
-        );
+        self.r.read_exact(&mut hdr)?;
+        let version = u16::from_be_bytes([hdr[0], hdr[1]]);
+        let len = u32::from_be_bytes([hdr[2], hdr[3], hdr[4], hdr[5]]);
+        let mut seq_b = [0u8; 8];
+        seq_b.copy_from_slice(&hdr[6..14]);
+        let seq = u64::from_be_bytes(seq_b);
+        let want_crc = u32::from_be_bytes([hdr[14], hdr[15], hdr[16], hdr[17]]);
         if version != FORMAT_VERSION {
             return Err(JournalError::Corrupt {
                 seq,
@@ -338,29 +367,46 @@ fn replay(f: &mut File) -> Result<Vec<Record>, JournalError> {
                 why: format!("len {len} over cap"),
             });
         }
-        let frame_end = pos + HEADER_LEN as u64 + len as u64;
-        if frame_end > file_len {
+        let frame_end = self.pos + HEADER_LEN as u64 + len as u64;
+        if frame_end > self.file_len {
             // Torn tail: header complete, payload short — safe to discard.
-            return Ok(records);
+            self.done = true;
+            return Ok(None);
         }
-        let mut payload = vec![0u8; len as usize];
-        f.read_exact(&mut payload)?;
-        if crc(&payload) != want_crc {
+        buf.clear();
+        buf.resize(len as usize, 0);
+        self.r.read_exact(buf)?;
+        if crc(buf) != want_crc {
             return Err(JournalError::Corrupt {
                 seq,
                 why: "checksum".into(),
             });
         }
-        if seq != expected_seq {
+        if seq != self.expected_seq {
             return Err(JournalError::Corrupt {
                 seq,
-                why: format!("expected seq {expected_seq}"),
+                why: format!("expected seq {}", self.expected_seq),
             });
         }
-        records.push(Record { seq, payload });
-        expected_seq += 1;
-        pos = frame_end;
-        f.seek(SeekFrom::Start(pos))?;
+        self.expected_seq += 1;
+        self.pos = frame_end;
+        Ok(Some(seq))
+    }
+}
+
+impl Iterator for Records {
+    type Item = Result<Record, JournalError>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let mut payload = Vec::new();
+        match self.advance(&mut payload) {
+            Ok(Some(seq)) => Some(Ok(Record { seq, payload })),
+            Ok(None) => None,
+            Err(e) => {
+                self.done = true;
+                Some(Err(e))
+            }
+        }
     }
 }
 
@@ -451,17 +497,22 @@ impl Journal {
             sync_dir(&opts, dir)?; // the generation directory's entry
         }
 
-        // Replay: verify committed history, then truncate a torn tail only.
-        let records = replay(&mut file)?;
-        let good_len = records
-            .iter()
-            .fold(0u64, |p, r| p + HEADER_LEN as u64 + r.payload.len() as u64);
+        // Verify committed history frame by frame (one payload buffer, never
+        // the whole log in memory), then truncate a torn tail only.
+        let mut scan = Records::new(File::open(&log_path)?)?;
+        let mut buf = Vec::new();
+        let mut last_seq = 0;
+        while let Some(seq) = scan.advance(&mut buf)? {
+            last_seq = seq;
+        }
+        let good_len = scan.good_len();
+        drop(scan);
         if file.metadata()?.len() != good_len {
             file.set_len(good_len)?; // discard the demonstrably-torn tail
             file.sync_data()?;
         }
         file.seek(SeekFrom::End(0))?;
-        let next_seq = records.last().map_or(1, |r| r.seq + 1);
+        let next_seq = last_seq + 1;
         Ok(Self {
             root: dir.into(),
             generation,
@@ -1005,48 +1056,133 @@ fn write_snapshot_stream(
     Ok(())
 }
 
-/// Load the generation's snapshot if one exists, verified. A legacy
-/// `snapshot.json` (no checksum) from before D-021 is still read.
-pub fn load_snapshot(dir: &Path) -> Result<Option<Snapshot>, JournalError> {
-    match fs::read(dir.join("snapshot.bin")) {
-        Ok(bytes) => return decode_snapshot(&bytes).map(Some),
+/// A generation's snapshot as found on disk.
+pub enum SnapshotSource {
+    /// `snapshot.bin`, streamed: read the payload, then `finish` verifies
+    /// its checksum — before anything decoded from it is used.
+    Binary(SnapshotReader),
+    /// A legacy `snapshot.json` (before D-021), read whole; no checksum.
+    Legacy(Snapshot),
+}
+
+/// The payload of a `snapshot.bin`, read through a bounded buffer with a
+/// running CRC: memory stays a buffer, not the snapshot's size (D-028).
+pub struct SnapshotReader {
+    r: io::BufReader<File>,
+    left: u64,
+    crc: crc32fast::Hasher,
+    want: u32,
+    covered_seq: u64,
+}
+
+impl SnapshotReader {
+    /// Payload bytes not yet read.
+    pub fn remaining(&self) -> u64 {
+        self.left
+    }
+
+    pub fn covered_seq(&self) -> u64 {
+        self.covered_seq
+    }
+
+    /// Verify that the whole payload was read and its checksum matches.
+    pub fn finish(self) -> Result<u64, JournalError> {
+        if self.left != 0 {
+            return Err(JournalError::CorruptSnapshot(format!(
+                "{} payload bytes were not read",
+                self.left
+            )));
+        }
+        if self.crc.finalize() != self.want {
+            return Err(JournalError::CorruptSnapshot("checksum mismatch".into()));
+        }
+        Ok(self.covered_seq)
+    }
+}
+
+impl Read for SnapshotReader {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        let room = buf
+            .len()
+            .min(usize::try_from(self.left).unwrap_or(usize::MAX));
+        if room == 0 {
+            return Ok(0);
+        }
+        let n = self.r.read(&mut buf[..room])?;
+        if n == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "snapshot shorter than its header says",
+            ));
+        }
+        self.crc.update(&buf[..n]);
+        self.left -= n as u64;
+        Ok(n)
+    }
+}
+
+/// Open the generation's snapshot, if any, for a streamed, verified read.
+pub fn open_snapshot(dir: &Path) -> Result<Option<SnapshotSource>, JournalError> {
+    match File::open(dir.join("snapshot.bin")) {
+        Ok(f) => return open_binary(f).map(|r| Some(SnapshotSource::Binary(r))),
         Err(e) if e.kind() == io::ErrorKind::NotFound => {}
         Err(e) => return Err(e.into()),
     }
     match fs::read(dir.join("snapshot.json")) {
         Ok(bytes) => serde_json::from_slice(&bytes)
-            .map(Some)
+            .map(|s| Some(SnapshotSource::Legacy(s)))
             .map_err(|e| JournalError::CorruptSnapshot(format!("legacy snapshot: {e}"))),
         Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
         Err(e) => Err(e.into()),
     }
 }
 
-fn decode_snapshot(bytes: &[u8]) -> Result<Snapshot, JournalError> {
+fn open_binary(f: File) -> Result<SnapshotReader, JournalError> {
     let bad = |why: &str| JournalError::CorruptSnapshot(why.to_string());
-    let header = bytes
-        .get(..SNAPSHOT_HEADER_LEN as usize)
-        .ok_or_else(|| bad("shorter than its header"))?;
+    let file_len = f.metadata()?.len();
+    if file_len < SNAPSHOT_HEADER_LEN {
+        return Err(bad("shorter than its header"));
+    }
+    let mut r = io::BufReader::with_capacity(256 * 1024, f);
+    let mut header = [0u8; SNAPSHOT_HEADER_LEN as usize];
+    r.read_exact(&mut header)?;
     if &header[..8] != SNAPSHOT_MAGIC {
         return Err(bad("unknown magic or frame version"));
     }
-    let word = |r: std::ops::Range<usize>| -> u64 {
-        header[r]
+    let word = |range: std::ops::Range<usize>| -> u64 {
+        header[range]
             .iter()
             .fold(0u64, |acc, b| (acc << 8) | u64::from(*b))
     };
     let (covered_seq, len, want) = (word(8..16), word(16..24), word(24..28) as u32);
-    let payload = &bytes[SNAPSHOT_HEADER_LEN as usize..];
-    if payload.len() as u64 != len {
+    if file_len - SNAPSHOT_HEADER_LEN != len {
         return Err(bad("payload length does not match its header"));
     }
-    if crc(payload) != want {
-        return Err(bad("checksum mismatch"));
-    }
-    Ok(Snapshot {
+    Ok(SnapshotReader {
+        r,
+        left: len,
+        crc: crc32fast::Hasher::new(),
+        want,
         covered_seq,
-        payload: payload.to_vec(),
     })
+}
+
+/// Load the generation's snapshot whole, verified (tests and tools; the
+/// engine streams through `open_snapshot`).
+pub fn load_snapshot(dir: &Path) -> Result<Option<Snapshot>, JournalError> {
+    match open_snapshot(dir)? {
+        None => Ok(None),
+        Some(SnapshotSource::Legacy(s)) => Ok(Some(s)),
+        Some(SnapshotSource::Binary(mut r)) => {
+            let mut payload = Vec::new();
+            r.read_to_end(&mut payload)?;
+            let covered_seq = r.finish()?;
+            Ok(Some(Snapshot {
+                covered_seq,
+                payload,
+            }))
+        }
+    }
 }
 
 /// Replay only records after `from_seq` (used with a snapshot).
@@ -1539,6 +1675,38 @@ mod tests {
         assert!(out.path().join("nightly").exists());
         assert!(out.path().join(".keep").exists());
         assert!(!out.path().join(".t0.partial").exists());
+    }
+
+    /// The streamed snapshot reader refuses a file whose length disagrees
+    /// with its header before reading the payload, and verifies the
+    /// checksum only once every byte has been read.
+    #[test]
+    fn streamed_snapshot_checks_length_and_checksum() {
+        let dir = tempfile::tempdir().unwrap_or_else(|e| panic!("{e}"));
+        let snap = Snapshot {
+            covered_seq: 3,
+            payload: (0..5000u32).map(|i| (i % 251) as u8).collect(),
+        };
+        write_snapshot(dir.path(), &snap).unwrap_or_else(|e| panic!("{e}"));
+        let Some(SnapshotSource::Binary(mut r)) =
+            open_snapshot(dir.path()).unwrap_or_else(|e| panic!("{e}"))
+        else {
+            panic!("binary snapshot expected")
+        };
+        let mut half = vec![0u8; 2500];
+        r.read_exact(&mut half).unwrap_or_else(|e| panic!("{e}"));
+        assert!(
+            matches!(r.finish(), Err(JournalError::CorruptSnapshot(_))),
+            "a partly read snapshot is not verified"
+        );
+        let file = dir.path().join("snapshot.bin");
+        let mut bytes = fs::read(&file).unwrap_or_else(|e| panic!("{e}"));
+        bytes.pop();
+        fs::write(&file, &bytes).unwrap_or_else(|e| panic!("{e}"));
+        assert!(matches!(
+            open_snapshot(dir.path()),
+            Err(JournalError::CorruptSnapshot(_))
+        ));
     }
 
     #[test]
