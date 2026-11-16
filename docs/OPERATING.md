@@ -78,11 +78,14 @@ $CLI compact
 $CLI backup --name nightly-1          # -> data/backups/nightly-1
 ```
 
-Bounds a submit must respect (refused `409 refused: job spec over limits`
+Bounds a submit must respect (refused `409 {"code":"over_limits"}`
 otherwise, before anything is journaled): `op_key` 1-256 bytes without
 control characters, step and handler names 1-128 bytes, input 64 KiB, at
 most 64 steps; the whole request body 256 KiB (`413`). A handler reply
 larger than 256 KiB fails the attempt (it is read only up to the limit).
+The key bound applies to new keys: resubmitting a key that already has a
+run returns that run even if the key is longer than today's bound (it was
+accepted under an earlier one).
 
 A backup name is a plain name (`[A-Za-z0-9_.-]`, up to 64, not starting
 with `.`): the server writes only `<backup-root>/<name>` and refuses an

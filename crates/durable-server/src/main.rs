@@ -342,6 +342,12 @@ impl From<EngineError> for ApiError {
                 "at_capacity",
                 "the runner holds as many runs as it is configured to; retry later with the same op_key",
             ),
+            EngineError::Refused(Refusal::OverLimits) => Self::new(
+                StatusCode::CONFLICT,
+                "over_limits",
+                "job spec over limits (op_key 1-256 bytes without control characters, \
+                 names 1-128 bytes, input 64 KiB, at most 64 steps)",
+            ),
             EngineError::Refused(r) => Self::new(StatusCode::CONFLICT, "refused", r.to_string()),
             EngineError::UnregisteredHandler(_) => {
                 Self::new(StatusCode::CONFLICT, "unregistered_handler", e.to_string())
@@ -1392,6 +1398,23 @@ mod tests {
         assert_eq!(
             (status, v["code"].clone()),
             (StatusCode::BAD_REQUEST, json!("bad_body"))
+        );
+    }
+
+    #[tokio::test]
+    async fn over_long_key_is_refused_with_a_stable_code() {
+        let h = harness(false);
+        let (status, v) = call(
+            &h.router,
+            "POST",
+            "/jobs",
+            Some(KEY),
+            Some(submit_body(&"k".repeat(300))),
+        )
+        .await;
+        assert_eq!(
+            (status, v["code"].clone()),
+            (StatusCode::CONFLICT, json!("over_limits"))
         );
     }
 

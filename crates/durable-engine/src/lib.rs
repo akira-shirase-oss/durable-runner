@@ -559,10 +559,12 @@ impl EngineCore {
         not_before: Millis,
         now: Millis,
     ) -> Result<RunId, EngineError> {
-        self.limits.admits_key(&key)?;
+        // Dedup first: a run accepted under an older (larger) key bound
+        // must still return itself. The bound refuses new keys only.
         if let Some(existing) = self.by_op.get(&key) {
             return Ok(*existing); // duplicate: hand back the original run
         }
+        self.limits.admits_key(&key)?;
         self.limits.admits(&spec)?; // limits refuse before anything is written
                                     // Capacity: a bounded index, refused explicitly (contract: "cap
                                     // memory and disk; reject overload explicitly").
@@ -1260,6 +1262,28 @@ mod tests {
         assert!(matches!(
             e.submit(OperationKey("bytes".into()), spec(), 3),
             Err(EngineError::Refused(Refusal::AtCapacity))
+        ));
+    }
+
+    /// Review finding 15(b): a run accepted with a key over today's bound
+    /// (journaled before the bound, or under a larger one) must still
+    /// deduplicate. The key bound applies to new keys only.
+    #[test]
+    fn existing_over_long_key_still_deduplicates() {
+        let (_d, mut e) = open();
+        e.limits.max_key_bytes = 1024;
+        let long = OperationKey("k".repeat(300));
+        let id = e
+            .submit(long.clone(), spec(), 0)
+            .unwrap_or_else(|e| panic!("{e}"));
+        e.limits.max_key_bytes = 256; // the bound tightens (an upgrade)
+        let again = e
+            .submit(long, spec(), 1)
+            .unwrap_or_else(|e| panic!("dedup must still find the original run: {e}"));
+        assert_eq!(again, id);
+        assert!(matches!(
+            e.submit(OperationKey("n".repeat(300)), spec(), 2),
+            Err(EngineError::Refused(Refusal::OverLimits))
         ));
     }
 
