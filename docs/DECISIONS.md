@@ -121,9 +121,9 @@ convention; these seed the contract's prescribed directions.
   carry to Linux. Assumed: a *successful* fsync makes every byte written to
   that file before it durable. Not assumed: that unsynced bytes reach disk
   in order or whole, that a file's length and its data persist together,
-  or that a failed fsync can be retried. Known gap (not built): directory
-  entries are fsynced for manifest and snapshot renames, but not for the
-  generation directory and `journal.log` created on first open.
+  or that a failed fsync can be retried. Directory entries are fsynced for
+  manifest and snapshot renames and, since D-025, for the generation
+  directory and `journal.log` created on first open.
 
   *The boundaries of one record.*
   1. **Before the write.** Nothing is on disk. A crash loses only the
@@ -328,3 +328,11 @@ convention; these seed the contract's prescribed directions.
   original run. The server exposes `--max-live-runs`,
   `--max-index-bytes`, `--max-in-flight` and `--max-dispatch-per-tick`.
   Diagnostics report `active_runs` and `index_bytes`.
+- **D-025 — First open makes its directory entries durable.** D-014
+  named the gap: the manifest's rename was fsynced, but `gen-000001/`
+  and its `journal.log`, created on first open, never had their directory
+  entries fsynced. Under the power-loss model, jobs acknowledged before
+  the first compaction could vanish with the entry. `Journal::open` now
+  fsyncs the directory holding each entry it creates before returning:
+  the root's parent (if it created the root), the root (manifest),
+  `gen-000001/` (`journal.log`) and the root again (`gen-000001/`).

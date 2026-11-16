@@ -41,6 +41,7 @@ pub mod faults {
         released: Condvar,
         // 0 = disarmed; n = the process "dies" at compaction step n.
         compaction_crash: AtomicU64,
+        dir_syncs: Mutex<Vec<std::path::PathBuf>>,
     }
 
     impl Faults {
@@ -70,6 +71,19 @@ pub mod faults {
                 return Err(std::io::Error::other("injected crash during compaction"));
             }
             Ok(())
+        }
+        /// Directories fsynced at open, in order.
+        pub fn dir_syncs(&self) -> Vec<std::path::PathBuf> {
+            self.dir_syncs
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .clone()
+        }
+        pub(crate) fn record_dir_sync(&self, dir: &std::path::Path) {
+            self.dir_syncs
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .push(dir.to_path_buf());
         }
         /// How many times the log was fsynced (rollbacks excluded).
         pub fn sync_calls(&self) -> u64 {
@@ -365,7 +379,18 @@ impl Journal {
 
     /// `open` with explicit options.
     pub fn open_with(dir: &Path, opts: JournalOptions) -> Result<Self, JournalError> {
+        // Directory entries created here are fsynced before the first
+        // append can be acknowledged (D-025): a new file or directory is
+        // durable only once the directory holding its entry is.
+        let root_existed = dir.exists();
         fs::create_dir_all(dir)?;
+        if !root_existed {
+            let parent = dir
+                .parent()
+                .filter(|p| !p.as_os_str().is_empty())
+                .unwrap_or(Path::new("."));
+            sync_dir(&opts, parent)?;
+        }
         let lock_path = dir.join("LOCK");
         let lock_file = OpenOptions::new()
             .read(true)
@@ -389,21 +414,29 @@ impl Journal {
                 fs::write(&tmp, serde_json::to_string(&m).map_err(io::Error::other)?)?;
                 File::open(&tmp)?.sync_data()?;
                 fs::rename(&tmp, &manifest_path)?;
-                sync_parent(&manifest_path)?;
+                sync_dir(&opts, dir)?;
                 1
             }
             Err(e) => return Err(e.into()),
         };
 
         let gdir = gen_dir_path(dir, generation);
+        let gen_existed = gdir.exists();
         fs::create_dir_all(&gdir)?;
         let log_path = gdir.join("journal.log");
+        let log_existed = log_path.exists();
         let mut file = OpenOptions::new()
             .read(true)
             .write(true)
             .create(true)
             .truncate(false)
             .open(&log_path)?;
+        if !log_existed {
+            sync_dir(&opts, &gdir)?; // journal.log's entry
+        }
+        if !gen_existed {
+            sync_dir(&opts, dir)?; // the generation directory's entry
+        }
 
         // Replay: verify committed history, then truncate a torn tail only.
         let records = replay(&mut file)?;
@@ -951,6 +984,15 @@ pub fn replay_dir_from(dir: &Path, from_seq: u64) -> Result<Vec<Record>, Journal
         .collect())
 }
 
+/// fsync a directory, so the entries created in it are durable.
+fn sync_dir(_opts: &JournalOptions, dir: &Path) -> io::Result<()> {
+    #[cfg(any(test, feature = "fault-injection"))]
+    if let Some(f) = _opts.faults.as_ref() {
+        f.record_dir_sync(dir);
+    }
+    File::open(dir)?.sync_data()
+}
+
 fn sync_parent(path: &Path) -> io::Result<()> {
     if let Some(parent) = path.parent() {
         File::open(parent)?.sync_data()?;
@@ -1359,6 +1401,30 @@ mod tests {
                 Err(JournalError::CorruptSnapshot(_))
             ),
             "a damaged snapshot must not load"
+        );
+    }
+
+    /// Review finding 8 (D-014's named gap): on first open the new
+    /// generation directory and its `journal.log` were created but their
+    /// directory entries never fsynced, so under power loss jobs
+    /// acknowledged before the first compaction could vanish with the
+    /// entry. Both directories must be fsynced before the first append.
+    #[test]
+    fn first_open_makes_its_directory_entries_durable() {
+        let dir = tempfile::tempdir().unwrap_or_else(|e| panic!("{e}"));
+        let root = dir.path().join("journal");
+        let (_j, f) = open_faulty(&root);
+        let synced = f.dir_syncs();
+        let gdir = gen_dir_path(&root, 1);
+        assert!(
+            synced.contains(&gdir),
+            "gen-000001 (holding journal.log's entry) not fsynced: {synced:?}"
+        );
+        let last_root = synced.iter().rposition(|p| *p == root);
+        let gen_created = synced.iter().position(|p| *p == gdir);
+        assert!(
+            matches!((last_root, gen_created), (Some(r), Some(g)) if r > g),
+            "the root (holding gen-000001's entry) must be fsynced after the generation exists: {synced:?}"
         );
     }
 
