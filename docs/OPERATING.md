@@ -32,7 +32,11 @@ target/release/durable-server \
   (an `op_key` reused after that re-executes) and deletes every superseded
   `gen-*` directory, so the journal directory holds one generation. `GET /admin/diagnostics` reports
   `stale_generations` (0 unless a delete failed; the next compaction
-  retries it).
+  retries it). A compaction whose snapshot would exceed
+  `--max-snapshot-bytes` (default 2 GiB) is refused `409
+  snapshot_over_budget` before anything is written. A damaged
+  `snapshot.bin` stops startup (`snapshot is damaged`): restore from a
+  backup.
 - **API key.** The server refuses to start without `DURABLE_API_KEY` (read
   from the environment, never argv). Every mutating and admin route —
   `POST /jobs`, `POST /jobs/{id}/cancel`, `POST /admin/compact`,

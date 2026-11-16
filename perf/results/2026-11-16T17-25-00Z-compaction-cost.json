@@ -1,0 +1,99 @@
+{
+  "machine": {
+    "host": "maintainer laptop",
+    "platform": "darwin/arm64",
+    "cpu": "Apple M2 Pro",
+    "cores": 12,
+    "mem_gb": 32,
+    "date": "2026-11-16",
+    "note": "shared, busy machine; load averages recorded per run; development observation, not capacity"
+  },
+  "scenario": "compaction-cost (review finding 3)",
+  "workload": {
+    "retained_runs": 100000,
+    "input_bytes": 1024,
+    "steps": 1,
+    "start": "delayed (pure accept path, no dispatch)"
+  },
+  "probe": "crates/durable-engine/src/shell.rs::compaction_cost_probe, release build, under /usr/bin/time -l",
+  "command": "PROBE_RUNS=100000 PROBE_INPUT=1024 /usr/bin/time -l <release test binary> --ignored compaction_cost_probe --nocapture",
+  "commits": {
+    "before": "7cb1324 (JSON snapshot, index cloned + encoded on the actor) + the probe",
+    "after": "binary streamed snapshot, Arc view (this commit)"
+  },
+  "fields": "compact_s = POST compact to reply; submit_during_ms = a submit issued 20 ms into the compaction; reopen_s = EngineCore::open after the compaction; peak_rss = max resident set of the probe process (includes the 100k-run fill)",
+  "runs": [
+    {
+      "variant": "before",
+      "load_1m": 25.4,
+      "snapshot_mib": 1104.3,
+      "compact_s": 2.49,
+      "submit_during_ms": 2058.0,
+      "idle_submit_ms": 3.7,
+      "reopen_s": 4.01,
+      "peak_rss_mib": 1770
+    },
+    {
+      "variant": "after",
+      "load_1m": 79.0,
+      "snapshot_mib": 103.2,
+      "compact_s": 0.17,
+      "submit_during_ms": 159.3,
+      "idle_submit_ms": 4.0,
+      "reopen_s": 0.07,
+      "peak_rss_mib": 458
+    },
+    {
+      "variant": "after",
+      "load_1m": 79.0,
+      "snapshot_mib": 103.2,
+      "compact_s": 0.17,
+      "submit_during_ms": 152.6,
+      "idle_submit_ms": 4.8,
+      "reopen_s": 0.08,
+      "peak_rss_mib": 458
+    },
+    {
+      "variant": "before",
+      "load_1m": 54.3,
+      "snapshot_mib": 1104.3,
+      "compact_s": 2.51,
+      "submit_during_ms": 2042.2,
+      "idle_submit_ms": 4.9,
+      "reopen_s": 4.13,
+      "peak_rss_mib": 1870
+    },
+    {
+      "variant": "after",
+      "load_1m": 48.8,
+      "snapshot_mib": 103.2,
+      "compact_s": 0.1,
+      "submit_during_ms": 81.8,
+      "idle_submit_ms": 3.9,
+      "reopen_s": 0.06,
+      "peak_rss_mib": 458
+    },
+    {
+      "variant": "before",
+      "load_1m": 48.8,
+      "snapshot_mib": 1104.3,
+      "compact_s": 2.41,
+      "submit_during_ms": 1955.4,
+      "idle_submit_ms": 3.8,
+      "reopen_s": 4.14,
+      "peak_rss_mib": 1770
+    },
+    {
+      "variant": "after",
+      "load_1m": 46.1,
+      "snapshot_mib": 103.2,
+      "compact_s": 0.13,
+      "submit_during_ms": 106.3,
+      "idle_submit_ms": 4.2,
+      "reopen_s": 0.06,
+      "peak_rss_mib": 459
+    }
+  ],
+  "reading": "Snapshot about 10.7x smaller; compaction about 15-25x faster; the submit stall during compaction drops from about 2 s to 80-160 ms. The remaining stall is the writer writing and fsyncing the 103 MiB snapshot while later appends queue behind it, so it still grows with the retained index. Peak RSS falls from about 1.8 GiB to 0.46 GiB (most of what remains is the 100k-run index itself).",
+  "verdict": "improvement measured; no capacity claim"
+}

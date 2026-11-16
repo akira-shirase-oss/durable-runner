@@ -19,7 +19,7 @@
 //!   journal and stops the writer exactly like a failed append (D-019).
 
 use crate::EngineError;
-use durable_journal::{Journal, JournalError, Snapshot};
+use durable_journal::{Journal, JournalError};
 use std::path::PathBuf;
 use std::sync::mpsc::{self, Receiver, SyncSender, TryRecvError};
 use std::sync::Arc;
@@ -74,8 +74,10 @@ pub struct WriterStatus {
 pub(crate) enum WriterMsg {
     /// Consecutive records; `upto` is the commit index of the last one.
     Append { records: Vec<Vec<u8>>, upto: u64 },
+    /// Encode `view` (exactly `bytes`) straight into the new generation.
     Compact {
-        snapshot: Snapshot,
+        view: crate::snapshot::View,
+        bytes: u64,
         reply: oneshot::Sender<Result<u32, JournalError>>,
     },
     Backup {
@@ -151,8 +153,12 @@ fn run(
                     }
                 }
             }
-            WriterMsg::Compact { snapshot, reply } => {
-                let r = journal.compact(&snapshot).map(|()| journal.generation());
+            WriterMsg::Compact { view, bytes, reply } => {
+                // Streamed: memory stays a buffer, not the snapshot's size.
+                let r = journal
+                    .compact_with(0, bytes, |w| crate::snapshot::encode(&view, w))
+                    .map(|()| journal.generation());
+                drop(view); // release the shared runs promptly
                 match r {
                     Ok(generation) => {
                         st.generation = generation;

@@ -5,7 +5,7 @@
 //! <dir>/LOCK                      exclusive writer lock (flock, non-blocking)
 //! <dir>/manifest.json             { "generation": N }
 //! <dir>/gen-00000N/journal.log    append-only framed records
-//! <dir>/gen-00000N/snapshot.json  optional checkpoint (accelerator only)
+//! <dir>/gen-00000N/snapshot.bin   checksummed checkpoint written by compaction
 //! ```
 //!
 //! Frame: `[version u16][len u32][seq u64][crc32 u32][payload len]` — big
@@ -214,6 +214,10 @@ pub enum JournalError {
     /// the writer is poisoned and a restart opens what the manifest names.
     #[error("manifest names generation {on_disk}, writer is on {in_memory}; poisoned, restart to replay")]
     ManifestMismatch { on_disk: u32, in_memory: u32 },
+    /// The snapshot (the only authority for compacted state) failed its
+    /// checksum or framing: startup stops rather than trust it.
+    #[error("snapshot is damaged: {0}")]
+    CorruptSnapshot(String),
     /// A backup never merges into an existing directory.
     #[error("backup destination already exists")]
     BackupExists,
@@ -615,13 +619,27 @@ impl Journal {
     /// the manifest. A crash at any point opens either the old complete
     /// generation or the new one, never a mixture (contract §02).
     pub fn compact(&mut self, snapshot: &Snapshot) -> Result<(), JournalError> {
+        let payload = &snapshot.payload;
+        self.compact_with(snapshot.covered_seq, payload.len() as u64, |w| {
+            w.write_all(payload)
+        })
+    }
+
+    /// `compact`, with the snapshot payload streamed by `write` (exactly
+    /// `payload_len` bytes) straight into the new generation's checksummed
+    /// `snapshot.bin` — the caller never needs the whole payload in memory.
+    pub fn compact_with(
+        &mut self,
+        covered_seq: u64,
+        payload_len: u64,
+        write: impl FnOnce(&mut dyn Write) -> io::Result<()>,
+    ) -> Result<(), JournalError> {
         if self.poisoned {
             return Err(JournalError::Poisoned);
         }
         // The new generation's snapshot must fit with the reserve intact —
         // checked before anything is written, so a refusal leaves no trace.
-        let snapshot_bytes = serde_json::to_vec(snapshot).map_err(io::Error::other)?;
-        self.ensure_space(&self.root, snapshot_bytes.len() as u64)?;
+        self.ensure_space(&self.root, SNAPSHOT_HEADER_LEN + payload_len)?;
         let next = self.generation + 1;
         let gdir = gen_dir_path(&self.root, next);
         // A `gen-(N+1)` already on disk is what a compaction killed before
@@ -658,7 +676,7 @@ impl Journal {
         self.compaction_step(1)?;
 
         // 2. Snapshot for the new generation (tmp + rename + dir fsync).
-        write_snapshot_bytes(&gdir, &snapshot_bytes)?;
+        write_snapshot_stream(&gdir, covered_seq, payload_len, write)?;
         self.compaction_step(2)?;
 
         // 3. The atomic manifest swap — the single point that moves the
@@ -755,7 +773,7 @@ impl Journal {
             if n.starts_with("gen-") && entry.file_type()?.is_dir() {
                 let gd = dest.join(n);
                 fs::create_dir_all(&gd)?;
-                for f in ["journal.log", "snapshot.json"] {
+                for f in SNAPSHOT_FILES {
                     let src = entry.path().join(f);
                     if src.exists() {
                         fs::copy(&src, gd.join(f))?;
@@ -783,7 +801,7 @@ impl Journal {
                 .to_str()
                 .is_some_and(|n| n.starts_with("gen-"));
             if is_gen && entry.file_type()?.is_dir() {
-                for f in ["journal.log", "snapshot.json"] {
+                for f in SNAPSHOT_FILES {
                     match fs::metadata(entry.path().join(f)) {
                         Ok(m) => total += m.len(),
                         Err(e) if e.kind() == io::ErrorKind::NotFound => {}
@@ -805,30 +823,124 @@ pub struct Snapshot {
     pub payload: Vec<u8>,
 }
 
-/// Atomically write the generation's snapshot (tmp + rename + dir fsync).
-pub fn write_snapshot(dir: &Path, snap: &Snapshot) -> Result<(), JournalError> {
-    write_snapshot_bytes(dir, &serde_json::to_vec(snap).map_err(io::Error::other)?)
+/// Files a generation directory may hold (backup copies exactly these).
+const SNAPSHOT_FILES: [&str; 3] = ["journal.log", "snapshot.bin", "snapshot.json"];
+
+/// `snapshot.bin`: `[magic 8][covered_seq u64][payload_len u64][crc32 u32]
+/// [payload]`, big-endian. The magic carries the frame version. The snapshot
+/// is the only authority for compacted state, so its checksum is checked on
+/// every load; a mismatch stops startup.
+const SNAPSHOT_MAGIC: &[u8; 8] = b"DRSNAP\x00\x02";
+const SNAPSHOT_HEADER_LEN: u64 = 8 + 8 + 8 + 4;
+
+/// Counts and checksums what passes through to the file.
+struct Checked<W> {
+    inner: W,
+    crc: crc32fast::Hasher,
+    len: u64,
 }
 
-fn write_snapshot_bytes(dir: &Path, bytes: &[u8]) -> Result<(), JournalError> {
-    let tmp = dir.join("snapshot.json.tmp");
-    fs::write(&tmp, bytes)?;
-    File::open(&tmp)?.sync_data()?;
-    fs::rename(&tmp, dir.join("snapshot.json"))?;
+impl<W: Write> Write for Checked<W> {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        let n = self.inner.write(buf)?;
+        self.crc.update(&buf[..n]);
+        self.len += n as u64;
+        Ok(n)
+    }
+    fn flush(&mut self) -> io::Result<()> {
+        self.inner.flush()
+    }
+}
+
+/// Atomically write the generation's snapshot (tmp + rename + dir fsync).
+pub fn write_snapshot(dir: &Path, snap: &Snapshot) -> Result<(), JournalError> {
+    let payload = &snap.payload;
+    write_snapshot_stream(dir, snap.covered_seq, payload.len() as u64, |w| {
+        w.write_all(payload)
+    })
+}
+
+fn write_snapshot_stream(
+    dir: &Path,
+    covered_seq: u64,
+    payload_len: u64,
+    write: impl FnOnce(&mut dyn Write) -> io::Result<()>,
+) -> Result<(), JournalError> {
+    let tmp = dir.join("snapshot.bin.tmp");
+    let mut file = File::create(&tmp)?;
+    file.write_all(&[0u8; SNAPSHOT_HEADER_LEN as usize])?; // patched below
+    let (len, crc) = {
+        let mut out = Checked {
+            inner: io::BufWriter::with_capacity(256 * 1024, &mut file),
+            crc: crc32fast::Hasher::new(),
+            len: 0,
+        };
+        write(&mut out)?;
+        let Checked { inner, crc, len } = out;
+        inner.into_inner().map_err(io::IntoInnerError::into_error)?;
+        (len, crc.finalize())
+    };
+    if len != payload_len {
+        return Err(JournalError::CorruptSnapshot(format!(
+            "encoder wrote {len} bytes, promised {payload_len}"
+        )));
+    }
+    let mut header = Vec::with_capacity(SNAPSHOT_HEADER_LEN as usize);
+    header.extend_from_slice(SNAPSHOT_MAGIC);
+    header.extend_from_slice(&covered_seq.to_be_bytes());
+    header.extend_from_slice(&len.to_be_bytes());
+    header.extend_from_slice(&crc.to_be_bytes());
+    file.seek(SeekFrom::Start(0))?;
+    file.write_all(&header)?;
+    file.sync_data()?;
+    drop(file);
+    fs::rename(&tmp, dir.join("snapshot.bin"))?;
     sync_parent(&tmp)?;
     Ok(())
 }
 
-/// Load the generation's snapshot if one exists.
+/// Load the generation's snapshot if one exists, verified. A legacy
+/// `snapshot.json` (no checksum) from before D-021 is still read.
 pub fn load_snapshot(dir: &Path) -> Result<Option<Snapshot>, JournalError> {
-    let p = dir.join("snapshot.json");
-    match fs::read(&p) {
+    match fs::read(dir.join("snapshot.bin")) {
+        Ok(bytes) => return decode_snapshot(&bytes).map(Some),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e.into()),
+    }
+    match fs::read(dir.join("snapshot.json")) {
         Ok(bytes) => serde_json::from_slice(&bytes)
             .map(Some)
-            .map_err(|e| JournalError::Manifest(format!("snapshot: {e}"))),
+            .map_err(|e| JournalError::CorruptSnapshot(format!("legacy snapshot: {e}"))),
         Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
         Err(e) => Err(e.into()),
     }
+}
+
+fn decode_snapshot(bytes: &[u8]) -> Result<Snapshot, JournalError> {
+    let bad = |why: &str| JournalError::CorruptSnapshot(why.to_string());
+    let header = bytes
+        .get(..SNAPSHOT_HEADER_LEN as usize)
+        .ok_or_else(|| bad("shorter than its header"))?;
+    if &header[..8] != SNAPSHOT_MAGIC {
+        return Err(bad("unknown magic or frame version"));
+    }
+    let word = |r: std::ops::Range<usize>| -> u64 {
+        header[r]
+            .iter()
+            .fold(0u64, |acc, b| (acc << 8) | u64::from(*b))
+    };
+    let (covered_seq, len, want) = (word(8..16), word(16..24), word(24..28) as u32);
+    let payload = &bytes[SNAPSHOT_HEADER_LEN as usize..];
+    if payload.len() as u64 != len {
+        return Err(bad("payload length does not match its header"));
+    }
+    if crc(payload) != want {
+        return Err(bad("checksum mismatch"));
+    }
+    Ok(Snapshot {
+        covered_seq,
+        payload: payload.to_vec(),
+    })
 }
 
 /// Replay only records after `from_seq` (used with a snapshot).
@@ -1107,7 +1219,7 @@ mod tests {
         j.compact(&big).unwrap_or_else(|e| panic!("{e}"));
         j.backup_to(&dest).unwrap_or_else(|e| panic!("{e}"));
         assert_eq!(j.generation(), 2);
-        assert!(dest.join("gen-000002/snapshot.json").exists());
+        assert!(dest.join("gen-000002/snapshot.bin").exists());
     }
 
     /// A batch is consecutive frames with contiguous sequence numbers,
@@ -1222,6 +1334,32 @@ mod tests {
             .unwrap_or_else(|e| panic!("{e}"))
             .unwrap_or_else(|| panic!("the live generation's snapshot was deleted"));
         assert_eq!(kept.payload, b"the live state");
+    }
+
+    /// The snapshot is the only authority for compacted state, so it is
+    /// checksummed: a damaged one stops startup instead of being trusted.
+    #[test]
+    fn damaged_snapshot_is_refused_not_trusted() {
+        let dir = tempfile::tempdir().unwrap_or_else(|e| panic!("{e}"));
+        let mut j = Journal::open(dir.path()).unwrap_or_else(|e| panic!("{e}"));
+        let snap = Snapshot {
+            covered_seq: 0,
+            payload: vec![7u8; 4096],
+        };
+        j.compact(&snap).unwrap_or_else(|e| panic!("{e}"));
+        drop(j);
+        let file = gen_dir_path(dir.path(), 2).join("snapshot.bin");
+        let mut bytes = fs::read(&file).unwrap_or_else(|e| panic!("binary snapshot: {e}"));
+        let last = bytes.len() - 1;
+        bytes[last] ^= 0x01; // one flipped bit in the payload
+        fs::write(&file, &bytes).unwrap_or_else(|e| panic!("{e}"));
+        assert!(
+            matches!(
+                load_snapshot(&gen_dir_path(dir.path(), 2)),
+                Err(JournalError::CorruptSnapshot(_))
+            ),
+            "a damaged snapshot must not load"
+        );
     }
 
     #[test]

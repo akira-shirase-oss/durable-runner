@@ -44,7 +44,9 @@ tick; a call past its deadline is cancelled locally and reconciled.
 **Recovery:** read manifest → load snapshot → replay journal records in order →
 discard only a provably-torn tail append → rebuild index → serve.
 
-**Compaction:** write the new generation to a new directory → fsync → swap the
+**Compaction:** the actor takes a pointer view of the retained runs (copy-on-
+write) → the writer streams it as the binary index into the new generation's
+checksummed `snapshot.bin` → fsync → swap the
 manifest atomically → open old or new complete generation, never mixed → expire
 terminal history after 7 days while preserving live state and dedup deps →
 delete every superseded `gen-*` directory (retention). Runs on `POST

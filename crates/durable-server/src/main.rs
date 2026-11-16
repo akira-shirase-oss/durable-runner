@@ -52,6 +52,10 @@ struct Args {
     /// generations) every N seconds; 0 (the default) = only on request.
     #[arg(long, default_value_t = 0)]
     compact_every_secs: u64,
+    /// Refuse a compaction whose snapshot would exceed this many bytes
+    /// (409 `snapshot_over_budget`) instead of writing it.
+    #[arg(long, default_value_t = 2 * 1024 * 1024 * 1024)]
+    max_snapshot_bytes: u64,
 }
 
 /// The environment variable holding the API key. Read from the
@@ -275,6 +279,9 @@ impl From<EngineError> for ApiError {
             // failed after: either way nothing was acknowledged.
             EngineError::Journal(j) => Self::journal(j, &e),
             EngineError::CommitFailed(j) => Self::journal(j, &e),
+            EngineError::SnapshotOverBudget { .. } => {
+                Self::new(StatusCode::CONFLICT, "snapshot_over_budget", e.to_string())
+            }
             EngineError::Serde(_) | EngineError::Piped => Self::internal(&e),
         }
     }
@@ -581,6 +588,7 @@ async fn main() -> Result<()> {
         },
         compact_every: (args.compact_every_secs > 0)
             .then(|| Duration::from_secs(args.compact_every_secs)),
+        max_snapshot_bytes: args.max_snapshot_bytes,
         ..Default::default()
     };
     let mut registry = Registry::default();

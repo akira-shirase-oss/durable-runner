@@ -282,6 +282,9 @@ pub struct ShellConfig {
     /// new commands (they then wait in, and are refused by, the bounded
     /// command channel).
     pub max_outbox_records: usize,
+    /// Refuse a compaction whose snapshot would exceed this many bytes
+    /// (`SnapshotOverBudget`) instead of writing it.
+    pub max_snapshot_bytes: u64,
     /// Compact on this schedule (expiring 7-day-old terminal runs and
     /// deleting superseded generations); `None` (the default) = only on
     /// request.
@@ -299,6 +302,7 @@ impl Default for ShellConfig {
             journal: JournalOptions::default(),
             group_commit: GroupCommit::default(),
             max_outbox_records: 16 * 1024,
+            max_snapshot_bytes: 2 * 1024 * 1024 * 1024,
             // Off until compaction is cheap and its error path is fatal
             // (D-018): an operator schedules it explicitly.
             compact_every: None,
@@ -352,6 +356,7 @@ impl Monitor {
         }
         match e {
             EngineError::Refused(_) => "stale_event",
+            EngineError::SnapshotOverBudget { .. } => "snapshot_over_budget",
             EngineError::Journal(j) => journal(j),
             EngineError::CommitFailed(j) => journal(j),
             _ => "internal",
@@ -597,16 +602,25 @@ type CompactReply = oneshot::Sender<Result<u32, EngineError>>;
 fn start_compaction(
     core: &mut EngineCore,
     pipe: &mut Pipeline,
+    budget: u64,
     reply: Option<CompactReply>,
 ) -> Result<PendingCompaction, (EngineError, Option<CompactReply>)> {
     let plan = match core.plan_compaction(wall_ms()) {
         Ok(p) => p,
         Err(e) => return Err((e, reply)),
     };
+    if plan.bytes > budget {
+        let e = EngineError::SnapshotOverBudget {
+            bytes: plan.bytes,
+            budget,
+        };
+        return Err((e, reply));
+    }
     pipe.collect(core);
     let (done_tx, done) = oneshot::channel();
     pipe.outbound.push_back(WriterMsg::Compact {
-        snapshot: plan.snapshot,
+        view: plan.view,
+        bytes: plan.bytes,
         reply: done_tx,
     });
     Ok(PendingCompaction {
@@ -763,7 +777,7 @@ async fn actor(
                             durable_domain::Refusal::ReserveExhausted,
                         )));
                     } else {
-                        match start_compaction(&mut core, &mut pipe, Some(reply)) {
+                        match start_compaction(&mut core, &mut pipe, cfg.max_snapshot_bytes, Some(reply)) {
                             Ok(p) => pending_compaction = Some(p),
                             Err((e, reply)) => {
                                 if let Some(reply) = reply {
@@ -842,7 +856,7 @@ async fn actor(
             () = scheduled(&mut compactor) => {
                 // Retention on a schedule; skipped while one is running.
                 if pending_compaction.is_none() {
-                    match start_compaction(&mut core, &mut pipe, None) {
+                    match start_compaction(&mut core, &mut pipe, cfg.max_snapshot_bytes, None) {
                         Ok(p) => pending_compaction = Some(p),
                         Err((e, _)) => mon.handled(&e),
                     }
@@ -2200,6 +2214,133 @@ mod tests {
                 "acknowledged {id:?} lost on restart"
             );
         }
+    }
+
+    /// Compaction cost probe (review finding 3): the contract's 1 KiB
+    /// inputs at `PROBE_RUNS` retained runs. Ignored by default; run it in
+    /// release mode under `/usr/bin/time -l` for peak RSS:
+    /// `PROBE_RUNS=100000 PROBE_INPUT=1024 cargo test --release -p durable-engine -- --ignored compaction_cost_probe --nocapture`
+    #[tokio::test(flavor = "current_thread")]
+    #[ignore = "measurement probe: run explicitly, in release mode"]
+    async fn compaction_cost_probe() {
+        let env = |k: &str, d: usize| {
+            std::env::var(k)
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(d)
+        };
+        let (runs, input) = (env("PROBE_RUNS", 100_000), env("PROBE_INPUT", 1024));
+        let d = tempfile::tempdir().unwrap_or_else(|e| panic!("{e}"));
+        let cfg = ShellConfig {
+            cmd_capacity: 4096,
+            max_outbox_records: 1 << 20,
+            ..Default::default()
+        };
+        let eng = spawn(d.path(), echo_registry(), cfg).unwrap_or_else(|e| panic!("{e}"));
+        let payload: Vec<u8> = (0..input).map(|i| (i % 251) as u8).collect();
+        let job = move || JobSpec {
+            version: 1,
+            input: payload.clone(),
+            steps: vec![StepSpec {
+                name: "a".into(),
+                handler: "echo".into(),
+            }],
+        };
+        let t = std::time::Instant::now();
+        let mut next = 0;
+        while next < runs {
+            let mut hs = Vec::new();
+            for _ in 0..512.min(runs - next) {
+                let (e, k, s) = (eng.clone(), OperationKey(format!("probe-{next}")), job());
+                hs.push(tokio::spawn(async move { e.submit_at(k, s, FAR).await }));
+                next += 1;
+            }
+            for h in hs {
+                h.await
+                    .unwrap_or_else(|e| panic!("{e}"))
+                    .unwrap_or_else(|e| panic!("{e}"));
+            }
+        }
+        let fill = t.elapsed();
+        let t = std::time::Instant::now();
+        eng.submit_at(OperationKey("idle".into()), job(), FAR)
+            .await
+            .unwrap_or_else(|e| panic!("{e}"));
+        let idle = t.elapsed();
+        let e2 = eng.clone();
+        let t0 = std::time::Instant::now();
+        let compaction = tokio::spawn(async move { (e2.compact().await, t0.elapsed()) });
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        let t = std::time::Instant::now();
+        eng.submit_at(OperationKey("during".into()), job(), FAR)
+            .await
+            .unwrap_or_else(|e| panic!("{e}"));
+        let during = t.elapsed();
+        let (r, compact_took) = compaction.await.unwrap_or_else(|e| panic!("{e}"));
+        let generation = r.unwrap_or_else(|e| panic!("{e}"));
+        let gdir = durable_journal::gen_dir_path(d.path(), generation);
+        let snapshot_bytes: u64 = std::fs::read_dir(&gdir)
+            .unwrap_or_else(|e| panic!("{e}"))
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_string_lossy().starts_with("snapshot"))
+            .filter_map(|e| e.metadata().ok())
+            .map(|m| m.len())
+            .sum();
+        drop(eng);
+        let mut reopen_took = Duration::ZERO;
+        for _ in 0..3000 {
+            let t = std::time::Instant::now();
+            match EngineCore::open(d.path()) {
+                Ok(c) => {
+                    reopen_took = t.elapsed();
+                    assert_eq!(c.runs().count(), runs + 2);
+                    break;
+                }
+                Err(EngineError::Journal(JournalError::SecondWriter)) => {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+                Err(e) => panic!("{e}"),
+            }
+        }
+        println!(
+            "PROBE runs={runs} input={input} fill_s={:.2} idle_submit_ms={:.1} compact_s={:.2} \
+             submit_during_compaction_ms={:.1} snapshot_mib={:.1} reopen_s={:.2}",
+            fill.as_secs_f64(),
+            idle.as_secs_f64() * 1e3,
+            compact_took.as_secs_f64(),
+            during.as_secs_f64() * 1e3,
+            snapshot_bytes as f64 / (1024.0 * 1024.0),
+            reopen_took.as_secs_f64(),
+        );
+    }
+
+    /// A compaction whose snapshot would exceed the byte budget is refused
+    /// with a stable error before anything is written, and the engine
+    /// carries on.
+    #[tokio::test(flavor = "current_thread")]
+    async fn compaction_over_the_snapshot_budget_is_refused() {
+        let d = tempfile::tempdir().unwrap_or_else(|e| panic!("{e}"));
+        let cfg = ShellConfig {
+            tick_ms: 5,
+            max_snapshot_bytes: 1024,
+            ..Default::default()
+        };
+        let eng = spawn(d.path(), echo_registry(), cfg).unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(submit_acked(&eng, "budget", 20).await.len(), 20);
+        let r = bounded(eng.compact()).await;
+        assert!(
+            matches!(r, Err(EngineError::SnapshotOverBudget { budget: 1024, .. })),
+            "{r:?}"
+        );
+        assert!(
+            !durable_journal::gen_dir_path(d.path(), 2).exists(),
+            "nothing written"
+        );
+        assert_eq!(
+            submit_acked(&eng, "after", 1).await.len(),
+            1,
+            "the engine carries on"
+        );
     }
 
     /// A failed fsync must stop the engine — never retry it, never keep

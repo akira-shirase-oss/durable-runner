@@ -27,6 +27,7 @@ use std::sync::Arc;
 use thiserror::Error;
 
 pub mod shell;
+pub mod snapshot;
 pub mod writer;
 
 #[derive(Debug, Error)]
@@ -50,6 +51,11 @@ pub enum EngineError {
     /// journal (a programming error, never a client one).
     #[error("operation unavailable while the group-commit writer owns the journal")]
     Piped,
+    /// The snapshot a compaction would write exceeds the configured budget:
+    /// refused before anything is written (raise the budget, or bound the
+    /// index with the admission limits).
+    #[error("snapshot would be {bytes} bytes, over the {budget}-byte budget")]
+    SnapshotOverBudget { bytes: u64, budget: u64 },
 }
 
 /// A journaled record: the run, the commit clock value, and the event.
@@ -84,14 +90,11 @@ pub struct Diagnostics {
     pub stale_generations: u32,
 }
 
-/// The serialized in-memory index — what a compaction snapshot carries.
-/// Live runs, their dedup keys, and the next id. Superseded generations are
-/// deleted after a compaction (retention), so this snapshot plus the new
-/// generation's records are the whole durable state.
-#[derive(Debug, Serialize, Deserialize)]
-struct IndexSnapshot {
-    // Ordered by id so listing can page; serialises exactly like the
-    // HashMap it replaced (a JSON object keyed by id), so old snapshots load.
+/// The index as snapshots before D-021 carried it (JSON, inputs as number
+/// arrays). Read only, so journals compacted by older builds still open;
+/// every new snapshot is the binary `snapshot::encode` format.
+#[derive(Debug, Deserialize)]
+struct LegacyIndex {
     runs: BTreeMap<RunId, Run>,
     by_op: HashMap<OperationKey, RunId>,
     next_run: u64,
@@ -143,9 +146,11 @@ impl Pipe {
 }
 
 /// A compaction worked out against the live index but not yet applied:
-/// the snapshot for the new generation and the runs it expires.
+/// a consistent view of the runs it keeps (pointers, not copies), the exact
+/// size of their encoding, and the runs it expires.
 pub struct CompactionPlan {
-    pub snapshot: durable_journal::Snapshot,
+    pub view: snapshot::View,
+    pub bytes: u64,
     pub expired: Vec<RunId>,
 }
 
@@ -153,7 +158,9 @@ pub struct CompactionPlan {
 /// the reducer — the same fold the live path performs.
 pub struct EngineCore {
     log: Log,
-    runs: BTreeMap<RunId, Run>,
+    /// Copy-on-write per run: a compaction's view shares these, and a run
+    /// is copied only if it changes while that view is alive.
+    runs: BTreeMap<RunId, Arc<Run>>,
     by_op: HashMap<OperationKey, RunId>,
     next_run: u64,
     pub limits: Limits,
@@ -186,10 +193,23 @@ impl EngineCore {
             retry: RetryPolicy::default(),
         };
         if let Some(snap) = durable_journal::load_snapshot(&gdir)? {
-            let idx: IndexSnapshot = serde_json::from_slice(&snap.payload)?;
-            core.runs = idx.runs;
-            core.by_op = idx.by_op;
-            core.next_run = idx.next_run;
+            if snap.payload.starts_with(snapshot::MAGIC) {
+                let (next_run, runs) =
+                    snapshot::decode(&snap.payload).map_err(JournalError::CorruptSnapshot)?;
+                // Dedup keys are exactly the retained runs' keys.
+                core.by_op = runs.values().map(|r| (r.key.clone(), r.id)).collect();
+                core.runs = runs;
+                core.next_run = next_run;
+            } else {
+                let idx: LegacyIndex = serde_json::from_slice(&snap.payload)?;
+                core.runs = idx
+                    .runs
+                    .into_iter()
+                    .map(|(id, r)| (id, Arc::new(r)))
+                    .collect();
+                core.by_op = idx.by_op;
+                core.next_run = idx.next_run;
+            }
         }
         let mut max_run = core.next_run.saturating_sub(1);
         for r in durable_journal::replay_dir(&gdir)? {
@@ -298,29 +318,22 @@ impl EngineCore {
             })
             .map(|r| r.id)
             .collect();
-        let runs: BTreeMap<RunId, Run> = self
-            .runs
-            .iter()
-            .filter(|(id, _)| !expired.contains(id))
-            .map(|(id, r)| (*id, r.clone()))
-            .collect();
-        // Dedup keys live only as long as their run — no orphan entries.
-        let by_op: HashMap<OperationKey, RunId> = self
-            .by_op
-            .iter()
-            .filter(|(_, id)| runs.contains_key(id))
-            .map(|(k, id)| (k.clone(), *id))
-            .collect();
-        let payload = serde_json::to_vec(&IndexSnapshot {
-            runs,
-            by_op,
+        let gone: std::collections::HashSet<RunId> = expired.iter().copied().collect();
+        // A pointer per retained run: nothing is copied or encoded here, on
+        // the actor; the writer encodes the view while the actor moves on.
+        let view = snapshot::View {
             next_run: self.next_run,
-        })?;
+            runs: self
+                .runs
+                .iter()
+                .filter(|(id, _)| !gone.contains(id))
+                .map(|(_, r)| Arc::clone(r))
+                .collect(),
+        };
+        let bytes = snapshot::encoded_len(&view);
         Ok(CompactionPlan {
-            snapshot: durable_journal::Snapshot {
-                covered_seq: 0,
-                payload,
-            },
+            view,
+            bytes,
             expired,
         })
     }
@@ -344,7 +357,7 @@ impl EngineCore {
         let Log::Direct(journal) = &mut self.log else {
             return Err(EngineError::Piped);
         };
-        journal.compact(&plan.snapshot)?;
+        journal.compact_with(0, plan.bytes, |w| snapshot::encode(&plan.view, w))?;
         let generation = journal.generation();
         self.finish_compaction(&plan.expired);
         Ok(generation)
@@ -375,13 +388,16 @@ impl EngineCore {
                 return Err(Refusal::DuplicateKey.into());
             }
             self.by_op.insert(key.clone(), run_id);
-            self.runs
-                .insert(run_id, Run::accepted(run_id, key, spec, not_before));
+            self.runs.insert(
+                run_id,
+                Arc::new(Run::accepted(run_id, key, spec, not_before)),
+            );
             return Ok(vec![]);
         }
         let run = self.runs.get(&run_id).ok_or(Refusal::StaleReply)?;
         let (state, effects) = reduce(run, &event, now, &self.limits, &self.retry)?;
-        let run = self.runs.get_mut(&run_id).ok_or(Refusal::StaleReply)?;
+        // Copies the run only if a compaction's view still shares it.
+        let run = Arc::make_mut(self.runs.get_mut(&run_id).ok_or(Refusal::StaleReply)?);
         if state.is_terminal() && run.finished_at.is_none() {
             run.finished_at = Some(now); // the 7-day expiry clock starts
         }
@@ -555,7 +571,7 @@ impl EngineCore {
     }
 
     pub fn run(&self, id: RunId) -> Option<&Run> {
-        self.runs.get(&id)
+        self.runs.get(&id).map(|r| &**r)
     }
 
     /// Bounded diagnostics: counts, never rows — O(number of states),
@@ -599,7 +615,7 @@ impl EngineCore {
     /// Iterate the live index in id order (bounded by the index, never by
     /// history).
     pub fn runs(&self) -> impl Iterator<Item = &Run> {
-        self.runs.values()
+        self.runs.values().map(|r| &**r)
     }
 
     /// One page of the live index: up to `limit` runs with id > `after`,
@@ -607,7 +623,11 @@ impl EngineCore {
     pub fn page(&self, after: Option<RunId>, limit: usize) -> (Vec<Run>, Option<RunId>) {
         let start = after.map_or(Bound::Unbounded, Bound::Excluded);
         let mut it = self.runs.range((start, Bound::Unbounded));
-        let page: Vec<Run> = it.by_ref().take(limit).map(|(_, r)| r.clone()).collect();
+        let page: Vec<Run> = it
+            .by_ref()
+            .take(limit)
+            .map(|(_, r)| (**r).clone())
+            .collect();
         let next = match (page.last(), it.next()) {
             (Some(last), Some(_)) => Some(last.id),
             _ => None,
@@ -967,6 +987,108 @@ mod tests {
         for id in ids {
             assert!(e.run(id).is_some(), "{id:?} lost");
         }
+    }
+
+    /// Review finding 3: the snapshot was the index JSON-encoded (inputs as
+    /// number arrays), then JSON-encoded again as a number array — about
+    /// 12 times the raw input. It must stay close to the raw size.
+    #[test]
+    fn snapshot_is_compact() {
+        let (d, mut e) = open();
+        let input: Vec<u8> = (0..1024).map(|i| (i % 251) as u8).collect();
+        for i in 0..200 {
+            let mut s = spec();
+            s.input = input.clone();
+            e.submit(OperationKey(format!("compact-{i}")), s, 0)
+                .unwrap_or_else(|e| panic!("{e}"));
+        }
+        let generation = e.compact(1).unwrap_or_else(|e| panic!("{e}"));
+        let gdir = durable_journal::gen_dir_path(d.path(), generation);
+        let bytes: u64 = std::fs::read_dir(&gdir)
+            .unwrap_or_else(|e| panic!("{e}"))
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_string_lossy().starts_with("snapshot"))
+            .filter_map(|e| e.metadata().ok())
+            .map(|m| m.len())
+            .sum();
+        let raw = 200 * 1024;
+        assert!(
+            bytes <= raw + raw / 4,
+            "snapshot is {bytes} bytes for {raw} bytes of input"
+        );
+        drop(e);
+        let e = EngineCore::open(d.path()).unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(e.runs().count(), 200);
+        assert!(e.runs().all(|r| r.spec.input == input));
+    }
+
+    /// Journals compacted by builds before D-021 carry a JSON
+    /// `snapshot.json`; they must still open.
+    #[test]
+    fn legacy_json_snapshot_still_opens() {
+        #[derive(Serialize)]
+        struct OldIndex {
+            runs: BTreeMap<RunId, Run>,
+            by_op: HashMap<OperationKey, RunId>,
+            next_run: u64,
+        }
+        let d = tempfile::tempdir().unwrap_or_else(|e| panic!("{e}"));
+        let run = Run::accepted(RunId(7), OperationKey("legacy".into()), spec(), 0);
+        let payload = serde_json::to_vec(&OldIndex {
+            runs: BTreeMap::from([(RunId(7), run)]),
+            by_op: HashMap::from([(OperationKey("legacy".into()), RunId(7))]),
+            next_run: 8,
+        })
+        .unwrap_or_else(|e| panic!("{e}"));
+        let g2 = durable_journal::gen_dir_path(d.path(), 2);
+        std::fs::create_dir_all(&g2).unwrap_or_else(|e| panic!("{e}"));
+        std::fs::write(g2.join("journal.log"), b"").unwrap_or_else(|e| panic!("{e}"));
+        let snap = durable_journal::Snapshot {
+            covered_seq: 0,
+            payload,
+        };
+        std::fs::write(
+            g2.join("snapshot.json"),
+            serde_json::to_vec(&snap).unwrap_or_else(|e| panic!("{e}")),
+        )
+        .unwrap_or_else(|e| panic!("{e}"));
+        std::fs::write(d.path().join("manifest.json"), "{\"generation\":2}")
+            .unwrap_or_else(|e| panic!("{e}"));
+        let mut e = EngineCore::open(d.path()).unwrap_or_else(|e| panic!("{e}"));
+        assert!(e.run(RunId(7)).is_some());
+        let again = e
+            .submit(OperationKey("legacy".into()), spec(), 1)
+            .unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(again, RunId(7), "dedup survives the format change");
+        // The next compaction rewrites it in the binary format.
+        e.compact(2).unwrap_or_else(|e| panic!("{e}"));
+        assert!(durable_journal::gen_dir_path(d.path(), 3)
+            .join("snapshot.bin")
+            .exists());
+    }
+
+    /// The compaction view is consistent: a run changed after the plan was
+    /// taken is copied, and the view still holds the state as planned.
+    #[test]
+    fn compaction_view_is_unchanged_by_later_commits() {
+        let (_d, mut e) = open();
+        let run = e
+            .submit(OperationKey("cow".into()), spec(), 0)
+            .unwrap_or_else(|e| panic!("{e}"));
+        let plan = e.plan_compaction(1).unwrap_or_else(|e| panic!("{e}"));
+        e.cancel(run, 2).unwrap_or_else(|e| panic!("{e}"));
+        assert!(matches!(
+            e.run(run).map(|r| &r.state),
+            Some(RunState::Cancelled)
+        ));
+        let mut bytes = Vec::new();
+        snapshot::encode(&plan.view, &mut bytes).unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(bytes.len() as u64, plan.bytes);
+        let (_, runs) = snapshot::decode(&bytes).unwrap_or_else(|e| panic!("{e}"));
+        assert!(matches!(
+            runs.get(&run).map(|r| &r.state),
+            Some(RunState::Queued { .. })
+        ));
     }
 
     #[test]

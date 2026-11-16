@@ -250,3 +250,43 @@ convention; these seed the contract's prescribed directions.
   (`ManifestMismatch`), and lets the restart open what the manifest
   names. D-019 makes the disagreement unreachable inside one process;
   this check stops the cleanup from assuming it.
+- **D-021 — Compaction: a binary, checksummed snapshot built from a
+  pointer view, not by the actor.** Review measured compaction at 100,000
+  runs with 1 KiB inputs. The snapshot was 1.2 GB because inputs were
+  JSON number arrays inside a payload JSON-encoded again as a number
+  array. The whole index was cloned and encoded on the actor, so a submit
+  waited 6-7 s, and peak RSS was about 1.4 GB. Now:
+  - The index holds `Arc<Run>`, and a run is copied only when it changes
+    while a view shares it (`Arc::make_mut`). Planning a compaction is a
+    pointer per retained run.
+  - The writer thread streams that view through an explicit binary
+    encoding (`snapshot.rs`, `DRIX` v1, a bounds-checked decoder that
+    refuses anything malformed) into `snapshot.bin`, framed with a magic,
+    a length and a CRC-32. Its memory is a buffer, not the snapshot's
+    size.
+  - The snapshot is the only authority for compacted state, so a damaged
+    one now stops startup. This closes the "snapshot has no checksum"
+    gap. A legacy `snapshot.json` from older builds still loads, and the
+    next compaction rewrites it.
+  - The exact encoded size is checked against a byte budget
+    (`--max-snapshot-bytes`, default 2 GiB; over it is 409
+    `snapshot_over_budget`, nothing written) and the disk reserve before
+    anything is written.
+
+  Measured with the same probe, A/B on a busy laptop (load 25-79; see
+  `perf/results/2026-11-16T17-25-00Z-compaction-cost.json`):
+
+  | | before | after |
+  |---|---|---|
+  | snapshot | 1,104 MiB | 103 MiB |
+  | compaction | 2.4-2.5 s | 0.10-0.17 s |
+  | submit issued during it | ~2.0 s | 82-159 ms |
+  | restart | 4.1 s | 0.06-0.08 s |
+  | peak RSS | 1.8 GiB | 0.46 GiB |
+
+  Not done: the writer still writes the snapshot inline, so appends queue
+  behind it for as long as the write and fsync take, which still grows
+  with the index. The next step is to write the snapshot on a helper
+  thread and copy the records appended meanwhile into the new
+  generation's log before the swap. Until that is built, scheduled
+  compaction stays off by default (D-018).
