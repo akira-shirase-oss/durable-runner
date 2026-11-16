@@ -210,3 +210,13 @@ convention; these seed the contract's prescribed directions.
   `gen-(N+1)` that the manifest (still naming N) does not reference was
   never authority, so it is now removed before the new generation is
   built.
+- **D-018 — Scheduled compaction is off by default.** D-016 made
+  compaction hourly by default without measuring it. An independent
+  review then found two things. Compaction cloned and JSON-encoded the
+  whole index on the actor: at 100,000 runs with 1 KiB inputs that was a
+  1.2 GB snapshot, and acks stalled for 6-7 s. And an I/O error after its
+  manifest swap could lose acknowledged jobs. Hourly scheduling made both
+  reachable with no operator action. `--compact-every-secs` now defaults
+  to 0 (off) and `ShellConfig::compact_every` to `None`. Operators who
+  schedule it opt in. The default can be revisited once compaction is
+  cheap (D-020) and its error path is fatal (D-019).
