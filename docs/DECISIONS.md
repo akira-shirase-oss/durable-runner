@@ -63,3 +63,18 @@ convention; these seed the contract's prescribed directions.
   a permit forever (cancelling never undoes a remote effect; the probe
   decides). Dispatches and expiries are capped per tick
   (`max_dispatch_per_tick`, default 64), longest-waiting first.
+- **D-011 — An API key on every mutating and admin route; backups only
+  under a configured root.** No route was authenticated, and
+  `/admin/backup` wrote to whatever path the client sent. Now the server
+  refuses to start without `DURABLE_API_KEY` (at least 32 characters, read
+  from the environment, never argv) and keeps only its SHA-256 digest;
+  every mutating and admin handler takes an `Authorized` extractor that
+  compares digests in constant time (`subtle`), before the body is parsed.
+  Reads stay open on purpose for the loopback pilot and the read-only
+  inspector; the SaaS plan must gate them per tenant before exposure.
+  Backups take a plain name and land only in `<--backup-root>/<name>`
+  (no separators, no leading `.`, at most 64 characters); without a root
+  backups are disabled, and an existing name is refused rather than merged
+  into (`create_dir` is the atomic check). The pilot generates a random
+  key per run and now restores with `durable-cli restore` into a separate
+  directory before starting the second server.

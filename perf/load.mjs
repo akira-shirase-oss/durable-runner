@@ -30,6 +30,10 @@ const PORT = Number(args.port ?? 58400);
 const HPORT = Number(args.hport ?? 58401);
 const API = `http://127.0.0.1:${PORT}`;
 const INPUT_B64 = Buffer.from('load').toString('base64');
+// Mutating and admin routes need the API key; the spawned server reads it
+// from DURABLE_API_KEY, so one random key per harness run serves both.
+const API_KEY = process.env.DURABLE_API_KEY ?? (await import('node:crypto')).randomBytes(32).toString('hex');
+const AUTH = { authorization: `Bearer ${API_KEY}` };
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const now = () => Date.now();
@@ -87,7 +91,8 @@ function startHandler(mode, stallMs = 0) {
 
 async function startServer(journalDir, extra = []) {
   const p = spawn(SRV, ['--journal', journalDir, '--listen', `127.0.0.1:${PORT}`,
-    '--handler', `step=http://127.0.0.1:${HPORT}/step`, ...extra], { stdio: 'ignore' });
+    '--handler', `step=http://127.0.0.1:${HPORT}/step`, ...extra],
+    { stdio: 'ignore', env: { ...process.env, DURABLE_API_KEY: API_KEY } });
   for (let i = 0; i < 100; i++) {
     try { await fetch(`${API}/health`); return p; } catch { await sleep(50); }
   }
@@ -97,7 +102,7 @@ async function startServer(journalDir, extra = []) {
 async function submit(opKey, steps = 1) {
   const t0 = performance.now();
   const r = await fetch(`${API}/jobs`, {
-    method: 'POST', headers: { 'content-type': 'application/json' },
+    method: 'POST', headers: { 'content-type': 'application/json', ...AUTH },
     body: JSON.stringify({
       op_key: opKey,
       spec: { version: 1, steps: Array.from({ length: steps }, (_, i) => ({ name: `s${i}`, handler: 'step' })), input_b64: INPUT_B64 },
@@ -220,7 +225,7 @@ async function runCompact() {
   const compactions = [];
   while (now() - t0 < secs * 1000) {
     const tc = now();
-    const r = await fetch(`${API}/admin/compact`, { method: 'POST' });
+    const r = await fetch(`${API}/admin/compact`, { method: 'POST', headers: AUTH });
     compactions.push({ status: r.status, ms: now() - tc });
     await sleep(5000);
   }

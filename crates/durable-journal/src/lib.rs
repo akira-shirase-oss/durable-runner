@@ -109,6 +109,9 @@ pub enum JournalError {
     /// An earlier write or fsync failure poisoned this writer.
     #[error("journal writer poisoned by an earlier failure; restart to replay")]
     Poisoned,
+    /// A backup never merges into an existing directory.
+    #[error("backup destination already exists")]
+    BackupExists,
 }
 
 /// One committed record as replayed: its sequence and payload.
@@ -467,14 +470,23 @@ impl Journal {
         Ok(())
     }
 
-    /// A consistent copy for backup: generation data first, manifest LAST —
+    /// A consistent copy for backup into `dest`, which must not exist yet
+    /// (its parent must): generation data first, manifest LAST —
     /// a copy interrupted mid-flight still opens as a complete older
     /// generation, never a torn mixed one.
     pub fn backup_to(&self, dest: &Path) -> Result<(), JournalError> {
         if self.poisoned {
             return Err(JournalError::Poisoned); // the log may hold an unrolled tail
         }
-        fs::create_dir_all(dest)?;
+        // A fresh directory only: copying into an existing one could mix
+        // generations from two backups. `create_dir` is the atomic check.
+        match fs::create_dir(dest) {
+            Ok(()) => {}
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
+                return Err(JournalError::BackupExists)
+            }
+            Err(e) => return Err(e.into()),
+        }
         for entry in fs::read_dir(&self.root)? {
             let entry = entry?;
             let name = entry.file_name();

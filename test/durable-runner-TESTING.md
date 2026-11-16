@@ -38,10 +38,12 @@ cargo build --release --locked -p durable-server -p durable-cli
 cd apps/inspector && npm install && npm run build && cd ../..
 
 python3 examples/pilot/handler.py &
+export DURABLE_API_KEY=$(openssl rand -hex 32)   # the server and the CLI both read it
 target/release/durable-server \
   --journal data/journal \
   --listen 127.0.0.1:58300 \
   --ui-dir apps/inspector/build \
+  --backup-root data/backups \
   --handler step=http://127.0.0.1:58320/step
 
 CLI="target/release/durable-cli --server http://127.0.0.1:58300"
@@ -85,15 +87,15 @@ cargo test --workspace --locked
 - Resubmit the same `--op-key`; you get the original run, nothing re-runs.
 - Submit a step whose handler name is not in `--handler`; expect HTTP 409, and the journal should not have taken the job.
 - `$CLI cancel --run <id>` should stop scheduling. It must **not** undo a remote effect already attempted.
-- `$CLI backup --to /tmp/durable-backup` then restore into a new directory (or use the pilot's restore). The restored server should show the same run ids and `finished_at`.
+- `$CLI backup --name b1` (it lands in `data/backups/b1`, nowhere else) then restore into a new directory (the pilot does exactly this). The restored server should show the same run ids and `finished_at`.
 
 ```sh
-target/release/durable-cli restore --from /tmp/durable-backup --to data/restored
+target/release/durable-cli restore --from data/backups/b1 --to data/restored
 target/release/durable-server --journal data/restored --listen 127.0.0.1:58301 \
   --handler step=http://127.0.0.1:58320/step
 ```
 
-(`examples/pilot/run.sh` currently restarts the restored server on the backup directory itself; the operating doc's `restore --from ... --to ...` path is the more general one.)
+- Without `DURABLE_API_KEY` (or with a wrong one) every mutating/admin call is `401`; a backup name with `/`, `..` or a leading `.` is `400`; an existing backup name is `409`.
 
 If the server is full, a 503 is the honest refusal (admission reserve), not a silent queue.
 

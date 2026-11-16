@@ -572,9 +572,17 @@ mod tests {
             .unwrap_or_else(|e| panic!("{e}"));
         e.cancel(run, 1).unwrap_or_else(|e| panic!("{e}"));
         let dest = tempfile::tempdir().unwrap_or_else(|e| panic!("{e}"));
-        e.backup_to(dest.path()).unwrap_or_else(|e| panic!("{e}"));
+        let dest = dest.path().join("backup");
+        e.backup_to(&dest).unwrap_or_else(|e| panic!("{e}"));
+        assert!(
+            matches!(
+                e.backup_to(&dest),
+                Err(EngineError::Journal(JournalError::BackupExists))
+            ),
+            "a backup never merges into an existing directory"
+        );
         drop(e); // release the writer lock on the source
-        let e2 = EngineCore::open(dest.path()).unwrap_or_else(|e| panic!("{e}"));
+        let e2 = EngineCore::open(&dest).unwrap_or_else(|e| panic!("{e}"));
         assert!(matches!(
             e2.run(run).unwrap_or_else(|| panic!("run")).state,
             RunState::Cancelled

@@ -322,10 +322,16 @@ dependencies = [
  "clap",
  "durable-domain",
  "durable-engine",
+ "durable-journal",
+ "http-body-util",
  "reqwest",
+ "ring",
  "serde",
  "serde_json",
+ "subtle",
+ "tempfile",
  "tokio",
+ "tower",
  "tower-http",
 ]
 

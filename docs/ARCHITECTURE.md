@@ -22,8 +22,9 @@
 
 ## Paths
 
-**Submit:** `POST /api/jobs {operation_key, version, input}` → admission check
-(reserve + caps) → journal append → fsync → `202 {run_id}` → dispatch.
+**Submit:** `POST /jobs {op_key, spec: {version, steps, input_b64}}` (API key)
+→ admission check (allowlist, reserve, caps) → journal append → fsync →
+`200 {run_id}` → dispatch.
 
 **Step:** coordinator takes a concurrency permit (none free → the run stays
 queued) → journals `StepDispatched` with a per-attempt deadline → allowlisted
@@ -38,6 +39,22 @@ discard only a provably-torn tail append → rebuild index → serve.
 **Compaction:** write the new generation to a new directory → fsync → swap the
 manifest atomically → open old or new complete generation, never mixed → expire
 terminal history after 7 days while preserving live state and dedup deps.
+
+## HTTP surface
+
+| Route | Auth | Purpose |
+|---|---|---|
+| `GET /health` | open | liveness |
+| `GET /jobs`, `GET /jobs/{id}` | open | list / inspect runs |
+| `POST /jobs` | API key | submit (dedup by `op_key`) |
+| `POST /jobs/{id}/cancel` | API key | cancel (stops scheduling, never undoes) |
+| `POST /admin/compact` | API key | compact into a new generation |
+| `POST /admin/backup {name}` | API key | backup to `<backup-root>/<name>` only |
+| `GET /admin/diagnostics` | API key | bounded counts |
+| `/inspector/` | open (cancel needs the key) | SvelteKit UI |
+
+The key is `DURABLE_API_KEY`, compared as SHA-256 digests in constant time.
+Errors share one envelope: `{"error": <safe message>, "code": <stable code>}`.
 
 ## Failure cases
 
