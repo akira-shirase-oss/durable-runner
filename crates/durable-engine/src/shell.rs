@@ -1935,6 +1935,65 @@ mod tests {
         assert_eq!(h.calls.load(SeqCst), 1);
     }
 
+    /// Answers Lost once its gate opens; counts its probes (which find the
+    /// effect).
+    #[derive(Clone)]
+    struct LostAfterGate {
+        gate: Arc<Semaphore>,
+        probes: Arc<std::sync::atomic::AtomicUsize>,
+    }
+    #[async_trait::async_trait]
+    impl StepHandler for LostAfterGate {
+        async fn execute(&self, _s: &StepSpec, _i: &[u8], _k: &str) -> Outcome {
+            match self.gate.acquire().await {
+                Ok(p) => {
+                    p.forget();
+                    Outcome::Lost
+                }
+                Err(_) => Outcome::Failed,
+            }
+        }
+        async fn probe(&self, _s: &StepSpec, _k: &str) -> bool {
+            self.probes
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            true
+        }
+    }
+
+    /// Rule (a) for probes: a reconcile probe is a handler call, so it may
+    /// not start until the record that made the run `Reconciling`
+    /// (`ReplyLost`) is durable. Review: making probes start immediately
+    /// passed every test.
+    #[tokio::test(flavor = "current_thread")]
+    async fn no_probe_before_the_reply_lost_record_is_durable() {
+        use std::sync::atomic::Ordering::SeqCst;
+        let d = tempfile::tempdir().unwrap_or_else(|e| panic!("{e}"));
+        let faults = Arc::new(Faults::default());
+        let h = LostAfterGate {
+            gate: Arc::new(Semaphore::new(0)),
+            probes: Arc::default(),
+        };
+        let mut reg = Registry::default();
+        reg.register("lost", Arc::new(h.clone()));
+        let eng = spawn(d.path(), reg, piped(&faults, GroupCommit::default()))
+            .unwrap_or_else(|e| panic!("{e}"));
+        let run = bounded(eng.submit(OperationKey("probe-hold".into()), spec1("lost")))
+            .await
+            .unwrap_or_else(|e| panic!("{e}"));
+        wait_state(&eng, run, "running").await; // dispatched and durable
+        faults.hold_syncs();
+        h.gate.add_permits(1); // the handler answers Lost -> ReplyLost queued
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(
+            h.probes.load(SeqCst),
+            0,
+            "a probe started before ReplyLost was durable"
+        );
+        faults.release_syncs();
+        assert!(matches!(until_done(&eng, run).await, RunState::Done));
+        assert!(h.probes.load(SeqCst) >= 1);
+    }
+
     /// Rule (b): commits that queue up behind an fsync share the next one,
     /// and the journal still holds contiguous sequence numbers in commit
     /// order (replay refuses any gap).
