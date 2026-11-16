@@ -85,6 +85,9 @@ pub struct Diagnostics {
     /// Group commits written (one write + one fsync each) and the largest.
     pub journal_batches: u64,
     pub largest_batch: u64,
+    /// Payload bytes in the largest batch (bounded by `max_batch_bytes`
+    /// unless a single record is larger).
+    pub largest_batch_bytes: u64,
     /// Superseded generations still on disk; retention deletes them after
     /// each successful compaction, so this stays 0 unless a delete failed.
     pub stale_generations: u32,
@@ -110,6 +113,8 @@ enum Log {
 /// to be handed to the writer, plus the writer's last reported state.
 struct Pipe {
     pending: VecDeque<Vec<u8>>,
+    /// Payload bytes in `pending`.
+    pending_bytes: usize,
     /// Commit index (this process) of the newest queued record.
     last_index: u64,
     root: PathBuf,
@@ -133,6 +138,7 @@ impl Pipe {
                 reserve: self.reserve,
             });
         }
+        self.pending_bytes += payload.len();
         self.pending.push_back(payload);
         self.last_index += 1;
         Ok(())
@@ -143,6 +149,14 @@ impl Pipe {
             .available(&self.root)
             .is_ok_and(|a| a >= self.reserve)
     }
+}
+
+/// Records handed to the writer together, with their payload bytes and
+/// the commit index of the last one.
+pub struct Batch {
+    pub records: Vec<Vec<u8>>,
+    pub bytes: usize,
+    pub upto: u64,
 }
 
 /// A compaction worked out against the live index but not yet applied:
@@ -229,6 +243,7 @@ impl EngineCore {
             &mut self.log,
             Log::Piped(Pipe {
                 pending: VecDeque::new(),
+                pending_bytes: 0,
                 last_index: 0,
                 root: PathBuf::new(),
                 space: SpaceProbe::default(),
@@ -271,19 +286,48 @@ impl EngineCore {
         }
     }
 
-    /// Up to `max` queued records, oldest first, with the commit index of
-    /// the last one — the unit handed to the writer.
-    pub fn take_batch(&mut self, max: usize) -> Option<(Vec<Vec<u8>>, u64)> {
+    /// Payload bytes queued for the writer and not yet handed over.
+    pub fn pending_bytes(&self) -> usize {
+        match &self.log {
+            Log::Direct(_) => 0,
+            Log::Piped(p) => p.pending_bytes,
+        }
+    }
+
+    /// Queued records, oldest first, up to `max_records` and `max_bytes`
+    /// (always at least one, so a single oversized record still moves),
+    /// with their total bytes and the commit index of the last one — the
+    /// unit handed to the writer.
+    pub fn take_batch(&mut self, max_records: usize, max_bytes: usize) -> Option<Batch> {
         let Log::Piped(p) = &mut self.log else {
             return None;
         };
-        if p.pending.is_empty() {
+        let mut records = Vec::new();
+        let mut bytes = 0usize;
+        while let Some(next) = p.pending.front() {
+            let fits = records.len() < max_records.max(1) && bytes + next.len() <= max_bytes;
+            if !records.is_empty() && !fits {
+                break;
+            }
+            let Some(rec) = p.pending.pop_front() else {
+                break;
+            };
+            bytes += rec.len();
+            records.push(rec);
+            if records.len() >= max_records.max(1) {
+                break;
+            }
+        }
+        if records.is_empty() {
             return None;
         }
-        let n = max.max(1).min(p.pending.len());
-        let records: Vec<Vec<u8>> = p.pending.drain(..n).collect();
+        p.pending_bytes -= bytes;
         let upto = p.last_index - p.pending.len() as u64;
-        Some((records, upto))
+        Some(Batch {
+            records,
+            bytes,
+            upto,
+        })
     }
 
     /// Take in the writer's latest report (generation, counts, failure).
@@ -581,23 +625,25 @@ impl EngineCore {
         for r in self.runs.values() {
             *states.entry(r.state.kind()).or_insert(0u64) += 1;
         }
-        let (generation, records_written, journal_batches, largest_batch, stale_generations) =
-            match &self.log {
-                Log::Direct(j) => (
-                    j.generation(),
-                    j.records_written(),
-                    0,
-                    0,
-                    j.stale_generations().unwrap_or(0),
-                ),
-                Log::Piped(p) => (
-                    p.status.generation,
-                    p.status.records_written,
+        let (generation, records_written, stale_generations, batches) = match &self.log {
+            Log::Direct(j) => (
+                j.generation(),
+                j.records_written(),
+                j.stale_generations().unwrap_or(0),
+                (0, 0, 0),
+            ),
+            Log::Piped(p) => (
+                p.status.generation,
+                p.status.records_written,
+                p.status.stale_generations,
+                (
                     p.status.batches,
                     p.status.largest_batch,
-                    p.status.stale_generations,
+                    p.status.largest_batch_bytes,
                 ),
-            };
+            ),
+        };
+        let (journal_batches, largest_batch, largest_batch_bytes) = batches;
         Diagnostics {
             generation,
             records_written,
@@ -608,6 +654,7 @@ impl EngineCore {
             errors: std::collections::BTreeMap::new(),
             journal_batches,
             largest_batch,
+            largest_batch_bytes,
             stale_generations,
         }
     }

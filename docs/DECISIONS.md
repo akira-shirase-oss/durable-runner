@@ -290,3 +290,16 @@ convention; these seed the contract's prescribed directions.
   thread and copy the records appended meanwhile into the new
   generation's log before the swap. Until that is built, scheduled
   compaction stays off by default (D-018).
+- **D-022 — Batches and the outbox are bounded in bytes, not only
+  records.** D-014(d) and D-015 claimed byte-bounded batches, but the
+  actor merged up to `max_batch_records` records into one message with no
+  byte check, and the writer took the first message whole. Review put
+  40 records of 120 KB in one write under a 16 KiB bound; at the defaults
+  one batch could reach about 235 MB, and the 16,384-record outbox about
+  3.8 GB. Now `take_batch` and the actor's merge stop at
+  `max_batch_bytes` as well as `max_batch_records` (a single record
+  larger than the bound still moves, alone). The writer's gather keeps to
+  both bounds. The actor stops taking commands once its backlog reaches
+  `max_outbox_bytes` (64 MiB) or `max_outbox_records`. The bounded
+  command channel then refuses submits as `busy` rather than buffering.
+  Diagnostics report `largest_batch_bytes`.

@@ -282,6 +282,8 @@ pub struct ShellConfig {
     /// new commands (they then wait in, and are refused by, the bounded
     /// command channel).
     pub max_outbox_records: usize,
+    /// The same bound in payload bytes.
+    pub max_outbox_bytes: usize,
     /// Refuse a compaction whose snapshot would exceed this many bytes
     /// (`SnapshotOverBudget`) instead of writing it.
     pub max_snapshot_bytes: u64,
@@ -302,6 +304,7 @@ impl Default for ShellConfig {
             journal: JournalOptions::default(),
             group_commit: GroupCommit::default(),
             max_outbox_records: 16 * 1024,
+            max_outbox_bytes: 64 * 1024 * 1024,
             max_snapshot_bytes: 2 * 1024 * 1024 * 1024,
             // Off until compaction is cheap and its error path is fatal
             // (D-018): an operator schedules it explicitly.
@@ -440,18 +443,21 @@ struct Pipeline {
     /// Messages not yet handed to the writer, in commit order.
     outbound: VecDeque<WriterMsg>,
     outbound_records: usize,
+    outbound_bytes: usize,
     /// Commit index of the last record handed to the writer.
     sent_upto: u64,
     /// Commit index the writer has reported durable.
     durable: u64,
     held: VecDeque<(u64, Held)>,
     max_batch: usize,
+    max_batch_bytes: usize,
 }
 
 impl Pipeline {
     fn new(
         writer: Option<(SyncSender<WriterMsg>, std::thread::JoinHandle<()>)>,
         max_batch: usize,
+        max_batch_bytes: usize,
     ) -> Self {
         let (tx, thread) = match writer {
             Some((tx, t)) => (Some(tx), Some(t)),
@@ -462,28 +468,39 @@ impl Pipeline {
             thread,
             outbound: VecDeque::new(),
             outbound_records: 0,
+            outbound_bytes: 0,
             sent_upto: 0,
             durable: 0,
             held: VecDeque::new(),
             max_batch: max_batch.max(1),
+            max_batch_bytes,
         }
     }
 
     /// Move the core's newly committed records into the outbound queue,
     /// merging into the last append so the writer sees few, large
-    /// messages (each at most `max_batch` records).
+    /// messages — each within `max_batch` records and `max_batch_bytes`.
     fn collect(&mut self, core: &mut EngineCore) {
-        while let Some((records, upto)) = core.take_batch(self.max_batch) {
-            self.outbound_records += records.len();
+        while let Some(b) = core.take_batch(self.max_batch, self.max_batch_bytes) {
+            self.outbound_records += b.records.len();
+            self.outbound_bytes += b.bytes;
             match self.outbound.back_mut() {
                 Some(WriterMsg::Append {
                     records: queued,
+                    bytes,
                     upto: u,
-                }) if queued.len() + records.len() <= self.max_batch => {
-                    queued.extend(records);
-                    *u = upto;
+                }) if queued.len() + b.records.len() <= self.max_batch
+                    && *bytes + b.bytes <= self.max_batch_bytes =>
+                {
+                    queued.extend(b.records);
+                    *bytes += b.bytes;
+                    *u = b.upto;
                 }
-                _ => self.outbound.push_back(WriterMsg::Append { records, upto }),
+                _ => self.outbound.push_back(WriterMsg::Append {
+                    records: b.records,
+                    bytes: b.bytes,
+                    upto: b.upto,
+                }),
             }
         }
     }
@@ -497,7 +514,7 @@ impl Pipeline {
         }
         let Some(tx) = &self.tx else { return true };
         while let Some(msg) = self.outbound.pop_front() {
-            let n = msg.records();
+            let (n, nb) = (msg.records(), msg.bytes());
             let upto = match &msg {
                 WriterMsg::Append { upto, .. } => Some(*upto),
                 _ => None,
@@ -505,6 +522,7 @@ impl Pipeline {
             match tx.try_send(msg) {
                 Ok(()) => {
                     self.outbound_records -= n;
+                    self.outbound_bytes -= nb;
                     if let Some(u) = upto {
                         self.sent_upto = u;
                     }
@@ -519,9 +537,12 @@ impl Pipeline {
         true
     }
 
-    /// Records decided but not yet handed to the writer.
-    fn backlog(&self, core: &EngineCore) -> usize {
-        self.outbound_records + core.pending_records()
+    /// Records and payload bytes decided but not yet handed to the writer.
+    fn backlog(&self, core: &EngineCore) -> (usize, usize) {
+        (
+            self.outbound_records + core.pending_records(),
+            self.outbound_bytes + core.pending_bytes(),
+        )
     }
 
     /// Answer a caller once `needs` is durable.
@@ -666,6 +687,7 @@ async fn actor(
     let mut pipe = Pipeline::new(
         Some((writer.tx, writer.thread)),
         cfg.group_commit.max_batch_records,
+        cfg.group_commit.max_batch_bytes,
     );
     let mut pending_compaction: Option<PendingCompaction> = None;
     // First run one period after start, then every period.
@@ -730,7 +752,9 @@ async fn actor(
             pipe.shutdown().await;
             return;
         }
-        let accepting = pipe.backlog(&core) < cfg.max_outbox_records;
+        let (backlog_records, backlog_bytes) = pipe.backlog(&core);
+        let accepting =
+            backlog_records < cfg.max_outbox_records && backlog_bytes < cfg.max_outbox_bytes;
         tokio::select! {
             cmd = rx.recv(), if accepting => match cmd {
                 Some(Cmd::Submit { key, spec, not_before, reply }) => {
@@ -1563,7 +1587,7 @@ mod tests {
             errors: BTreeMap::new(),
         };
         // Direct-mode core: every commit is durable when it returns.
-        let mut pipe = Pipeline::new(None, 1024);
+        let mut pipe = Pipeline::new(None, 1024, usize::MAX);
         let mut ex = Exec {
             registry: &reg,
             sem: sem.clone(),
@@ -2341,6 +2365,108 @@ mod tests {
             1,
             "the engine carries on"
         );
+    }
+
+    /// Submit delayed runs with `input` bytes each, concurrently.
+    fn submit_sized(
+        eng: &Engine,
+        prefix: &str,
+        n: usize,
+        input: usize,
+    ) -> Vec<tokio::task::JoinHandle<Result<RunId, EngineError>>> {
+        (0..n)
+            .map(|i| {
+                let e = eng.clone();
+                let key = OperationKey(format!("{prefix}-{i}"));
+                let mut s = spec("echo");
+                s.input = vec![b'x'; input];
+                tokio::spawn(async move { e.submit_at(key, s, FAR).await })
+            })
+            .collect()
+    }
+
+    /// Review finding 4: batches were bounded only in records, so
+    /// `max_batch_bytes` bounded nothing (40 records of 120 KB went in one
+    /// write). With a 16 KiB bound and ~3 KB records, 41 commits need at
+    /// least 8 writes + fsyncs.
+    #[tokio::test(flavor = "current_thread")]
+    async fn group_commit_batches_are_bounded_in_bytes() {
+        let d = tempfile::tempdir().unwrap_or_else(|e| panic!("{e}"));
+        let faults = Arc::new(Faults::default());
+        let gc = GroupCommit {
+            max_batch_bytes: 16 * 1024,
+            ..GroupCommit::default()
+        };
+        let eng =
+            spawn(d.path(), echo_registry(), piped(&faults, gc)).unwrap_or_else(|e| panic!("{e}"));
+        faults.hold_syncs();
+        let first = submit_sized(&eng, "b0", 1, 1024);
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        let rest = submit_sized(&eng, "b", 40, 1024);
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        faults.release_syncs();
+        for r in join_all(first)
+            .await
+            .into_iter()
+            .chain(join_all(rest).await)
+        {
+            r.unwrap_or_else(|e| panic!("{e}"));
+        }
+        let syncs = faults.sync_calls();
+        assert!(
+            syncs >= 8,
+            "41 records of ~3 KB in {syncs} fsyncs under a 16 KiB bound"
+        );
+    }
+
+    /// The actor's outbox is bounded in bytes too: once it holds
+    /// `max_outbox_bytes` it stops taking commands, the bounded command
+    /// channel fills, and further submits are refused busy instead of
+    /// buffered without limit while the writer is slow.
+    #[tokio::test(flavor = "current_thread")]
+    async fn outbox_is_bounded_in_bytes() {
+        let d = tempfile::tempdir().unwrap_or_else(|e| panic!("{e}"));
+        let faults = Arc::new(Faults::default());
+        let cfg = ShellConfig {
+            cmd_capacity: 2,
+            max_outbox_bytes: 32 * 1024,
+            ..piped(&faults, GroupCommit::default())
+        };
+        let eng = spawn(d.path(), echo_registry(), cfg).unwrap_or_else(|e| panic!("{e}"));
+        faults.hold_syncs();
+        let first = submit_sized(&eng, "o-first", 1, 1024);
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        let mut handles = Vec::new();
+        for i in 0..100 {
+            handles.extend(submit_sized(&eng, &format!("o{i}"), 1, 1024));
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let (done, waiting): (Vec<_>, Vec<_>) = handles.into_iter().partition(|h| h.is_finished());
+        let busy = join_all(done)
+            .await
+            .into_iter()
+            .filter(|r| {
+                matches!(
+                    r,
+                    Err(EngineError::Refused(
+                        durable_domain::Refusal::ReserveExhausted
+                    ))
+                )
+            })
+            .count();
+        assert!(
+            busy >= 80,
+            "only {busy} of 100 refused: the outbox kept buffering"
+        );
+        faults.release_syncs();
+        for r in join_all(first)
+            .await
+            .into_iter()
+            .chain(join_all(waiting).await)
+        {
+            r.unwrap_or_else(|e| panic!("held submits complete: {e}"));
+        }
     }
 
     /// A failed fsync must stop the engine — never retry it, never keep

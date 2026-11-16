@@ -65,6 +65,7 @@ pub struct WriterStatus {
     pub records_written: u64,
     pub batches: u64,
     pub largest_batch: u64,
+    pub largest_batch_bytes: u64,
     /// Superseded generation directories still on disk (retention lag).
     pub stale_generations: u32,
     /// Set once a write or fsync failed; the writer has stopped.
@@ -72,8 +73,13 @@ pub struct WriterStatus {
 }
 
 pub(crate) enum WriterMsg {
-    /// Consecutive records; `upto` is the commit index of the last one.
-    Append { records: Vec<Vec<u8>>, upto: u64 },
+    /// Consecutive records (`bytes` of payload); `upto` is the commit
+    /// index of the last one.
+    Append {
+        records: Vec<Vec<u8>>,
+        bytes: usize,
+        upto: u64,
+    },
     /// Encode `view` (exactly `bytes`) straight into the new generation.
     Compact {
         view: crate::snapshot::View,
@@ -90,6 +96,12 @@ impl WriterMsg {
     pub(crate) fn records(&self) -> usize {
         match self {
             WriterMsg::Append { records, .. } => records.len(),
+            _ => 0,
+        }
+    }
+    pub(crate) fn bytes(&self) -> usize {
+        match self {
+            WriterMsg::Append { bytes, .. } => *bytes,
             _ => 0,
         }
     }
@@ -134,8 +146,12 @@ fn run(
             },
         };
         match msg {
-            WriterMsg::Append { records, upto } => {
-                let (batch, upto, next) = gather(&rx, records, upto, &cfg);
+            WriterMsg::Append {
+                records,
+                bytes,
+                upto,
+            } => {
+                let (batch, bytes, upto, next) = gather(&rx, records, bytes, upto, &cfg);
                 carry = next;
                 match journal.append_batch(&batch) {
                     Ok(_) => {
@@ -143,6 +159,7 @@ fn run(
                         st.records_written = journal.records_written();
                         st.batches += 1;
                         st.largest_batch = st.largest_batch.max(batch.len() as u64);
+                        st.largest_batch_bytes = st.largest_batch_bytes.max(bytes as u64);
                     }
                     Err(e) => {
                         // Every waiter in this batch, and every later one,
@@ -199,40 +216,42 @@ fn run(
 fn gather(
     rx: &Receiver<WriterMsg>,
     mut batch: Vec<Vec<u8>>,
+    mut bytes: usize,
     mut upto: u64,
     cfg: &GroupCommit,
-) -> (Vec<Vec<u8>>, u64, Option<WriterMsg>) {
-    let mut bytes: usize = batch.iter().map(Vec::len).sum();
+) -> (Vec<Vec<u8>>, usize, u64, Option<WriterMsg>) {
     let deadline = Instant::now() + cfg.max_wait;
     loop {
         if batch.len() >= cfg.max_batch_records || bytes >= cfg.max_batch_bytes {
-            return (batch, upto, None);
+            return (batch, bytes, upto, None);
         }
         let next = match rx.try_recv() {
             Ok(m) => m,
-            Err(TryRecvError::Disconnected) => return (batch, upto, None),
+            Err(TryRecvError::Disconnected) => return (batch, bytes, upto, None),
             Err(TryRecvError::Empty) => {
                 let left = deadline.saturating_duration_since(Instant::now());
                 if left.is_zero() {
-                    return (batch, upto, None);
+                    return (batch, bytes, upto, None);
                 }
                 match rx.recv_timeout(left) {
                     Ok(m) => m,
-                    Err(_) => return (batch, upto, None),
+                    Err(_) => return (batch, bytes, upto, None),
                 }
             }
         };
         match next {
-            WriterMsg::Append { records, upto: u }
-                if batch.len() + records.len() <= cfg.max_batch_records
-                    && bytes + records.iter().map(Vec::len).sum::<usize>()
-                        <= cfg.max_batch_bytes =>
+            WriterMsg::Append {
+                records,
+                bytes: b,
+                upto: u,
+            } if batch.len() + records.len() <= cfg.max_batch_records
+                && bytes + b <= cfg.max_batch_bytes =>
             {
-                bytes += records.iter().map(Vec::len).sum::<usize>();
+                bytes += b;
                 batch.extend(records);
                 upto = u;
             }
-            other => return (batch, upto, Some(other)),
+            other => return (batch, bytes, upto, Some(other)),
         }
     }
 }
