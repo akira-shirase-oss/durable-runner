@@ -2308,6 +2308,12 @@ mod tests {
         let cfg = ShellConfig {
             cmd_capacity: 4096,
             max_outbox_records: 1 << 20,
+            // The probe holds every run queued on purpose.
+            limits: Limits {
+                max_live_runs: usize::MAX,
+                max_index_bytes: u64::MAX,
+                ..Limits::default()
+            },
             ..Default::default()
         };
         let eng = spawn(d.path(), echo_registry(), cfg).unwrap_or_else(|e| panic!("{e}"));

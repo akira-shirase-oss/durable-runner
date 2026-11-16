@@ -313,3 +313,18 @@ convention; these seed the contract's prescribed directions.
   and be refused busy, but it can no longer take a slot a submit or
   cancel needs. Rate limiting open reads remains a requirement before any
   non-loopback exposure.
+- **D-024 — Admission is bounded by live runs and index bytes.** Nothing
+  bounded how many runs, or how many bytes of them, the index held.
+  Inputs stay in memory at least seven days. Group commit made the index
+  fill about 15 times faster, and first-step dispatch is capped by
+  construction (64 per 50 ms tick, 1,280/s), so accepted submits could
+  outrun dispatch indefinitely. The contract says "cap memory and disk;
+  reject overload explicitly". `Limits` gains `max_live_runs` (100,000
+  non-terminal runs) and `max_index_bytes` (1 GiB, an approximation:
+  payloads plus a fixed per-run and per-step overhead). The core keeps
+  both counts current, so the check is O(1), and refuses past them with
+  `AtCapacity` (503 `at_capacity`) before journaling; finishing or
+  expiring runs frees room. Duplicate submits still return their
+  original run. The server exposes `--max-live-runs`,
+  `--max-index-bytes`, `--max-in-flight` and `--max-dispatch-per-tick`.
+  Diagnostics report `active_runs` and `index_bytes`.

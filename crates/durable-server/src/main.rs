@@ -56,6 +56,21 @@ struct Args {
     /// (409 `snapshot_over_budget`) instead of writing it.
     #[arg(long, default_value_t = 2 * 1024 * 1024 * 1024)]
     max_snapshot_bytes: u64,
+    /// Non-terminal runs admitted at once; beyond it submits are 503
+    /// `at_capacity`.
+    #[arg(long, default_value_t = 100_000)]
+    max_live_runs: usize,
+    /// Approximate bytes of all retained runs; beyond it submits are 503
+    /// `at_capacity`.
+    #[arg(long, default_value_t = 1024 * 1024 * 1024)]
+    max_index_bytes: u64,
+    /// Handler calls (attempts and probes) in flight at once.
+    #[arg(long, default_value_t = 32)]
+    max_in_flight: usize,
+    /// Dispatches per scheduler tick (ticks every 50 ms, so the first-step
+    /// dispatch rate is at most 20 × this per second).
+    #[arg(long, default_value_t = 64)]
+    max_dispatch_per_tick: usize,
 }
 
 /// The environment variable holding the API key. Read from the
@@ -265,6 +280,11 @@ impl From<EngineError> for ApiError {
                 StatusCode::SERVICE_UNAVAILABLE,
                 "busy",
                 "the server is at capacity; retry with the same op_key",
+            ),
+            EngineError::Refused(Refusal::AtCapacity) => Self::new(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "at_capacity",
+                "the runner holds as many runs as it is configured to; retry later with the same op_key",
             ),
             EngineError::Refused(r) => Self::new(StatusCode::CONFLICT, "refused", r.to_string()),
             EngineError::UnregisteredHandler(_) => {
@@ -611,6 +631,13 @@ async fn main() -> Result<()> {
         compact_every: (args.compact_every_secs > 0)
             .then(|| Duration::from_secs(args.compact_every_secs)),
         max_snapshot_bytes: args.max_snapshot_bytes,
+        max_in_flight: args.max_in_flight.max(1),
+        max_dispatch_per_tick: args.max_dispatch_per_tick.max(1),
+        limits: durable_domain::Limits {
+            max_live_runs: args.max_live_runs,
+            max_index_bytes: args.max_index_bytes,
+            ..durable_domain::Limits::default()
+        },
         ..Default::default()
     };
     let mut registry = Registry::default();
@@ -1152,6 +1179,15 @@ mod tests {
         assert_eq!(
             args.compact_every_secs, 0,
             "scheduled compaction must be opt-in"
+        );
+    }
+
+    #[test]
+    fn capacity_refusal_is_503_at_capacity() {
+        let e = ApiError::from(EngineError::Refused(durable_domain::Refusal::AtCapacity));
+        assert_eq!(
+            (e.status, e.code),
+            (StatusCode::SERVICE_UNAVAILABLE, "at_capacity")
         );
     }
 

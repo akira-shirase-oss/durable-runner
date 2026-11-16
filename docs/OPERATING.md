@@ -26,6 +26,13 @@ target/release/durable-server \
 
 - **Reserve.** `--reserve-bytes N` (default 64 MiB) must stay free on the
   journal filesystem; see "What honest looks like" for the 503s.
+- **Capacity.** `--max-live-runs` (100,000 non-terminal runs) and
+  `--max-index-bytes` (1 GiB of retained runs) bound the index; past them
+  a submit is `503 at_capacity` (nothing journaled; retry with the same
+  `op_key`). `--max-in-flight` (32 handler calls) and
+  `--max-dispatch-per-tick` (64 per 50 ms tick) bound execution; raise
+  them if dispatch is the bottleneck. `GET /admin/diagnostics` shows
+  `active_runs` and `index_bytes`.
 - **Retention.** Compaction runs only when asked (`durable compact`) unless
   you pass `--compact-every-secs N` (default 0 = off; see D-018 for why it
   is opt-in). Each compaction expires terminal runs older than seven days
@@ -111,7 +118,8 @@ state — same run ids, same `finished_at`. Verified live by
 - HTTP 401 — no or wrong API key on a mutating/admin route.
 - HTTP 503 — the server is bounded and said so instead of queueing
   silently. The `code` says which bound: `busy` (the command queue is
-  full — retry with the same `op_key`), `no_space` (free disk is below
+  full — retry with the same `op_key`), `at_capacity` (the live-run or
+  index-byte bound), `no_space` (free disk is below
   `--reserve-bytes`, default 64 MiB — nothing was written), or
   `journal_unavailable` (a journal write failed and was rolled back, or
   the writer is poisoned and the process is about to exit).

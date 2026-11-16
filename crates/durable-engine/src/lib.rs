@@ -74,6 +74,10 @@ pub struct Diagnostics {
     pub generation: u32,
     pub records_written: u64,
     pub live_runs: u64,
+    /// Non-terminal runs (bounded by `max_live_runs`) and the index's
+    /// approximate bytes (bounded by `max_index_bytes`).
+    pub active_runs: u64,
+    pub index_bytes: u64,
     pub dedup_keys: u64,
     pub states: std::collections::BTreeMap<&'static str, u64>,
     /// Whether the journal filesystem has its reserve free.
@@ -200,6 +204,10 @@ pub struct EngineCore {
     runs: BTreeMap<RunId, Arc<Run>>,
     by_op: HashMap<OperationKey, RunId>,
     next_run: u64,
+    /// Non-terminal runs and the index's approximate bytes, kept current
+    /// so admission is O(1).
+    live: usize,
+    index_bytes: u64,
     pub limits: Limits,
     pub retry: RetryPolicy,
 }
@@ -226,6 +234,8 @@ impl EngineCore {
             runs: BTreeMap::new(),
             by_op: HashMap::new(),
             next_run: 1,
+            live: 0,
+            index_bytes: 0,
             limits: Limits::default(),
             retry: RetryPolicy::default(),
         };
@@ -255,6 +265,7 @@ impl EngineCore {
             core.apply_committed(RunId(env.run), env.event, env.at)?;
         }
         core.next_run = max_run + 1;
+        core.recount();
         Ok(core)
     }
 
@@ -409,11 +420,28 @@ impl EngineCore {
     pub fn finish_compaction(&mut self, expired: &[RunId]) {
         for id in expired {
             if let Some(run) = self.runs.remove(id) {
+                self.index_bytes = self
+                    .index_bytes
+                    .saturating_sub(Limits::run_bytes(&run.key, &run.spec));
                 if self.by_op.get(&run.key) == Some(id) {
                     self.by_op.remove(&run.key);
                 }
             }
         }
+    }
+
+    /// Recompute the admission counters from the index (after replay).
+    fn recount(&mut self) {
+        self.live = self
+            .runs
+            .values()
+            .filter(|r| !r.state.is_terminal())
+            .count();
+        self.index_bytes = self
+            .runs
+            .values()
+            .map(|r| Limits::run_bytes(&r.key, &r.spec))
+            .sum();
     }
 
     /// Compact (direct mode): expire 7-day-old terminal runs, snapshot the
@@ -455,6 +483,8 @@ impl EngineCore {
                 return Err(Refusal::DuplicateKey.into());
             }
             self.by_op.insert(key.clone(), run_id);
+            self.live += 1;
+            self.index_bytes += Limits::run_bytes(&key, &spec);
             self.runs.insert(
                 run_id,
                 Arc::new(Run::accepted(run_id, key, spec, not_before)),
@@ -467,6 +497,9 @@ impl EngineCore {
         let run = Arc::make_mut(self.runs.get_mut(&run_id).ok_or(Refusal::StaleReply)?);
         if state.is_terminal() && run.finished_at.is_none() {
             run.finished_at = Some(now); // the 7-day expiry clock starts
+        }
+        if state.is_terminal() && !run.state.is_terminal() {
+            self.live = self.live.saturating_sub(1);
         }
         run.state = state;
         Ok(effects)
@@ -528,6 +561,13 @@ impl EngineCore {
             return Ok(*existing); // duplicate: hand back the original run
         }
         self.limits.admits(&spec)?; // limits refuse before anything is written
+                                    // Capacity: a bounded index, refused explicitly (contract: "cap
+                                    // memory and disk; reject overload explicitly").
+        if self.live >= self.limits.max_live_runs
+            || self.index_bytes + Limits::run_bytes(&key, &spec) > self.limits.max_index_bytes
+        {
+            return Err(Refusal::AtCapacity.into());
+        }
         let run = RunId(self.next_run);
         self.commit(
             run,
@@ -671,6 +711,8 @@ impl EngineCore {
             generation,
             records_written,
             live_runs: self.runs.len() as u64,
+            active_runs: self.live as u64,
+            index_bytes: self.index_bytes,
             dedup_keys: self.by_op.len() as u64,
             states,
             space_ok: self.space_ok(),
@@ -1179,6 +1221,42 @@ mod tests {
         assert!(matches!(
             runs.get(&run).map(|r| &r.state),
             Some(RunState::Queued { .. })
+        ));
+    }
+
+    /// Review finding 7: nothing bounded live runs, and accepted submits
+    /// could outrun dispatch indefinitely. Beyond `max_live_runs` (or the
+    /// index byte bound) a submit is refused `AtCapacity` before anything
+    /// is journaled; finishing a run frees room.
+    #[test]
+    fn admission_is_bounded_by_live_runs_and_index_bytes() {
+        let (_d, mut e) = open();
+        e.limits.max_live_runs = 3;
+        let ids: Vec<RunId> = (0..3)
+            .map(|i| {
+                e.submit(OperationKey(format!("cap-{i}")), spec(), 0)
+                    .unwrap_or_else(|e| panic!("{e}"))
+            })
+            .collect();
+        let written = e.diagnostics().records_written;
+        assert!(matches!(
+            e.submit(OperationKey("cap-4".into()), spec(), 0),
+            Err(EngineError::Refused(Refusal::AtCapacity))
+        ));
+        assert_eq!(
+            e.diagnostics().records_written,
+            written,
+            "nothing journaled"
+        );
+        e.cancel(ids[0], 1).unwrap_or_else(|e| panic!("{e}"));
+        e.submit(OperationKey("cap-4".into()), spec(), 2)
+            .unwrap_or_else(|e| panic!("a finished run frees room: {e}"));
+
+        e.limits.max_live_runs = usize::MAX;
+        e.limits.max_index_bytes = e.diagnostics().index_bytes; // already full
+        assert!(matches!(
+            e.submit(OperationKey("bytes".into()), spec(), 3),
+            Err(EngineError::Refused(Refusal::AtCapacity))
         ));
     }
 
