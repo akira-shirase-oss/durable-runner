@@ -6,19 +6,28 @@
 //!
 //! `EngineCore` is synchronous and clock-injected so tests are deterministic;
 //! the async dispatcher (D2's Tokio shell) wraps it.
+//!
+//! Two log modes. **Direct** (startup replay, tools, core tests): `commit`
+//! appends and fsyncs before it returns. **Piped** (the running shell):
+//! `commit` applies the record in memory and queues it for the group-commit
+//! writer thread (`writer`); the shell releases everything the record
+//! decided — acks, read answers, handler calls — only after the writer
+//! reports the covering fsync (D-014, D-015).
 
 use durable_domain::{
     reduce, Effect, Event, JobSpec, Limits, Millis, OperationKey, Refusal, RetryPolicy, Run, RunId,
     RunState, StepIndex,
 };
-use durable_journal::{Journal, JournalError, JournalOptions};
+use durable_journal::{Journal, JournalError, JournalOptions, SpaceProbe};
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::ops::Bound;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use thiserror::Error;
 
 pub mod shell;
+pub mod writer;
 
 #[derive(Debug, Error)]
 pub enum EngineError {
@@ -32,6 +41,15 @@ pub enum EngineError {
     Stopped,
     #[error("unregistered handler: {0}")]
     UnregisteredHandler(String),
+    /// The group commit holding this request's record failed. Nothing
+    /// decided on the strength of it left the process; the engine stops
+    /// and restart replay decides what is durable.
+    #[error("journal commit failed; nothing was acknowledged: {0}")]
+    CommitFailed(Arc<JournalError>),
+    /// A direct-mode operation was called while the writer thread owns the
+    /// journal (a programming error, never a client one).
+    #[error("operation unavailable while the group-commit writer owns the journal")]
+    Piped,
 }
 
 /// A journaled record: the run, the commit clock value, and the event.
@@ -58,6 +76,9 @@ pub struct Diagnostics {
     /// (a handler outcome that could not be journaled, a stale reply),
     /// by kind — counted, never silently dropped.
     pub errors: std::collections::BTreeMap<&'static str, u64>,
+    /// Group commits written (one write + one fsync each) and the largest.
+    pub journal_batches: u64,
+    pub largest_batch: u64,
 }
 
 /// The serialized in-memory index — what a compaction snapshot carries.
@@ -72,10 +93,62 @@ struct IndexSnapshot {
     next_run: u64,
 }
 
+/// Where commits go: straight to disk, or to the group-commit writer.
+enum Log {
+    Direct(Journal),
+    Piped(Pipe),
+}
+
+/// Piped mode's side of the journal: records applied in memory and waiting
+/// to be handed to the writer, plus the writer's last reported state.
+struct Pipe {
+    pending: VecDeque<Vec<u8>>,
+    /// Commit index (this process) of the newest queued record.
+    last_index: u64,
+    root: PathBuf,
+    space: SpaceProbe,
+    reserve: u64,
+    status: writer::WriterStatus,
+}
+
+impl Pipe {
+    /// The same admission rule as `Journal::append`, checked when the
+    /// record is queued: it must fit with the reserve still free.
+    fn enqueue(&mut self, payload: Vec<u8>) -> Result<(), JournalError> {
+        if self.status.failed.is_some() {
+            return Err(JournalError::Poisoned);
+        }
+        let available = self.space.available(&self.root)?;
+        let need = 18 + payload.len() as u64; // frame header + payload
+        if available < self.reserve.saturating_add(need) {
+            return Err(JournalError::NoSpace {
+                available,
+                reserve: self.reserve,
+            });
+        }
+        self.pending.push_back(payload);
+        self.last_index += 1;
+        Ok(())
+    }
+
+    fn space_ok(&self) -> bool {
+        self.space
+            .available(&self.root)
+            .is_ok_and(|a| a >= self.reserve)
+    }
+}
+
+/// A compaction worked out against the live index but not yet applied:
+/// the snapshot for the new generation and the runs it expires.
+pub struct CompactionPlan {
+    pub snapshot: durable_journal::Snapshot,
+    pub expired: Vec<RunId>,
+}
+
 /// The whole runtime index, rebuilt only by replaying the journal through
 /// the reducer — the same fold the live path performs.
 pub struct EngineCore {
-    journal: Journal,
+    log: Log,
     runs: BTreeMap<RunId, Run>,
     by_op: HashMap<OperationKey, RunId>,
     next_run: u64,
@@ -100,7 +173,7 @@ impl EngineCore {
         let journal = Journal::open_with(dir, opts)?;
         let gdir = durable_journal::gen_dir_path(dir, journal.generation());
         let mut core = Self {
-            journal,
+            log: Log::Direct(journal),
             runs: BTreeMap::new(),
             by_op: HashMap::new(),
             next_run: 1,
@@ -123,29 +196,107 @@ impl EngineCore {
         Ok(core)
     }
 
-    /// Consistent backup: generation data copied first, manifest last —
-    /// a partial copy opens as a complete older generation.
-    pub fn backup_to(&self, dest: &Path) -> Result<(), EngineError> {
-        self.journal.backup_to(dest)?;
-        Ok(())
+    /// Hand the journal to a group-commit writer: from now on commits are
+    /// queued (`take_batch`) instead of written. Returns the journal for
+    /// the writer thread to own.
+    pub fn into_piped(mut self) -> (Self, Option<Journal>) {
+        let log = std::mem::replace(
+            &mut self.log,
+            Log::Piped(Pipe {
+                pending: VecDeque::new(),
+                last_index: 0,
+                root: PathBuf::new(),
+                space: SpaceProbe::default(),
+                reserve: 0,
+                status: writer::WriterStatus::default(),
+            }),
+        );
+        match log {
+            Log::Direct(journal) => {
+                if let Log::Piped(p) = &mut self.log {
+                    p.root = journal.dir().to_path_buf();
+                    p.space = journal.options().space.clone();
+                    p.reserve = journal.options().reserve_bytes;
+                    p.status.generation = journal.generation();
+                    p.status.records_written = journal.records_written();
+                }
+                (self, Some(journal))
+            }
+            piped @ Log::Piped(_) => {
+                self.log = piped;
+                (self, None)
+            }
+        }
     }
 
-    /// Compact: expire 7-day-old terminal runs, snapshot the live index
-    /// into a new generation, atomically swap the manifest. Returns the
-    /// new generation number.
-    ///
-    /// All or nothing: expiry is applied to the live index only after the
-    /// new generation is durable, so a refused compaction (`NoSpace`)
-    /// leaves memory and disk agreeing.
-    pub fn compact(&mut self, now: Millis) -> Result<u32, EngineError> {
+    /// Commit index of the newest record (piped mode; 0 in direct mode,
+    /// where every commit is durable when `commit` returns).
+    pub fn last_index(&self) -> u64 {
+        match &self.log {
+            Log::Direct(_) => 0,
+            Log::Piped(p) => p.last_index,
+        }
+    }
+
+    /// Records queued for the writer and not yet handed over.
+    pub fn pending_records(&self) -> usize {
+        match &self.log {
+            Log::Direct(_) => 0,
+            Log::Piped(p) => p.pending.len(),
+        }
+    }
+
+    /// Up to `max` queued records, oldest first, with the commit index of
+    /// the last one — the unit handed to the writer.
+    pub fn take_batch(&mut self, max: usize) -> Option<(Vec<Vec<u8>>, u64)> {
+        let Log::Piped(p) = &mut self.log else {
+            return None;
+        };
+        if p.pending.is_empty() {
+            return None;
+        }
+        let n = max.max(1).min(p.pending.len());
+        let records: Vec<Vec<u8>> = p.pending.drain(..n).collect();
+        let upto = p.last_index - p.pending.len() as u64;
+        Some((records, upto))
+    }
+
+    /// Take in the writer's latest report (generation, counts, failure).
+    pub fn observe(&mut self, status: &writer::WriterStatus) {
+        if let Log::Piped(p) = &mut self.log {
+            p.status = status.clone();
+        }
+    }
+
+    /// Consistent backup: generation data copied first, manifest last —
+    /// a partial copy opens as a complete older generation. Direct mode
+    /// only; the shell backs up through the writer.
+    pub fn backup_to(&self, dest: &Path) -> Result<(), EngineError> {
+        match &self.log {
+            Log::Direct(j) => Ok(j.backup_to(dest)?),
+            Log::Piped(_) => Err(EngineError::Piped),
+        }
+    }
+
+    /// Work out a compaction: expire 7-day-old terminal runs and snapshot
+    /// the rest. Nothing changes until `finish_compaction`, which the
+    /// caller runs only once the new generation is durable — so a refused
+    /// compaction (`NoSpace`) leaves memory and disk agreeing.
+    pub fn plan_compaction(&self, now: Millis) -> Result<CompactionPlan, EngineError> {
+        let expired: Vec<RunId> = self
+            .runs
+            .values()
+            .filter(|r| {
+                r.state.is_terminal()
+                    && r.finished_at
+                        .is_some_and(|t| now.saturating_sub(t) > TERMINAL_EXPIRY_MS)
+            })
+            .map(|r| r.id)
+            .collect();
         let runs: BTreeMap<RunId, Run> = self
             .runs
             .iter()
-            .filter(|(_, r)| {
-                !(r.state.is_terminal()
-                    && r.finished_at
-                        .is_some_and(|t| now.saturating_sub(t) > TERMINAL_EXPIRY_MS))
-            })
+            .filter(|(id, _)| !expired.contains(id))
             .map(|(id, r)| (*id, r.clone()))
             .collect();
         // Dedup keys live only as long as their run — no orphan entries.
@@ -155,24 +306,51 @@ impl EngineCore {
             .filter(|(_, id)| runs.contains_key(id))
             .map(|(k, id)| (k.clone(), *id))
             .collect();
-        let idx = IndexSnapshot {
+        let payload = serde_json::to_vec(&IndexSnapshot {
             runs,
             by_op,
             next_run: self.next_run,
-        };
-        let payload = serde_json::to_vec(&idx)?;
-        self.journal.compact(&durable_journal::Snapshot {
-            covered_seq: 0,
-            payload,
         })?;
-        self.runs = idx.runs;
-        self.by_op = idx.by_op;
-        Ok(self.journal.generation())
+        Ok(CompactionPlan {
+            snapshot: durable_journal::Snapshot {
+                covered_seq: 0,
+                payload,
+            },
+            expired,
+        })
+    }
+
+    /// Apply a durable compaction's expiry to the live index.
+    pub fn finish_compaction(&mut self, expired: &[RunId]) {
+        for id in expired {
+            if let Some(run) = self.runs.remove(id) {
+                if self.by_op.get(&run.key) == Some(id) {
+                    self.by_op.remove(&run.key);
+                }
+            }
+        }
+    }
+
+    /// Compact (direct mode): expire 7-day-old terminal runs, snapshot the
+    /// live index into a new generation, atomically swap the manifest.
+    /// Returns the new generation number. All or nothing.
+    pub fn compact(&mut self, now: Millis) -> Result<u32, EngineError> {
+        let plan = self.plan_compaction(now)?;
+        let Log::Direct(journal) = &mut self.log else {
+            return Err(EngineError::Piped);
+        };
+        journal.compact(&plan.snapshot)?;
+        let generation = journal.generation();
+        self.finish_compaction(&plan.expired);
+        Ok(generation)
     }
 
     /// Whether the journal filesystem has its reserve free (readiness).
     pub fn space_ok(&self) -> bool {
-        self.journal.space_ok()
+        match &self.log {
+            Log::Direct(j) => j.space_ok(),
+            Log::Piped(p) => p.space_ok(),
+        }
     }
 
     fn apply_committed(
@@ -224,7 +402,16 @@ impl EngineCore {
             at: now,
             event: event.clone(),
         })?;
-        self.journal.append(&payload)?; // durable BEFORE applied below
+        match &mut self.log {
+            // durable BEFORE applied below
+            Log::Direct(j) => {
+                j.append(&payload)?;
+            }
+            // Applied now so later decisions see it; the shell releases
+            // nothing this record decides until the writer reports it
+            // durable.
+            Log::Piped(p) => p.enqueue(payload)?,
+        }
         self.apply_committed(run, event, now)
     }
 
@@ -356,7 +543,10 @@ impl EngineCore {
     /// A poisoned journal writer refuses every commit: the process must
     /// stop and let startup replay decide what is durable.
     pub fn is_poisoned(&self) -> bool {
-        self.journal.is_poisoned()
+        match &self.log {
+            Log::Direct(j) => j.is_poisoned(),
+            Log::Piped(p) => p.status.failed.is_some(),
+        }
     }
 
     pub fn run(&self, id: RunId) -> Option<&Run> {
@@ -370,14 +560,25 @@ impl EngineCore {
         for r in self.runs.values() {
             *states.entry(r.state.kind()).or_insert(0u64) += 1;
         }
+        let (generation, records_written, journal_batches, largest_batch) = match &self.log {
+            Log::Direct(j) => (j.generation(), j.records_written(), 0, 0),
+            Log::Piped(p) => (
+                p.status.generation,
+                p.status.records_written,
+                p.status.batches,
+                p.status.largest_batch,
+            ),
+        };
         Diagnostics {
-            generation: self.journal.generation(),
-            records_written: self.journal.records_written(),
+            generation,
+            records_written,
             live_runs: self.runs.len() as u64,
             dedup_keys: self.by_op.len() as u64,
             states,
-            space_ok: self.journal.space_ok(),
+            space_ok: self.space_ok(),
             errors: std::collections::BTreeMap::new(),
+            journal_batches,
+            largest_batch,
         }
     }
 

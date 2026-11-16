@@ -113,6 +113,8 @@ state — same run ids, same `finished_at`. Verified live by
   `GET /admin/diagnostics` (`errors.no_space`) and the run reconciles
   after its deadline once space returns.
 - Process exit with `engine stopped: journal writer poisoned` — a journal
-  fsync failed. It is never retried; run the server under a supervisor
-  that restarts on failure (systemd `Restart=on-failure`) and startup
-  replay recovers exactly the durable history.
+  write or fsync failed. It is never retried: every request waiting on
+  that group commit (and after it) got `503 journal_unavailable`, nothing
+  of it was acknowledged. Run the server under a supervisor that restarts
+  on failure (systemd `Restart=on-failure`) and startup replay recovers
+  exactly the durable history.

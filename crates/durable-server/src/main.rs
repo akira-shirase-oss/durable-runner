@@ -252,7 +252,6 @@ impl IntoResponse for ApiError {
 impl From<EngineError> for ApiError {
     fn from(e: EngineError) -> Self {
         use durable_domain::Refusal;
-        use durable_journal::JournalError as J;
         match &e {
             EngineError::Refused(Refusal::ReserveExhausted) => Self::new(
                 StatusCode::SERVICE_UNAVAILABLE,
@@ -268,21 +267,32 @@ impl From<EngineError> for ApiError {
                 "engine_stopped",
                 "the engine has stopped; the server is restarting",
             ),
-            EngineError::Journal(J::NoSpace { .. }) => Self::new(
+            // Refused before anything was written, or a group commit that
+            // failed after: either way nothing was acknowledged.
+            EngineError::Journal(j) => Self::journal(j, &e),
+            EngineError::CommitFailed(j) => Self::journal(j, &e),
+            EngineError::Serde(_) | EngineError::Piped => Self::internal(&e),
+        }
+    }
+}
+
+impl ApiError {
+    fn journal(j: &durable_journal::JournalError, e: &EngineError) -> Self {
+        use durable_journal::JournalError as J;
+        match j {
+            J::NoSpace { .. } => Self::new(
                 StatusCode::SERVICE_UNAVAILABLE,
                 "no_space",
                 "free disk space is below the reserve; retry later with the same op_key",
             ),
-            EngineError::Journal(J::WriteFailed { source, .. })
-                if source.kind() == std::io::ErrorKind::StorageFull =>
-            {
+            J::WriteFailed { source, .. } if source.kind() == std::io::ErrorKind::StorageFull => {
                 Self::new(
                     StatusCode::SERVICE_UNAVAILABLE,
                     "no_space",
                     "the disk filled during the write; nothing was committed",
                 )
             }
-            EngineError::Journal(J::WriteFailed { .. } | J::SyncFailed(_) | J::Poisoned) => {
+            J::WriteFailed { .. } | J::SyncFailed(_) | J::Poisoned => {
                 eprintln!("durable-server: journal unavailable: {e}");
                 Self::new(
                     StatusCode::SERVICE_UNAVAILABLE,
@@ -290,15 +300,17 @@ impl From<EngineError> for ApiError {
                     "the journal could not commit; nothing was acknowledged, retry with the same op_key",
                 )
             }
-            EngineError::Journal(_) | EngineError::Serde(_) => {
-                eprintln!("durable-server: internal error: {e}");
-                Self::new(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    "internal",
-                    "internal error",
-                )
-            }
+            _ => Self::internal(e),
         }
+    }
+
+    fn internal(e: &EngineError) -> Self {
+        eprintln!("durable-server: internal error: {e}");
+        Self::new(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "internal",
+            "internal error",
+        )
     }
 }
 
