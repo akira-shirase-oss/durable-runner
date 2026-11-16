@@ -879,6 +879,60 @@ mod tests {
             .unwrap_or_else(|e| panic!("{e}"));
     }
 
+    /// Contract failure case "crash during compaction": killed at any step,
+    /// a restart opens the old complete generation or the new complete one,
+    /// never a mix. The next compaction succeeds and leaves one generation
+    /// on disk.
+    #[test]
+    fn crash_at_any_compaction_step_reopens_one_complete_generation() {
+        use durable_journal::faults::Faults;
+        use std::sync::Arc;
+        let eight_days = 8 * 24 * 60 * 60 * 1000;
+        for step in 1..=3u64 {
+            let d = tempfile::tempdir().unwrap_or_else(|e| panic!("{e}"));
+            let faults = Arc::new(Faults::default());
+            let opts = JournalOptions {
+                faults: Some(faults.clone()),
+                ..JournalOptions::default()
+            };
+            let (live, old);
+            {
+                let mut e = EngineCore::open_with(d.path(), opts).unwrap_or_else(|e| panic!("{e}"));
+                live = e
+                    .submit(OperationKey("live".into()), spec(), 0)
+                    .unwrap_or_else(|e| panic!("{e}"));
+                old = e
+                    .submit(OperationKey("old".into()), spec(), 0)
+                    .unwrap_or_else(|e| panic!("{e}"));
+                e.cancel(old, 1).unwrap_or_else(|e| panic!("{e}"));
+                faults.crash_compaction_at(step);
+                assert!(e.compact(eight_days).is_err(), "step {step}: the crash");
+            } // the process dies here
+
+            let mut e = EngineCore::open(d.path())
+                .unwrap_or_else(|e| panic!("step {step}: restart must open a generation: {e}"));
+            let (generation, old_survives) = if step < 3 { (1, true) } else { (2, false) };
+            assert_eq!(e.diagnostics().generation, generation, "step {step}");
+            assert!(e.run(live).is_some(), "step {step}: live state survives");
+            assert_eq!(
+                e.run(old).is_some(),
+                old_survives,
+                "step {step}: old generation replays it; new snapshot expired it"
+            );
+            let next = e
+                .compact(eight_days)
+                .unwrap_or_else(|e| panic!("step {step}: the next compaction must work: {e}"));
+            assert_eq!(next, generation + 1);
+            let gens = std::fs::read_dir(d.path())
+                .unwrap_or_else(|e| panic!("{e}"))
+                .filter_map(|e| e.ok()?.file_name().into_string().ok())
+                .filter(|n| n.starts_with("gen-"))
+                .count();
+            assert_eq!(gens, 1, "step {step}: leftovers are cleaned up");
+            assert!(e.run(live).is_some());
+        }
+    }
+
     #[test]
     fn refused_event_neither_journals_nor_loses_the_run() {
         let (d, mut e) = open();

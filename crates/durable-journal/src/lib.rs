@@ -39,6 +39,8 @@ pub mod faults {
         sync_calls: AtomicU64,
         held: Mutex<bool>,
         released: Condvar,
+        // 0 = disarmed; n = the process "dies" at compaction step n.
+        compaction_crash: AtomicU64,
     }
 
     impl Faults {
@@ -50,6 +52,24 @@ pub mod faults {
         pub fn release_syncs(&self) {
             *self.held.lock().unwrap_or_else(PoisonError::into_inner) = false;
             self.released.notify_all();
+        }
+        /// The next compaction stops dead at `step` — 1: the new
+        /// generation's log exists; 2: its snapshot is written; 3: the
+        /// manifest names it (old generations not yet deleted) — as if the
+        /// process were killed there. Drop the journal and reopen to see
+        /// what a restart finds.
+        pub fn crash_compaction_at(&self, step: u64) {
+            self.compaction_crash.store(step, Ordering::SeqCst);
+        }
+        pub(crate) fn compaction_step(&self, step: u64) -> std::io::Result<()> {
+            if self
+                .compaction_crash
+                .compare_exchange(step, 0, Ordering::SeqCst, Ordering::SeqCst)
+                .is_ok()
+            {
+                return Err(std::io::Error::other("injected crash during compaction"));
+            }
+            Ok(())
         }
         /// How many times the log was fsynced (rollbacks excluded).
         pub fn sync_calls(&self) -> u64 {
@@ -523,6 +543,15 @@ impl Journal {
         Ok(())
     }
 
+    /// Crash points inside `compact` (fault seam for tests; free otherwise).
+    fn compaction_step(&self, _step: u64) -> io::Result<()> {
+        #[cfg(any(test, feature = "fault-injection"))]
+        if let Some(f) = self.opts.faults.as_ref() {
+            f.compaction_step(_step)?;
+        }
+        Ok(())
+    }
+
     /// The one place log bytes are written (fault seam for tests).
     fn write_log(&mut self, bytes: &[u8]) -> io::Result<()> {
         #[cfg(any(test, feature = "fault-injection"))]
@@ -572,6 +601,15 @@ impl Journal {
         self.ensure_space(&self.root, snapshot_bytes.len() as u64)?;
         let next = self.generation + 1;
         let gdir = gen_dir_path(&self.root, next);
+        // A `gen-(N+1)` already on disk is what a compaction killed before
+        // its manifest swap left behind. The manifest still names N, so it
+        // was never authority: remove it rather than refuse every later
+        // compaction (`create_new` below would fail on its log).
+        match fs::remove_dir_all(&gdir) {
+            Ok(()) => {}
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e.into()),
+        }
         fs::create_dir_all(&gdir)?;
 
         // 1. Fresh log, created and fsynced before the manifest moves.
@@ -582,9 +620,11 @@ impl Journal {
             .create_new(true) // a reused generation is corruption, refuse it
             .open(&log_path)?;
         new_log.sync_data()?;
+        self.compaction_step(1)?;
 
         // 2. Snapshot for the new generation (tmp + rename + dir fsync).
         write_snapshot_bytes(&gdir, &snapshot_bytes)?;
+        self.compaction_step(2)?;
 
         // 3. The atomic manifest swap — the single point that moves the
         //    world from generation N to N+1.
@@ -596,6 +636,7 @@ impl Journal {
         File::open(&tmp)?.sync_data()?;
         fs::rename(&tmp, self.root.join("manifest.json"))?;
         sync_parent(&tmp)?;
+        self.compaction_step(3)?;
 
         // 4. Only now does the writer move: new generation, seq restarts.
         self.file = OpenOptions::new().read(true).append(true).open(&log_path)?;

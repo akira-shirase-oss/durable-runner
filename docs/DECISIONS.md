@@ -199,3 +199,14 @@ convention; these seed the contract's prescribed directions.
   expired runs is gone with their generation. Only the current state of
   retained runs is kept (in the snapshot), which is all `inspect` ever
   showed.
+- **D-017 — A crashed compaction never blocks the next one.** Crash points
+  inside `compact` (fault injection) proved the contract case "crash
+  during compaction": killed after the new generation's log exists, after
+  its snapshot, or after the manifest swap, a restart opens the old
+  complete generation (steps 1–2) or the new one (step 3), never a mix.
+  It also found a real bug. A compaction killed before its manifest swap
+  left `gen-(N+1)/journal.log` behind, and every later compaction failed
+  with `File exists`, because the new log is opened `create_new`. A
+  `gen-(N+1)` that the manifest (still naming N) does not reference was
+  never authority, so it is now removed before the new generation is
+  built.
