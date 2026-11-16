@@ -345,7 +345,8 @@ impl Monitor {
                 JournalError::WriteFailed { .. } => "journal_write_failed",
                 JournalError::SyncFailed(_)
                 | JournalError::Poisoned
-                | JournalError::ManifestSwapFailed(_) => "journal_poisoned",
+                | JournalError::ManifestSwapFailed(_)
+                | JournalError::ManifestMismatch { .. } => "journal_poisoned",
                 _ => "internal",
             }
         }

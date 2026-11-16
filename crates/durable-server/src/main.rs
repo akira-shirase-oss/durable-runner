@@ -296,7 +296,11 @@ impl ApiError {
                     "the disk filled during the write; nothing was committed",
                 )
             }
-            J::WriteFailed { .. } | J::SyncFailed(_) | J::Poisoned | J::ManifestSwapFailed(_) => {
+            J::WriteFailed { .. }
+            | J::SyncFailed(_)
+            | J::Poisoned
+            | J::ManifestSwapFailed(_)
+            | J::ManifestMismatch { .. } => {
                 eprintln!("durable-server: journal unavailable: {e}");
                 Self::new(
                     StatusCode::SERVICE_UNAVAILABLE,

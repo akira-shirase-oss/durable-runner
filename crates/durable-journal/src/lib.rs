@@ -209,6 +209,11 @@ pub enum JournalError {
     /// durably names.
     #[error("compaction failed at its manifest swap; writer poisoned, restart to replay: {0}")]
     ManifestSwapFailed(#[source] io::Error),
+    /// The durable manifest does not name the generation this writer is
+    /// on: something moved it underneath. Nothing is deleted or written;
+    /// the writer is poisoned and a restart opens what the manifest names.
+    #[error("manifest names generation {on_disk}, writer is on {in_memory}; poisoned, restart to replay")]
+    ManifestMismatch { on_disk: u32, in_memory: u32 },
     /// A backup never merges into an existing directory.
     #[error("backup destination already exists")]
     BackupExists,
@@ -224,6 +229,17 @@ pub struct Record {
 #[derive(Debug, Serialize, Deserialize)]
 struct Manifest {
     generation: u32,
+}
+
+/// The generation the durable manifest names (`None` if there is none).
+fn read_manifest(root: &Path) -> Result<Option<u32>, JournalError> {
+    match fs::read_to_string(root.join("manifest.json")) {
+        Ok(text) => serde_json::from_str::<Manifest>(&text)
+            .map(|m| Some(m.generation))
+            .map_err(|e| JournalError::Manifest(e.to_string())),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e.into()),
+    }
 }
 
 /// The generation number of a `gen-NNNNNN` directory name.
@@ -609,8 +625,18 @@ impl Journal {
         let next = self.generation + 1;
         let gdir = gen_dir_path(&self.root, next);
         // A `gen-(N+1)` already on disk is what a compaction killed before
-        // its manifest swap left behind. The manifest still names N, so it
-        // was never authority: remove it rather than refuse every later
+        // its manifest swap left behind — but only if the *durable*
+        // manifest still names N. Check the file, never assume from memory:
+        // if it names anything else, `gen-(N+1)` may be the live generation.
+        let on_disk = read_manifest(&self.root)?;
+        if on_disk != Some(self.generation) {
+            self.poisoned = true;
+            return Err(JournalError::ManifestMismatch {
+                on_disk: on_disk.unwrap_or(0),
+                in_memory: self.generation,
+            });
+        }
+        // Not authority, so remove it rather than refuse every later
         // compaction (`create_new` below would fail on its log).
         match fs::remove_dir_all(&gdir) {
             Ok(()) => {}
@@ -1155,6 +1181,47 @@ mod tests {
         drop(j);
         let j = Journal::open(dir.path()).unwrap_or_else(|e| panic!("{e}"));
         assert_eq!(j.generation(), 3);
+    }
+
+    /// Review finding (high): the leftover cleanup used to delete
+    /// `gen-(N+1)` on the strength of the in-memory generation alone. If the
+    /// durable manifest already names N+1, that directory is the live
+    /// generation. The cleanup must check the manifest on disk, refuse, and
+    /// leave it untouched.
+    #[test]
+    fn leftover_cleanup_never_deletes_the_generation_the_manifest_names() {
+        let dir = tempfile::tempdir().unwrap_or_else(|e| panic!("{e}"));
+        let mut j = Journal::open(dir.path()).unwrap_or_else(|e| panic!("{e}"));
+        j.append(b"one").unwrap_or_else(|e| panic!("{e}"));
+        // The durable manifest moves to generation 2 behind this writer's
+        // back (what a failed swap used to leave), with real content.
+        let g2 = gen_dir_path(dir.path(), 2);
+        fs::create_dir_all(&g2).unwrap_or_else(|e| panic!("{e}"));
+        fs::write(g2.join("journal.log"), b"").unwrap_or_else(|e| panic!("{e}"));
+        write_snapshot(
+            &g2,
+            &Snapshot {
+                covered_seq: 0,
+                payload: b"the live state".to_vec(),
+            },
+        )
+        .unwrap_or_else(|e| panic!("{e}"));
+        fs::write(dir.path().join("manifest.json"), "{\"generation\":2}")
+            .unwrap_or_else(|e| panic!("{e}"));
+
+        let snap = Snapshot {
+            covered_seq: 0,
+            payload: b"stale".to_vec(),
+        };
+        assert!(
+            j.compact(&snap).is_err(),
+            "memory and manifest disagree: refuse"
+        );
+        assert!(j.is_poisoned(), "and never write again");
+        let kept = load_snapshot(&g2)
+            .unwrap_or_else(|e| panic!("{e}"))
+            .unwrap_or_else(|| panic!("the live generation's snapshot was deleted"));
+        assert_eq!(kept.payload, b"the live state");
     }
 
     #[test]

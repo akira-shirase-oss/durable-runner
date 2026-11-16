@@ -219,7 +219,7 @@ convention; these seed the contract's prescribed directions.
   reachable with no operator action. `--compact-every-secs` now defaults
   to 0 (off) and `ShellConfig::compact_every` to `None`. Operators who
   schedule it opt in. The default can be revisited once compaction is
-  cheap (D-020) and its error path is fatal (D-019).
+  cheap (D-021) and its error path is fatal (D-019).
 - **D-019 — A compaction error from the manifest swap onward is fatal.**
   D-009/D-015 made failed appends stop the process, but compaction's
   error path was left out. Independent review reproduced the loss on the
@@ -240,3 +240,13 @@ convention; these seed the contract's prescribed directions.
   injection, with a real EACCES at engine level, and at process level
   against the real binary. D-017's crash-only test could not show this,
   because dropping the journal turned the error into a crash.
+- **D-020 — The leftover cleanup checks the durable manifest first.**
+  D-017 removed `gen-(N+1)` before a compaction on the strength of the
+  in-memory generation N. When memory and the manifest disagreed (as
+  D-019's bug left them), that directory was the live generation: review
+  showed a later crashed compaction losing 10 of 10 runs. `compact` now
+  reads `manifest.json` from disk and removes `gen-(N+1)` only if the
+  manifest names N. Otherwise it deletes nothing, poisons the writer
+  (`ManifestMismatch`), and lets the restart open what the manifest
+  names. D-019 makes the disagreement unreachable inside one process;
+  this check stops the cleanup from assuming it.

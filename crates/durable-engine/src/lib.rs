@@ -933,6 +933,42 @@ mod tests {
         }
     }
 
+    /// The review's crash sequence: a compaction fails at its manifest
+    /// swap, then the next compaction is killed while building its new
+    /// generation. That used to delete the live generation (10 of 10 runs
+    /// lost). Now the first failure poisons the journal, the second
+    /// compaction is refused without touching the disk, and every run
+    /// survives the restart.
+    #[test]
+    fn failed_swap_then_crashed_compaction_loses_nothing() {
+        use durable_journal::faults::Faults;
+        use std::sync::Arc;
+        let d = tempfile::tempdir().unwrap_or_else(|e| panic!("{e}"));
+        let faults = Arc::new(Faults::default());
+        let opts = JournalOptions {
+            faults: Some(faults.clone()),
+            ..JournalOptions::default()
+        };
+        let mut ids = Vec::new();
+        {
+            let mut e = EngineCore::open_with(d.path(), opts).unwrap_or_else(|e| panic!("{e}"));
+            for i in 0..10 {
+                ids.push(
+                    e.submit(OperationKey(format!("r2-{i}")), spec(), 0)
+                        .unwrap_or_else(|e| panic!("{e}")),
+                );
+            }
+            faults.crash_compaction_at(3);
+            assert!(e.compact(1).is_err());
+            faults.crash_compaction_at(1);
+            assert!(e.compact(2).is_err());
+        }
+        let e = EngineCore::open(d.path()).unwrap_or_else(|e| panic!("restart: {e}"));
+        for id in ids {
+            assert!(e.run(id).is_some(), "{id:?} lost");
+        }
+    }
+
     #[test]
     fn refused_event_neither_journals_nor_loses_the_run() {
         let (d, mut e) = open();
