@@ -207,11 +207,16 @@ impl FromRequestParts<App> for Authorized {
     type Rejection = ApiError;
 
     async fn from_request_parts(parts: &mut Parts, app: &App) -> Result<Self, Self::Rejection> {
+        // `<scheme> <token>`; the scheme is case-insensitive (RFC 9110
+        // §11.1) and surrounding whitespace is ignored.
         let presented = parts
             .headers
             .get(header::AUTHORIZATION)
             .and_then(|v| v.to_str().ok())
-            .and_then(|v| v.strip_prefix("Bearer "));
+            .and_then(|v| v.trim().split_once(char::is_whitespace))
+            .and_then(|(scheme, token)| {
+                scheme.eq_ignore_ascii_case("bearer").then(|| token.trim())
+            });
         match presented {
             Some(key) if app.api_key.verify(key) => Ok(Authorized),
             _ => Err(ApiError::new(
@@ -219,6 +224,57 @@ impl FromRequestParts<App> for Authorized {
                 "unauthorized",
                 "missing or invalid API key (Authorization: Bearer <key>)",
             )),
+        }
+    }
+}
+
+/// `Query` whose rejection is the JSON error envelope.
+struct Q<T>(T);
+
+impl<T: serde::de::DeserializeOwned, S: Send + Sync> FromRequestParts<S> for Q<T> {
+    type Rejection = ApiError;
+
+    async fn from_request_parts(parts: &mut Parts, state: &S) -> Result<Self, Self::Rejection> {
+        Query::<T>::from_request_parts(parts, state)
+            .await
+            .map(|Query(v)| Q(v))
+            .map_err(|r| ApiError::new(StatusCode::BAD_REQUEST, "bad_query", r.body_text()))
+    }
+}
+
+/// `Path` whose rejection is the JSON error envelope.
+struct P<T>(T);
+
+impl<T: serde::de::DeserializeOwned + Send, S: Send + Sync> FromRequestParts<S> for P<T> {
+    type Rejection = ApiError;
+
+    async fn from_request_parts(parts: &mut Parts, state: &S) -> Result<Self, Self::Rejection> {
+        AxPath::<T>::from_request_parts(parts, state)
+            .await
+            .map(|AxPath(v)| P(v))
+            .map_err(|r| ApiError::new(StatusCode::BAD_REQUEST, "bad_path", r.body_text()))
+    }
+}
+
+/// `Json` whose rejection is the JSON error envelope (keeping axum's
+/// status: 400 malformed, 413 too large, 415 wrong type, 422 wrong shape).
+struct J<T>(T);
+
+impl<T: serde::de::DeserializeOwned, S: Send + Sync> axum::extract::FromRequest<S> for J<T> {
+    type Rejection = ApiError;
+
+    async fn from_request(req: axum::extract::Request, state: &S) -> Result<Self, Self::Rejection> {
+        match Json::<T>::from_request(req, state).await {
+            Ok(Json(v)) => Ok(J(v)),
+            Err(r) => {
+                let status = r.status();
+                let code = match status {
+                    StatusCode::PAYLOAD_TOO_LARGE => "body_too_large",
+                    StatusCode::UNSUPPORTED_MEDIA_TYPE => "bad_content_type",
+                    _ => "bad_body",
+                };
+                Err(ApiError::new(status, code, r.body_text()))
+            }
         }
     }
 }
@@ -366,7 +422,7 @@ impl ApiError {
 async fn submit(
     _: Authorized,
     State(app): State<App>,
-    Json(req): Json<SubmitReq>,
+    J(req): J<SubmitReq>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let input = base64_decode(&req.spec.input_b64)
         .map_err(|m| ApiError::new(StatusCode::BAD_REQUEST, "bad_input", m))?;
@@ -401,7 +457,7 @@ fn state_name(s: &RunState) -> String {
 
 async fn inspect(
     State(app): State<App>,
-    AxPath(id): AxPath<u64>,
+    P(id): P<u64>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let run = app
         .engine
@@ -420,7 +476,7 @@ async fn inspect(
 async fn cancel(
     _: Authorized,
     State(app): State<App>,
-    AxPath(id): AxPath<u64>,
+    P(id): P<u64>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     app.engine.cancel(RunId(id)).await?;
     Ok(Json(serde_json::json!({ "cancelled": id })))
@@ -441,7 +497,7 @@ struct ListQuery {
 
 async fn list(
     State(app): State<App>,
-    Query(q): Query<ListQuery>,
+    Q(q): Q<ListQuery>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let newest = match q.order.as_deref() {
         None | Some("asc") => false,
@@ -549,7 +605,7 @@ fn backup_dest(root: &Path, name: &str) -> Result<PathBuf, ApiError> {
 async fn backup(
     _: Authorized,
     State(app): State<App>,
-    Json(req): Json<BackupReq>,
+    J(req): J<BackupReq>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let Some(root) = app.backup_root.as_deref() else {
         return Err(ApiError::new(
@@ -1269,6 +1325,74 @@ mod tests {
         fail.store(true, std::sync::atomic::Ordering::SeqCst);
         let (status, v) = call(&r, "POST", "/jobs", Some(KEY), Some(submit_body("p"))).await;
         assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{v}");
+    }
+
+    /// Auth schemes are case-insensitive (RFC 9110 §11.1), and the token
+    /// may be surrounded by extra whitespace.
+    #[tokio::test]
+    async fn bearer_scheme_is_case_insensitive() {
+        let h = harness(false);
+        for (i, header) in [format!("bearer {KEY}"), format!("BEARER   {KEY} ")]
+            .into_iter()
+            .enumerate()
+        {
+            let req = axum::http::Request::builder()
+                .method("POST")
+                .uri("/jobs")
+                .header("authorization", header)
+                .header("content-type", "application/json")
+                .body(Body::from(submit_body(&format!("case-{i}")).to_string()))
+                .unwrap_or_else(|e| panic!("{e}"));
+            let res = h
+                .router
+                .clone()
+                .oneshot(req)
+                .await
+                .unwrap_or_else(|e| panic!("{e}"));
+            assert_eq!(res.status(), StatusCode::OK, "header variant {i}");
+        }
+    }
+
+    /// Bad query strings and bodies answer in the one error envelope, not
+    /// axum's plain-text rejections.
+    #[tokio::test]
+    async fn rejections_use_the_json_envelope() {
+        let h = harness(false);
+        let (status, v) = call(&h.router, "GET", "/jobs?limit=-1", None, None).await;
+        assert_eq!(
+            (status, v["code"].clone()),
+            (StatusCode::BAD_REQUEST, json!("bad_query"))
+        );
+        let (status, v) = call(&h.router, "GET", "/jobs?after=abc", None, None).await;
+        assert_eq!(
+            (status, v["code"].clone()),
+            (StatusCode::BAD_REQUEST, json!("bad_query"))
+        );
+        let req = axum::http::Request::builder()
+            .method("POST")
+            .uri("/jobs")
+            .header("authorization", format!("Bearer {KEY}"))
+            .header("content-type", "application/json")
+            .body(Body::from("{not json"))
+            .unwrap_or_else(|e| panic!("{e}"));
+        let res = h
+            .router
+            .clone()
+            .oneshot(req)
+            .await
+            .unwrap_or_else(|e| panic!("{e}"));
+        let status = res.status();
+        let bytes = res
+            .into_body()
+            .collect()
+            .await
+            .unwrap_or_else(|e| panic!("{e}"))
+            .to_bytes();
+        let v: Value = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
+        assert_eq!(
+            (status, v["code"].clone()),
+            (StatusCode::BAD_REQUEST, json!("bad_body"))
+        );
     }
 
     #[test]
