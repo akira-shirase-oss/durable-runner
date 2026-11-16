@@ -1780,7 +1780,13 @@ mod tests {
         let probe_free = free.clone();
         let cfg = ShellConfig {
             tick_ms: 5,
-            limits: fast_limits(),
+            // A deadline long enough that no scheduler delay lets the sweep
+            // reconcile the run before the disk is "filled" (review S5):
+            // the sweep is what recovers it once space returns.
+            limits: Limits {
+                max_step_deadline_ms: 1500,
+                ..Limits::default()
+            },
             journal: JournalOptions {
                 reserve_bytes: 4096,
                 space: durable_journal::SpaceProbe::new(move |_| Ok(probe_free.load(SeqCst))),
@@ -1819,7 +1825,16 @@ mod tests {
         ));
 
         free.store(1 << 20, SeqCst);
-        assert!(matches!(until_done(&eng, run).await, RunState::Done));
+        // Reconciled after the 1.5 s deadline; allow generously for load.
+        let mut state = None;
+        for _ in 0..1000 {
+            state = eng.inspect(run).await.unwrap_or(None).map(|r| r.state);
+            if state.as_ref().is_some_and(RunState::is_terminal) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(matches!(state, Some(RunState::Done)), "{state:?}");
         assert!(eng.readiness().ready);
     }
 
