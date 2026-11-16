@@ -49,8 +49,8 @@ struct Args {
     #[arg(long, default_value_t = durable_journal::DEFAULT_RESERVE_BYTES)]
     reserve_bytes: u64,
     /// Compact (expire week-old terminal runs, delete superseded
-    /// generations) every N seconds; 0 = only on request.
-    #[arg(long, default_value_t = 3600)]
+    /// generations) every N seconds; 0 (the default) = only on request.
+    #[arg(long, default_value_t = 0)]
     compact_every_secs: u64,
 }
 
@@ -1064,6 +1064,15 @@ mod tests {
             Outcome::Checkpoint(b) => assert_eq!(b, br#"{"ok":true}"#),
             other => panic!("expected a checkpoint, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn server_does_not_schedule_compaction_by_default() {
+        let args = Args::try_parse_from(["durable-server"]).unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(
+            args.compact_every_secs, 0,
+            "scheduled compaction must be opt-in"
+        );
     }
 
     #[test]

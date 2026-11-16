@@ -283,7 +283,8 @@ pub struct ShellConfig {
     /// command channel).
     pub max_outbox_records: usize,
     /// Compact on this schedule (expiring 7-day-old terminal runs and
-    /// deleting superseded generations); `None` = only on request.
+    /// deleting superseded generations); `None` (the default) = only on
+    /// request.
     pub compact_every: Option<Duration>,
 }
 
@@ -298,7 +299,9 @@ impl Default for ShellConfig {
             journal: JournalOptions::default(),
             group_commit: GroupCommit::default(),
             max_outbox_records: 16 * 1024,
-            compact_every: Some(Duration::from_secs(60 * 60)),
+            // Off until compaction is cheap and its error path is fatal
+            // (D-018): an operator schedules it explicitly.
+            compact_every: None,
         }
     }
 }
@@ -2051,6 +2054,13 @@ mod tests {
         assert_eq!(gens.len(), 1, "one generation on disk: {gens:?}");
         // The fresh run (not 7 days old) survived the compaction.
         assert!(bounded(eng.inspect(run)).await.unwrap_or(None).is_some());
+    }
+
+    /// Compaction is expensive (it snapshots the whole index) and its
+    /// error path decides durability, so it never runs unasked by default.
+    #[test]
+    fn scheduled_compaction_is_off_by_default() {
+        assert!(ShellConfig::default().compact_every.is_none());
     }
 
     /// A failed fsync must stop the engine — never retry it, never keep
