@@ -134,7 +134,10 @@ impl Pipe {
         if self.status.failed.is_some() {
             return Err(JournalError::Poisoned);
         }
-        let available = self.space.available(&self.root)?;
+        let available = self
+            .space
+            .available(&self.root)
+            .map_err(JournalError::SpaceProbe)?;
         let need = 18 + payload.len() as u64; // frame header + payload
         if available < self.reserve.saturating_add(need) {
             return Err(JournalError::NoSpace {

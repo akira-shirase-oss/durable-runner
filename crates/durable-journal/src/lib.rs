@@ -237,6 +237,10 @@ pub enum JournalError {
     /// the writer is poisoned and a restart opens what the manifest names.
     #[error("manifest names generation {on_disk}, writer is on {in_memory}; poisoned, restart to replay")]
     ManifestMismatch { on_disk: u32, in_memory: u32 },
+    /// The free-space probe could not answer, so nothing was written
+    /// (unknown free space is treated as not enough).
+    #[error("free space unknown: {0}")]
+    SpaceProbe(#[source] io::Error),
     /// The snapshot (the only authority for compacted state) failed its
     /// checksum or framing: startup stops rather than trust it.
     #[error("snapshot is damaged: {0}")]
@@ -474,7 +478,11 @@ impl Journal {
     /// filesystem holding `path` with the reserve still free afterwards
     /// (contract: full disk fails admission safely, not silently).
     fn ensure_space(&self, path: &Path, need: u64) -> Result<u64, JournalError> {
-        let available = self.opts.space.available(path)?;
+        let available = self
+            .opts
+            .space
+            .available(path)
+            .map_err(JournalError::SpaceProbe)?;
         let reserve = self.opts.reserve_bytes;
         if available < reserve.saturating_add(need) {
             return Err(JournalError::NoSpace { available, reserve });

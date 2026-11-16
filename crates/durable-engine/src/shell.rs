@@ -389,6 +389,7 @@ impl Monitor {
         fn journal(e: &JournalError) -> &'static str {
             match e {
                 JournalError::NoSpace { .. } => "no_space",
+                JournalError::SpaceProbe(_) => "space_unknown",
                 JournalError::WriteFailed { .. } => "journal_write_failed",
                 JournalError::SyncFailed(_)
                 | JournalError::Poisoned

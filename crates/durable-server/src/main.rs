@@ -316,6 +316,20 @@ impl ApiError {
                 "no_space",
                 "free disk space is below the reserve; retry later with the same op_key",
             ),
+            // A real ENOSPC after the reserve check (compaction, backup).
+            J::Io(source) if source.kind() == std::io::ErrorKind::StorageFull => Self::new(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "no_space",
+                "the disk filled during the operation; nothing was committed",
+            ),
+            J::SpaceProbe(_) => {
+                eprintln!("durable-server: free-space probe failed: {e}");
+                Self::new(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "unavailable",
+                    "free disk space could not be read; nothing was written, retry later",
+                )
+            }
             J::WriteFailed { source, .. } if source.kind() == std::io::ErrorKind::StorageFull => {
                 Self::new(
                     StatusCode::SERVICE_UNAVAILABLE,
@@ -1205,6 +1219,56 @@ mod tests {
         prepare_backup_root(root.path()).unwrap_or_else(|e| panic!("{e}"));
         assert!(!root.path().join(".b1.partial").exists());
         assert!(root.path().join("b0").exists());
+    }
+
+    /// Review finding 13: a real ENOSPC inside compaction or backup (after
+    /// the reserve check) is an `Io` error, and was a 500.
+    #[test]
+    fn storage_full_io_error_is_503_no_space() {
+        let e = ApiError::from(EngineError::Journal(durable_journal::JournalError::Io(
+            std::io::Error::from(std::io::ErrorKind::StorageFull),
+        )));
+        assert_eq!(
+            (e.status, e.code),
+            (StatusCode::SERVICE_UNAVAILABLE, "no_space")
+        );
+    }
+
+    /// A free-space probe that cannot answer (statvfs failing) refuses the
+    /// submit as unavailable, not a 500.
+    #[tokio::test]
+    async fn failing_space_probe_is_503_not_500() {
+        let journal = tempfile::tempdir().unwrap_or_else(|e| panic!("{e}"));
+        let mut reg = Registry::default();
+        reg.register("step", Arc::new(Echo));
+        let fail = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let probe_fail = fail.clone();
+        let cfg = ShellConfig {
+            tick_ms: 5,
+            journal: durable_journal::JournalOptions {
+                space: durable_journal::SpaceProbe::new(move |_| {
+                    if probe_fail.load(std::sync::atomic::Ordering::SeqCst) {
+                        Err(std::io::Error::other("statvfs failed"))
+                    } else {
+                        Ok(u64::MAX)
+                    }
+                }),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let engine = spawn(journal.path(), reg, cfg).unwrap_or_else(|e| panic!("{e}"));
+        let r = router(
+            App {
+                engine,
+                api_key: ApiKey::new(KEY),
+                backup_root: None,
+            },
+            None,
+        );
+        fail.store(true, std::sync::atomic::Ordering::SeqCst);
+        let (status, v) = call(&r, "POST", "/jobs", Some(KEY), Some(submit_body("p"))).await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{v}");
     }
 
     #[test]

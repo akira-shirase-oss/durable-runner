@@ -122,7 +122,8 @@ state — same run ids, same `finished_at`. Verified live by
   silently. The `code` says which bound: `busy` (the command queue is
   full — retry with the same `op_key`), `at_capacity` (the live-run or
   index-byte bound), `no_space` (free disk is below
-  `--reserve-bytes`, default 64 MiB — nothing was written), or
+  `--reserve-bytes`, default 64 MiB, or a real ENOSPC — nothing was
+  written), `unavailable` (free space could not be read), or
   `journal_unavailable` (a journal write failed and was rolled back, or
   the writer is poisoned and the process is about to exit).
 - `GET /ready` — readiness, separate from `/health` (liveness): `503
