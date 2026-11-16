@@ -10,11 +10,18 @@ export interface RunItem {
 
 const API = '';
 
-export async function listRuns(): Promise<RunItem[]> {
-	const r = await fetch(`${API}/jobs`);
+export interface RunPage {
+	runs: RunItem[];
+	next_after: number | null;
+}
+
+// `GET /jobs` is paged (ids ascending, at most 1000 per page).
+export async function listRuns(after: number | null = null, limit = 100): Promise<RunPage> {
+	const q = new URLSearchParams({ limit: String(limit) });
+	if (after !== null) q.set('after', String(after));
+	const r = await fetch(`${API}/jobs?${q}`);
 	if (!r.ok) throw new Error(`list failed: ${r.status}`);
-	const body = (await r.json()) as { runs: RunItem[] };
-	return body.runs;
+	return (await r.json()) as RunPage;
 }
 
 // Reads are open; cancel (like every mutating route) needs the server's

@@ -46,7 +46,8 @@ terminal history after 7 days while preserving live state and dedup deps.
 |---|---|---|
 | `GET /health` | open | liveness |
 | `GET /ready` | open | readiness: 503 `no_space` / `engine_stopped` |
-| `GET /jobs`, `GET /jobs/{id}` | open | list / inspect runs |
+| `GET /jobs?after=&limit=` | open | one page of runs, ids ascending (limit 100 default, 1000 max); `next_after` continues |
+| `GET /jobs/{id}` | open | inspect a run |
 | `POST /jobs` | API key | submit (dedup by `op_key`) |
 | `POST /jobs/{id}/cancel` | API key | cancel (stops scheduling, never undoes) |
 | `POST /admin/compact` | API key | compact into a new generation |
@@ -55,6 +56,9 @@ terminal history after 7 days while preserving live state and dedup deps.
 | `/inspector/` | open (cancel needs the key) | SvelteKit UI |
 
 The key is `DURABLE_API_KEY`, compared as SHA-256 digests in constant time.
+Request bodies are capped at 256 KiB; operation keys at 256 bytes and step
+and handler names at 128 (non-empty, no control characters in keys); a
+handler reply is read only up to the 256 KiB output limit.
 Errors share one envelope: `{"error": <safe message>, "code": <stable code>}`.
 
 ## Failure cases

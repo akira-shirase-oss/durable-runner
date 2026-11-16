@@ -4,7 +4,7 @@
 
 use anyhow::{Context, Result};
 use axum::{
-    extract::{FromRequestParts, Path as AxPath, State},
+    extract::{DefaultBodyLimit, FromRequestParts, Path as AxPath, Query, State},
     http::{header, request::Parts, StatusCode},
     response::{IntoResponse, Response},
     routing::{get, post},
@@ -54,6 +54,8 @@ struct Args {
 /// environment, never from argv (argv is visible to every local user).
 const API_KEY_ENV: &str = "DURABLE_API_KEY";
 const MIN_API_KEY_LEN: usize = 32;
+/// Largest request body accepted on any route.
+const MAX_REQUEST_BYTES: usize = 256 * 1024;
 
 fn parse_handler(s: &str) -> Result<(String, String), String> {
     let (name, url) = s.split_once('=').ok_or("expected name=URL")?;
@@ -67,6 +69,27 @@ struct HttpHandler {
     client: reqwest::Client,
     url: String,
     timeout: Duration,
+    /// Largest reply body read; a bigger one is refused mid-stream.
+    max_output: usize,
+}
+
+/// Read a reply body, stopping as soon as it would exceed `max` bytes —
+/// never buffering an unbounded body first. `Ok(None)` = over the limit.
+async fn read_bounded(
+    mut res: reqwest::Response,
+    max: usize,
+) -> Result<Option<Vec<u8>>, reqwest::Error> {
+    if res.content_length().is_some_and(|n| n > max as u64) {
+        return Ok(None); // declared too big: not a byte is read
+    }
+    let mut body = Vec::new();
+    while let Some(chunk) = res.chunk().await? {
+        if body.len() + chunk.len() > max {
+            return Ok(None);
+        }
+        body.extend_from_slice(&chunk);
+    }
+    Ok(Some(body))
 }
 
 #[async_trait::async_trait]
@@ -85,8 +108,11 @@ impl StepHandler for HttpHandler {
             .send()
             .await;
         match res {
-            Ok(r) if r.status().is_success() => match r.bytes().await {
-                Ok(b) => Outcome::Checkpoint(b.to_vec()),
+            Ok(r) if r.status().is_success() => match read_bounded(r, self.max_output).await {
+                Ok(Some(b)) => Outcome::Checkpoint(b),
+                // The reply breaks the output bound: the attempt failed (it
+                // is retried under the same idempotency key, then fails).
+                Ok(None) => Outcome::Failed,
                 Err(_) => Outcome::Lost,
             },
             Ok(r) if r.status().is_server_error() => Outcome::Failed,
@@ -339,9 +365,24 @@ async fn cancel(
     Ok(Json(serde_json::json!({ "cancelled": id })))
 }
 
-async fn list(State(app): State<App>) -> Result<Json<serde_json::Value>, ApiError> {
-    let runs = app.engine.list().await?;
-    let items: Vec<serde_json::Value> = runs
+#[derive(Deserialize)]
+struct ListQuery {
+    /// Return runs with id greater than this (the previous `next_after`).
+    after: Option<u64>,
+    /// Page size: default 100, clamped to 1..=1000.
+    limit: Option<usize>,
+}
+
+async fn list(
+    State(app): State<App>,
+    Query(q): Query<ListQuery>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let page = app
+        .engine
+        .list(q.after.map(RunId), q.limit.unwrap_or(100))
+        .await?;
+    let items: Vec<serde_json::Value> = page
+        .runs
         .iter()
         .map(|r| {
             serde_json::json!({
@@ -353,7 +394,10 @@ async fn list(State(app): State<App>) -> Result<Json<serde_json::Value>, ApiErro
             })
         })
         .collect();
-    Ok(Json(serde_json::json!({ "runs": items })))
+    Ok(Json(serde_json::json!({
+        "runs": items,
+        "next_after": page.next_after.map(|id| id.0),
+    })))
 }
 
 /// Liveness: the process answers.
@@ -465,6 +509,9 @@ fn router(app: App, ui_dir: Option<&Path>) -> Router {
         .route("/admin/compact", post(compact))
         .route("/admin/backup", post(backup))
         .route("/admin/diagnostics", get(diagnostics))
+        // A submit is at most 64 KiB of input (base64: ~88 KiB) plus its
+        // spec; nothing legitimate comes near this.
+        .layer(DefaultBodyLimit::max(MAX_REQUEST_BYTES))
         .with_state(app);
     if let Some(ui) = ui_dir {
         router = router.nest_service(
@@ -507,6 +554,13 @@ async fn main() -> Result<()> {
         .as_deref()
         .map(prepare_backup_root)
         .transpose()?;
+    let cfg = ShellConfig {
+        journal: durable_journal::JournalOptions {
+            reserve_bytes: args.reserve_bytes,
+            ..Default::default()
+        },
+        ..Default::default()
+    };
     let mut registry = Registry::default();
     let client = reqwest::Client::new();
     for (name, url) in &args.handlers {
@@ -516,16 +570,10 @@ async fn main() -> Result<()> {
                 client: client.clone(),
                 url: url.clone(),
                 timeout: Duration::from_millis(args.step_timeout_ms),
+                max_output: cfg.limits.max_output_bytes,
             }),
         );
     }
-    let cfg = ShellConfig {
-        journal: durable_journal::JournalOptions {
-            reserve_bytes: args.reserve_bytes,
-            ..Default::default()
-        },
-        ..Default::default()
-    };
     let engine =
         spawn(&args.journal, registry, cfg).map_err(|e| anyhow::anyhow!("engine open: {e}"))?;
     let stopped = engine.clone();
@@ -863,6 +911,141 @@ mod tests {
         )
         .await;
         assert_eq!((status, v["run_id"].clone()), (StatusCode::OK, json!(2)));
+    }
+
+    /// `GET /jobs` is paged by run id: `limit` (default 100, at most 1000)
+    /// and `after`; `next_after` points at the next page or is null.
+    #[tokio::test]
+    async fn list_is_paged() {
+        let h = harness(false);
+        for i in 0..5 {
+            let (status, _) = call(
+                &h.router,
+                "POST",
+                "/jobs",
+                Some(KEY),
+                Some(submit_body(&format!("page-{i}"))),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK);
+        }
+        let ids = |v: &Value| -> Vec<u64> {
+            v["runs"]
+                .as_array()
+                .unwrap_or_else(|| panic!("runs array: {v}"))
+                .iter()
+                .filter_map(|r| r["id"].as_u64())
+                .collect()
+        };
+        let (_, v) = call(&h.router, "GET", "/jobs?limit=2", None, None).await;
+        assert_eq!((ids(&v), v["next_after"].clone()), (vec![1, 2], json!(2)));
+        let (_, v) = call(&h.router, "GET", "/jobs?after=2&limit=2", None, None).await;
+        assert_eq!((ids(&v), v["next_after"].clone()), (vec![3, 4], json!(4)));
+        let (_, v) = call(&h.router, "GET", "/jobs?after=4&limit=2", None, None).await;
+        assert_eq!((ids(&v), v["next_after"].clone()), (vec![5], Value::Null));
+        let (status, v) = call(&h.router, "GET", "/jobs?limit=100000", None, None).await;
+        assert_eq!(
+            (status, ids(&v).len()),
+            (StatusCode::OK, 5),
+            "limit is clamped, not refused"
+        );
+    }
+
+    /// Request bodies are capped well below axum's 2 MB default: a submit
+    /// can never legitimately exceed the input limit plus its spec.
+    #[tokio::test]
+    async fn oversized_request_body_is_413() {
+        let h = harness(false);
+        let mut body = submit_body("big");
+        body["spec"]["input_b64"] = json!("A".repeat(1 << 20));
+        let (status, _) = call(&h.router, "POST", "/jobs", Some(KEY), Some(body)).await;
+        assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE);
+    }
+
+    /// A raw HTTP handler that answers every request with `reply`, then
+    /// (for a streamed reply) keeps writing `chunk` forever.
+    async fn raw_handler(head: &'static str, chunk: Option<&'static [u8]>) -> String {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .unwrap_or_else(|e| panic!("{e}"));
+        let addr = listener.local_addr().unwrap_or_else(|e| panic!("{e}"));
+        tokio::spawn(async move {
+            while let Ok((mut sock, _)) = listener.accept().await {
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 4096];
+                    let _ = sock.read(&mut buf).await; // the request; contents irrelevant
+                    if sock.write_all(head.as_bytes()).await.is_err() {
+                        return;
+                    }
+                    match chunk {
+                        Some(c) => loop {
+                            let frame = format!("{:x}\r\n", c.len());
+                            if sock.write_all(frame.as_bytes()).await.is_err()
+                                || sock.write_all(c).await.is_err()
+                                || sock.write_all(b"\r\n").await.is_err()
+                            {
+                                return; // the client hung up: the bound worked
+                            }
+                        },
+                        None => tokio::time::sleep(Duration::from_secs(30)).await,
+                    }
+                });
+            }
+        });
+        format!("http://{addr}/step")
+    }
+
+    fn http_handler(url: String) -> HttpHandler {
+        HttpHandler {
+            client: reqwest::Client::new(),
+            url,
+            timeout: Duration::from_secs(10),
+            max_output: 1024,
+        }
+    }
+
+    async fn execute(h: &HttpHandler) -> Outcome {
+        let step = StepSpec {
+            name: "s".into(),
+            handler: "h".into(),
+        };
+        tokio::time::timeout(Duration::from_secs(3), h.execute(&step, b"in", "k/0"))
+            .await
+            .unwrap_or_else(|_| panic!("a bounded read must not wait for the whole body"))
+    }
+
+    /// A reply that declares more than the output limit is refused from its
+    /// headers: not a byte of the body is buffered.
+    #[tokio::test]
+    async fn reply_declared_over_the_limit_is_refused_unread() {
+        let url = raw_handler("HTTP/1.1 200 OK\r\ncontent-length: 10485760\r\n\r\n{", None).await;
+        assert!(matches!(execute(&http_handler(url)).await, Outcome::Failed));
+    }
+
+    /// A chunked reply with no length is read only up to the limit.
+    #[tokio::test]
+    async fn endless_chunked_reply_is_cut_at_the_limit() {
+        static CHUNK: [u8; 512] = [b'x'; 512];
+        let url = raw_handler(
+            "HTTP/1.1 200 OK\r\ntransfer-encoding: chunked\r\n\r\n",
+            Some(&CHUNK),
+        )
+        .await;
+        assert!(matches!(execute(&http_handler(url)).await, Outcome::Failed));
+    }
+
+    #[tokio::test]
+    async fn reply_within_the_limit_is_checkpointed() {
+        let url = raw_handler(
+            "HTTP/1.1 200 OK\r\ncontent-length: 11\r\n\r\n{\"ok\":true}",
+            None,
+        )
+        .await;
+        match execute(&http_handler(url)).await {
+            Outcome::Checkpoint(b) => assert_eq!(b, br#"{"ok":true}"#),
+            other => panic!("expected a checkpoint, got {other:?}"),
+        }
     }
 
     #[test]

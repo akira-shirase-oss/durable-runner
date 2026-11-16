@@ -13,7 +13,7 @@ use thiserror::Error;
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct OperationKey(pub String);
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct RunId(pub u64);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -213,6 +213,10 @@ pub struct Limits {
     pub max_steps: u32,
     pub max_attempts: u32,
     pub max_step_deadline_ms: u64,
+    /// Operation keys ride in every record, probe URL and idempotency key.
+    pub max_key_bytes: usize,
+    /// Step and handler names.
+    pub max_name_bytes: usize,
 }
 
 impl Default for Limits {
@@ -223,16 +227,35 @@ impl Default for Limits {
             max_steps: 64,
             max_attempts: 5,
             max_step_deadline_ms: 30_000,
+            max_key_bytes: 256,
+            max_name_bytes: 128,
         }
     }
 }
 
 impl Limits {
     pub fn admits(&self, spec: &JobSpec) -> Result<(), Refusal> {
+        let bad_name = |n: &str| n.is_empty() || n.len() > self.max_name_bytes;
         if spec.input.len() > self.max_input_bytes
             || spec.steps.len() as u32 > self.max_steps
             || spec.steps.is_empty()
             || spec.version == 0
+            || spec
+                .steps
+                .iter()
+                .any(|s| bad_name(&s.name) || bad_name(&s.handler))
+        {
+            return Err(Refusal::OverLimits);
+        }
+        Ok(())
+    }
+
+    /// An operation key is non-empty, at most `max_key_bytes`, and free of
+    /// control characters (it is echoed into logs, URLs and headers).
+    pub fn admits_key(&self, key: &OperationKey) -> Result<(), Refusal> {
+        if key.0.is_empty()
+            || key.0.len() > self.max_key_bytes
+            || key.0.chars().any(char::is_control)
         {
             return Err(Refusal::OverLimits);
         }

@@ -45,8 +45,15 @@ enum Cmd {
         #[arg(long)]
         run: u64,
     },
-    /// List every run in the live index.
-    List,
+    /// List one page of the live index (ids ascending).
+    List {
+        /// Start after this run id (the previous page's `next_after`).
+        #[arg(long)]
+        after: Option<u64>,
+        /// Page size (server clamps to 1..=1000; default 100).
+        #[arg(long)]
+        limit: Option<usize>,
+    },
     /// Bounded diagnostics: generation, records, runs by state kind.
     Diag,
     /// Compact the journal into a new generation.
@@ -156,8 +163,22 @@ async fn main() -> Result<()> {
             .await?;
             println!("{v}");
         }
-        Cmd::List => {
-            let v = check(client.get(format!("{}/jobs", args.server)).send().await?).await?;
+        Cmd::List { after, limit } => {
+            let mut q: Vec<(&str, String)> = Vec::new();
+            if let Some(a) = after {
+                q.push(("after", a.to_string()));
+            }
+            if let Some(l) = limit {
+                q.push(("limit", l.to_string()));
+            }
+            let v = check(
+                client
+                    .get(format!("{}/jobs", args.server))
+                    .query(&q)
+                    .send()
+                    .await?,
+            )
+            .await?;
             println!("{v}");
         }
         Cmd::Diag => {

@@ -92,7 +92,9 @@ enum Cmd {
         reply: oneshot::Sender<Option<Run>>,
     },
     List {
-        reply: oneshot::Sender<Vec<Run>>,
+        after: Option<RunId>,
+        limit: usize,
+        reply: oneshot::Sender<RunPage>,
     },
     Diag {
         reply: oneshot::Sender<crate::Diagnostics>,
@@ -119,6 +121,17 @@ pub struct Engine {
 #[derive(Debug, Default)]
 struct Health {
     space_low: AtomicBool,
+}
+
+/// The most runs one list call returns, whatever the caller asks for.
+pub const MAX_PAGE: usize = 1000;
+
+/// A page of runs and the cursor for the next one.
+#[derive(Debug, Clone, Default)]
+pub struct RunPage {
+    pub runs: Vec<Run>,
+    /// Pass as `after` to continue; `None` on the last page.
+    pub next_after: Option<RunId>,
 }
 
 /// Whether the engine should receive new work now, and if not, why.
@@ -193,11 +206,15 @@ impl Engine {
         rx.await.map_err(|_| EngineError::Stopped)?
     }
 
-    /// Every run in the live index (bounded by what the journal holds —
-    /// post-expiry index size, not history).
-    pub async fn list(&self) -> Result<Vec<Run>, EngineError> {
+    /// One page of the live index in id order: at most
+    /// `min(limit, MAX_PAGE)` runs with id > `after`.
+    pub async fn list(&self, after: Option<RunId>, limit: usize) -> Result<RunPage, EngineError> {
         let (reply, rx) = oneshot::channel();
-        self.send(Cmd::List { reply })?;
+        self.send(Cmd::List {
+            after,
+            limit: limit.clamp(1, MAX_PAGE),
+            reply,
+        })?;
         rx.await.map_err(|_| EngineError::Stopped)
     }
 
@@ -444,10 +461,9 @@ async fn actor(
                 Some(Cmd::Inspect { run, reply }) => {
                     let _ = reply.send(core.run(run).cloned());
                 }
-                Some(Cmd::List { reply }) => {
-                    let mut all: Vec<Run> = core.runs().cloned().collect();
-                    all.sort_by_key(|r| r.id.0);
-                    let _ = reply.send(all);
+                Some(Cmd::List { after, limit, reply }) => {
+                    let (runs, next_after) = core.page(after, limit);
+                    let _ = reply.send(RunPage { runs, next_after });
                 }
                 Some(Cmd::Diag { reply }) => {
                     let mut d = core.diagnostics();
@@ -823,9 +839,10 @@ mod tests {
     }
 
     async fn running_count(eng: &Engine) -> usize {
-        eng.list()
+        eng.list(None, MAX_PAGE)
             .await
             .unwrap_or_default()
+            .runs
             .iter()
             .filter(|r| matches!(r.state, RunState::Running { .. }))
             .count()
@@ -1048,7 +1065,12 @@ mod tests {
             .err()
             .unwrap_or_else(|| panic!("unregistered handler must be refused"));
         assert!(matches!(err, EngineError::UnregisteredHandler(_)));
-        assert!(eng.list().await.unwrap_or_default().is_empty());
+        assert!(eng
+            .list(None, MAX_PAGE)
+            .await
+            .unwrap_or_default()
+            .runs
+            .is_empty());
     }
 
     /// Saturation above `max_in_flight`: a run may be journaled Running

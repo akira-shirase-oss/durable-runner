@@ -13,7 +13,8 @@ use durable_domain::{
 };
 use durable_journal::{Journal, JournalError, JournalOptions};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
+use std::ops::Bound;
 use std::path::Path;
 use thiserror::Error;
 
@@ -64,7 +65,9 @@ pub struct Diagnostics {
 /// past a generation boundary — the old generation's journal keeps it.
 #[derive(Debug, Serialize, Deserialize)]
 struct IndexSnapshot {
-    runs: HashMap<RunId, Run>,
+    // Ordered by id so listing can page; serialises exactly like the
+    // HashMap it replaced (a JSON object keyed by id), so old snapshots load.
+    runs: BTreeMap<RunId, Run>,
     by_op: HashMap<OperationKey, RunId>,
     next_run: u64,
 }
@@ -73,7 +76,7 @@ struct IndexSnapshot {
 /// the reducer — the same fold the live path performs.
 pub struct EngineCore {
     journal: Journal,
-    runs: HashMap<RunId, Run>,
+    runs: BTreeMap<RunId, Run>,
     by_op: HashMap<OperationKey, RunId>,
     next_run: u64,
     pub limits: Limits,
@@ -98,7 +101,7 @@ impl EngineCore {
         let gdir = durable_journal::gen_dir_path(dir, journal.generation());
         let mut core = Self {
             journal,
-            runs: HashMap::new(),
+            runs: BTreeMap::new(),
             by_op: HashMap::new(),
             next_run: 1,
             limits: Limits::default(),
@@ -135,7 +138,7 @@ impl EngineCore {
     /// new generation is durable, so a refused compaction (`NoSpace`)
     /// leaves memory and disk agreeing.
     pub fn compact(&mut self, now: Millis) -> Result<u32, EngineError> {
-        let runs: HashMap<RunId, Run> = self
+        let runs: BTreeMap<RunId, Run> = self
             .runs
             .iter()
             .filter(|(_, r)| {
@@ -245,6 +248,7 @@ impl EngineCore {
         not_before: Millis,
         now: Millis,
     ) -> Result<RunId, EngineError> {
+        self.limits.admits_key(&key)?;
         if let Some(existing) = self.by_op.get(&key) {
             return Ok(*existing); // duplicate: hand back the original run
         }
@@ -377,10 +381,23 @@ impl EngineCore {
         }
     }
 
-    /// Iterate the live index (used by the list surface; bounded by the
-    /// index, never by history).
+    /// Iterate the live index in id order (bounded by the index, never by
+    /// history).
     pub fn runs(&self) -> impl Iterator<Item = &Run> {
         self.runs.values()
+    }
+
+    /// One page of the live index: up to `limit` runs with id > `after`,
+    /// in id order, plus the cursor for the next page (if any).
+    pub fn page(&self, after: Option<RunId>, limit: usize) -> (Vec<Run>, Option<RunId>) {
+        let start = after.map_or(Bound::Unbounded, Bound::Excluded);
+        let mut it = self.runs.range((start, Bound::Unbounded));
+        let page: Vec<Run> = it.by_ref().take(limit).map(|(_, r)| r.clone()).collect();
+        let next = match (page.last(), it.next()) {
+            (Some(last), Some(_)) => Some(last.id),
+            _ => None,
+        };
+        (page, next)
     }
 
     /// Attempts whose deadline passed at `now` — each is a lost reply until
@@ -604,6 +621,47 @@ mod tests {
         free.store(1 << 20, SeqCst);
         assert_eq!(e.compact(eight_days).unwrap_or_else(|e| panic!("{e}")), 2);
         assert!(e.run(old).is_none());
+    }
+
+    /// Operation keys and step/handler names are bounded and must be
+    /// non-empty: an oversized one is refused before anything is
+    /// journaled (it would otherwise ride along in every record, probe URL
+    /// and idempotency key forever).
+    #[test]
+    fn oversized_keys_and_names_are_refused_before_journaling() {
+        let (_d, mut e) = open();
+        let huge = "k".repeat(10_000);
+        for (key, spec) in [
+            (huge.clone(), spec()),
+            (String::new(), spec()),
+            ("ctl\nkey".to_string(), spec()),
+            ("ok".to_string(), {
+                let mut s = spec();
+                s.steps[0].name = huge.clone();
+                s
+            }),
+            ("ok".to_string(), {
+                let mut s = spec();
+                s.steps[1].handler = huge.clone();
+                s
+            }),
+            ("ok".to_string(), {
+                let mut s = spec();
+                s.steps[0].name = String::new();
+                s
+            }),
+        ] {
+            let r = e.submit(OperationKey(key.clone()), spec, 0);
+            assert!(
+                matches!(r, Err(EngineError::Refused(Refusal::OverLimits))),
+                "key len {} must be refused: {r:?}",
+                key.len()
+            );
+        }
+        assert_eq!(e.diagnostics().records_written, 0, "nothing was journaled");
+        // At the bound is fine.
+        e.submit(OperationKey("k".repeat(256)), spec(), 0)
+            .unwrap_or_else(|e| panic!("{e}"));
     }
 
     #[test]

@@ -111,6 +111,13 @@ async function submit(opKey, steps = 1) {
   return { status: r.status, ms: performance.now() - t0, body: await r.text() };
 }
 
+// Run counts come from the bounded diagnostics (counts by state, never
+// rows): GET /jobs is paged, and paging 1M runs to count them would be the
+// unbounded read the paging exists to prevent.
+async function diag() {
+  return (await fetch(`${API}/admin/diagnostics`, { headers: AUTH })).json();
+}
+
 const pct = (a, p) => a.length ? a.sort((x, y) => x - y)[Math.min(a.length - 1, Math.floor(p * a.length))] : null;
 
 // --- scenarios -------------------------------------------------------------
@@ -133,8 +140,7 @@ async function runSubmit() {
     if (elapsed < 1000) await sleep(1000 - elapsed);
   }
   await sleep(8000); // let the last submissions drain
-  const list = await (await fetch(`${API}/jobs`)).json();
-  const done = list.runs.filter((r) => r.state === 'done').length;
+  const done = (await diag()).states.done ?? 0;
   h.kill(); s.kill();
   writeResult('submit', {
     params: { rate_per_s: rate, seconds: secs, fsync: 'per-record (default)' },
@@ -158,12 +164,12 @@ async function runReplay() {
   const t0 = now();
   s = await startServer(`${dir}/journal`); // open replays the journal
   const replayMs = now() - t0;
-  const list = await (await fetch(`${API}/jobs`)).json();
+  const recovered = (await diag()).live_runs;
   h.kill(); s.kill();
   writeResult('replay', {
     params: { target_events: events, runs, steps_per_run: steps },
-    replay_ms: replayMs, runs_recovered: list.runs.length,
-    verdict: list.runs.length === runs ? 'pass' : 'FAIL',
+    replay_ms: replayMs, runs_recovered: recovered,
+    verdict: recovered === runs ? 'pass' : 'FAIL',
   });
 }
 
@@ -179,9 +185,7 @@ async function runStall() {
   }
   // Wait past the stall: runs should end reconciled + done (probe finds key)
   await sleep(stallMs + 15_000);
-  const list = await (await fetch(`${API}/jobs`)).json();
-  const states = {};
-  for (const r of list.runs) states[r.state.split(':')[0]] = (states[r.state.split(':')[0]] ?? 0) + 1;
+  const states = (await diag()).states;
   h.kill(); s.kill();
   writeResult('stall', {
     params: { runs: n, handler_stall_ms: stallMs, step_deadline_ms: 2000 },
@@ -230,12 +234,12 @@ async function runCompact() {
     await sleep(5000);
   }
   await submits; await sleep(3000);
-  const list = await (await fetch(`${API}/jobs`)).json();
+  const runsAfter = (await diag()).live_runs;
   h.kill(); s.kill();
   writeResult('compact-under-load', {
     params: { seconds: secs, submit_interval_ms: 20 },
     submitted: sent, http_codes: codes, compactions,
-    runs_after: list.runs.length,
+    runs_after: runsAfter,
     latency_ms: { p50: pct(lat, 0.5), p99: pct(lat, 0.99) },
     verdict: Object.keys(codes).every((c) => c === '200') && compactions.every((c) => c.status === 200) ? 'pass' : 'FAIL',
   });
@@ -262,8 +266,7 @@ async function runSustained() {
     if (sent % 100_000 === 0) console.log(`${sent} sent, ${accepted} accepted @${((now() - t0) / 1000).toFixed(0)}s`);
   }
   await sleep(30_000);
-  const list = await (await fetch(`${API}/jobs`)).json();
-  const done = list.runs.filter((r) => r.state === 'done').length;
+  const done = (await diag()).states.done ?? 0;
   const jsize = execFileSync('du', ['-sk', `${dir}/journal`]).toString().split('\t')[0];
   h.kill(); s.kill();
   writeResult('sustained', {

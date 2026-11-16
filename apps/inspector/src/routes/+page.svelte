@@ -3,13 +3,16 @@
 	import { listRuns, cancelRun, loadApiKey, saveApiKey, type RunItem } from '../lib/api';
 
 	let runs = $state<RunItem[]>([]);
+	let more = $state(false);
 	let apiKey = $state('');
 	let error = $state<string | null>(null);
 	let timer: ReturnType<typeof setInterval> | null = null;
 
 	async function refresh() {
 		try {
-			runs = await listRuns();
+			const page = await listRuns();
+			runs = page.runs;
+			more = page.next_after !== null;
 			error = null;
 		} catch (e) {
 			error = e instanceof Error ? e.message : String(e);
@@ -78,6 +81,9 @@
 				{/each}
 			</tbody>
 		</table>
+		{#if more}
+			<p class="empty">showing the first {runs.length} runs; use <code>durable list --after</code> for more</p>
+		{/if}
 	{/if}
 </main>
 

@@ -96,3 +96,18 @@ convention; these seed the contract's prescribed directions.
   keeps the rule explainable; an emergency floor below the reserve for
   in-flight work is a possible refinement, not built. A refused submit no
   longer consumes a run id.
+- **D-013 — Every read and write a client can size is bounded.** `GET
+  /jobs` returned the whole index in one response; operation keys and
+  step/handler names had no length limit (an oversized key rides along in
+  every record, idempotency key and probe URL forever); a handler reply
+  was buffered in full before its size was checked. Now the index is
+  ordered by id (a `BTreeMap`, whose snapshot encoding is unchanged) and
+  `GET /jobs` pages it (`limit` default 100, clamped to 1000; `after`
+  cursor; `next_after`). `Limits` gains `max_key_bytes` (256) and
+  `max_name_bytes` (128), checked at admission before journaling — not in
+  the reducer, so replay of older records is unaffected. Request bodies are
+  capped at 256 KiB. A reply is refused from its `Content-Length` when it
+  declares too much and otherwise read chunk by chunk only up to
+  `max_output_bytes`; an oversized reply fails the attempt (retried under
+  the same idempotency key, then failed) rather than being truncated.
+  The load harness now counts runs from the bounded diagnostics.
