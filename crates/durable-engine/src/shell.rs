@@ -2046,14 +2046,34 @@ mod tests {
             "no scheduled compaction ran: {diag:?}"
         );
         assert_eq!(diag.stale_generations, 0, "{diag:?}");
+        // The fresh run (not 7 days old) survived the compaction.
+        assert!(bounded(eng.inspect(run)).await.unwrap_or(None).is_some());
+        // Stop the schedule before looking at the directory: a 60 ms
+        // schedule can be mid-compaction (gen-(N+1) created, gen-N not yet
+        // pruned). The writer finishes what it holds before it releases
+        // the lock, so once the journal reopens the directory is settled.
+        drop(eng);
+        let mut reopened = None;
+        for _ in 0..300 {
+            match EngineCore::open(d.path()) {
+                Ok(c) => {
+                    reopened = Some(c);
+                    break;
+                }
+                Err(EngineError::Journal(JournalError::SecondWriter)) => {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+                Err(e) => panic!("{e}"),
+            }
+        }
+        let core = reopened.unwrap_or_else(|| panic!("the engine never released the journal"));
         let gens: Vec<String> = std::fs::read_dir(d.path())
             .unwrap_or_else(|e| panic!("{e}"))
             .filter_map(|e| e.ok()?.file_name().into_string().ok())
             .filter(|n| n.starts_with("gen-"))
             .collect();
         assert_eq!(gens.len(), 1, "one generation on disk: {gens:?}");
-        // The fresh run (not 7 days old) survived the compaction.
-        assert!(bounded(eng.inspect(run)).await.unwrap_or(None).is_some());
+        assert!(core.run(run).is_some());
     }
 
     /// Compaction is expensive (it snapshots the whole index) and its
