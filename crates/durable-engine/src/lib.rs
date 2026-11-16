@@ -151,6 +151,29 @@ impl Pipe {
     }
 }
 
+/// What a list shows of a run: never its spec or input, so a page costs
+/// the listed fields, not up to 64 KiB of input per run.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RunSummary {
+    pub id: RunId,
+    pub key: OperationKey,
+    pub state: RunState,
+    pub steps: usize,
+    pub finished_at: Option<Millis>,
+}
+
+impl RunSummary {
+    fn of(r: &Run) -> Self {
+        Self {
+            id: r.id,
+            key: r.key.clone(),
+            state: r.state.clone(),
+            steps: r.spec.steps.len(),
+            finished_at: r.finished_at,
+        }
+    }
+}
+
 /// Records handed to the writer together, with their payload bytes and
 /// the commit index of the last one.
 pub struct Batch {
@@ -667,13 +690,13 @@ impl EngineCore {
 
     /// One page of the live index: up to `limit` runs with id > `after`,
     /// in id order, plus the cursor for the next page (if any).
-    pub fn page(&self, after: Option<RunId>, limit: usize) -> (Vec<Run>, Option<RunId>) {
+    pub fn page(&self, after: Option<RunId>, limit: usize) -> (Vec<RunSummary>, Option<RunId>) {
         let start = after.map_or(Bound::Unbounded, Bound::Excluded);
         let mut it = self.runs.range((start, Bound::Unbounded));
-        let page: Vec<Run> = it
+        let page: Vec<RunSummary> = it
             .by_ref()
             .take(limit)
-            .map(|(_, r)| (**r).clone())
+            .map(|(_, r)| RunSummary::of(r))
             .collect();
         let next = match (page.last(), it.next()) {
             (Some(last), Some(_)) => Some(last.id),

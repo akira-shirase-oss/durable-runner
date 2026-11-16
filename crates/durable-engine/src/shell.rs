@@ -89,6 +89,19 @@ enum Cmd {
         run: RunId,
         reply: oneshot::Sender<Result<(), EngineError>>,
     },
+    Compact {
+        reply: oneshot::Sender<Result<u32, EngineError>>,
+    },
+    Backup {
+        dest: std::path::PathBuf,
+        reply: oneshot::Sender<Result<(), EngineError>>,
+    },
+}
+
+/// Reads travel on their own bounded channel: a burst of (open,
+/// unauthenticated) reads can fill it and be refused busy, but can never
+/// take a slot a submit or cancel needs.
+enum Read {
     Inspect {
         run: RunId,
         reply: oneshot::Sender<Option<Run>>,
@@ -101,20 +114,14 @@ enum Cmd {
     Diag {
         reply: oneshot::Sender<crate::Diagnostics>,
     },
-    Compact {
-        reply: oneshot::Sender<Result<u32, EngineError>>,
-    },
-    Backup {
-        dest: std::path::PathBuf,
-        reply: oneshot::Sender<Result<(), EngineError>>,
-    },
 }
 
-/// Handle to the running engine. Cheap to clone; the channel capacity is
-/// the submitter back-pressure bound — a full channel refuses honestly.
+/// Handle to the running engine. Cheap to clone; the channel capacities
+/// are the back-pressure bounds — a full channel refuses honestly.
 #[derive(Clone)]
 pub struct Engine {
     tx: mpsc::Sender<Cmd>,
+    read_tx: mpsc::Sender<Read>,
     health: Arc<Health>,
 }
 
@@ -131,7 +138,7 @@ pub const MAX_PAGE: usize = 1000;
 /// A page of runs and the cursor for the next one.
 #[derive(Debug, Clone, Default)]
 pub struct RunPage {
-    pub runs: Vec<Run>,
+    pub runs: Vec<crate::RunSummary>,
     /// Pass as `after` to continue; `None` on the last page.
     pub next_after: Option<RunId>,
 }
@@ -150,6 +157,15 @@ impl Engine {
     /// stopped and nothing will ever answer.
     fn send(&self, cmd: Cmd) -> Result<(), EngineError> {
         self.tx.try_send(cmd).map_err(|e| match e {
+            mpsc::error::TrySendError::Full(_) => {
+                EngineError::Refused(durable_domain::Refusal::ReserveExhausted)
+            }
+            mpsc::error::TrySendError::Closed(_) => EngineError::Stopped,
+        })
+    }
+
+    fn send_read(&self, read: Read) -> Result<(), EngineError> {
+        self.read_tx.try_send(read).map_err(|e| match e {
             mpsc::error::TrySendError::Full(_) => {
                 EngineError::Refused(durable_domain::Refusal::ReserveExhausted)
             }
@@ -212,7 +228,7 @@ impl Engine {
     /// `min(limit, MAX_PAGE)` runs with id > `after`.
     pub async fn list(&self, after: Option<RunId>, limit: usize) -> Result<RunPage, EngineError> {
         let (reply, rx) = oneshot::channel();
-        self.send(Cmd::List {
+        self.send_read(Read::List {
             after,
             limit: limit.clamp(1, MAX_PAGE),
             reply,
@@ -223,7 +239,7 @@ impl Engine {
     /// Bounded diagnostics — counts by state kind, never rows.
     pub async fn diag(&self) -> Result<crate::Diagnostics, EngineError> {
         let (reply, rx) = oneshot::channel();
-        self.send(Cmd::Diag { reply })?;
+        self.send_read(Read::Diag { reply })?;
         rx.await.map_err(|_| EngineError::Stopped)
     }
 
@@ -253,7 +269,7 @@ impl Engine {
 
     pub async fn inspect(&self, run: RunId) -> Result<Option<Run>, EngineError> {
         let (reply, rx) = oneshot::channel();
-        self.send(Cmd::Inspect { run, reply })?;
+        self.send_read(Read::Inspect { run, reply })?;
         rx.await.map_err(|_| EngineError::Stopped)
     }
 }
@@ -271,6 +287,9 @@ pub struct ShellConfig {
     pub tick_ms: u64,
     /// Command channel capacity (submit back-pressure bound).
     pub cmd_capacity: usize,
+    /// Read channel capacity (inspect/list/diagnostics), separate so reads
+    /// cannot crowd out writes.
+    pub read_capacity: usize,
     /// Domain bounds — deadline, payload sizes, attempts. Tests shrink the
     /// step deadline so crash-recovery paths don't wait 30s.
     pub limits: Limits,
@@ -300,6 +319,7 @@ impl Default for ShellConfig {
             max_dispatch_per_tick: 64,
             tick_ms: 50,
             cmd_capacity: 1024,
+            read_capacity: 256,
             limits: Limits::default(),
             journal: JournalOptions::default(),
             group_commit: GroupCommit::default(),
@@ -325,14 +345,19 @@ pub fn spawn(dir: &Path, registry: Registry, cfg: ShellConfig) -> Result<Engine,
     let writer = writer::spawn(journal, cfg.group_commit.clone())
         .map_err(|e| EngineError::Journal(JournalError::Io(e)))?;
     let (tx, rx) = mpsc::channel::<Cmd>(cfg.cmd_capacity);
+    let (read_tx, read_rx) = mpsc::channel::<Read>(cfg.read_capacity.max(1));
     let health = Arc::new(Health::default());
     health.space_low.store(!core.space_ok(), Ordering::SeqCst);
     let mon = Monitor {
         health: health.clone(),
         errors: BTreeMap::new(),
     };
-    tokio::spawn(actor(core, registry, cfg, rx, mon, writer));
-    Ok(Engine { tx, health })
+    tokio::spawn(actor(core, registry, cfg, (rx, read_rx), mon, writer));
+    Ok(Engine {
+        tx,
+        read_tx,
+        health,
+    })
 }
 
 /// Errors the runtime handles itself — a handler outcome or a deadline
@@ -673,7 +698,7 @@ async fn actor(
     mut core: EngineCore,
     registry: Registry,
     cfg: ShellConfig,
-    mut rx: mpsc::Receiver<Cmd>,
+    (mut rx, mut read_rx): (mpsc::Receiver<Cmd>, mpsc::Receiver<Read>),
     mut mon: Monitor,
     writer: Writer,
 ) {
@@ -783,18 +808,6 @@ async fn actor(
                     }
                     pipe.answer(core.last_index(), reply, r);
                 }
-                Some(Cmd::Inspect { run, reply }) => {
-                    pipe.answer_read(core.last_index(), reply, core.run(run).cloned());
-                }
-                Some(Cmd::List { after, limit, reply }) => {
-                    let (runs, next_after) = core.page(after, limit);
-                    pipe.answer_read(core.last_index(), reply, RunPage { runs, next_after });
-                }
-                Some(Cmd::Diag { reply }) => {
-                    let mut d = core.diagnostics();
-                    d.errors = mon.errors.clone();
-                    pipe.answer_read(core.last_index(), reply, d);
-                }
                 Some(Cmd::Compact { reply }) => {
                     if pending_compaction.is_some() {
                         let _ = reply.send(Err(EngineError::Refused(
@@ -815,6 +828,25 @@ async fn actor(
                     pipe.collect(&mut core);
                     pipe.outbound.push_back(WriterMsg::Backup { dest, reply });
                 }
+                None => {
+                    pipe.shutdown().await;
+                    return;
+                }
+            },
+            read = read_rx.recv() => match read {
+                Some(Read::Inspect { run, reply }) => {
+                    pipe.answer_read(core.last_index(), reply, core.run(run).cloned());
+                }
+                Some(Read::List { after, limit, reply }) => {
+                    let (runs, next_after) = core.page(after, limit);
+                    pipe.answer_read(core.last_index(), reply, RunPage { runs, next_after });
+                }
+                Some(Read::Diag { reply }) => {
+                    let mut d = core.diagnostics();
+                    d.errors = mon.errors.clone();
+                    pipe.answer_read(core.last_index(), reply, d);
+                }
+                // Every handle is gone (the command channel closes with it).
                 None => {
                     pipe.shutdown().await;
                     return;
@@ -2466,6 +2498,36 @@ mod tests {
             .chain(join_all(waiting).await)
         {
             r.unwrap_or_else(|e| panic!("held submits complete: {e}"));
+        }
+    }
+
+    /// Review finding 5: open reads shared the writers' bounded command
+    /// queue, so a burst of unauthenticated `GET /jobs` could crowd an
+    /// authenticated submit out (refused busy). Reads have their own bound.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_read_burst_cannot_crowd_out_a_submit() {
+        let d = tempfile::tempdir().unwrap_or_else(|e| panic!("{e}"));
+        let cfg = ShellConfig {
+            tick_ms: 5,
+            cmd_capacity: 4,
+            ..Default::default()
+        };
+        let eng = spawn(d.path(), echo_registry(), cfg).unwrap_or_else(|e| panic!("{e}"));
+        let reads: Vec<_> = (0..200)
+            .map(|_| {
+                let e = eng.clone();
+                tokio::spawn(async move { e.list(None, MAX_PAGE).await.map(|p| p.runs.len()) })
+            })
+            .collect();
+        let e = eng.clone();
+        let submit = tokio::spawn(async move {
+            e.submit_at(OperationKey("writer".into()), spec("echo"), FAR)
+                .await
+        });
+        let r = bounded(submit).await.unwrap_or_else(|e| panic!("{e}"));
+        assert!(r.is_ok(), "the submit was crowded out by reads: {r:?}");
+        for h in reads {
+            let _ = bounded(h).await; // reads may be refused busy; never the submit
         }
     }
 

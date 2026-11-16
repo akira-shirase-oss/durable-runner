@@ -303,3 +303,13 @@ convention; these seed the contract's prescribed directions.
   `max_outbox_bytes` (64 MiB) or `max_outbox_records`. The bounded
   command channel then refuses submits as `busy` rather than buffering.
   Diagnostics report `largest_batch_bytes`.
+- **D-023 — Reads are projected and isolated from writes.** `GET /jobs`
+  is open (D-011) and went through the writers' command queue. Each page
+  also cloned whole runs, inputs of up to 64 KiB included, only to emit
+  five fields. Review measured 16 paging clients raising submit p99 from
+  24 to 541 ms. Now a page is built from `RunSummary` (id, key, state,
+  step count, finished_at) inside the actor, and reads travel on their
+  own bounded channel (`read_capacity`, 256). A read burst can fill it
+  and be refused busy, but it can no longer take a slot a submit or
+  cancel needs. Rate limiting open reads remains a requirement before any
+  non-loopback exposure.

@@ -416,7 +416,7 @@ async fn list(
                 "id": r.id.0,
                 "key": r.key.0,
                 "state": state_name(&r.state),
-                "steps": r.spec.steps.len(),
+                "steps": r.steps,
                 "finished_at": r.finished_at,
             })
         })
