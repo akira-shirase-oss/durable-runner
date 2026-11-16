@@ -111,3 +111,50 @@ convention; these seed the contract's prescribed directions.
   `max_output_bytes`; an oversized reply fails the attempt (retried under
   the same idempotency key, then failed) rather than being truncated.
   The load harness now counts runs from the bounded diagnostics.
+- **D-014 — Crash boundaries, written down before journal batching is
+  optimised** (contract §03).
+
+  *Crash model.* Process death (kill -9, panic, OOM kill) at any
+  instruction, and power loss on a local filesystem that honours fsync.
+  `File::sync_data` is `fdatasync` on Linux and `fcntl(F_FULLFSYNC)` on
+  macOS (Rust std, checked in the 1.97 source), so macOS numbers do not
+  carry to Linux. Assumed: a *successful* fsync makes every byte written to
+  that file before it durable. Not assumed: that unsynced bytes reach disk
+  in order or whole, that a file's length and its data persist together,
+  or that a failed fsync can be retried. Known gap (not built): directory
+  entries are fsynced for manifest and snapshot renames, but not for the
+  generation directory and `journal.log` created on first open.
+
+  *The boundaries of one record.*
+  1. **Before the write.** Nothing is on disk. A crash loses only the
+     request; the client saw no acknowledgement and retries with the same
+     `op_key`.
+  2. **Written, not fsynced.** Any prefix of the bytes may survive. Replay
+     keeps complete frames (valid checksum, next sequence number) and
+     discards a demonstrably torn tail. A surviving complete frame was
+     never acknowledged: that is at-least-once, and the retry with the same
+     `op_key` returns that run. A full-length tail frame with a bad
+     checksum is refused as corruption (only an incomplete tail may be
+     discarded), a deliberate choice the length-before-data case can hit.
+  3. **fsync returned success.** The record is committed. Only now may it
+     be acknowledged, answered in a read, or acted on (handler call,
+     probe).
+  4. **A write or fsync failed.** A failed write is cut back to the last
+     durable offset (D-009). A failed fsync is never retried: the writer
+     poisons and the process exits, and startup replay decides what is
+     durable.
+
+  *The rules any batching (group commit) must keep*, tested one by one:
+  (a) nothing a record decides (ack, read answer, handler call, probe)
+  leaves the process before the fsync that covers it returns. Memory may
+  run ahead of disk, but nothing escapes it. (b) One writer assigns
+  contiguous sequence numbers in commit order, and a batch is consecutive
+  frames written then fsynced once. (c) If a batch's write or fsync fails,
+  every waiter in it, and every later one, fails. The fsync is not
+  retried; the log is truncated to the durable offset when possible, and
+  the process exits so replay rebuilds memory from disk, because memory
+  already reflects records that are not durable. (d) Batches are bounded
+  in records and bytes, and the writer waits a bounded time for more. A
+  crash mid-batch loses only records nobody was told about. (e)
+  Compaction and backup run in commit order behind earlier appends, so a
+  snapshot never covers a record the log does not have.
