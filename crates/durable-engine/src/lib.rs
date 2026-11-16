@@ -717,6 +717,27 @@ impl EngineCore {
             .collect()
     }
 
+    /// One page newest first: up to `limit` runs with id < `before` (all
+    /// when `None`), ids descending, plus the cursor for the next page.
+    pub fn page_newest(
+        &self,
+        before: Option<RunId>,
+        limit: usize,
+    ) -> (Vec<RunSummary>, Option<RunId>) {
+        let end = before.map_or(Bound::Unbounded, Bound::Excluded);
+        let mut it = self.runs.range((Bound::Unbounded, end)).rev();
+        let page: Vec<RunSummary> = it
+            .by_ref()
+            .take(limit)
+            .map(|(_, r)| RunSummary::of(r))
+            .collect();
+        let next = match (page.last(), it.next()) {
+            (Some(last), Some(_)) => Some(last.id),
+            _ => None,
+        };
+        (page, next)
+    }
+
     /// Millisecond clock values the dispatcher should re-arm for.
     pub fn next_wake(&self) -> Option<Millis> {
         self.runs

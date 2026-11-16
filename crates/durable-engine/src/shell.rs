@@ -107,7 +107,7 @@ enum Read {
         reply: oneshot::Sender<Option<Run>>,
     },
     List {
-        after: Option<RunId>,
+        order: Order,
         limit: usize,
         reply: oneshot::Sender<RunPage>,
     },
@@ -135,12 +135,22 @@ struct Health {
 /// The most runs one list call returns, whatever the caller asks for.
 pub const MAX_PAGE: usize = 1000;
 
+/// Which end a list page starts from, with its cursor.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Order {
+    /// Ids ascending, after the cursor (oldest first).
+    Oldest { after: Option<RunId> },
+    /// Ids descending, before the cursor (newest first).
+    Newest { before: Option<RunId> },
+}
+
 /// A page of runs and the cursor for the next one.
 #[derive(Debug, Clone, Default)]
 pub struct RunPage {
     pub runs: Vec<crate::RunSummary>,
-    /// Pass as `after` to continue; `None` on the last page.
-    pub next_after: Option<RunId>,
+    /// The cursor for the next page in the same order (`after` when oldest
+    /// first, `before` when newest first); `None` on the last page.
+    pub next: Option<RunId>,
 }
 
 /// Whether the engine should receive new work now, and if not, why.
@@ -227,9 +237,14 @@ impl Engine {
     /// One page of the live index in id order: at most
     /// `min(limit, MAX_PAGE)` runs with id > `after`.
     pub async fn list(&self, after: Option<RunId>, limit: usize) -> Result<RunPage, EngineError> {
+        self.list_in(Order::Oldest { after }, limit).await
+    }
+
+    /// One page in either order, at most `min(limit, MAX_PAGE)` runs.
+    pub async fn list_in(&self, order: Order, limit: usize) -> Result<RunPage, EngineError> {
         let (reply, rx) = oneshot::channel();
         self.send_read(Read::List {
-            after,
+            order,
             limit: limit.clamp(1, MAX_PAGE),
             reply,
         })?;
@@ -837,9 +852,12 @@ async fn actor(
                 Some(Read::Inspect { run, reply }) => {
                     pipe.answer_read(core.last_index(), reply, core.run(run).cloned());
                 }
-                Some(Read::List { after, limit, reply }) => {
-                    let (runs, next_after) = core.page(after, limit);
-                    pipe.answer_read(core.last_index(), reply, RunPage { runs, next_after });
+                Some(Read::List { order, limit, reply }) => {
+                    let (runs, next) = match order {
+                        Order::Oldest { after } => core.page(after, limit),
+                        Order::Newest { before } => core.page_newest(before, limit),
+                    };
+                    pipe.answer_read(core.last_index(), reply, RunPage { runs, next });
                 }
                 Some(Read::Diag { reply }) => {
                     let mut d = core.diagnostics();

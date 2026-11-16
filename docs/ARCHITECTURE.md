@@ -59,6 +59,7 @@ delete every superseded `gen-*` directory (retention). Runs on `POST
 | `GET /health` | open | liveness |
 | `GET /ready` | open | readiness: 503 `no_space` / `engine_stopped` |
 | `GET /jobs?after=&limit=` | open | one page of runs, ids ascending (limit 100 default, 1000 max); `next_after` continues |
+| `GET /jobs?order=desc&before=&limit=` | open | newest first; `next_before` continues (the inspector's view) |
 | `GET /jobs/{id}` | open | inspect a run |
 | `POST /jobs` | API key | submit (dedup by `op_key`) |
 | `POST /jobs/{id}/cancel` | API key | cancel (stops scheduling, never undoes) |

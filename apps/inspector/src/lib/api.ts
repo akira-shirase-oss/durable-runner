@@ -12,13 +12,15 @@ const API = '';
 
 export interface RunPage {
 	runs: RunItem[];
-	next_after: number | null;
+	/** Cursor for the next (older) page; null on the last page. */
+	next_before: number | null;
 }
 
-// `GET /jobs` is paged (ids ascending, at most 1000 per page).
-export async function listRuns(after: number | null = null, limit = 100): Promise<RunPage> {
-	const q = new URLSearchParams({ limit: String(limit) });
-	if (after !== null) q.set('after', String(after));
+// `GET /jobs?order=desc` pages newest first (at most 1000 per page);
+// `before` continues from the previous page's `next_before`.
+export async function listRuns(before: number | null = null, limit = 50): Promise<RunPage> {
+	const q = new URLSearchParams({ order: 'desc', limit: String(limit) });
+	if (before !== null) q.set('before', String(before));
 	const r = await fetch(`${API}/jobs?${q}`);
 	if (!r.ok) throw new Error(`list failed: ${r.status}`);
 	return (await r.json()) as RunPage;

@@ -53,7 +53,8 @@ target/release/durable-server \
 - The journal directory is created on first run: `LOCK`, `manifest.json`,
   `gen-00000N/{journal.log,snapshot.json}`. A second server on the same
   directory **fails startup** — the exclusive writer lock is held.
-- The inspector is at `http://127.0.0.1:58300/inspector/`.
+- The inspector is at `http://127.0.0.1:58300/inspector/`: newest runs
+  first, 50 per page, with newer/older controls.
 
 ## Submit, inspect, cancel (the CLI)
 
@@ -64,6 +65,7 @@ $CLI submit --op-key pilot/onboarding-email \
       --input '{"user":"alice"}'
 $CLI inspect --run 1
 $CLI list --limit 50                  # one page; continue with --after <next_after>
+$CLI list --newest --limit 50         # newest first; continue with --before <next_before>
 $CLI cancel --run 1
 $CLI compact
 $CLI backup --name nightly-1          # -> data/backups/nightly-1

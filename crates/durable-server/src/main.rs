@@ -12,7 +12,7 @@ use axum::{
 };
 use clap::Parser;
 use durable_domain::{JobSpec, Millis, OperationKey, RunId, RunState, StepSpec};
-use durable_engine::shell::{spawn, Engine, Outcome, Registry, ShellConfig, StepHandler};
+use durable_engine::shell::{spawn, Engine, Order, Outcome, Registry, ShellConfig, StepHandler};
 use durable_engine::EngineError;
 use serde::Deserialize;
 use std::future::IntoFuture;
@@ -394,8 +394,13 @@ async fn cancel(
 
 #[derive(Deserialize)]
 struct ListQuery {
+    /// `asc` (default): oldest first, continue with `after`.
+    /// `desc`: newest first, continue with `before`.
+    order: Option<String>,
     /// Return runs with id greater than this (the previous `next_after`).
     after: Option<u64>,
+    /// Newest first: runs with id less than this (the previous `next_before`).
+    before: Option<u64>,
     /// Page size: default 100, clamped to 1..=1000.
     limit: Option<usize>,
 }
@@ -404,10 +409,27 @@ async fn list(
     State(app): State<App>,
     Query(q): Query<ListQuery>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let page = app
-        .engine
-        .list(q.after.map(RunId), q.limit.unwrap_or(100))
-        .await?;
+    let newest = match q.order.as_deref() {
+        None | Some("asc") => false,
+        Some("desc") => true,
+        Some(_) => {
+            return Err(ApiError::new(
+                StatusCode::BAD_REQUEST,
+                "bad_query",
+                "order must be asc or desc",
+            ))
+        }
+    };
+    let order = if newest {
+        Order::Newest {
+            before: q.before.map(RunId),
+        }
+    } else {
+        Order::Oldest {
+            after: q.after.map(RunId),
+        }
+    };
+    let page = app.engine.list_in(order, q.limit.unwrap_or(100)).await?;
     let items: Vec<serde_json::Value> = page
         .runs
         .iter()
@@ -421,10 +443,10 @@ async fn list(
             })
         })
         .collect();
-    Ok(Json(serde_json::json!({
-        "runs": items,
-        "next_after": page.next_after.map(|id| id.0),
-    })))
+    let cursor = if newest { "next_before" } else { "next_after" };
+    let mut body = serde_json::json!({ "runs": items });
+    body[cursor] = serde_json::json!(page.next.map(|id| id.0));
+    Ok(Json(body))
 }
 
 /// Liveness: the process answers.
@@ -979,6 +1001,52 @@ mod tests {
             (StatusCode::OK, 5),
             "limit is clamped, not refused"
         );
+    }
+
+    /// Newest first, for the inspector: `order=desc` pages down from the
+    /// newest run with a `before` cursor and `next_before`.
+    #[tokio::test]
+    async fn list_pages_newest_first() {
+        let h = harness(false);
+        for i in 0..5 {
+            let (status, _) = call(
+                &h.router,
+                "POST",
+                "/jobs",
+                Some(KEY),
+                Some(submit_body(&format!("desc-{i}"))),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK);
+        }
+        let ids = |v: &Value| -> Vec<u64> {
+            v["runs"]
+                .as_array()
+                .unwrap_or_else(|| panic!("runs array: {v}"))
+                .iter()
+                .filter_map(|r| r["id"].as_u64())
+                .collect()
+        };
+        let (_, v) = call(&h.router, "GET", "/jobs?order=desc&limit=2", None, None).await;
+        assert_eq!((ids(&v), v["next_before"].clone()), (vec![5, 4], json!(4)));
+        let (_, v) = call(
+            &h.router,
+            "GET",
+            "/jobs?order=desc&before=4&limit=2",
+            None,
+            None,
+        )
+        .await;
+        assert_eq!((ids(&v), v["next_before"].clone()), (vec![3, 2], json!(2)));
+        let (_, v) = call(
+            &h.router,
+            "GET",
+            "/jobs?order=desc&before=2&limit=2",
+            None,
+            None,
+        )
+        .await;
+        assert_eq!((ids(&v), v["next_before"].clone()), (vec![1], Value::Null));
     }
 
     /// Request bodies are capped well below axum's 2 MB default: a submit
