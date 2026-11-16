@@ -30,6 +30,10 @@ const PORT = Number(args.port ?? 58400);
 const HPORT = Number(args.hport ?? 58401);
 const API = `http://127.0.0.1:${PORT}`;
 const INPUT_B64 = Buffer.from('load').toString('base64');
+// Mutating and admin routes need the API key; the spawned server reads it
+// from DURABLE_API_KEY, so one random key per harness run serves both.
+const API_KEY = process.env.DURABLE_API_KEY ?? (await import('node:crypto')).randomBytes(32).toString('hex');
+const AUTH = { authorization: `Bearer ${API_KEY}` };
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const now = () => Date.now();
@@ -87,7 +91,8 @@ function startHandler(mode, stallMs = 0) {
 
 async function startServer(journalDir, extra = []) {
   const p = spawn(SRV, ['--journal', journalDir, '--listen', `127.0.0.1:${PORT}`,
-    '--handler', `step=http://127.0.0.1:${HPORT}/step`, ...extra], { stdio: 'ignore' });
+    '--handler', `step=http://127.0.0.1:${HPORT}/step`, ...extra],
+    { stdio: 'ignore', env: { ...process.env, DURABLE_API_KEY: API_KEY } });
   for (let i = 0; i < 100; i++) {
     try { await fetch(`${API}/health`); return p; } catch { await sleep(50); }
   }
@@ -97,13 +102,20 @@ async function startServer(journalDir, extra = []) {
 async function submit(opKey, steps = 1) {
   const t0 = performance.now();
   const r = await fetch(`${API}/jobs`, {
-    method: 'POST', headers: { 'content-type': 'application/json' },
+    method: 'POST', headers: { 'content-type': 'application/json', ...AUTH },
     body: JSON.stringify({
       op_key: opKey,
       spec: { version: 1, steps: Array.from({ length: steps }, (_, i) => ({ name: `s${i}`, handler: 'step' })), input_b64: INPUT_B64 },
     }),
   });
   return { status: r.status, ms: performance.now() - t0, body: await r.text() };
+}
+
+// Run counts come from the bounded diagnostics (counts by state, never
+// rows): GET /jobs is paged, and paging 1M runs to count them would be the
+// unbounded read the paging exists to prevent.
+async function diag() {
+  return (await fetch(`${API}/admin/diagnostics`, { headers: AUTH })).json();
 }
 
 const pct = (a, p) => a.length ? a.sort((x, y) => x - y)[Math.min(a.length - 1, Math.floor(p * a.length))] : null;
@@ -128,8 +140,7 @@ async function runSubmit() {
     if (elapsed < 1000) await sleep(1000 - elapsed);
   }
   await sleep(8000); // let the last submissions drain
-  const list = await (await fetch(`${API}/jobs`)).json();
-  const done = list.runs.filter((r) => r.state === 'done').length;
+  const done = (await diag()).states.done ?? 0;
   h.kill(); s.kill();
   writeResult('submit', {
     params: { rate_per_s: rate, seconds: secs, fsync: 'per-record (default)' },
@@ -153,12 +164,12 @@ async function runReplay() {
   const t0 = now();
   s = await startServer(`${dir}/journal`); // open replays the journal
   const replayMs = now() - t0;
-  const list = await (await fetch(`${API}/jobs`)).json();
+  const recovered = (await diag()).live_runs;
   h.kill(); s.kill();
   writeResult('replay', {
     params: { target_events: events, runs, steps_per_run: steps },
-    replay_ms: replayMs, runs_recovered: list.runs.length,
-    verdict: list.runs.length === runs ? 'pass' : 'FAIL',
+    replay_ms: replayMs, runs_recovered: recovered,
+    verdict: recovered === runs ? 'pass' : 'FAIL',
   });
 }
 
@@ -174,9 +185,7 @@ async function runStall() {
   }
   // Wait past the stall: runs should end reconciled + done (probe finds key)
   await sleep(stallMs + 15_000);
-  const list = await (await fetch(`${API}/jobs`)).json();
-  const states = {};
-  for (const r of list.runs) states[r.state.split(':')[0]] = (states[r.state.split(':')[0]] ?? 0) + 1;
+  const states = (await diag()).states;
   h.kill(); s.kill();
   writeResult('stall', {
     params: { runs: n, handler_stall_ms: stallMs, step_deadline_ms: 2000 },
@@ -220,17 +229,17 @@ async function runCompact() {
   const compactions = [];
   while (now() - t0 < secs * 1000) {
     const tc = now();
-    const r = await fetch(`${API}/admin/compact`, { method: 'POST' });
+    const r = await fetch(`${API}/admin/compact`, { method: 'POST', headers: AUTH });
     compactions.push({ status: r.status, ms: now() - tc });
     await sleep(5000);
   }
   await submits; await sleep(3000);
-  const list = await (await fetch(`${API}/jobs`)).json();
+  const runsAfter = (await diag()).live_runs;
   h.kill(); s.kill();
   writeResult('compact-under-load', {
     params: { seconds: secs, submit_interval_ms: 20 },
     submitted: sent, http_codes: codes, compactions,
-    runs_after: list.runs.length,
+    runs_after: runsAfter,
     latency_ms: { p50: pct(lat, 0.5), p99: pct(lat, 0.99) },
     verdict: Object.keys(codes).every((c) => c === '200') && compactions.every((c) => c.status === 200) ? 'pass' : 'FAIL',
   });
@@ -257,8 +266,7 @@ async function runSustained() {
     if (sent % 100_000 === 0) console.log(`${sent} sent, ${accepted} accepted @${((now() - t0) / 1000).toFixed(0)}s`);
   }
   await sleep(30_000);
-  const list = await (await fetch(`${API}/jobs`)).json();
-  const done = list.runs.filter((r) => r.state === 'done').length;
+  const done = (await diag()).states.done ?? 0;
   const jsize = execFileSync('du', ['-sk', `${dir}/journal`]).toString().split('\t')[0];
   h.kill(); s.kill();
   writeResult('sustained', {

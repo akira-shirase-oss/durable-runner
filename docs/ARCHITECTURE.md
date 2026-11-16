@@ -22,19 +22,54 @@
 
 ## Paths
 
-**Submit:** `POST /api/jobs {operation_key, version, input}` → admission check
-(reserve + caps) → journal append → fsync → `202 {run_id}` → dispatch.
+**Submit:** `POST /jobs {op_key, spec: {version, steps, input_b64}}` (API key)
+→ admission check (allowlist, reserve, caps) → record applied in memory and
+queued → the writer thread's group commit (one write + one fsync for
+everything queued) → `200 {run_id}` → dispatch. Acks, reads and handler
+calls wait for the fsync that covers their record (D-014, D-015).
 
-**Step:** coordinator claims due step → per-attempt deadline → allowlisted HTTP
-handler → checkpoint record → schedule next step or retry (persisted
-next-run + attempt count) → finish → history becomes terminal.
+**Writer:** a dedicated OS thread owns `journal.log`. The actor never
+writes or fsyncs; it hands the writer bounded batches, one in flight at a
+time, and learns the durable commit index back. Compaction and backup run
+on the same thread, in commit order. A failed write or fsync stops the
+writer, the actor and the process; startup replay recovers.
+
+**Step:** coordinator takes a concurrency permit (none free → the run stays
+queued) → journals `StepDispatched` with a per-attempt deadline → allowlisted
+HTTP handler → checkpoint record (which is the next step's dispatch; it
+inherits the permit) → schedule next step or retry (persisted next-run +
+attempt count) → finish → history becomes terminal. Dispatch is capped per
+tick; a call past its deadline is cancelled locally and reconciled.
 
 **Recovery:** read manifest → load snapshot → replay journal records in order →
 discard only a provably-torn tail append → rebuild index → serve.
 
 **Compaction:** write the new generation to a new directory → fsync → swap the
 manifest atomically → open old or new complete generation, never mixed → expire
-terminal history after 7 days while preserving live state and dedup deps.
+terminal history after 7 days while preserving live state and dedup deps →
+delete every superseded `gen-*` directory (retention). Runs hourly by default
+(`--compact-every-secs`) and on `POST /admin/compact`.
+
+## HTTP surface
+
+| Route | Auth | Purpose |
+|---|---|---|
+| `GET /health` | open | liveness |
+| `GET /ready` | open | readiness: 503 `no_space` / `engine_stopped` |
+| `GET /jobs?after=&limit=` | open | one page of runs, ids ascending (limit 100 default, 1000 max); `next_after` continues |
+| `GET /jobs/{id}` | open | inspect a run |
+| `POST /jobs` | API key | submit (dedup by `op_key`) |
+| `POST /jobs/{id}/cancel` | API key | cancel (stops scheduling, never undoes) |
+| `POST /admin/compact` | API key | compact into a new generation |
+| `POST /admin/backup {name}` | API key | backup to `<backup-root>/<name>` only |
+| `GET /admin/diagnostics` | API key | bounded counts |
+| `/inspector/` | open (cancel needs the key) | SvelteKit UI |
+
+The key is `DURABLE_API_KEY`, compared as SHA-256 digests in constant time.
+Request bodies are capped at 256 KiB; operation keys at 256 bytes and step
+and handler names at 128 (non-empty, no control characters in keys); a
+handler reply is read only up to the 256 KiB output limit.
+Errors share one envelope: `{"error": <safe message>, "code": <stable code>}`.
 
 ## Failure cases
 

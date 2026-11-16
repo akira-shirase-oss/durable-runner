@@ -12,6 +12,13 @@ trap 'kill $(jobs -p) 2>/dev/null || true' EXIT
 
 step() { printf '\n== %s\n' "$1"; }
 
+# The API key: mutating and admin routes need it. The server and the CLI
+# both read DURABLE_API_KEY from the environment (never from argv). A
+# fresh random key per pilot run; in production, keep it in your secret
+# store and export it into the server's environment.
+DURABLE_API_KEY=$(python3 -c 'import secrets; print(secrets.token_hex(32))')
+export DURABLE_API_KEY
+
 step "build"
 export PATH="$(brew --prefix rustup 2>/dev/null)/bin:$PATH"
 cargo build --release -p durable-server -p durable-cli 2>&1 | tail -1
@@ -21,7 +28,7 @@ CLI="$ROOT/target/release/durable-cli --server http://127.0.0.1:$SRV_PORT"
 step "start the pilot handler + the server (UI mounted at /inspector)"
 python3 examples/pilot/handler.py &
 "$SRV" --journal "$WORK/journal" --listen 127.0.0.1:$SRV_PORT \
-  --ui-dir "$ROOT/apps/inspector/build" \
+  --ui-dir "$ROOT/apps/inspector/build" --backup-root "$WORK/backups" \
   --handler step=http://127.0.0.1:$HND_PORT/step >"$WORK/server.log" 2>&1 &
 sleep 1.2
 
@@ -47,19 +54,20 @@ echo "inspector -> http://127.0.0.1:$SRV_PORT/inspector/ ($(curl -s -o /dev/null
 step "kill -9 the server mid-life, restart against the same journal"
 kill -9 "$(lsof -ti :$SRV_PORT)" || true
 sleep 0.4
-"$SRV" --journal "$WORK/journal" --listen 127.0.0.1:$SRV_PORT \
+"$SRV" --journal "$WORK/journal" --listen 127.0.0.1:$SRV_PORT --backup-root "$WORK/backups" \
   --handler step=http://127.0.0.1:$HND_PORT/step >>"$WORK/server.log" 2>&1 &
 sleep 1.2
 echo "after replay -> $($CLI inspect --run "$ID")"
 
 step "compact + backup"
 $CLI compact
-$CLI backup --to "$WORK/backup"
+$CLI backup --name pilot          # lands in $WORK/backups/pilot, nowhere else
 
 step "restore on a second server instance (different port + journal dir)"
 kill -9 "$(lsof -ti :$SRV_PORT)" || true
 sleep 0.4
-"$SRV" --journal "$WORK/backup" --listen 127.0.0.1:$RSRV_PORT \
+"$ROOT/target/release/durable-cli" restore --from "$WORK/backups/pilot" --to "$WORK/restored"
+"$SRV" --journal "$WORK/restored" --listen 127.0.0.1:$RSRV_PORT \
   --handler step=http://127.0.0.1:$HND_PORT/step >"$WORK/restored.log" 2>&1 &
 sleep 1.2
 RCLI="$ROOT/target/release/durable-cli --server http://127.0.0.1:$RSRV_PORT"

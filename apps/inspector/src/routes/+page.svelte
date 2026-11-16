@@ -1,14 +1,18 @@
 <script lang="ts">
 	import { onMount, onDestroy } from 'svelte';
-	import { listRuns, cancelRun, type RunItem } from '../lib/api';
+	import { listRuns, cancelRun, loadApiKey, saveApiKey, type RunItem } from '../lib/api';
 
 	let runs = $state<RunItem[]>([]);
+	let more = $state(false);
+	let apiKey = $state('');
 	let error = $state<string | null>(null);
 	let timer: ReturnType<typeof setInterval> | null = null;
 
 	async function refresh() {
 		try {
-			runs = await listRuns();
+			const page = await listRuns();
+			runs = page.runs;
+			more = page.next_after !== null;
 			error = null;
 		} catch (e) {
 			error = e instanceof Error ? e.message : String(e);
@@ -17,7 +21,7 @@
 
 	async function cancel(id: number) {
 		try {
-			await cancelRun(id);
+			await cancelRun(id, apiKey);
 			await refresh();
 		} catch (e) {
 			error = e instanceof Error ? e.message : String(e);
@@ -29,6 +33,7 @@
 	}
 
 	onMount(() => {
+		apiKey = loadApiKey();
 		refresh();
 		timer = setInterval(refresh, 2000);
 	});
@@ -39,6 +44,15 @@
 
 <main>
 	<h1>durable — runs</h1>
+	<label class="key-field">
+		API key (needed to cancel)
+		<input
+			type="password"
+			autocomplete="off"
+			bind:value={apiKey}
+			onchange={() => saveApiKey(apiKey)}
+		/>
+	</label>
 	{#if error}
 		<p class="error">cannot reach the server: {error}</p>
 	{/if}
@@ -67,6 +81,9 @@
 				{/each}
 			</tbody>
 		</table>
+		{#if more}
+			<p class="empty">showing the first {runs.length} runs; use <code>durable list --after</code> for more</p>
+		{/if}
 	{/if}
 </main>
 
@@ -125,6 +142,23 @@
 	}
 	.error {
 		color: #f85149;
+	}
+	.key-field {
+		display: flex;
+		gap: 0.6rem;
+		align-items: center;
+		color: #8b949e;
+		margin-bottom: 1rem;
+	}
+	.key-field input {
+		flex: 1;
+		max-width: 28rem;
+		background: #0d1117;
+		color: #c9d1d9;
+		border: 1px solid #30363d;
+		border-radius: 4px;
+		padding: 0.25rem 0.5rem;
+		font: inherit;
 	}
 	.empty {
 		color: #8b949e;

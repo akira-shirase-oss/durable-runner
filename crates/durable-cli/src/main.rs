@@ -1,6 +1,9 @@
 //! durable: the operator CLI. Talks to a running durable-server over HTTP
 //! for live operations; `restore` is an offline filesystem operation on a
 //! stopped journal (the same layout backup produces).
+//!
+//! Mutating and admin commands send `Authorization: Bearer $DURABLE_API_KEY`
+//! — the same variable the server reads its key from.
 
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
@@ -42,16 +45,24 @@ enum Cmd {
         #[arg(long)]
         run: u64,
     },
-    /// List every run in the live index.
-    List,
+    /// List one page of the live index (ids ascending).
+    List {
+        /// Start after this run id (the previous page's `next_after`).
+        #[arg(long)]
+        after: Option<u64>,
+        /// Page size (server clamps to 1..=1000; default 100).
+        #[arg(long)]
+        limit: Option<usize>,
+    },
     /// Bounded diagnostics: generation, records, runs by state kind.
     Diag,
     /// Compact the journal into a new generation.
     Compact,
-    /// Consistent server-side backup into a destination directory.
+    /// Consistent server-side backup into `<server --backup-root>/<name>`.
     Backup {
+        /// A plain name ([A-Za-z0-9_.-]), never a path.
         #[arg(long)]
-        to: PathBuf,
+        name: String,
     },
     /// Restore a backup into a journal directory (server must be stopped).
     Restore {
@@ -74,6 +85,15 @@ fn input_bytes(arg: &str) -> Result<Vec<u8>> {
         std::fs::read(path).with_context(|| format!("read input {path}"))
     } else {
         Ok(arg.as_bytes().to_vec())
+    }
+}
+
+/// Attach the API key when one is configured; the server refuses
+/// mutating and admin calls without it (401).
+fn authed(rb: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+    match std::env::var("DURABLE_API_KEY") {
+        Ok(key) => rb.bearer_auth(key.trim()),
+        Err(_) => rb,
     }
 }
 
@@ -116,8 +136,7 @@ async fn main() -> Result<()> {
                 "not_before": delay_ms.map(|d| now_ms() + d),
             });
             let v = check(
-                client
-                    .post(format!("{}/jobs", args.server))
+                authed(client.post(format!("{}/jobs", args.server)))
                     .json(&body)
                     .send()
                     .await?,
@@ -137,22 +156,34 @@ async fn main() -> Result<()> {
         }
         Cmd::Cancel { run } => {
             let v = check(
-                client
-                    .post(format!("{}/jobs/{run}/cancel", args.server))
+                authed(client.post(format!("{}/jobs/{run}/cancel", args.server)))
                     .send()
                     .await?,
             )
             .await?;
             println!("{v}");
         }
-        Cmd::List => {
-            let v = check(client.get(format!("{}/jobs", args.server)).send().await?).await?;
+        Cmd::List { after, limit } => {
+            let mut q: Vec<(&str, String)> = Vec::new();
+            if let Some(a) = after {
+                q.push(("after", a.to_string()));
+            }
+            if let Some(l) = limit {
+                q.push(("limit", l.to_string()));
+            }
+            let v = check(
+                client
+                    .get(format!("{}/jobs", args.server))
+                    .query(&q)
+                    .send()
+                    .await?,
+            )
+            .await?;
             println!("{v}");
         }
         Cmd::Diag => {
             let v = check(
-                client
-                    .get(format!("{}/admin/diagnostics", args.server))
+                authed(client.get(format!("{}/admin/diagnostics", args.server)))
                     .send()
                     .await?,
             )
@@ -161,19 +192,17 @@ async fn main() -> Result<()> {
         }
         Cmd::Compact => {
             let v = check(
-                client
-                    .post(format!("{}/admin/compact", args.server))
+                authed(client.post(format!("{}/admin/compact", args.server)))
                     .send()
                     .await?,
             )
             .await?;
             println!("{v}");
         }
-        Cmd::Backup { to } => {
+        Cmd::Backup { name } => {
             let v = check(
-                client
-                    .post(format!("{}/admin/backup", args.server))
-                    .json(&json!({ "dest": to.display().to_string() }))
+                authed(client.post(format!("{}/admin/backup", args.server)))
+                    .json(&json!({ "name": name }))
                     .send()
                     .await?,
             )
