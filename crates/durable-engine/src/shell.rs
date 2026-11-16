@@ -343,7 +343,9 @@ impl Monitor {
             match e {
                 JournalError::NoSpace { .. } => "no_space",
                 JournalError::WriteFailed { .. } => "journal_write_failed",
-                JournalError::SyncFailed(_) | JournalError::Poisoned => "journal_poisoned",
+                JournalError::SyncFailed(_)
+                | JournalError::Poisoned
+                | JournalError::ManifestSwapFailed(_) => "journal_poisoned",
                 _ => "internal",
             }
         }
@@ -2053,20 +2055,7 @@ mod tests {
         // pruned). The writer finishes what it holds before it releases
         // the lock, so once the journal reopens the directory is settled.
         drop(eng);
-        let mut reopened = None;
-        for _ in 0..300 {
-            match EngineCore::open(d.path()) {
-                Ok(c) => {
-                    reopened = Some(c);
-                    break;
-                }
-                Err(EngineError::Journal(JournalError::SecondWriter)) => {
-                    tokio::time::sleep(Duration::from_millis(10)).await;
-                }
-                Err(e) => panic!("{e}"),
-            }
-        }
-        let core = reopened.unwrap_or_else(|| panic!("the engine never released the journal"));
+        let core = reopen(d.path()).await;
         let gens: Vec<String> = std::fs::read_dir(d.path())
             .unwrap_or_else(|e| panic!("{e}"))
             .filter_map(|e| e.ok()?.file_name().into_string().ok())
@@ -2081,6 +2070,135 @@ mod tests {
     #[test]
     fn scheduled_compaction_is_off_by_default() {
         assert!(ShellConfig::default().compact_every.is_none());
+    }
+
+    /// Reopen once the stopped engine's writer has released the lock.
+    async fn reopen(dir: &Path) -> EngineCore {
+        for _ in 0..300 {
+            match EngineCore::open(dir) {
+                Ok(c) => return c,
+                Err(EngineError::Journal(JournalError::SecondWriter)) => {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+                Err(e) => panic!("restart must replay: {e}"),
+            }
+        }
+        panic!("the stopped engine never released the journal");
+    }
+
+    /// Submit `n` delayed runs one by one; the ids that were acknowledged.
+    async fn submit_acked(eng: &Engine, prefix: &str, n: usize) -> Vec<RunId> {
+        let mut acked = Vec::new();
+        for i in 0..n {
+            let r =
+                bounded(eng.submit_at(OperationKey(format!("{prefix}-{i}")), spec("echo"), FAR))
+                    .await;
+            if let Ok(id) = r {
+                acked.push(id);
+            }
+        }
+        acked
+    }
+
+    /// Review finding (high): an error at or after the manifest swap used
+    /// to leave the writer appending to the generation the manifest no
+    /// longer names — every job acknowledged afterwards was lost on
+    /// restart. Whatever compaction step fails on a *running* engine, no
+    /// acknowledged job may be lost: before the swap the engine carries on,
+    /// from the swap onward it stops and the restart replays.
+    #[tokio::test(flavor = "current_thread")]
+    async fn compaction_error_at_any_step_loses_no_acknowledged_job() {
+        for step in 1..=3u64 {
+            let d = tempfile::tempdir().unwrap_or_else(|e| panic!("{e}"));
+            let faults = Arc::new(Faults::default());
+            let eng = spawn(
+                d.path(),
+                echo_registry(),
+                piped(&faults, GroupCommit::default()),
+            )
+            .unwrap_or_else(|e| panic!("{e}"));
+            let mut acked = submit_acked(&eng, "pre", 5).await;
+            assert_eq!(acked.len(), 5);
+            faults.crash_compaction_at(step);
+            assert!(
+                bounded(eng.compact()).await.is_err(),
+                "step {step}: injected error"
+            );
+            let after = submit_acked(&eng, "post", 10).await;
+            if step >= 3 {
+                assert!(
+                    after.is_empty(),
+                    "step {step}: nothing may be acked once the manifest moved"
+                );
+                bounded(eng.closed()).await;
+            } else {
+                assert_eq!(
+                    after.len(),
+                    10,
+                    "step {step}: before the swap the engine carries on"
+                );
+            }
+            acked.extend(after);
+            drop(eng);
+            let core = reopen(d.path()).await;
+            for id in &acked {
+                assert!(
+                    core.run(*id).is_some(),
+                    "step {step}: acknowledged {id:?} lost on restart"
+                );
+            }
+        }
+    }
+
+    /// The same with a real OS error: a journal root the process can write
+    /// into but not open for reading makes the post-rename directory fsync
+    /// fail (EACCES), as the reviewer reproduced on the release binary.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "current_thread")]
+    async fn real_io_error_after_manifest_swap_stops_the_engine() {
+        use std::os::unix::fs::PermissionsExt;
+        struct Restore<'a>(&'a Path);
+        impl Drop for Restore<'_> {
+            fn drop(&mut self) {
+                let _ = std::fs::set_permissions(self.0, std::fs::Permissions::from_mode(0o700));
+            }
+        }
+        let d = tempfile::tempdir().unwrap_or_else(|e| panic!("{e}"));
+        let eng = spawn(
+            d.path(),
+            echo_registry(),
+            ShellConfig {
+                tick_ms: 5,
+                ..Default::default()
+            },
+        )
+        .unwrap_or_else(|e| panic!("{e}"));
+        let mut acked = submit_acked(&eng, "pre", 3).await;
+        let guard = Restore(d.path());
+        std::fs::set_permissions(d.path(), std::fs::Permissions::from_mode(0o300))
+            .unwrap_or_else(|e| panic!("{e}"));
+        if std::fs::File::open(d.path()).is_ok() {
+            eprintln!("skipped: this user ignores directory permissions");
+            return;
+        }
+        assert!(bounded(eng.compact()).await.is_err());
+        let after = submit_acked(&eng, "post", 30).await;
+        drop(guard);
+        assert!(
+            after.is_empty(),
+            "{} submits acked after the failed swap",
+            after.len()
+        );
+        acked.extend(after);
+        bounded(eng.closed()).await;
+        drop(eng);
+        let core = reopen(d.path()).await;
+        for id in &acked {
+            assert!(
+                core.run(*id).is_some(),
+                "acknowledged {id:?} lost on restart"
+            );
+        }
     }
 
     /// A failed fsync must stop the engine — never retry it, never keep

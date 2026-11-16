@@ -220,3 +220,23 @@ convention; these seed the contract's prescribed directions.
   to 0 (off) and `ShellConfig::compact_every` to `None`. Operators who
   schedule it opt in. The default can be revisited once compaction is
   cheap (D-020) and its error path is fatal (D-019).
+- **D-019 — A compaction error from the manifest swap onward is fatal.**
+  D-009/D-015 made failed appends stop the process, but compaction's
+  error path was left out. Independent review reproduced the loss on the
+  release binary with a real EACCES: the manifest was renamed to name
+  N+1, the following directory fsync failed, and `compact` returned an
+  error with the writer still pointing at N. The writer and actor treated
+  that as an ordinary failed compaction, kept appending to N and
+  acknowledged 30 jobs; the restart opened N+1 and all 30 were gone,
+  while `/ready` stayed 200. Now everything the writer needs after the
+  swap (the new log handle, created with `create_new`) is opened before
+  it, so nothing can fail past the point of no return except the rename
+  itself and the directory fsync. Any error from the rename onward
+  poisons the journal (`ManifestSwapFailed`). The writer stops exactly
+  as for a failed append: every waiter fails, the server exits non-zero,
+  and restart opens whatever the manifest durably names. A compaction
+  failing before the swap is still an ordinary error: nothing moved, and
+  the engine carries on. Proven on a running engine at each step by fault
+  injection, with a real EACCES at engine level, and at process level
+  against the real binary. D-017's crash-only test could not show this,
+  because dropping the journal turned the error into a crash.

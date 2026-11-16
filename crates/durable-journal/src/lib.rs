@@ -53,11 +53,11 @@ pub mod faults {
             *self.held.lock().unwrap_or_else(PoisonError::into_inner) = false;
             self.released.notify_all();
         }
-        /// The next compaction stops dead at `step` — 1: the new
-        /// generation's log exists; 2: its snapshot is written; 3: the
-        /// manifest names it (old generations not yet deleted) — as if the
-        /// process were killed there. Drop the journal and reopen to see
-        /// what a restart finds.
+        /// The next compaction fails at `step` — 1: the new generation's
+        /// log exists; 2: its snapshot is written; 3: the manifest has just
+        /// been renamed to name it (its directory fsync not yet done). Drop
+        /// the journal to model a crash there, or keep running to model an
+        /// I/O error there.
         pub fn crash_compaction_at(&self, step: u64) {
             self.compaction_crash.store(step, Ordering::SeqCst);
         }
@@ -202,6 +202,13 @@ pub enum JournalError {
     /// An earlier write or fsync failure poisoned this writer.
     #[error("journal writer poisoned by an earlier failure; restart to replay")]
     Poisoned,
+    /// Compaction failed at or after its manifest swap: the manifest may
+    /// already name the new generation while this writer still points at
+    /// the old one, so continuing would acknowledge records no restart
+    /// replays. The writer is poisoned; restart opens what the manifest
+    /// durably names.
+    #[error("compaction failed at its manifest swap; writer poisoned, restart to replay: {0}")]
+    ManifestSwapFailed(#[source] io::Error),
     /// A backup never merges into an existing directory.
     #[error("backup destination already exists")]
     BackupExists,
@@ -612,9 +619,11 @@ impl Journal {
         }
         fs::create_dir_all(&gdir)?;
 
-        // 1. Fresh log, created and fsynced before the manifest moves.
+        // 1. Fresh log, created and fsynced before the manifest moves. This
+        //    handle becomes the writer's file after the swap, so nothing
+        //    has to be opened past the point of no return.
         let log_path = gdir.join("journal.log");
-        let new_log = OpenOptions::new()
+        let mut new_log = OpenOptions::new()
             .read(true)
             .write(true)
             .create_new(true) // a reused generation is corruption, refuse it
@@ -627,20 +636,27 @@ impl Journal {
         self.compaction_step(2)?;
 
         // 3. The atomic manifest swap — the single point that moves the
-        //    world from generation N to N+1.
+        //    world from generation N to N+1, and the point of no return.
+        //    From the rename on, an error leaves the manifest possibly
+        //    naming N+1 while this writer points at N: poison, never
+        //    continue (appends would go where no restart looks).
         let tmp = self.root.join("manifest.json.tmp");
         fs::write(
             &tmp,
             serde_json::to_vec(&Manifest { generation: next }).map_err(io::Error::other)?,
         )?;
         File::open(&tmp)?.sync_data()?;
-        fs::rename(&tmp, self.root.join("manifest.json"))?;
-        sync_parent(&tmp)?;
-        self.compaction_step(3)?;
+        let swapped = fs::rename(&tmp, self.root.join("manifest.json"))
+            .and_then(|()| self.compaction_step(3))
+            .and_then(|()| sync_parent(&tmp))
+            .and_then(|()| new_log.seek(SeekFrom::End(0)).map(|_| ()));
+        if let Err(e) = swapped {
+            self.poisoned = true;
+            return Err(JournalError::ManifestSwapFailed(e));
+        }
 
         // 4. Only now does the writer move: new generation, seq restarts.
-        self.file = OpenOptions::new().read(true).append(true).open(&log_path)?;
-        self.file.seek(SeekFrom::End(0))?;
+        self.file = new_log;
         self.generation = next;
         self.next_seq = 1;
         self.durable_len = 0;

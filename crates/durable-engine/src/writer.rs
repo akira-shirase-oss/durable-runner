@@ -14,7 +14,9 @@
 //!   process exits so replay rebuilds memory, which is already ahead of disk;
 //! - batches are bounded in records and bytes, and the wait for more
 //!   records is bounded by `max_wait`;
-//! - compaction and backup run here, in queue order behind earlier appends.
+//! - compaction and backup run here, in queue order behind earlier appends;
+//!   a compaction that fails at or after its manifest swap poisons the
+//!   journal and stops the writer exactly like a failed append (D-019).
 
 use crate::EngineError;
 use durable_journal::{Journal, JournalError, Snapshot};
@@ -151,14 +153,29 @@ fn run(
             }
             WriterMsg::Compact { snapshot, reply } => {
                 let r = journal.compact(&snapshot).map(|()| journal.generation());
-                if r.is_ok() {
-                    st.generation = journal.generation();
-                    st.records_written = 0;
+                match r {
+                    Ok(generation) => {
+                        st.generation = generation;
+                        st.records_written = 0;
+                        if let Ok(n) = journal.stale_generations() {
+                            st.stale_generations = n;
+                        }
+                        let _ = reply.send(Ok(generation));
+                    }
+                    // Failed at or after the manifest swap: the journal is
+                    // poisoned. Same rule as a failed append — stop, so the
+                    // actor fails every waiter and the process exits.
+                    Err(e) if journal.is_poisoned() => {
+                        let _ = reply.send(Err(JournalError::Poisoned));
+                        st.failed = Some(Arc::new(e));
+                        status.send_replace(st);
+                        return;
+                    }
+                    // Failed before the swap: nothing moved, carry on.
+                    Err(e) => {
+                        let _ = reply.send(Err(e)); // the actor may have stopped meanwhile
+                    }
                 }
-                if let Ok(n) = journal.stale_generations() {
-                    st.stale_generations = n;
-                }
-                let _ = reply.send(r); // the actor may have stopped meanwhile
             }
             WriterMsg::Backup { dest, reply } => {
                 let _ = reply.send(journal.backup_to(&dest).map_err(EngineError::from));
