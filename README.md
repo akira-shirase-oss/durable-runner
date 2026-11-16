@@ -25,3 +25,7 @@ and a second developer can run, inspect, back up and restore a workflow.
 ```sh
 cargo build --release && examples/pilot/run.sh   # the whole story, one command
 ```
+
+## License
+
+MIT; see [LICENSE](LICENSE).
