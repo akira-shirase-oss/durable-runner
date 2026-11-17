@@ -717,3 +717,29 @@ convention; these seed the contract's prescribed directions.
     starting empty. Without a manifest, an empty `gen-000001` (what a
     crash during first open leaves) still opens as new; any other
     generation without a manifest is refused, as in D-034.
+- **D-045 — Connections are capped and timed.** The server ran on
+  `axum::serve`, which sets no timer, so hyper's header timeout never
+  armed; nothing capped connections, and nothing bounded a request body.
+  Review held 300 sockets, each with a partial request head, against a
+  server with 256 descriptors: `/health` timed out, and the partial
+  requests were still held 35 s later. Unauthenticated, from anywhere
+  that can connect. The server now accepts on its own loop over hyper
+  (`hyper-util`, HTTP/1.1):
+  - at most `--max-connections` (512) at once, one semaphore permit each;
+    the rest wait in the kernel's accept queue, and a failed accept (out
+    of descriptors) backs off 100 ms instead of spinning;
+  - `--header-timeout-ms` (10 s): a request head, and the next one on an
+    idle keep-alive connection, must arrive in time or the connection
+    closes (hyper's `header_read_timeout` with a Tokio timer);
+  - `--body-deadline-ms` (30 s): a whole request body, by tower-http's
+    `RequestBodyDeadline`, not reset by a trickle;
+  - graceful shutdown through hyper-util's `GracefulShutdown`, and every
+    connection task in a `JoinSet`.
+
+  Drilled on the release binary (`perf/results/2026-11-17T03-20-00Z-
+  idle-connections.json`): 300 partial-head sockets against 256
+  descriptors and a 3 s header timeout. The first `/health` answered in
+  3.1 s, once the timeout freed descriptors, then at once, and all 300
+  sockets were closed. Not handled here, so a reverse proxy must do it for
+  any non-local exposure: TLS, per-client rate limits, a cap on
+  connections per client address, and slow-response (download) limits.

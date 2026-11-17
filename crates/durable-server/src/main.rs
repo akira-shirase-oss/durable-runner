@@ -15,7 +15,6 @@ use durable_domain::{JobSpec, Millis, OperationKey, RunId, RunState, StepSpec};
 use durable_engine::shell::{spawn, Engine, Order, Outcome, Registry, ShellConfig, StepHandler};
 use durable_engine::EngineError;
 use serde::Deserialize;
-use std::future::IntoFuture;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -80,6 +79,17 @@ struct Args {
     /// can reach a non-loopback listener could read every op_key (D-037).
     #[arg(long)]
     open_reads: bool,
+    /// Connections served at once; more wait in the kernel's accept queue.
+    /// Keep it below the process's descriptor limit (`ulimit -n`) less 64.
+    #[arg(long, default_value_t = 512)]
+    max_connections: usize,
+    /// A request head (or the next one on an idle keep-alive connection)
+    /// must arrive within this many ms, or the connection is closed.
+    #[arg(long, default_value_t = 10_000)]
+    header_timeout_ms: u64,
+    /// A request body must arrive in full within this many ms.
+    #[arg(long, default_value_t = 30_000)]
+    body_deadline_ms: u64,
     /// On SIGTERM or SIGINT: how long to let requests in flight finish,
     /// and then how long the engine may take to make everything it
     /// decided durable, before exiting non-zero instead of 0.
@@ -958,11 +968,12 @@ async fn main() -> Result<()> {
         .with_context(|| format!("bind {}", args.listen))?;
     eprintln!("durable-server listening on {}", args.listen);
     let (stop_http, http_stopped) = tokio::sync::oneshot::channel::<()>();
-    let serve = axum::serve(listener, router)
-        .with_graceful_shutdown(async {
-            let _ = http_stopped.await;
-        })
-        .into_future();
+    let limits = HttpLimits {
+        max_connections: args.max_connections.max(1),
+        header_timeout: Duration::from_millis(args.header_timeout_ms.max(1)),
+        body_deadline: Duration::from_millis(args.body_deadline_ms.max(1)),
+    };
+    let serve = serve_http(listener, router, limits, http_stopped);
     tokio::pin!(serve);
     tokio::select! {
         r = &mut serve => return r.context("serve"),
@@ -993,6 +1004,96 @@ async fn main() -> Result<()> {
         .await
         .map_err(|e| anyhow::anyhow!("drain did not finish ({e}); a restart replays"))?;
     eprintln!("durable-server: drained; exiting");
+    Ok(())
+}
+
+/// Bounds on what one client connection may hold.
+#[derive(Debug, Clone, Copy)]
+struct HttpLimits {
+    max_connections: usize,
+    header_timeout: Duration,
+    body_deadline: Duration,
+}
+
+impl Default for HttpLimits {
+    /// The server's flag defaults.
+    fn default() -> Self {
+        Self {
+            max_connections: 512,
+            header_timeout: Duration::from_secs(10),
+            body_deadline: Duration::from_secs(30),
+        }
+    }
+}
+
+/// Serve `router` on `listener` until `stop` fires, then let the requests
+/// in flight finish (D-045). Every connection holds one of
+/// `max_connections` permits (the rest wait in the kernel's accept queue);
+/// a request head (and an idle keep-alive connection waiting for one) must
+/// arrive within `header_timeout`; a request body within `body_deadline`.
+async fn serve_http(
+    listener: tokio::net::TcpListener,
+    router: Router,
+    limits: HttpLimits,
+    mut stop: tokio::sync::oneshot::Receiver<()>,
+) -> std::io::Result<()> {
+    use hyper_util::rt::{TokioIo, TokioTimer};
+    let permits = Arc::new(tokio::sync::Semaphore::new(limits.max_connections.max(1)));
+    let graceful = hyper_util::server::graceful::GracefulShutdown::new();
+    let service = hyper_util::service::TowerToHyperService::new(
+        tower_http::timeout::RequestBodyDeadline::new(router, limits.body_deadline),
+    );
+    let mut conns = tokio::task::JoinSet::new();
+    let mut accept_failing = false;
+    loop {
+        let permit = tokio::select! {
+            p = permits.clone().acquire_owned() => match p {
+                Ok(p) => p,
+                Err(_) => break, // the semaphore is never closed
+            },
+            _ = &mut stop => break,
+            Some(done) = conns.join_next(), if !conns.is_empty() => {
+                if let Err(e) = done {
+                    eprintln!("durable-server: a connection task failed: {e}");
+                }
+                continue;
+            }
+        };
+        let stream = tokio::select! {
+            r = listener.accept() => match r {
+                Ok((stream, _)) => {
+                    accept_failing = false;
+                    stream
+                }
+                Err(e) => {
+                    // Out of descriptors or a reset handshake: back off
+                    // rather than spin (logged once per episode); the
+                    // permit returns.
+                    if !accept_failing {
+                        eprintln!("durable-server: accept failed: {e}; retrying");
+                        accept_failing = true;
+                    }
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                    continue;
+                }
+            },
+            _ = &mut stop => break,
+        };
+        let conn = hyper::server::conn::http1::Builder::new()
+            .timer(TokioTimer::new())
+            .header_read_timeout(limits.header_timeout)
+            .serve_connection(TokioIo::new(stream), service.clone());
+        let conn = graceful.watch(conn);
+        conns.spawn(async move {
+            let _permit = permit;
+            // A connection error (a reset, a timed-out head) ends only
+            // that connection.
+            let _ = conn.await;
+        });
+    }
+    drop(listener); // stop accepting: new connections are refused
+    graceful.shutdown().await; // in-flight requests finish, idle ones close
+    while conns.join_next().await.is_some() {}
     Ok(())
 }
 
@@ -1828,6 +1929,137 @@ mod tests {
                 "{uri}: scripts must not be unsafe-inline: {csp}"
             );
         }
+    }
+
+    /// A served router with `limits` on 127.0.0.1; its address and a stop
+    /// sender.
+    async fn serving(
+        limits: HttpLimits,
+    ) -> (
+        std::net::SocketAddr,
+        tokio::sync::oneshot::Sender<()>,
+        Harness,
+    ) {
+        let h = harness(false);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .unwrap_or_else(|e| panic!("{e}"));
+        let addr = listener.local_addr().unwrap_or_else(|e| panic!("{e}"));
+        let (stop, stopped) = tokio::sync::oneshot::channel();
+        tokio::spawn(serve_http(listener, h.router.clone(), limits, stopped));
+        (addr, stop, h)
+    }
+
+    /// Whether the server closes `sock` within `limit` (reads to EOF).
+    async fn closed_within(sock: &mut tokio::net::TcpStream, limit: Duration) -> bool {
+        use tokio::io::AsyncReadExt as _;
+        let mut buf = [0u8; 1024];
+        let deadline = tokio::time::Instant::now() + limit;
+        loop {
+            match tokio::time::timeout_at(deadline, sock.read(&mut buf)).await {
+                Err(_) => return false,
+                Ok(Ok(0)) | Ok(Err(_)) => return true,
+                Ok(Ok(_)) => {} // a response (e.g. 408) before the close
+            }
+        }
+    }
+
+    /// Review U2: with no header timeout, a client that sends part of a
+    /// request (or opens a keep-alive connection and goes quiet) held its
+    /// connection forever; 300 of them made `/health` time out. A head
+    /// not finished within the header timeout is cut off.
+    #[tokio::test]
+    async fn a_slow_request_head_is_cut_off() {
+        use tokio::io::AsyncWriteExt as _;
+        let limits = HttpLimits {
+            header_timeout: Duration::from_millis(300),
+            ..HttpLimits::default()
+        };
+        let (addr, _stop, _h) = serving(limits).await;
+        let mut partial = tokio::net::TcpStream::connect(addr)
+            .await
+            .unwrap_or_else(|e| panic!("{e}"));
+        partial
+            .write_all(b"GET /health HTTP/1.1\r\nhost: x\r\n")
+            .await
+            .unwrap_or_else(|e| panic!("{e}"));
+        assert!(
+            closed_within(&mut partial, Duration::from_secs(5)).await,
+            "a half-sent request head held its connection"
+        );
+        let mut silent = tokio::net::TcpStream::connect(addr)
+            .await
+            .unwrap_or_else(|e| panic!("{e}"));
+        assert!(
+            closed_within(&mut silent, Duration::from_secs(5)).await,
+            "a silent connection was kept"
+        );
+    }
+
+    /// A request body that trickles is cut off at the body deadline, so a
+    /// client holding a key cannot hold a connection open forever either.
+    #[tokio::test]
+    async fn a_request_body_has_a_deadline() {
+        use tokio::io::AsyncWriteExt as _;
+        let limits = HttpLimits {
+            body_deadline: Duration::from_millis(300),
+            ..HttpLimits::default()
+        };
+        let (addr, _stop, _h) = serving(limits).await;
+        let mut slow = tokio::net::TcpStream::connect(addr)
+            .await
+            .unwrap_or_else(|e| panic!("{e}"));
+        let head = format!(
+            "POST /jobs HTTP/1.1\r\nhost: x\r\nauthorization: Bearer {KEY}\r\n\
+             content-type: application/json\r\ncontent-length: 1000\r\n\r\n{{\"op"
+        );
+        slow.write_all(head.as_bytes())
+            .await
+            .unwrap_or_else(|e| panic!("{e}"));
+        assert!(
+            closed_within(&mut slow, Duration::from_secs(5)).await,
+            "a stalled body held its connection"
+        );
+    }
+
+    /// At most `max_connections` are served at once; the rest wait to be
+    /// accepted, and a slot frees when a held connection times out.
+    #[tokio::test]
+    async fn connections_are_capped_and_slots_come_back() {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+        let limits = HttpLimits {
+            max_connections: 4,
+            header_timeout: Duration::from_millis(500),
+            ..HttpLimits::default()
+        };
+        let (addr, _stop, _h) = serving(limits).await;
+        let mut held = Vec::new();
+        for _ in 0..8 {
+            let mut s = tokio::net::TcpStream::connect(addr)
+                .await
+                .unwrap_or_else(|e| panic!("{e}"));
+            s.write_all(b"GET /health HTTP/1.1\r\n")
+                .await
+                .unwrap_or_else(|e| panic!("{e}"));
+            held.push(s);
+        }
+        let mut probe = tokio::net::TcpStream::connect(addr)
+            .await
+            .unwrap_or_else(|e| panic!("{e}"));
+        probe
+            .write_all(b"GET /health HTTP/1.1\r\nhost: x\r\nconnection: close\r\n\r\n")
+            .await
+            .unwrap_or_else(|e| panic!("{e}"));
+        let mut reply = Vec::new();
+        tokio::time::timeout(Duration::from_secs(10), probe.read_to_end(&mut reply))
+            .await
+            .unwrap_or_else(|_| panic!("/health never answered while connections were held"))
+            .unwrap_or_else(|e| panic!("{e}"));
+        assert!(
+            reply.starts_with(b"HTTP/1.1 200"),
+            "{}",
+            String::from_utf8_lossy(&reply)
+        );
     }
 
     /// A full command channel is 503 `busy` (retry with the same op_key),

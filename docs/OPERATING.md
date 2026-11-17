@@ -102,6 +102,14 @@ target/release/durable-server \
 - **Backup root.** `--backup-root DIR` is the only place backups are
   written; without it `/admin/backup` answers `403 backups_disabled`.
 
+- **Connections.** `--max-connections` (512) are served at once (keep
+  it below `ulimit -n` less 64); a request head must arrive within
+  `--header-timeout-ms` (10 s, idle keep-alive connections too) and a
+  body within `--body-deadline-ms` (30 s) (D-045). That bounds one host's
+  worth of slow clients; it is not a defence on the open internet. For
+  any non-local exposure put a reverse proxy in front that terminates
+  TLS, rate-limits per client, caps connections per client address, and
+  limits slow responses.
 - **Stopping.** Send SIGTERM (or Ctrl-C). The server stops accepting,
   lets requests in flight finish, makes everything it already decided
   durable, releases the journal and exits 0; it exits non-zero if that
