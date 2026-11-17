@@ -1,0 +1,32 @@
+{
+  "machine": {
+    "host": "maintainer-laptop",
+    "platform": "darwin/arm64",
+    "cpu": "Apple M2 Pro",
+    "cores": 12,
+    "mem_gb": 32,
+    "date": "2026-11-17T08:42:51.580Z",
+    "commit": "cdbdfb8"
+  },
+  "scenario": "sustained",
+  "params": {
+    "rate_per_s": 100,
+    "target_submits": 1000000,
+    "fsync": "per-record"
+  },
+  "sent": 1000000,
+  "accepted": 1000000,
+  "done_after_drain": 1000000,
+  "http_codes": {
+    "200": 1000000
+  },
+  "wall_clock_s": 10176,
+  "journal_kb": 507912,
+  "latency_ms": {
+    "p50": 12.538708999752998,
+    "p99": 41.25045899953693,
+    "max": 3167.16329200007
+  },
+  "verdict": "pass",
+  "note": "Server binary built at cdbdfb8; the harness ran from 9ed95d2, which only moved its default ports. 1-minute load average during the run: min 0.91, median 3.52, max 24.96 (170 samples); other projects' builds overlapped parts of the run."
+}

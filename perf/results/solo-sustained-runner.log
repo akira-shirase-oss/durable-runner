@@ -12,5 +12,5 @@
 800000 sent, 394377 accepted @8083s
 900000 sent, 438063 accepted @9091s
 1000000 sent, 480891 accepted @10100s
-result -> /Users/vinaysandhu/Desktop/Learning/akira-shirase-oss/projects/durable-runner/perf/results/2026-11-10T20-38-48-041Z-sustained.json
+result -> ~/Desktop/Learning/akira-shirase-oss/projects/durable-runner/perf/results/2026-11-10T20-38-48-041Z-sustained.json
 2026-11-10T20:38:48Z solo sustained done (exit 0)
