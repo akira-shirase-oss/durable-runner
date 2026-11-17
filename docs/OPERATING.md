@@ -109,7 +109,9 @@ target/release/durable-server \
 - `--handler name=URL` is the allowlist — repeatable; a submit naming a
   handler outside it is refused 409 with `unregistered handler`.
 - The journal directory is created on first run: `LOCK`, `manifest.json`,
-  `gen-00000N/{journal.log,snapshot.json}`. A second server on the same
+  `gen-00000N/{journal.log,snapshot.bin}`, owner-only (directories 0700,
+  files 0600; backups and restores too, D-038). Run the server as the
+  user that owns them. A second server on the same
   directory **fails startup** — the exclusive writer lock is held.
 - The inspector is at `http://127.0.0.1:58300/inspector/`: newest runs
   first, 50 per page, with newer/older controls.

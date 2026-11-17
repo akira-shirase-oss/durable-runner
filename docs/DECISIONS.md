@@ -581,3 +581,15 @@ convention; these seed the contract's prescribed directions.
   Startup now has process tests: no API key, a 31-character one, a short
   read key, a read key equal to the API key, and `--open-reads` on
   `0.0.0.0` each exit non-zero without listening.
+- **D-038 — Journal, snapshot and backup files are owner-only.** They
+  hold every job's input and were created with the process umask,
+  usually world-readable (0644 files, 0755 directories), and `fs::copy`
+  carried those modes into backups. Every directory the journal creates
+  (the root, generations, backups and their partial copies, a restore
+  target) is now 0700 and every file 0600: the log, the snapshot and its
+  temporary, the manifest and its temporary, `LOCK`, and each copy a
+  backup or restore makes. A journal from an older build is tightened
+  when it opens (the root, `LOCK`, the manifest and the current
+  generation), best effort: a path this user may not chmod is left as it
+  is rather than stopping startup. Unix only; elsewhere the modes are
+  the platform's.

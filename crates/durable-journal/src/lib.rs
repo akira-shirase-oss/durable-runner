@@ -692,7 +692,8 @@ impl Journal {
         // append can be acknowledged (D-025): a new file or directory is
         // durable only once the directory holding its entry is.
         let root_existed = dir.exists();
-        fs::create_dir_all(dir)?;
+        private_dir_all(dir)?;
+        tighten(dir, DIR_MODE); // a journal from before owner-only modes
         if !root_existed {
             let parent = dir
                 .parent()
@@ -701,13 +702,12 @@ impl Journal {
             sync_dir(&opts, parent)?;
         }
         let lock_path = dir.join("LOCK");
-        let lock_file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
+        let lock_file = private(OpenOptions::new().read(true).write(true).create(true))
             .truncate(false)
             .open(&lock_path)?;
         fs2::FileExt::try_lock_exclusive(&lock_file).map_err(|_| JournalError::SecondWriter)?;
+        tighten(&lock_path, FILE_MODE);
+        tighten(&manifest_path_of(dir), FILE_MODE);
 
         // Manifest: keep the last valid one; create generation 1 on first open.
         let manifest_path = dir.join("manifest.json");
@@ -732,8 +732,7 @@ impl Journal {
                 }
                 let m = Manifest { generation: 1 };
                 let tmp = dir.join("manifest.json.tmp");
-                fs::write(&tmp, serde_json::to_string(&m).map_err(io::Error::other)?)?;
-                File::open(&tmp)?.sync_data()?;
+                write_private(&tmp, &serde_json::to_vec(&m).map_err(io::Error::other)?)?;
                 fs::rename(&tmp, &manifest_path)?;
                 sync_dir(&opts, dir)?;
                 1
@@ -743,15 +742,16 @@ impl Journal {
 
         let gdir = gen_dir_path(dir, generation);
         let gen_existed = gdir.exists();
-        fs::create_dir_all(&gdir)?;
+        private_dir_all(&gdir)?;
+        tighten(&gdir, DIR_MODE);
         let log_path = gdir.join("journal.log");
         let log_existed = log_path.exists();
-        let mut file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
+        let mut file = private(OpenOptions::new().read(true).write(true).create(true))
             .truncate(false)
             .open(&log_path)?;
+        for f in SNAPSHOT_FILES {
+            tighten(&gdir.join(f), FILE_MODE);
+        }
         if !log_existed {
             sync_dir(&opts, &gdir)?; // journal.log's entry
         }
@@ -1023,15 +1023,13 @@ impl Journal {
             Err(e) if e.kind() == io::ErrorKind::NotFound => {}
             Err(e) => return Err(e.into()),
         }
-        fs::create_dir_all(&gdir)?;
+        private_dir_all(&gdir)?;
 
         // 1. Fresh log, created and fsynced before the manifest moves. This
         //    handle becomes the writer's file after the swap, so nothing
         //    has to be opened past the point of no return.
         let log_path = gdir.join("journal.log");
-        let mut new_log = OpenOptions::new()
-            .read(true)
-            .write(true)
+        let mut new_log = private(OpenOptions::new().read(true).write(true))
             .create_new(true) // a reused generation is corruption, refuse it
             .open(&log_path)?;
         new_log.sync_data()?;
@@ -1047,11 +1045,10 @@ impl Journal {
         //    naming N+1 while this writer points at N: poison, never
         //    continue (appends would go where no restart looks).
         let tmp = self.root.join("manifest.json.tmp");
-        fs::write(
+        write_private(
             &tmp,
-            serde_json::to_vec(&Manifest { generation: next }).map_err(io::Error::other)?,
+            &serde_json::to_vec(&Manifest { generation: next }).map_err(io::Error::other)?,
         )?;
-        File::open(&tmp)?.sync_data()?;
         let swapped = fs::rename(&tmp, self.root.join("manifest.json"))
             .and_then(|()| self.compaction_step(3))
             .and_then(|()| sync_parent(&tmp))
@@ -1142,19 +1139,18 @@ impl Journal {
             Err(e) if e.kind() == io::ErrorKind::NotFound => {}
             Err(e) => return Err(e.into()),
         }
-        fs::create_dir(&partial)?;
+        private_dir(&partial)?;
         for entry in fs::read_dir(&self.root)? {
             let entry = entry?;
             let gname = entry.file_name();
             let Some(n) = gname.to_str() else { continue };
             if n.starts_with("gen-") && entry.file_type()?.is_dir() {
                 let gd = partial.join(n);
-                fs::create_dir_all(&gd)?;
+                private_dir(&gd)?;
                 for f in SNAPSHOT_FILES {
                     let src = entry.path().join(f);
                     if src.exists() {
-                        fs::copy(&src, gd.join(f))?;
-                        File::open(gd.join(f))?.sync_data()?;
+                        copy_file_durably(&src, &gd.join(f))?;
                     }
                 }
                 File::open(&gd)?.sync_data()?;
@@ -1170,11 +1166,10 @@ impl Journal {
             return Err(io::Error::other("injected crash during backup").into());
         }
         // Manifest last: even the partial copy opens as one generation.
-        fs::copy(
-            self.root.join("manifest.json"),
-            partial.join("manifest.json"),
+        copy_file_durably(
+            &self.root.join("manifest.json"),
+            &partial.join("manifest.json"),
         )?;
-        File::open(partial.join("manifest.json"))?.sync_data()?;
         File::open(&partial)?.sync_data()?;
         if fs::symlink_metadata(dest).is_ok() {
             return Err(JournalError::BackupExists); // appeared meanwhile
@@ -1264,11 +1259,8 @@ pub fn restore_backup(from: &Path, to: &Path) -> Result<(), JournalError> {
         }
         Err(e) => return Err(e.into()),
     }
-    fs::create_dir_all(to)?;
-    let lock = OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create(true)
+    private_dir_all(to)?;
+    let lock = private(OpenOptions::new().read(true).write(true).create(true))
         .truncate(false)
         .open(to.join("LOCK"))?;
     fs2::FileExt::try_lock_exclusive(&lock).map_err(|_| JournalError::SecondWriter)?;
@@ -1292,7 +1284,7 @@ pub fn restore_backup(from: &Path, to: &Path) -> Result<(), JournalError> {
             )));
         }
         let gd = to.join(&name);
-        fs::create_dir(&gd)?;
+        private_dir(&gd)?;
         for f in fs::read_dir(entry.path())? {
             let f = f?;
             let fname = f.file_name();
@@ -1330,13 +1322,69 @@ fn copy_file_durably(src: &Path, dest: &Path) -> io::Result<()> {
 }
 
 /// Create a new file the journal owns: refuses an existing path (so never
-/// writes through a planted symlink) and, on Unix, is owner-only (0600).
+/// writes through a planted symlink) and is owner-only.
 fn new_file(path: &Path) -> io::Result<File> {
-    let mut o = OpenOptions::new();
-    o.write(true).create_new(true);
+    private(OpenOptions::new().write(true).create_new(true)).open(path)
+}
+
+/// Owner-only modes for everything the journal creates: it holds every
+/// job's input (checklist; D-038).
+const DIR_MODE: u32 = 0o700;
+const FILE_MODE: u32 = 0o600;
+
+/// `opts` creating files owner-only (Unix; elsewhere unchanged).
+fn private(opts: &mut OpenOptions) -> &mut OpenOptions {
     #[cfg(unix)]
-    std::os::unix::fs::OpenOptionsExt::mode(&mut o, 0o600);
-    o.open(path)
+    std::os::unix::fs::OpenOptionsExt::mode(opts, FILE_MODE);
+    opts
+}
+
+/// `create_dir_all`, owner-only for every directory it creates.
+fn private_dir_all(path: &Path) -> io::Result<()> {
+    let mut b = fs::DirBuilder::new();
+    b.recursive(true);
+    #[cfg(unix)]
+    std::os::unix::fs::DirBuilderExt::mode(&mut b, DIR_MODE);
+    b.create(path)
+}
+
+/// `create_dir` (fails if it exists), owner-only.
+fn private_dir(path: &Path) -> io::Result<()> {
+    let mut b = fs::DirBuilder::new();
+    #[cfg(unix)]
+    std::os::unix::fs::DirBuilderExt::mode(&mut b, DIR_MODE);
+    b.create(path)
+}
+
+/// Write a small file owner-only and fsync it (a leftover at `path` from
+/// a crash is replaced, and tightened).
+fn write_private(path: &Path, bytes: &[u8]) -> io::Result<()> {
+    let mut f = private(OpenOptions::new().write(true).create(true))
+        .truncate(true)
+        .open(path)?;
+    tighten(path, FILE_MODE);
+    f.write_all(bytes)?;
+    f.sync_data()
+}
+
+/// Narrow an existing path to `mode`, best effort: a journal made by an
+/// older build had the umask's modes. A path that is missing, or that this
+/// user may not chmod, is left as it is.
+fn tighten(_path: &Path, _mode: u32) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if let Ok(m) = fs::symlink_metadata(_path) {
+            if !m.file_type().is_symlink() && m.permissions().mode() & 0o777 != _mode {
+                let _ = fs::set_permissions(_path, fs::Permissions::from_mode(_mode));
+            }
+        }
+    }
+}
+
+/// Where a journal root keeps its manifest.
+fn manifest_path_of(root: &Path) -> PathBuf {
+    root.join("manifest.json")
 }
 
 /// Files a generation directory may hold (backup copies exactly these).
@@ -1383,7 +1431,10 @@ fn write_snapshot_stream(
     write: impl FnOnce(&mut dyn Write) -> io::Result<()>,
 ) -> Result<(), JournalError> {
     let tmp = dir.join("snapshot.bin.tmp");
-    let mut file = File::create(&tmp)?;
+    let mut file = private(OpenOptions::new().write(true).create(true))
+        .truncate(true)
+        .open(&tmp)?;
+    tighten(&tmp, FILE_MODE); // a leftover from a crash keeps its old mode
     file.write_all(&[0u8; SNAPSHOT_HEADER_LEN as usize])?; // patched below
     let (len, crc) = {
         let mut out = Checked {
@@ -2222,6 +2273,75 @@ mod tests {
             Err(JournalError::Manifest(_))
         ));
         assert!(!dir.path().join("manifest.json").exists());
+    }
+
+    /// Checklist: the journal, its snapshots and backups hold every job's
+    /// input, and got the process umask (typically world-readable). Every
+    /// directory the journal makes is 0700 and every file 0600, and an
+    /// older journal is tightened when it opens.
+    #[cfg(unix)]
+    #[test]
+    fn journal_snapshot_and_backup_files_are_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = |p: &Path| {
+            fs::metadata(p)
+                .unwrap_or_else(|e| panic!("{}: {e}", p.display()))
+                .permissions()
+                .mode()
+                & 0o777
+        };
+        let check = |root: &Path| {
+            for entry in walk(root) {
+                let want = if entry.is_dir() { 0o700 } else { 0o600 };
+                assert_eq!(mode(&entry), want, "{}", entry.display());
+            }
+        };
+        let d = tempfile::tempdir().unwrap_or_else(|e| panic!("{e}"));
+        let root = d.path().join("journal");
+        let mut j = Journal::open(&root).unwrap_or_else(|e| panic!("{e}"));
+        j.append(b"secret input").unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(mode(&root), 0o700);
+        check(&root);
+        j.compact(&Snapshot {
+            covered_seq: 0,
+            payload: b"state".to_vec(),
+        })
+        .unwrap_or_else(|e| panic!("{e}"));
+        check(&root);
+        let backups = d.path().join("backups");
+        fs::create_dir(&backups).unwrap_or_else(|e| panic!("{e}"));
+        j.backup_to(&backups.join("b1"))
+            .unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(mode(&backups.join("b1")), 0o700);
+        check(&backups.join("b1"));
+        let restored = d.path().join("restored");
+        restore_backup(&backups.join("b1"), &restored).unwrap_or_else(|e| panic!("{e}"));
+        check(&restored);
+        drop(j);
+        // A journal from an older build (umask modes) is tightened at open.
+        for p in walk(&root) {
+            let loose = if p.is_dir() { 0o755 } else { 0o644 };
+            fs::set_permissions(&p, fs::Permissions::from_mode(loose))
+                .unwrap_or_else(|e| panic!("{e}"));
+        }
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o755))
+            .unwrap_or_else(|e| panic!("{e}"));
+        drop(Journal::open(&root).unwrap_or_else(|e| panic!("{e}")));
+        assert_eq!(mode(&root), 0o700);
+        check(&root);
+    }
+
+    /// Every path under `root`, depth first.
+    fn walk(root: &Path) -> Vec<PathBuf> {
+        let mut out = Vec::new();
+        for e in fs::read_dir(root).unwrap_or_else(|e| panic!("{e}")) {
+            let p = e.unwrap_or_else(|e| panic!("{e}")).path();
+            if p.is_dir() {
+                out.extend(walk(&p));
+            }
+            out.push(p);
+        }
+        out
     }
 
     #[test]
