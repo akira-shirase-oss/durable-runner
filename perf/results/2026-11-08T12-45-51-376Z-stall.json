@@ -1,6 +1,6 @@
 {
   "machine": {
-    "host": "Vinays-MacBook-Pro-2.local",
+    "host": "maintainer-laptop",
     "platform": "darwin/arm64",
     "cpu": "Apple M2 Pro",
     "cores": 12,

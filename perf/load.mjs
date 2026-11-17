@@ -40,7 +40,7 @@ const now = () => Date.now();
 
 function machine() {
   return {
-    host: os.hostname(),
+    host: process.env.PERF_HOST_LABEL ?? "maintainer-laptop", // never the real hostname: results are public
     platform: `${os.platform()}/${os.arch()}`,
     cpu: os.cpus()[0]?.model,
     cores: os.cpus().length,

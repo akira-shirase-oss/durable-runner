@@ -101,7 +101,7 @@ If the server is full, a 503 is the honest refusal (admission reserve), not a si
 
 ## How to report a bug
 
-Send Vinay (`akira-shirase-oss` / @404humandev) a note, or open a GitHub issue, including:
+Send a note to `akira-shirase-oss` (@404humandev), or open a GitHub issue, including:
 
 - Commit SHA (`git rev-parse HEAD`).
 - OS, `rustc --version`.
