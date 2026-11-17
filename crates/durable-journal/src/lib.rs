@@ -1505,7 +1505,8 @@ fn copy_and_verify(
                 private_dir(&to.join(g))?;
             }
         }
-        let (bytes, crc32) = copy_file_durably(&src, &to.join(&f.path))?;
+        let input = open_checked(&src, &m)?;
+        let (bytes, crc32) = copy_open_file_durably(input, &to.join(&f.path))?;
         if bytes != f.bytes || f.crc32.is_some_and(|c| c != crc32) {
             return Err(bad(format!(
                 "{} changed after the backup was taken ({bytes} bytes, listed {})",
@@ -1543,7 +1544,34 @@ fn copy_and_verify(
 /// Copy a regular file into a new file (never through a symlink at the
 /// destination) and fsync it; the bytes copied and their CRC-32.
 fn copy_file_durably(src: &Path, dest: &Path) -> io::Result<(u64, u32)> {
-    let mut input = OpenOptions::new().read(true).open(src)?;
+    copy_open_file_durably(OpenOptions::new().read(true).open(src)?, dest)
+}
+
+/// Open `path`, which `lstat` described as `seen` (a regular file), and
+/// check after opening that the handle is that very file: `open` follows
+/// a symlink swapped in after the check, and then `fstat` names another
+/// file (Unix: device and inode; elsewhere: the handle must still be a
+/// regular file).
+fn open_checked(path: &Path, seen: &fs::Metadata) -> io::Result<File> {
+    let file = OpenOptions::new().read(true).open(path)?;
+    let now = file.metadata()?;
+    #[cfg(unix)]
+    let same = {
+        use std::os::unix::fs::MetadataExt;
+        now.dev() == seen.dev() && now.ino() == seen.ino()
+    };
+    #[cfg(not(unix))]
+    let same = seen.is_file();
+    if !now.is_file() || !same {
+        return Err(io::Error::other(format!(
+            "{} changed while it was being restored",
+            path.display()
+        )));
+    }
+    Ok(file)
+}
+
+fn copy_open_file_durably(mut input: File, dest: &Path) -> io::Result<(u64, u32)> {
     let mut out = Checked {
         inner: new_file(dest)?,
         crc: crc32fast::Hasher::new(),
@@ -2723,6 +2751,33 @@ mod tests {
         assert!(
             rewritten == snap,
             "the snapshot writer no longer matches its golden file"
+        );
+    }
+
+    /// Review U9: restore checked a file's type with `lstat`, then opened
+    /// it, following a symlink swapped in between. The opened handle must
+    /// be the very file that was checked.
+    #[cfg(unix)]
+    #[test]
+    fn a_file_swapped_for_a_symlink_after_its_check_is_refused() {
+        let d = tempfile::tempdir().unwrap_or_else(|e| panic!("{e}"));
+        let file = d.path().join("journal.log");
+        let secret = d.path().join("secret");
+        fs::write(&file, b"backup data").unwrap_or_else(|e| panic!("{e}"));
+        fs::write(&secret, b"not backup data").unwrap_or_else(|e| panic!("{e}"));
+        let seen = fs::symlink_metadata(&file).unwrap_or_else(|e| panic!("{e}"));
+        open_checked(&file, &seen).unwrap_or_else(|e| panic!("the checked file itself: {e}"));
+        fs::remove_file(&file).unwrap_or_else(|e| panic!("{e}"));
+        std::os::unix::fs::symlink(&secret, &file).unwrap_or_else(|e| panic!("{e}"));
+        assert!(
+            open_checked(&file, &seen).is_err(),
+            "opened a symlink swapped in after the check"
+        );
+        fs::remove_file(&file).unwrap_or_else(|e| panic!("{e}"));
+        fs::write(&file, b"another file, same name").unwrap_or_else(|e| panic!("{e}"));
+        assert!(
+            open_checked(&file, &seen).is_err(),
+            "opened a replaced file"
         );
     }
 

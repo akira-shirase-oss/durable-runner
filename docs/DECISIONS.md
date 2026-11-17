@@ -714,7 +714,10 @@ convention; these seed the contract's prescribed directions.
     commits), its snapshot by checksum. It copies only canonical
     `gen-NNNNNN` names (`gen-+1` parsed as 1 before). On failure it
     removes what it copied, so the target holds no generation. A backup
-    from before file lists is verified by structure and replay.
+    from before file lists is verified by structure and replay. Each
+    source file is opened and then checked by `fstat` to be the very file
+    `lstat` checked (device and inode), so a symlink swapped in between is
+    refused, not followed (review U9).
   - First open now creates generation 1 and its log, then writes the
     manifest that names it, so a manifest naming a missing generation is
     always damage: `open` refuses it (`restore from a backup`) instead of
