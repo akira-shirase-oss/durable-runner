@@ -19,7 +19,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{SyncSender, TrySendError};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
-use tokio::sync::{mpsc, oneshot, OwnedSemaphorePermit, Semaphore};
+use tokio::sync::{mpsc, oneshot, watch, OwnedSemaphorePermit, Semaphore};
 use tokio::task::{AbortHandle, JoinSet};
 
 /// What a handler can honestly report about an attempt.
@@ -124,6 +124,9 @@ pub struct Engine {
     read_tx: mpsc::Sender<Read>,
     health: Arc<Health>,
     discarded_tail: Option<durable_journal::TornTail>,
+    /// Becomes true once the actor has returned and the writer thread has
+    /// released the journal.
+    stopped: watch::Receiver<bool>,
 }
 
 /// State the actor publishes for readiness, readable without a round trip
@@ -283,6 +286,20 @@ impl Engine {
         self.tx.closed().await;
     }
 
+    /// Resolves once the engine has fully stopped: the actor has returned
+    /// and the writer thread has been joined, so the journal's lock is
+    /// free and another engine may open it. The future holds no handle, so
+    /// awaiting it after dropping every `Engine` waits for that shutdown
+    /// instead of keeping the engine alive. (If the actor panicked, it
+    /// resolves when the actor is gone; the writer then releases the
+    /// journal on its own thread.)
+    pub fn on_stop(&self) -> impl std::future::Future<Output = ()> + Send + 'static {
+        let mut stopped = self.stopped.clone();
+        async move {
+            let _ = stopped.wait_for(|s| *s).await;
+        }
+    }
+
     /// The torn tail startup discarded (an incomplete final frame, never
     /// acknowledged), so the operator's log can say so.
     pub fn discarded_tail(&self) -> Option<durable_journal::TornTail> {
@@ -377,12 +394,18 @@ pub fn spawn(dir: &Path, registry: Registry, mut cfg: ShellConfig) -> Result<Eng
         health: health.clone(),
         errors: BTreeMap::new(),
     };
-    tokio::spawn(actor(core, registry, cfg, (rx, read_rx), mon, writer));
+    let (stopped_tx, stopped) = watch::channel(false);
+    tokio::spawn(async move {
+        // Every return path of the actor joins the writer first.
+        actor(core, registry, cfg, (rx, read_rx), mon, writer).await;
+        stopped_tx.send_replace(true);
+    });
     Ok(Engine {
         tx,
         read_tx,
         health,
         discarded_tail,
+        stopped,
     })
 }
 
@@ -1268,20 +1291,38 @@ mod tests {
     }
 
     /// Hangs mid-flight on its first call, answers every later one — the
-    /// shape of a worker killed between dispatch and reply.
+    /// shape of a worker killed between dispatch and reply. On that first
+    /// call it can freeze the engine's journal (free space to 0: nothing
+    /// more is journaled, the deadline sweep included) and say it was
+    /// called. Its probe is honest: the effect landed iff a call reached it.
     struct HangOnce {
         calls: Arc<std::sync::atomic::AtomicUsize>,
+        freeze: Option<Arc<std::sync::atomic::AtomicU64>>,
+        entered: Arc<tokio::sync::Notify>,
+    }
+    impl HangOnce {
+        fn new(calls: &Arc<std::sync::atomic::AtomicUsize>) -> Self {
+            Self {
+                calls: calls.clone(),
+                freeze: None,
+                entered: Arc::default(),
+            }
+        }
     }
     #[async_trait::async_trait]
     impl StepHandler for HangOnce {
         async fn execute(&self, _s: &StepSpec, _i: &[u8], _k: &str) -> Outcome {
             if self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+                if let Some(free) = &self.freeze {
+                    free.store(0, std::sync::atomic::Ordering::SeqCst);
+                }
+                self.entered.notify_one();
                 std::future::pending().await
             }
             Outcome::Checkpoint(b"ok".to_vec())
         }
         async fn probe(&self, _s: &StepSpec, _k: &str) -> bool {
-            true // reconcile finds the effect landed — never re-fires
+            self.calls.load(std::sync::atomic::Ordering::SeqCst) > 0
         }
     }
 
@@ -1383,45 +1424,80 @@ mod tests {
         panic!("run never reached state {kind}");
     }
 
+    /// Poll until the run is terminal, against a wall-clock deadline (not
+    /// a count of sleeps, which a loaded scheduler stretches).
+    async fn until_terminal_within(eng: &Engine, run: RunId, limit: Duration) -> RunState {
+        let deadline = tokio::time::Instant::now() + limit;
+        while tokio::time::Instant::now() < deadline {
+            if let Some(r) = eng.inspect(run).await.unwrap_or(None) {
+                if r.state.is_terminal() {
+                    return r.state;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        panic!("run never reached a terminal state within {limit:?}");
+    }
+
     /// kill -9 between dispatch and reply, then restart on the same
     /// journal: the orphaned Running attempt must reconcile — never sit
     /// `running` forever, and never blindly re-fire the remote call.
+    ///
+    /// Deterministic under load (review T2): the first engine is stopped
+    /// on the handler's own signal that it was called (not by catching a
+    /// 100 ms state window), its journal frozen at that moment so the
+    /// deadline sweep cannot move the run on first; the restart waits for
+    /// the first engine to release the journal (not a fixed sleep); and the
+    /// probe answers from whether the call happened (not always "found").
     #[tokio::test(flavor = "current_thread")]
     async fn restart_orphaned_running_run_reconciles() {
         let d = tempfile::tempdir().unwrap_or_else(|e| panic!("{e}"));
         let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let free = Arc::new(std::sync::atomic::AtomicU64::new(u64::MAX));
+        let probe_free = free.clone();
         let cfg = ShellConfig {
             tick_ms: 5,
             limits: fast_limits(),
             ..Default::default()
         };
+        let first = ShellConfig {
+            journal: JournalOptions {
+                space: durable_journal::SpaceProbe::new(move |_| {
+                    Ok(probe_free.load(std::sync::atomic::Ordering::SeqCst))
+                }),
+                ..JournalOptions::default()
+            },
+            ..cfg.clone()
+        };
         let run;
         {
+            let handler = HangOnce {
+                freeze: Some(free),
+                ..HangOnce::new(&calls)
+            };
+            let entered = handler.entered.clone();
             let mut reg = Registry::default();
-            reg.register(
-                "hang",
-                Arc::new(HangOnce {
-                    calls: calls.clone(),
-                }),
-            );
-            let eng = spawn(d.path(), reg, cfg.clone()).unwrap_or_else(|e| panic!("{e}"));
+            reg.register("hang", Arc::new(handler));
+            let eng = spawn(d.path(), reg, first).unwrap_or_else(|e| panic!("{e}"));
             run = eng
                 .submit(OperationKey("orphan-running".into()), spec1("hang"))
                 .await
                 .unwrap_or_else(|e| panic!("{e}"));
-            wait_state(&eng, run, "running").await;
+            // The call is in flight, so its dispatch is durable (D-014).
+            tokio::time::timeout(Duration::from_secs(30), entered.notified())
+                .await
+                .unwrap_or_else(|_| panic!("the handler was never called"));
+            let stopped = eng.on_stop();
             drop(eng); // the process dies mid-flight; the journal keeps Running
-            tokio::time::sleep(Duration::from_millis(50)).await; // actor exits, LOCK frees
+            tokio::time::timeout(Duration::from_secs(30), stopped)
+                .await
+                .unwrap_or_else(|_| panic!("the first engine never released the journal"));
         }
         let mut reg = Registry::default();
-        reg.register(
-            "hang",
-            Arc::new(HangOnce {
-                calls: calls.clone(),
-            }),
-        );
+        reg.register("hang", Arc::new(HangOnce::new(&calls)));
         let eng = spawn(d.path(), reg, cfg).unwrap_or_else(|e| panic!("{e}"));
-        assert!(matches!(until_done(&eng, run).await, RunState::Done));
+        let state = until_terminal_within(&eng, run, Duration::from_secs(30)).await;
+        assert!(matches!(state, RunState::Done), "{state:?}");
         assert_eq!(
             calls.load(std::sync::atomic::Ordering::SeqCst),
             1,
@@ -1458,8 +1534,11 @@ mod tests {
                 .await
                 .unwrap_or_else(|e| panic!("{e}"));
             wait_state(&eng, run, "reconciling").await;
+            let stopped = eng.on_stop();
             drop(eng); // probe#1 hangs forever — the crash window
-            tokio::time::sleep(Duration::from_millis(50)).await;
+            tokio::time::timeout(Duration::from_secs(30), stopped)
+                .await
+                .unwrap_or_else(|_| panic!("the first engine never released the journal"));
         }
         let mut reg = Registry::default();
         reg.register(
@@ -2059,8 +2138,9 @@ mod tests {
         let diag = bounded(eng.diag()).await.unwrap_or_else(|e| panic!("{e}"));
         assert!(diag.largest_batch >= 50, "batch sizes: {diag:?}");
 
+        let stopped = eng.on_stop();
         drop(eng);
-        tokio::time::sleep(Duration::from_millis(50)).await;
+        bounded(stopped).await;
         let records = durable_journal::replay_dir(&durable_journal::gen_dir_path(d.path(), 1))
             .unwrap_or_else(|e| panic!("contiguous history replays: {e}"));
         let seqs: Vec<u64> = records.iter().map(|r| r.seq).collect();
@@ -2221,7 +2301,8 @@ mod tests {
 
     /// Reopen once the stopped engine's writer has released the lock.
     async fn reopen(dir: &Path) -> EngineCore {
-        for _ in 0..300 {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+        while tokio::time::Instant::now() < deadline {
             match EngineCore::open(dir) {
                 Ok(c) => return c,
                 Err(EngineError::Journal(JournalError::SecondWriter)) => {
