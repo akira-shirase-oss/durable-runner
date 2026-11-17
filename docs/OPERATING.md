@@ -33,10 +33,23 @@ target/release/durable-server \
   `--max-dispatch-per-tick` (64 per 50 ms tick) bound execution; raise
   them if dispatch is the bottleneck. `GET /admin/diagnostics` shows
   `active_runs` and `index_bytes`.
+
+  *Capacity arithmetic.* A run is charged `160 + key + Σ(48 + step name +
+  handler name) + input` bytes while it is live. When it finishes its
+  input is dropped at once and it becomes a dedup record (key, state,
+  step count, finish time) charged `160 + key + Σ(48 + names)`. For a
+  one-step job with a 20-byte key and a 1 KiB input that is about
+  1,250 B live and 230 B finished. The record stays until a compaction
+  runs at least seven days after the run finished (compaction is opt-in,
+  `--compact-every-secs`). So at a sustained R jobs/s, finished records
+  need about `R × 604,800 s × 230 B` of `--max-index-bytes` on top of the
+  live runs. Without scheduled compaction the records never leave, and
+  `503 at_capacity` comes once `max_index_bytes ÷ 230 B` jobs have run.
 - **Retention.** Compaction runs only when asked (`durable compact`) unless
   you pass `--compact-every-secs N` (default 0 = off; see D-018 for why it
-  is opt-in). Each compaction expires terminal runs older than seven days
-  (an `op_key` reused after that re-executes) and deletes every superseded
+  is opt-in). Each compaction removes the dedup records of runs that
+  finished more than seven days ago (an `op_key` reused after that
+  re-executes, and their capacity returns) and deletes every superseded
   `gen-*` directory, so the journal directory holds one generation. `GET /admin/diagnostics` reports
   `stale_generations` (0 unless a delete failed; the next compaction
   retries it). A compaction whose snapshot would exceed
@@ -116,8 +129,11 @@ state — same run ids, same `finished_at`. Verified live by
 - `running:step:N:attempt:M` — an attempt is in flight with a deadline.
 - `reconciling:step:N` — a reply vanished; the probe is deciding whether
   the remote effect landed before any retry.
-- `done` / `failed:step:N` / `cancelled` — terminal; expires from the
-  index after seven days (dedup deps preserved until then).
+- `done` / `failed:step:N` / `cancelled` — terminal. The run's input is
+  dropped at once and a small dedup record stays (resubmitting its
+  `op_key` returns this run). The record leaves the index when a
+  compaction runs at least seven days later; nothing expires without a
+  compaction.
 - HTTP 409 — a named refusal (duplicate semantics aside: stale reply,
   terminal transition, unregistered handler, an existing backup name).
 - HTTP 401 — no or wrong API key on a mutating/admin route.

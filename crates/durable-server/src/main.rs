@@ -340,7 +340,10 @@ impl From<EngineError> for ApiError {
             EngineError::Refused(Refusal::AtCapacity) => Self::new(
                 StatusCode::SERVICE_UNAVAILABLE,
                 "at_capacity",
-                "the runner holds as many runs as it is configured to; retry later with the same op_key",
+                "the runner holds as many runs as it is configured to (--max-live-runs, \
+                 --max-index-bytes); finished runs free their input at once, and their small \
+                 dedup records leave when a compaction runs after seven days; retry later with \
+                 the same op_key",
             ),
             EngineError::Refused(Refusal::OverLimits) => Self::new(
                 StatusCode::CONFLICT,

@@ -323,8 +323,10 @@ convention; these seed the contract's prescribed directions.
   non-terminal runs) and `max_index_bytes` (1 GiB, an approximation:
   payloads plus a fixed per-run and per-step overhead). The core keeps
   both counts current, so the check is O(1), and refuses past them with
-  `AtCapacity` (503 `at_capacity`) before journaling; finishing or
-  expiring runs frees room. Duplicate submits still return their
+  `AtCapacity` (503 `at_capacity`) before journaling. Finishing a run
+  frees its live-run slot (and, since D-030, its input bytes); its dedup
+  record's bytes return only when a compaction expires it after seven
+  days. Duplicate submits still return their
   original run. The server exposes `--max-live-runs`,
   `--max-index-bytes`, `--max-in-flight` and `--max-dispatch-per-tick`.
   Diagnostics report `active_runs` and `index_bytes`.
@@ -390,3 +392,19 @@ convention; these seed the contract's prescribed directions.
   snapshot as fatal, and now a missing one is too
   (`snapshot is damaged: generation N has no snapshot`): restore from a
   backup.
+- **D-030 — A finished run keeps only a dedup record.** Index-byte
+  capacity came back only when runs expired, which takes seven days and a
+  compaction, and compaction is opt-in. Finished runs kept their full
+  inputs, so with defaults about 860k 1 KiB jobs filled the bound and the
+  runner refused work forever. Review reproduced it: every run done,
+  `active_runs 0`, still `503 at_capacity` after a compaction. The
+  contract keeps live inputs and dedup dependencies, not finished inputs.
+  So when a run becomes terminal its input is dropped and its bytes leave
+  the capacity count at once. It keeps key, state, step count and finish
+  time, which is everything dedup and inspection use, charged
+  `160 + key + Σ(48 + names)` (about 230 B for a one-step job). Replay
+  does the same, and a snapshot from an older build has its finished
+  inputs dropped at load. Measured at 800k finished runs: `index_bytes`
+  184 MB, against 1.0 GB live, and a restart from their snapshot took
+  272 MiB. The `503` message says what frees room, and OPERATING gives
+  the arithmetic.

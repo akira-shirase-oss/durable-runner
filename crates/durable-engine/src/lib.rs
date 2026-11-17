@@ -467,6 +467,12 @@ impl EngineCore {
 
     /// Recompute the admission counters from the index (after replay).
     fn recount(&mut self) {
+        // Snapshots from before D-030 kept finished runs' inputs.
+        for r in self.runs.values_mut() {
+            if r.state.is_terminal() && !r.spec.input.is_empty() {
+                Arc::make_mut(r).spec.input = Vec::new();
+            }
+        }
         self.live = self
             .runs
             .values()
@@ -535,6 +541,11 @@ impl EngineCore {
         }
         if state.is_terminal() && !run.state.is_terminal() {
             self.live = self.live.saturating_sub(1);
+            // A finished run keeps only what dedup and inspection need (key,
+            // state, step count, finish time): its input goes, and so do its
+            // bytes from the capacity bound (D-030). Replay does the same.
+            let input = std::mem::take(&mut run.spec.input);
+            self.index_bytes = self.index_bytes.saturating_sub(input.len() as u64);
         }
         run.state = state;
         Ok(effects)
@@ -1341,6 +1352,45 @@ mod tests {
             Err(e) => panic!("wrong error: {e}"),
             Ok(c) => panic!("started with {} of 50 runs", c.runs().count()),
         }
+    }
+
+    /// Review S3: index-byte capacity came back only when runs expired (a
+    /// compaction after 7 days), so a runner whose every run was done still
+    /// answered at_capacity. Finishing a run keeps only what dedup and
+    /// inspection need — its input goes — and frees those bytes at once.
+    #[test]
+    fn finishing_runs_frees_index_capacity() {
+        let (d, mut e) = open();
+        let input = vec![7u8; 4096];
+        let job = || {
+            let mut s = spec();
+            s.input = input.clone();
+            s
+        };
+        let first = e
+            .submit(OperationKey("cap-0".into()), job(), 0)
+            .unwrap_or_else(|e| panic!("{e}"));
+        e.limits.max_index_bytes = e.diagnostics().index_bytes + 1000; // room for no second job
+        assert!(matches!(
+            e.submit(OperationKey("cap-1".into()), job(), 0),
+            Err(EngineError::Refused(Refusal::AtCapacity))
+        ));
+        e.cancel(first, 1).unwrap_or_else(|e| panic!("{e}"));
+        e.submit(OperationKey("cap-1".into()), job(), 2)
+            .unwrap_or_else(|e| panic!("a finished run must free its input's bytes: {e}"));
+        // The finished run keeps its dedup identity and its summary.
+        let again = e
+            .submit(OperationKey("cap-0".into()), job(), 3)
+            .unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(again, first);
+        let r = e.run(first).unwrap_or_else(|| panic!("tombstone kept"));
+        assert!(r.spec.input.is_empty() && r.spec.steps.len() == 2);
+        // Replay reproduces the same accounting.
+        let bytes = e.diagnostics().index_bytes;
+        drop(e);
+        let e = EngineCore::open(d.path()).unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(e.diagnostics().index_bytes, bytes);
+        assert!(e.run(first).is_some_and(|r| r.spec.input.is_empty()));
     }
 
     #[test]
