@@ -364,6 +364,11 @@ impl From<EngineError> for ApiError {
             // failed after: either way nothing was acknowledged.
             EngineError::Journal(j) => Self::journal(j, &e),
             EngineError::CommitFailed(j) => Self::journal(j, &e),
+            EngineError::CompactionRunning => Self::new(
+                StatusCode::CONFLICT,
+                "compaction_running",
+                "a compaction is already running; wait for it to finish",
+            ),
             EngineError::SnapshotOverBudget { .. } => {
                 Self::new(StatusCode::CONFLICT, "snapshot_over_budget", e.to_string())
             }

@@ -826,9 +826,8 @@ async fn actor(
                 }
                 Some(Cmd::Compact { reply }) => {
                     if pending_compaction.is_some() {
-                        let _ = reply.send(Err(EngineError::Refused(
-                            durable_domain::Refusal::ReserveExhausted,
-                        )));
+                        // Not "busy": retrying cannot help until it finishes.
+                        let _ = reply.send(Err(EngineError::CompactionRunning));
                     } else {
                         match start_compaction(&mut core, &mut pipe, cfg.max_snapshot_bytes, Some(reply)) {
                             Ok(p) => pending_compaction = Some(p),
@@ -2697,6 +2696,39 @@ mod tests {
             core.runs().count(),
             t.elapsed().as_secs_f64()
         );
+    }
+
+    /// A second compaction requested while one is still running is told so
+    /// with a stable conflict, not "busy, retry": retrying cannot help until
+    /// the first one finishes.
+    #[tokio::test(flavor = "current_thread")]
+    async fn second_compaction_while_one_runs_is_a_conflict() {
+        let d = tempfile::tempdir().unwrap_or_else(|e| panic!("{e}"));
+        let faults = Arc::new(Faults::default());
+        let eng = spawn(
+            d.path(),
+            echo_registry(),
+            piped(&faults, GroupCommit::default()),
+        )
+        .unwrap_or_else(|e| panic!("{e}"));
+        faults.hold_syncs();
+        let held = submit_many(&eng, "hold", 1); // the writer waits in this fsync
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        let e = eng.clone();
+        let first = tokio::spawn(async move { e.compact().await });
+        tokio::time::sleep(Duration::from_millis(30)).await; // queued behind the batch
+        let second = bounded(eng.compact()).await;
+        assert!(
+            matches!(second, Err(EngineError::CompactionRunning)),
+            "{second:?}"
+        );
+        faults.release_syncs();
+        join_all(held).await;
+        let generation = bounded(first)
+            .await
+            .unwrap_or_else(|e| panic!("{e}"))
+            .unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(generation, 2);
     }
 
     /// A failed fsync must stop the engine — never retry it, never keep

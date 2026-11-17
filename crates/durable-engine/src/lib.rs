@@ -56,6 +56,9 @@ pub enum EngineError {
     /// index with the admission limits).
     #[error("snapshot would be {bytes} bytes, over the {budget}-byte budget")]
     SnapshotOverBudget { bytes: u64, budget: u64 },
+    /// A compaction is already running; this request was not queued.
+    #[error("a compaction is already running")]
+    CompactionRunning,
 }
 
 /// A journaled record: the run, the commit clock value, and the event.

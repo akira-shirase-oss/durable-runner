@@ -156,7 +156,8 @@ state — same run ids, same `finished_at`. Verified live by
   compaction runs at least seven days later; nothing expires without a
   compaction.
 - HTTP 409 — a named refusal (duplicate semantics aside: stale reply,
-  terminal transition, unregistered handler, an existing backup name).
+  terminal transition, unregistered handler, an existing backup name,
+  `compaction_running` when a compaction is requested while one runs).
 - HTTP 401 — no or wrong API key on a mutating/admin route.
 - HTTP 503 — the server is bounded and said so instead of queueing
   silently. The `code` says which bound: `busy` (the command queue is
