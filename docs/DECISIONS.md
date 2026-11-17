@@ -501,3 +501,19 @@ convention; these seed the contract's prescribed directions.
   against the same bounds. `Limits::validate` refuses, at spawn,
   admission limits looser than the stored bounds, so the engine can never
   accept a run that its own snapshot would refuse.
+- **D-034 — Restore locks its target and never merges.** `durable-cli
+  restore` was a plain copy: it took no lock, so it would write
+  generations and a manifest into a journal a running server was
+  appending to; it merged into an existing journal (two histories'
+  generations mixed); and `fs::copy` followed symlinks planted in a
+  backup. Restore is now `durable_journal::restore_backup`. It takes the
+  target's journal lock for the whole copy, so a server running there
+  makes it fail (`SecondWriter`) and no server can open the target half
+  restored. It refuses a target that already holds a manifest or any
+  generation. It copies only the backup's own regular files, refuses a
+  symlink or a special file, and writes each copy as a new owner-only
+  file that is fsynced, the manifest last by rename. Separately,
+  `Journal::open` now refuses a directory that has generations but no
+  manifest instead of starting a new journal there: first open writes
+  the manifest before any generation, so that layout is only damage or
+  an interrupted restore. Remove it and restore again.

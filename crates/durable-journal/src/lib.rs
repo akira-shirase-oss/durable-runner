@@ -279,6 +279,14 @@ pub enum JournalError {
     /// before anything is written.
     #[error("batch of {bytes} bytes is over the {MAX_BATCH_FRAME_BYTES}-byte frame limit")]
     BatchTooLarge { bytes: u64 },
+    /// A restore never merges into a directory that already holds a
+    /// journal: two histories' generations would mix.
+    #[error("restore target already holds a journal (move it aside first)")]
+    RestoreTargetNotEmpty,
+    /// A backup holds something restore will not copy (a symlink, a
+    /// special file): it copies only the backup's own regular files.
+    #[error("backup is not restorable: {0}")]
+    BadBackup(String),
 }
 
 /// A torn tail `Journal::open` discarded: the file ended inside its last
@@ -710,6 +718,18 @@ impl Journal {
                     .generation
             }
             Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                // First open writes the manifest before any generation, so
+                // generations without one are damage or an interrupted
+                // restore — never a fresh journal to start over in.
+                for entry in fs::read_dir(dir)? {
+                    if parse_gen(&entry?.file_name()).is_some() {
+                        return Err(JournalError::Manifest(
+                            "generation directories but no manifest.json: a damaged journal \
+                             or an interrupted restore (remove it and restore again)"
+                                .into(),
+                        ));
+                    }
+                }
                 let m = Manifest { generation: 1 };
                 let tmp = dir.join("manifest.json.tmp");
                 fs::write(&tmp, serde_json::to_string(&m).map_err(io::Error::other)?)?;
@@ -1219,6 +1239,104 @@ pub fn sweep_partial_backups(root: &Path) -> Result<usize, JournalError> {
         }
     }
     Ok(removed)
+}
+
+/// Restore the backup at `from` into `to`, the way `backup_to` wrote it:
+/// generation data first, manifest last. `to` is locked like a journal for
+/// the whole copy, so a server running on it refuses the restore
+/// (`SecondWriter`) and no server can open it half-restored; a `to` that
+/// already holds a journal is refused (`RestoreTargetNotEmpty`). Only the
+/// backup's own regular files are copied — a symlink or special file in it
+/// is refused, never followed.
+pub fn restore_backup(from: &Path, to: &Path) -> Result<(), JournalError> {
+    let manifest = from.join("manifest.json");
+    match fs::symlink_metadata(&manifest) {
+        Ok(m) if m.file_type().is_file() => {}
+        Ok(_) => {
+            return Err(JournalError::BadBackup(
+                "manifest.json is not a file".into(),
+            ))
+        }
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {
+            return Err(JournalError::BadBackup(
+                "no manifest.json: not a journal backup".into(),
+            ))
+        }
+        Err(e) => return Err(e.into()),
+    }
+    fs::create_dir_all(to)?;
+    let lock = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(to.join("LOCK"))?;
+    fs2::FileExt::try_lock_exclusive(&lock).map_err(|_| JournalError::SecondWriter)?;
+    for entry in fs::read_dir(to)? {
+        let name = entry?.file_name();
+        let n = name.to_string_lossy();
+        if n == "manifest.json" || n.starts_with("gen-") {
+            return Err(JournalError::RestoreTargetNotEmpty);
+        }
+    }
+    for entry in fs::read_dir(from)? {
+        let entry = entry?;
+        let name = entry.file_name();
+        if parse_gen(&name).is_none() {
+            continue;
+        }
+        if !entry.file_type()?.is_dir() {
+            return Err(JournalError::BadBackup(format!(
+                "{} is not a directory",
+                name.to_string_lossy()
+            )));
+        }
+        let gd = to.join(&name);
+        fs::create_dir(&gd)?;
+        for f in fs::read_dir(entry.path())? {
+            let f = f?;
+            let fname = f.file_name();
+            let known = SNAPSHOT_FILES.iter().any(|k| fname == *k);
+            if !known {
+                continue; // a leftover `.tmp`: never part of a generation
+            }
+            if !f.file_type()?.is_file() {
+                return Err(JournalError::BadBackup(format!(
+                    "{}/{} is not a regular file",
+                    name.to_string_lossy(),
+                    fname.to_string_lossy()
+                )));
+            }
+            copy_file_durably(&f.path(), &gd.join(&fname))?;
+        }
+        File::open(&gd)?.sync_data()?;
+    }
+    // Manifest last, by rename: until it lands, `to` opens as nothing.
+    let tmp = to.join("manifest.json.tmp");
+    copy_file_durably(&manifest, &tmp)?;
+    fs::rename(&tmp, to.join("manifest.json"))?;
+    File::open(to)?.sync_data()?;
+    drop(lock);
+    Ok(())
+}
+
+/// Copy a regular file into a new file (never through a symlink at the
+/// destination) and fsync it.
+fn copy_file_durably(src: &Path, dest: &Path) -> io::Result<()> {
+    let mut input = OpenOptions::new().read(true).open(src)?;
+    let mut out = new_file(dest)?;
+    io::copy(&mut input, &mut out)?;
+    out.sync_data()
+}
+
+/// Create a new file the journal owns: refuses an existing path (so never
+/// writes through a planted symlink) and, on Unix, is owner-only (0600).
+fn new_file(path: &Path) -> io::Result<File> {
+    let mut o = OpenOptions::new();
+    o.write(true).create_new(true);
+    #[cfg(unix)]
+    std::os::unix::fs::OpenOptionsExt::mode(&mut o, 0o600);
+    o.open(path)
 }
 
 /// Files a generation directory may hold (backup copies exactly these).
@@ -2087,6 +2205,23 @@ mod tests {
         out.extend_from_slice(&seq.to_be_bytes());
         out.extend_from_slice(&crc(payload).to_be_bytes());
         out.extend_from_slice(payload);
+    }
+
+    /// An interrupted restore leaves generations without a manifest; that
+    /// directory must not open as a fresh (or half) journal.
+    #[test]
+    fn generations_without_a_manifest_never_open_as_a_new_journal() {
+        let dir = tempfile::tempdir().unwrap_or_else(|e| panic!("{e}"));
+        let g = gen_dir_path(dir.path(), 1);
+        fs::create_dir_all(&g).unwrap_or_else(|e| panic!("{e}"));
+        let mut half = Vec::new();
+        put_frame(&mut half, 1, (HEADER_LEN + 3) as u32, b"one");
+        fs::write(g.join("journal.log"), &half[..half.len() - 1]).unwrap_or_else(|e| panic!("{e}"));
+        assert!(matches!(
+            Journal::open(dir.path()),
+            Err(JournalError::Manifest(_))
+        ));
+        assert!(!dir.path().join("manifest.json").exists());
     }
 
     #[test]

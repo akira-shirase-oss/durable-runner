@@ -144,6 +144,14 @@ The restored server replays snapshot + journal and rebuilds identical
 state — same run ids, same `finished_at`. Verified live by
 `examples/pilot/run.sh`.
 
+`restore` takes the target's journal lock for the whole copy, so it
+fails while a server runs on that directory, and no server can start on
+it half restored. It refuses a target that already holds a journal
+(move a damaged one aside first; it never merges two histories), and it
+copies only the backup's own regular files, refusing symlinks. An
+interrupted restore leaves generations without a manifest; a server
+refuses to start there, so remove the directory and restore again.
+
 ## What "honest" looks like in the output
 
 - `queued` / `retry_waiting:*` — scheduled, not yet attempted.

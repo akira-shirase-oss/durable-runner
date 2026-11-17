@@ -242,24 +242,93 @@ fn now_ms() -> u64 {
 }
 
 /// Restore mirrors backup's ordering: generation data first, manifest
-/// last — so an interrupted restore still opens a complete generation.
+/// last — so an interrupted restore never opens as a half journal. It
+/// takes the target's journal lock (a server running there refuses it),
+/// refuses a target that already holds a journal, and copies only the
+/// backup's own regular files.
 fn restore(from: &std::path::Path, to: &std::path::Path) -> Result<()> {
-    if !from.join("manifest.json").exists() {
-        bail!("{from:?} has no manifest.json — not a durable journal backup");
+    durable_journal::restore_backup(from, to).map_err(|e| match e {
+        durable_journal::JournalError::SecondWriter => anyhow::anyhow!(
+            "{} is in use: a server holds its journal lock; stop it, or restore into a new directory",
+            to.display()
+        ),
+        e => anyhow::anyhow!("restore {} -> {}: {e}", from.display(), to.display()),
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use durable_journal::Journal;
+    use std::path::Path;
+
+    /// A backup of a journal holding one record.
+    fn backup_of_one(root: &Path) -> PathBuf {
+        let src = root.join("src");
+        let dest = root.join("backup");
+        let mut j = Journal::open(&src).unwrap_or_else(|e| panic!("{e}"));
+        j.append(br#"{"run":1}"#).unwrap_or_else(|e| panic!("{e}"));
+        j.backup_to(&dest).unwrap_or_else(|e| panic!("{e}"));
+        dest
     }
-    std::fs::create_dir_all(to)?;
-    for entry in std::fs::read_dir(from)? {
-        let entry = entry?;
-        let name = entry.file_name();
-        if name.to_str().is_some_and(|n| n.starts_with("gen-")) && entry.file_type()?.is_dir() {
-            let gd = to.join(&name);
-            std::fs::create_dir_all(&gd)?;
-            for f in std::fs::read_dir(entry.path())? {
-                let f = f?;
-                std::fs::copy(f.path(), gd.join(f.file_name()))?;
-            }
-        }
+
+    fn log_of(dir: &Path) -> Vec<u8> {
+        std::fs::read(durable_journal::gen_dir_path(dir, 1).join("journal.log"))
+            .unwrap_or_else(|e| panic!("{e}"))
     }
-    std::fs::copy(from.join("manifest.json"), to.join("manifest.json"))?;
-    Ok(())
+
+    /// Review (still open): restore took no lock, so it copied generations
+    /// and a manifest into a journal a running server was appending to.
+    #[test]
+    fn restore_refuses_a_journal_a_server_holds() {
+        let d = tempfile::tempdir().unwrap_or_else(|e| panic!("{e}"));
+        let backup = backup_of_one(d.path());
+        let live = d.path().join("live");
+        let _server = Journal::open(&live).unwrap_or_else(|e| panic!("{e}"));
+        let before = log_of(&live);
+        assert!(
+            restore(&backup, &live).is_err(),
+            "restored under a live writer"
+        );
+        assert_eq!(log_of(&live), before, "the live journal was written to");
+    }
+
+    /// A restore never merges into an existing journal (generations from
+    /// two histories would mix), even a stopped one.
+    #[test]
+    fn restore_refuses_to_merge_into_an_existing_journal() {
+        let d = tempfile::tempdir().unwrap_or_else(|e| panic!("{e}"));
+        let backup = backup_of_one(d.path());
+        let stopped = d.path().join("stopped");
+        drop(Journal::open(&stopped).unwrap_or_else(|e| panic!("{e}")));
+        let before = log_of(&stopped);
+        assert!(restore(&backup, &stopped).is_err());
+        assert_eq!(log_of(&stopped), before);
+        // Into a fresh directory it works and opens.
+        let fresh = d.path().join("fresh");
+        restore(&backup, &fresh).unwrap_or_else(|e| panic!("{e}"));
+        let j = Journal::open(&fresh).unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(j.records_written(), 1);
+    }
+
+    /// A symlink planted in a backup is refused, never followed: restore
+    /// copies only the backup's own regular files.
+    #[cfg(unix)]
+    #[test]
+    fn restore_does_not_follow_symlinks_in_the_backup() {
+        let d = tempfile::tempdir().unwrap_or_else(|e| panic!("{e}"));
+        let backup = backup_of_one(d.path());
+        let secret = d.path().join("secret");
+        std::fs::write(&secret, b"not journal data").unwrap_or_else(|e| panic!("{e}"));
+        let planted = durable_journal::gen_dir_path(&backup, 1).join("snapshot.bin");
+        std::os::unix::fs::symlink(&secret, &planted).unwrap_or_else(|e| panic!("{e}"));
+        let to = d.path().join("to");
+        assert!(restore(&backup, &to).is_err(), "a symlink was followed");
+        assert!(
+            !durable_journal::gen_dir_path(&to, 1)
+                .join("snapshot.bin")
+                .exists(),
+            "the symlink's target was copied"
+        );
+    }
 }
