@@ -325,6 +325,7 @@ dependencies = [
  "durable-domain",
  "durable-engine",
  "durable-journal",
+ "http-body",
  "http-body-util",
  "reqwest",
  "ring",

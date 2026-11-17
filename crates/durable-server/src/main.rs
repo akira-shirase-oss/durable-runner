@@ -1293,6 +1293,34 @@ mod tests {
             .path()
             .join("root/nightly-1/manifest.json")
             .exists());
+        // Checklist: a symlink planted under the root at a backup's name is
+        // an existing name (409), and nothing is written through it.
+        #[cfg(unix)]
+        {
+            let elsewhere = h.backups.path().join("elsewhere");
+            std::fs::create_dir(&elsewhere).unwrap_or_else(|e| panic!("{e}"));
+            std::os::unix::fs::symlink(&elsewhere, h.backups.path().join("root/planted"))
+                .unwrap_or_else(|e| panic!("{e}"));
+            let (status, v) = call(
+                &h.router,
+                "POST",
+                "/admin/backup",
+                Some(KEY),
+                Some(json!({ "name": "planted" })),
+            )
+            .await;
+            assert_eq!(
+                (status, v["code"].clone()),
+                (StatusCode::CONFLICT, json!("backup_exists"))
+            );
+            assert_eq!(
+                std::fs::read_dir(&elsewhere)
+                    .map(|d| d.count())
+                    .unwrap_or(1),
+                0,
+                "a backup was written through the symlink"
+            );
+        }
         let (status, v) = call(&h.router, "POST", "/admin/backup", Some(KEY), Some(ok)).await;
         assert_eq!(status, StatusCode::CONFLICT, "{v}");
         assert_eq!(v["code"], "backup_exists");
@@ -1667,6 +1695,57 @@ mod tests {
             args.compact_every_secs, 0,
             "scheduled compaction must be opt-in"
         );
+    }
+
+    /// A full command channel is 503 `busy` (retry with the same op_key),
+    /// never a queue that grows.
+    #[test]
+    fn full_channel_refusal_is_503_busy() {
+        let e = ApiError::from(EngineError::Refused(
+            durable_domain::Refusal::ReserveExhausted,
+        ));
+        assert_eq!(
+            (e.status, e.code),
+            (StatusCode::SERVICE_UNAVAILABLE, "busy")
+        );
+    }
+
+    /// Checklist: the key is checked before the body is read. An
+    /// unauthenticated submit whose 250 KiB body never ends is refused 401
+    /// at once: the handler never waits on it.
+    #[tokio::test]
+    async fn an_unauthenticated_body_is_refused_unread() {
+        let h = harness(false);
+        let chunk = axum::body::Bytes::from(vec![b' '; 250 * 1024]);
+        let req = Request::builder()
+            .method("POST")
+            .uri("/jobs")
+            .header("content-type", "application/json")
+            .body(Body::new(Endless(Some(chunk))))
+            .unwrap_or_else(|e| panic!("{e}"));
+        let res = tokio::time::timeout(Duration::from_secs(5), h.router.clone().oneshot(req))
+            .await
+            .unwrap_or_else(|_| panic!("the server waited on an unauthenticated body"))
+            .unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    /// A request body that sends one chunk and then never ends.
+    struct Endless(Option<axum::body::Bytes>);
+
+    impl http_body::Body for Endless {
+        type Data = axum::body::Bytes;
+        type Error = std::io::Error;
+
+        fn poll_frame(
+            mut self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Option<Result<http_body::Frame<Self::Data>, Self::Error>>> {
+            match self.0.take() {
+                Some(b) => std::task::Poll::Ready(Some(Ok(http_body::Frame::data(b)))),
+                None => std::task::Poll::Pending,
+            }
+        }
     }
 
     #[test]

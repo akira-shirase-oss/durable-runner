@@ -3173,16 +3173,32 @@ mod tests {
             },
         )
         .unwrap_or_else(|e| panic!("{e}"));
-        // Flood a channel of capacity 1: submits either land or refuse —
-        // they never pile up unbounded, and nothing panics or hangs.
+        // Flood a channel of capacity 1 with 50 submits at once: each
+        // lands or is refused busy at once — they never pile up unbounded,
+        // and nothing panics or hangs. (On this single-threaded runtime the
+        // 50 tasks run before the actor drains the channel, so most are
+        // refused.)
+        let mut flood = tokio::task::JoinSet::new();
         for i in 0..50 {
-            match eng
-                .submit(OperationKey(format!("flood-{i}")), spec("none"))
-                .await
-            {
-                Ok(_) | Err(EngineError::Refused(_)) => {}
+            let eng = eng.clone();
+            flood.spawn(async move {
+                eng.submit(OperationKey(format!("flood-{i}")), spec("none"))
+                    .await
+            });
+        }
+        let (mut landed, mut busy) = (0, 0);
+        while let Some(r) = flood.join_next().await {
+            match r.unwrap_or_else(|e| panic!("{e}")) {
+                Ok(_) => landed += 1,
+                Err(EngineError::Refused(durable_domain::Refusal::ReserveExhausted)) => busy += 1,
                 Err(e) => panic!("{e}"),
             }
         }
+        assert_eq!(landed + busy, 50);
+        assert!(
+            busy >= 1,
+            "a full command channel must refuse, not queue ({landed} landed)"
+        );
+        assert!(landed >= 1, "the channel still admits what fits");
     }
 }
