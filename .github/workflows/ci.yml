@@ -1,0 +1,50 @@
+# The gate on hosted runners: scripts/check.sh, the same script developers
+# run locally (fmt, clippy -D warnings, tests, architecture checks, cargo
+# deny, npm audit + inspector build, the pilot). Daily as well, so a new
+# advisory fails the build without a push.
+name: ci
+
+on:
+  push:
+  pull_request:
+  schedule:
+    - cron: "23 5 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  gate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install the pinned Rust toolchain (rust-toolchain.toml)
+        run: |
+          rustup --version
+          rustup toolchain install || rustup show
+          cargo --version
+
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+
+      # A version this install-action release lists with its checksum; no
+      # fallback to an unverified download.
+      - uses: taiki-e/install-action@b80e2bb2635f28eb98b9fce1e2f0887e1535c6b2 # v2.90.0
+        with:
+          tool: cargo-deny@0.20.2
+          fallback: none
+
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: "22"
+
+      - name: Gate
+        run: scripts/check.sh

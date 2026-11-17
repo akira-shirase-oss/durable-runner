@@ -72,6 +72,8 @@ convention; these seed the contract's prescribed directions.
   compares digests in constant time (`subtle`), before the body is parsed.
   Reads stay open on purpose for the loopback pilot and the read-only
   inspector; the SaaS plan must gate them per tenant before exposure.
+  (Superseded for reads by D-037: they need a key unless opened on
+  loopback.)
   Backups take a plain name and land only in `<--backup-root>/<name>`
   (no separators, no leading `.`, at most 64 characters); without a root
   backups are disabled, and an existing name is refused rather than merged
@@ -153,8 +155,9 @@ convention; these seed the contract's prescribed directions.
   manual repair (truncate the log at the first bad frame). No
   acknowledged record is affected, because nothing in an unsynced batch
   was acknowledged. Group commit widens the window from one frame to one
-  batch. Recording batch boundaries so replay could tell this apart from
-  real corruption is not built. Process death (kill -9, OOM) cannot cause
+  batch. Since D-032 every frame records its batch, and such a `Corrupt`
+  says the damage lies inside the log's last batch; replay still refuses
+  rather than guess. Process death (kill -9, OOM) cannot cause
   it: the kernel keeps every written byte.
 
   *The rules any batching (group commit) must keep*, tested one by one:
@@ -440,3 +443,226 @@ convention; these seed the contract's prescribed directions.
   about 3.9 one-step 1 KiB jobs/s with scheduled compaction. That is a
   real limit of keeping every finished key for a week on that host, not
   a measurement artefact.
+- **D-032 — Frame v2: a checksummed header and a recorded batch; a
+  damaged length stops startup.** The frame checksum covered only the
+  payload. Replay treated a length that pointed past the end of the log
+  as a torn tail, so one damaged 4-byte length in any committed frame (a
+  bad sector, a stray write) dropped that record and every acknowledged
+  one after it, and startup then truncated them away. Review reproduced
+  it on the release binary: 25 of 50 runs served, the log cut from 10,181
+  to 5,081 bytes. That broke non-negotiable 2: only a demonstrably
+  incomplete tail may be discarded. Now:
+  - Every new frame is v2: `version 2 | len u32 | seq u64 | batch_len u32
+    | payload_crc u32 | header_crc u32 | payload` (26-byte header, 8 more
+    than v1). The header checksum covers version, length, sequence,
+    batch length and payload checksum. A header that fails it is never
+    trusted and never cut: `Corrupt`, with the log left byte for byte.
+  - `batch_len` is the byte length of the group commit (one write, one
+    fsync) the frame was written in. The frames of a batch must tile it
+    exactly, a batch must be complete before the next one starts, and a
+    single `append` is a batch of one. So a damaged length is caught a
+    second way, and a `Corrupt` inside the log's last batch says so (the
+    one case a power loss before that batch's fsync explains, D-014).
+    `GroupCommit` is clamped so a batch always fits the u32.
+  - The only tail cut is a file that ends inside its last frame: fewer
+    bytes than a header, or a header that checks out whose payload runs
+    past the end, with nothing after the header that checks out as a
+    frame. That cut is less than one frame, so never more than the last
+    batch. Startup reports it (`durable-server: discarded a torn tail: N
+    bytes at offset X`, and `discarded_tail_bytes` in diagnostics).
+  - A full-length frame with a bad payload checksum is still refused, as
+    D-014 chose.
+
+  *Migration.* A v2 build reads v1 frames. An existing log keeps its v1
+  frames untouched and new appends go after them as v2; a log may hold v1
+  then v2, never v2 then v1 (that is `Corrupt`). The next compaction
+  starts a generation that holds only v2. A v1 frame has no header
+  checksum, so for v1 the length is trusted only as far as the forward
+  rule allows: a v1 length that runs past the end with a later valid
+  frame behind it is `Corrupt` (the reviewer's repro on a v1 log now
+  stops startup), and a damaged length in a v1 log's *last* frame is
+  still indistinguishable from a torn one. There is no downgrade: an
+  older binary refuses a v2 frame (`version 2`) and stops, so roll back
+  by restoring a backup taken before the upgrade. Frame headers start
+  with a 0x00 byte and the engine's JSON payloads never contain one, so
+  the forward check finds no false frames inside a payload.
+- **D-033 — Stored runs are held to stored bounds when decoded.** The
+  streaming snapshot decoder (D-028) bounded each count and length only by
+  the bytes left. Each `StepSpec` is 48 bytes in memory and 8 or more on
+  disk, so one corrupted step count could reserve about 6 times the rest
+  of the file; keys and names could be as long as the file. The checksum
+  is verified after decoding, so random damage reaches that code. Now
+  `durable_domain::STORED` names the widest a stored run may be: 64
+  steps and 64 KiB of input (admission has never allowed more, since
+  D0), and 64 KiB keys and names. Keys and names get a wider bound than
+  admission's 256 and 128 bytes because those bounds date only from
+  D-013: a run accepted before them, or under a looser configured bound,
+  must still load (`existing_over_long_key_still_deduplicates`). The
+  decoder refuses any field past these before allocating for it, and a
+  legacy `snapshot.json` (which has no checksum) has every run checked
+  against the same bounds. `Limits::validate` refuses, at spawn,
+  admission limits looser than the stored bounds, so the engine can never
+  accept a run that its own snapshot would refuse.
+- **D-034 — Restore locks its target and never merges.** `durable-cli
+  restore` was a plain copy: it took no lock, so it would write
+  generations and a manifest into a journal a running server was
+  appending to; it merged into an existing journal (two histories'
+  generations mixed); and `fs::copy` followed symlinks planted in a
+  backup. Restore is now `durable_journal::restore_backup`. It takes the
+  target's journal lock for the whole copy, so a server running there
+  makes it fail (`SecondWriter`) and no server can open the target half
+  restored. It refuses a target that already holds a manifest or any
+  generation. It copies only the backup's own regular files, refuses a
+  symlink or a special file, and writes each copy as a new owner-only
+  file that is fsynced, the manifest last by rename. Separately,
+  `Journal::open` now refuses a directory that has generations but no
+  manifest instead of starting a new journal there: first open writes
+  the manifest before any generation, so that layout is only damage or
+  an interrupted restore. Remove it and restore again.
+- **D-035 — Every engine reply has a deadline.** The `Engine` handle
+  awaited the actor's answer with no deadline. Acks and reads are held
+  until their covering fsync (D-014), so a stuck disk (an fsync that
+  never returns) hung every request, open reads included, and the
+  connections piled up. Now each answer is awaited at most
+  `reply_timeout` (submit, cancel, inspect, list, diagnostics; default
+  10 s, `--reply-timeout-ms`) or `admin_timeout` (compact and backup,
+  600 s), and the caller then gets `EngineError::Timeout`, HTTP 503
+  `timeout`. A timeout is an unknown outcome, not a refusal: a timed-out
+  submit can still commit once the disk answers, so the message says to
+  retry with the same op_key, which dedup turns into the same run. The
+  engine's own state is unchanged by a timeout: nothing is cancelled, and
+  the held answer is dropped when it is released.
+- **D-036 — SIGTERM drains; exit 0 means nothing decided was left
+  behind.** SIGTERM (what systemd and most supervisors send to stop a
+  service) killed the server like a crash. Nothing acknowledged was lost,
+  because restart replays, but every request in flight was cut off, and
+  a planned stop looked like a failure. Now SIGTERM or SIGINT:
+  1. stops accepting connections and lets the requests in flight finish
+     (each ack still waits for its covering fsync), for at most
+     `--drain-timeout-secs` (default 30);
+  2. asks the engine to drain (`Engine::shutdown`). The actor closes its
+     channels and refuses anything still queued (`Stopped`, 503
+     `engine_stopped`: nothing of it was decided). It starts no new
+     handler call, hands every record it already decided to the writer,
+     waits for the fsync, answers every caller those records cover, lets
+     a compaction or backup already queued finish, and joins the writer,
+     which releases the journal lock;
+  3. exits 0 only if all of that happened within the drain timeout, and
+     non-zero otherwise (a restart then replays, as after a crash).
+
+  Handler calls in flight are abandoned, not awaited. Their runs are
+  journaled running or reconciling, and after a restart they reconcile
+  through the probe as after a crash: cancelling a local call never
+  undoes a remote effect, so waiting for them would only delay the stop.
+  Proven by a process test that sends SIGTERM to the release-shaped
+  binary under concurrent submits: exit 0, and every acknowledged run is
+  there after restart.
+- **D-037 — Reads need a key unless they are open on loopback; a read-only
+  key.** D-011 left `GET /jobs` and `GET /jobs/{id}` open for the loopback
+  pilot and the inspector. They show every op_key and run state, on any
+  listen address, and SAAS_PLAN puts the server behind a reverse proxy,
+  where even a loopback listener is reachable from outside. The decision:
+  reads need a key **by default, wherever the server listens**. With
+  `--open-reads` they need none, and that flag is refused at startup
+  unless `--listen` is a loopback IP address (`127.0.0.0/8` or `::1`; a
+  name such as `localhost` is not trusted to resolve to one). So reads
+  need the key whenever the listener is not loopback, with no way to opt
+  out, and a loopback listener is open only if the operator says so,
+  knowing nothing proxies to it. `/health`, `/ready` and the inspector's
+  static files stay open: they show no runs.
+
+  A second, optional key, `DURABLE_READ_KEY` (at least 32 characters, not
+  the API key), may read and nothing else: every mutating and admin route
+  answers it `403 forbidden`, so it is a valid key in the wrong scope,
+  where an unknown key gets 401. This is the key to give the inspector or
+  a dashboard instead of the admin key. The CLI sends `DURABLE_API_KEY`
+  on every call and falls back to `DURABLE_READ_KEY` for reads; the
+  inspector sends the key it holds on reads as well as on cancel.
+  Startup now has process tests: no API key, a 31-character one, a short
+  read key, a read key equal to the API key, and `--open-reads` on
+  `0.0.0.0` each exit non-zero without listening.
+- **D-038 — Journal, snapshot and backup files are owner-only.** They
+  hold every job's input and were created with the process umask,
+  usually world-readable (0644 files, 0755 directories), and `fs::copy`
+  carried those modes into backups. Every directory the journal creates
+  (the root, generations, backups and their partial copies, a restore
+  target) is now 0700 and every file 0600: the log, the snapshot and its
+  temporary, the manifest and its temporary, `LOCK`, and each copy a
+  backup or restore makes. A journal from an older build is tightened
+  when it opens (the root, `LOCK`, the manifest and the current
+  generation), best effort: a path this user may not chmod is left as it
+  is rather than stopping startup. Unix only; elsewhere the modes are
+  the platform's.
+- **D-039 — The handler client follows no redirect and no proxy.** The
+  client was `reqwest::Client::new()`. It followed redirects, so a
+  handler's 307 or 308 re-POSTed the job's input and idempotency key to
+  wherever the `Location` pointed, outside the allowlist. It honoured
+  `HTTP_PROXY`, `HTTPS_PROXY` and `ALL_PROXY`, so the environment could
+  route every call, input included, through a proxy. And `--handler`
+  accepted any URL scheme. Now the client never follows a redirect (a
+  3xx is the handler's answer: the attempt fails and is retried under the
+  same idempotency key; a 3xx probe is "not found"), ignores the proxy
+  variables, and gives up connecting after 5 s. `--handler` accepts only
+  `http://` or `https://` URLs with a host. Signing calls so a handler
+  can tell they come from this runner is not built; it belongs with the
+  SaaS handler registry (SAAS_PLAN S2).
+- **D-040 — The inspector is served with a strict CSP, and boots under
+  its mount.** The inspector holds a key (D-037) and renders op_keys,
+  which clients choose. Svelte renders them as escaped text, but nothing
+  limited what the page could load or run. Every `/inspector` response
+  now carries `Content-Security-Policy: default-src 'none'; script-src
+  'self' 'sha256-…'` (the hash of each inline bootstrap script in
+  `index.html`, computed when the server starts, so scripts are never
+  `'unsafe-inline'`), `connect-src 'self'`, `frame-ancestors 'none'`,
+  `base-uri 'none'`, `form-action 'none'`, plus `X-Content-Type-Options:
+  nosniff`, `X-Frame-Options: DENY` and `Referrer-Policy: no-referrer`.
+  Styles stay `'self' 'unsafe-inline'`. While checking this, the built
+  inspector turned out never to boot: SvelteKit's fallback page cannot use
+  relative asset paths, so `index.html` loaded `/_app/…`, which is not
+  served (only `/inspector/…` is). The app's base is now `/inspector`, and
+  every asset it references answers 200. Checked over HTTP (status codes
+  and the served hash recomputed independently); not checked in a browser.
+- **D-041 — One gate, locally and on hosted CI.** There was no CI, no
+  `deny.toml` and no check script; `--locked` was not in the gate.
+  `scripts/check.sh` is now the gate, and `.github/workflows/ci.yml` runs
+  exactly that script on every push and pull request and daily (so a new
+  advisory fails without a push), on `ubuntu-latest`: fmt, clippy
+  `-D warnings --locked`, `cargo test --workspace --locked`, three
+  architecture checks (the domain crate does no I/O; nothing in
+  `crates/*/src` spawns a process; neither shipped binary's normal build
+  enables `fault-injection`), `cargo deny --locked check` (advisories
+  including unmaintained and yanked crates, permissive licences only,
+  wildcard and duplicate bans, crates.io as the only source), `npm ci`,
+  `npm audit --omit=dev --audit-level=moderate`, the inspector's type
+  check and build, and the pilot against the release build. The workflow
+  has `permissions: contents: read`, checks out without persisting
+  credentials, pins every action to a full commit SHA with its version
+  in a comment, uses no `pull_request_target`, and puts no `${{ }}`
+  inside a `run:`. Dependabot proposes weekly grouped updates for cargo,
+  npm and the actions. The workspace crates are marked `publish = false`
+  (they are not on crates.io), which is also what lets cargo-deny accept
+  their path dependencies. The pilot now checks every step and exits
+  non-zero on the first that fails, takes its ports from
+  `DURABLE_PILOT_PORT`, and ends with a SIGTERM drain that must exit 0.
+- **D-042 — A kill -9 drill harness, and this round's result.** The
+  drills were run by hand before. `perf/drill.py` (standard library
+  only) now runs them: one persistent journal, 16 clients submitting
+  (half run at once through a local handler, half wait far in the
+  future) and cancelling about 40% of their acknowledged waiting runs,
+  a thread compacting and backing up, and a SIGKILL either at a random
+  moment or 0–30 ms after a compaction, a backup or a 50-cancel burst.
+  After every restart it checks everything acknowledged so far: each
+  submit present under its op_key, a resubmit returning the same run id,
+  each acknowledged cancel still `cancelled`, the round's last completed
+  backup restoring (through `durable-cli restore`, onto a second server)
+  with every run acknowledged before it was requested, and no half
+  backup under a visible name. It ends with SIGTERM, which must exit 0.
+
+  Result on the release build of this round's code
+  (`perf/results/2026-11-17T02-28-00Z-kill9-drill.json`; Apple M2 Pro,
+  load average 50–70, a development observation): 36 kills (20 random, 6
+  after a compaction, 5 after a backup, 5 after a cancel burst), 25,201
+  acknowledged submits and 9,119 acknowledged cancels, **0 lost, 0
+  duplicated, 0 id mismatches, 0 cancels lost**, 69 compactions, 58
+  backups, 31 of 31 checked backups restored complete, 0 visible partial
+  backups, final generation 70, and the closing SIGTERM exited 0.

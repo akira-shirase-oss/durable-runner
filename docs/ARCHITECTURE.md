@@ -14,7 +14,7 @@
 | Crate | Role |
 |---|---|
 | `durable-domain` | Pure state machine: job/step identities, transitions, invalid-state list, limits. No I/O — enforced. |
-| `durable-journal` | Framed append-only store: format version, length, sequence, checksum per record; generation manifest; torn-tail detection; exclusive writer lock. |
+| `durable-journal` | Framed append-only store: frame v2 = version, length, sequence, batch length, payload checksum and a header checksum per record (D-032; v1 still read); generation manifest; torn-tail detection that never cuts more than an incomplete final frame; exclusive writer lock. |
 | `durable-engine` | Execution: step claims, per-attempt deadlines, bounded retries with capped jitter, cancellation, effect reconciliation. |
 | `durable-server` | Axum API + the coordinator loop (pure reducer + fake clock, bounded channels). |
 | `durable-cli` | Submit/inspect/cancel/backup/restore from a shell. |
@@ -42,7 +42,10 @@ attempt count) → finish → history becomes terminal. Dispatch is capped per
 tick; a call past its deadline is cancelled locally and reconciled.
 
 **Recovery:** read manifest → load snapshot → replay journal records in order →
-discard only a provably-torn tail append → rebuild index → serve.
+discard only a provably-torn tail (the file ends inside its last frame, whose
+header checks out, and nothing after it is a frame) → rebuild index → serve.
+Any other damage — a header checksum, a payload checksum, a frame that does
+not fit its batch — stops startup with the log untouched.
 
 **Compaction:** the actor takes a pointer view of the retained runs (copy-on-
 write) → the writer streams it as the binary index into the new generation's
@@ -58,17 +61,19 @@ delete every superseded `gen-*` directory (retention). Runs on `POST
 |---|---|---|
 | `GET /health` | open | liveness |
 | `GET /ready` | open | readiness: 503 `no_space` / `engine_stopped` |
-| `GET /jobs?after=&limit=` | open | one page of runs, ids ascending (limit 100 default, 1000 max); `next_after` continues |
-| `GET /jobs?order=desc&before=&limit=` | open | newest first; `next_before` continues (the inspector's view) |
-| `GET /jobs/{id}` | open | inspect a run |
+| `GET /jobs?after=&limit=` | read key or API key (open only with `--open-reads` on loopback) | one page of runs, ids ascending (limit 100 default, 1000 max); `next_after` continues |
+| `GET /jobs?order=desc&before=&limit=` | read key or API key (same) | newest first; `next_before` continues (the inspector's view) |
+| `GET /jobs/{id}` | read key or API key (same) | inspect a run |
 | `POST /jobs` | API key | submit (dedup by `op_key`) |
 | `POST /jobs/{id}/cancel` | API key | cancel (stops scheduling, never undoes) |
 | `POST /admin/compact` | API key | compact into a new generation |
 | `POST /admin/backup {name}` | API key | backup to `<backup-root>/<name>` only |
 | `GET /admin/diagnostics` | API key | bounded counts |
-| `/inspector/` | open (cancel needs the key) | SvelteKit UI |
+| `/inspector/` | static files open; the UI sends its key on every call | SvelteKit UI |
 
-The key is `DURABLE_API_KEY`, compared as SHA-256 digests in constant time.
+The key is `DURABLE_API_KEY`; the optional `DURABLE_READ_KEY` may only read
+(403 on every other route, D-037). Both are compared as SHA-256 digests in
+constant time.
 Request bodies are capped at 256 KiB; operation keys at 256 bytes and step
 and handler names at 128 (non-empty, no control characters in keys); a
 handler reply is read only up to the 256 KiB output limit.
@@ -88,5 +93,7 @@ crates/        durable-domain, durable-journal, durable-engine,
 apps/inspect/  SvelteKit inspection UI
 docs/          END_GOAL, ARCHITECTURE, ROADMAP, DECISIONS, modules/
 fixtures/      torn-tail + crash-model fixtures, handler test server
-perf/          submit/replay/stall/compaction scenarios + results
+perf/          submit/replay/stall/compaction scenarios, drill.py (kill -9
+               drills with compactions, backups and cancels) + results
+scripts/       check.sh: the gate, the same one .github/workflows/ci.yml runs
 ```

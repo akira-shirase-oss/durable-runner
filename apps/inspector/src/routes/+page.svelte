@@ -15,7 +15,7 @@
 
 	async function refresh() {
 		try {
-			const page = await listRuns(cursor);
+			const page = await listRuns(apiKey, cursor);
 			runs = page.runs;
 			older = page.next_before;
 			error = null;
@@ -64,12 +64,15 @@
 <main>
 	<h1>durable — runs</h1>
 	<label class="key-field">
-		API key (needed to cancel)
+		key (the read key to view runs; the API key to cancel)
 		<input
 			type="password"
 			autocomplete="off"
 			bind:value={apiKey}
-			onchange={() => saveApiKey(apiKey)}
+			onchange={() => {
+				saveApiKey(apiKey);
+				refresh();
+			}}
 		/>
 	</label>
 	{#if error}

@@ -12,10 +12,11 @@ export default defineConfig({
 				runes: ({ filename }) =>
 					filename.split(/[/\\]/).includes('node_modules') ? undefined : true,
 			},
-			// A static single-page app served by durable-server under /inspector/.
-			// Relative base so it works under the mount prefix; 200.html answers every route.
+			// A static single-page app served by durable-server under /inspector/;
+			// index.html answers every route. The fallback page cannot use relative
+			// asset paths (it is served at any depth), so the base is the mount.
 			adapter: adapter({ pages: out, assets: out, fallback: 'index.html' }),
-			paths: { relative: true },
+			paths: { base: '/inspector' },
 		}),
 	],
 	server: {

@@ -12,6 +12,8 @@ members = [
 version = "0.1.0"
 edition = "2021"
 license = "MIT"
+# Built from this repository, not published to crates.io.
+publish = false
 
 [workspace.dependencies]
 thiserror = "2"

@@ -14,12 +14,13 @@ const KEY: &str = "process-test-key-0123456789abcdef0123456789";
 /// Set to skip the permission-based proofs where permissions are ignored.
 const SKIP_ENV: &str = "DURABLE_ALLOW_PERMISSION_SKIP";
 
-/// A free loopback port outside the ranges other local services use.
+/// A free loopback port outside the ranges other local services use
+/// (55432, 56000-62999, which holds 58000-58099 and 58400).
 fn free_port() -> u16 {
     loop {
         let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap_or_else(|e| panic!("{e}"));
         let port = l.local_addr().unwrap_or_else(|e| panic!("{e}")).port();
-        if port != 55432 && !(58000..=58099).contains(&port) {
+        if port != 55432 && !(56000..=62999).contains(&port) {
             return port;
         }
     }
@@ -147,6 +148,7 @@ async fn failed_manifest_swap_exits_the_process_and_loses_nothing() {
     for id in &acked {
         let s = c
             .get(format!("{base}/jobs/{id}"))
+            .bearer_auth(KEY)
             .send()
             .await
             .map(|r| r.status().as_u16())
@@ -155,4 +157,259 @@ async fn failed_manifest_swap_exits_the_process_and_loses_nothing() {
     }
     let _ = server.kill();
     let _ = server.wait();
+}
+
+/// Wait for the child to exit, at most `limit`.
+async fn exit_within(child: &mut Child, limit: Duration) -> Option<std::process::ExitStatus> {
+    let deadline = Instant::now() + limit;
+    while Instant::now() < deadline {
+        if let Some(s) = child.try_wait().unwrap_or_else(|e| panic!("{e}")) {
+            return Some(s);
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    None
+}
+
+fn signal(child: &Child, sig: &str) {
+    let ok = Command::new("kill")
+        .args([sig, &child.id().to_string()])
+        .status()
+        .unwrap_or_else(|e| panic!("{e}"))
+        .success();
+    assert!(ok, "kill {sig} failed");
+}
+
+/// Review (still open): SIGTERM killed the server like a crash. It must
+/// drain: stop accepting, let every request in flight finish (each
+/// acknowledged submit durable), flush the batch the writer holds, and exit
+/// 0 — and nothing acknowledged may be missing after a restart.
+#[tokio::test]
+async fn sigterm_drains_in_flight_work_and_exits_zero() {
+    let d = tempfile::tempdir().unwrap_or_else(|e| panic!("{e}"));
+    let journal = d.path().join("journal");
+    let port = free_port();
+    let base = format!("http://127.0.0.1:{port}");
+    let c = reqwest::Client::new();
+    let mut server = start(&journal, port);
+    wait_healthy(&c, &base).await;
+
+    let mut acked = Vec::new();
+    for i in 0..5 {
+        acked.extend(submit(&c, &base, &format!("before-{i}")).await);
+    }
+    assert_eq!(acked.len(), 5);
+    // Clients keep submitting while the signal lands.
+    let mut clients = tokio::task::JoinSet::new();
+    for t in 0..4 {
+        let (c, base) = (c.clone(), base.clone());
+        clients.spawn(async move {
+            let mut ids = Vec::new();
+            for i in 0..10_000 {
+                match submit(&c, &base, &format!("during-{t}-{i}")).await {
+                    Some(id) => ids.push(id),
+                    None => break, // refused or connection closed: the drain began
+                }
+            }
+            ids
+        });
+    }
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    signal(&server, "-TERM");
+    let status = match exit_within(&mut server, Duration::from_secs(20)).await {
+        Some(s) => s,
+        None => {
+            let _ = server.kill();
+            let _ = server.wait();
+            panic!("the server did not exit within 20 s of SIGTERM");
+        }
+    };
+    while let Some(ids) = clients.join_next().await {
+        acked.extend(ids.unwrap_or_else(|e| panic!("{e}")));
+    }
+    assert!(status.success(), "SIGTERM must drain and exit 0: {status}");
+    assert!(
+        acked.len() > 5,
+        "no submit was in flight when the signal landed"
+    );
+
+    let mut server = start(&journal, port);
+    wait_healthy(&c, &base).await;
+    for id in &acked {
+        let s = c
+            .get(format!("{base}/jobs/{id}"))
+            .bearer_auth(KEY)
+            .send()
+            .await
+            .map(|r| r.status().as_u16())
+            .unwrap_or(0);
+        assert_eq!(s, 200, "acknowledged run {id} lost across SIGTERM");
+    }
+    let _ = server.kill();
+    let _ = server.wait();
+}
+
+/// Run the server with `env` (and nothing inherited for the keys) and
+/// extra `args`; it must exit non-zero on its own, before serving, with
+/// `why` on stderr.
+async fn refuses_to_start(env: &[(&str, &str)], args: &[&str], why: &str) {
+    let d = tempfile::tempdir().unwrap_or_else(|e| panic!("{e}"));
+    let port = free_port();
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_durable-server"));
+    cmd.arg("--journal").arg(d.path().join("journal"));
+    if !args.contains(&"--listen") {
+        cmd.args(["--listen", &format!("127.0.0.1:{port}")]);
+    }
+    cmd.args(args)
+        .env_remove("DURABLE_API_KEY")
+        .env_remove("DURABLE_READ_KEY")
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped());
+    for (k, v) in env {
+        cmd.env(k, v);
+    }
+    let mut child = cmd.spawn().unwrap_or_else(|e| panic!("{e}"));
+    let Some(status) = exit_within(&mut child, Duration::from_secs(10)).await else {
+        let _ = child.kill();
+        let _ = child.wait();
+        panic!("the server kept running ({args:?}); it must refuse: {why}");
+    };
+    let mut err = String::new();
+    if let Some(mut e) = child.stderr.take() {
+        let _ = std::io::Read::read_to_string(&mut e, &mut err);
+    }
+    assert!(!status.success(), "{args:?}: exit {status}");
+    assert!(err.contains(why), "stderr does not say {why:?}: {err}");
+    let listened = args
+        .iter()
+        .position(|a| *a == "--listen")
+        .and_then(|i| args.get(i + 1))
+        .and_then(|l| l.rsplit(':').next())
+        .and_then(|p| p.parse::<u16>().ok())
+        .unwrap_or(port);
+    assert!(
+        std::net::TcpStream::connect(("127.0.0.1", listened)).is_err(),
+        "something listens on the refused server's port"
+    );
+}
+
+/// Checklist: a missing or short API key refuses startup — the server
+/// never serves with no key or a guessable one; and a read-only key must
+/// be long and different from the admin key.
+#[tokio::test]
+async fn a_missing_or_short_key_refuses_startup() {
+    refuses_to_start(&[], &[], "DURABLE_API_KEY is not set").await;
+    let short = "k".repeat(31);
+    refuses_to_start(&[("DURABLE_API_KEY", &short)], &[], "at least 32").await;
+    refuses_to_start(
+        &[("DURABLE_API_KEY", KEY), ("DURABLE_READ_KEY", &short)],
+        &[],
+        "DURABLE_READ_KEY must be at least 32",
+    )
+    .await;
+    refuses_to_start(
+        &[("DURABLE_API_KEY", KEY), ("DURABLE_READ_KEY", KEY)],
+        &[],
+        "must differ",
+    )
+    .await;
+}
+
+/// Checklist P0: unauthenticated reads only on a loopback listener.
+#[tokio::test]
+async fn open_reads_off_loopback_refuses_startup() {
+    let port = free_port();
+    let listen = format!("0.0.0.0:{port}");
+    refuses_to_start(
+        &[("DURABLE_API_KEY", KEY)],
+        &["--open-reads", "--listen", &listen],
+        "--open-reads is allowed only on a loopback",
+    )
+    .await;
+}
+
+/// A listener that answers every connection with `reply` and counts them.
+async fn counting(reply: &'static str) -> (u16, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
+    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+    let l = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .unwrap_or_else(|e| panic!("{e}"));
+    let port = l.local_addr().unwrap_or_else(|e| panic!("{e}")).port();
+    let seen = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let count = seen.clone();
+    tokio::spawn(async move {
+        while let Ok((mut s, _)) = l.accept().await {
+            count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            tokio::spawn(async move {
+                let mut buf = [0u8; 8192];
+                let _ = s.read(&mut buf).await;
+                let _ = s.write_all(reply.as_bytes()).await;
+            });
+        }
+    });
+    (port, seen)
+}
+
+/// Checklist: the handler client honoured HTTP_PROXY and friends, so an
+/// environment variable could route every job's input through a proxy.
+/// Handler calls go straight to the registered URL.
+#[tokio::test]
+async fn handler_calls_ignore_proxy_environment_variables() {
+    use std::sync::atomic::Ordering::SeqCst;
+    let (proxy, via_proxy) =
+        counting("HTTP/1.1 502 Bad Gateway\r\ncontent-length: 0\r\n\r\n").await;
+    let (handler, direct) = counting("HTTP/1.1 200 OK\r\ncontent-length: 2\r\n\r\n{}").await;
+    let d = tempfile::tempdir().unwrap_or_else(|e| panic!("{e}"));
+    let port = free_port();
+    let base = format!("http://127.0.0.1:{port}");
+    let proxy_url = format!("http://127.0.0.1:{proxy}");
+    let mut server = Command::new(env!("CARGO_BIN_EXE_durable-server"))
+        .arg("--journal")
+        .arg(d.path().join("journal"))
+        .args(["--listen", &format!("127.0.0.1:{port}")])
+        .args([
+            "--handler",
+            &format!("step=http://127.0.0.1:{handler}/step"),
+        ])
+        .env("DURABLE_API_KEY", KEY)
+        .env("HTTP_PROXY", &proxy_url)
+        .env("http_proxy", &proxy_url)
+        .env("HTTPS_PROXY", &proxy_url)
+        .env("ALL_PROXY", &proxy_url)
+        .env("all_proxy", &proxy_url)
+        .env_remove("NO_PROXY")
+        .env_remove("no_proxy")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap_or_else(|e| panic!("{e}"));
+    let c = reqwest::Client::builder()
+        .no_proxy()
+        .build()
+        .unwrap_or_else(|e| panic!("{e}"));
+    wait_healthy(&c, &base).await;
+    let body = serde_json::json!({
+        "op_key": "proxy-check",
+        "spec": { "version": 1, "steps": [{ "name": "a", "handler": "step" }], "input_b64": "aGk=" },
+    });
+    let r = c
+        .post(format!("{base}/jobs"))
+        .bearer_auth(KEY)
+        .json(&body)
+        .send()
+        .await
+        .unwrap_or_else(|e| panic!("{e}"));
+    assert!(r.status().is_success(), "{}", r.status());
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while direct.load(SeqCst) + via_proxy.load(SeqCst) == 0 && Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    let _ = server.kill();
+    let _ = server.wait();
+    assert_eq!(
+        via_proxy.load(SeqCst),
+        0,
+        "a handler call went through the proxy"
+    );
+    assert!(direct.load(SeqCst) >= 1, "the handler was never called");
 }

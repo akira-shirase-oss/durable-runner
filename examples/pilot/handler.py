@@ -9,6 +9,7 @@ GET  /step?idem_key=K          -> 200 if K was seen (the reconcile probe),
 """
 import http.server
 import json
+import sys
 import urllib.parse
 
 SEEN = {}
@@ -40,4 +41,5 @@ class H(http.server.BaseHTTPRequestHandler):
         pass
 
 
-http.server.HTTPServer(("127.0.0.1", 58320), H).serve_forever()
+PORT = int(sys.argv[1]) if len(sys.argv) > 1 else 58320
+http.server.HTTPServer(("127.0.0.1", PORT), H).serve_forever()

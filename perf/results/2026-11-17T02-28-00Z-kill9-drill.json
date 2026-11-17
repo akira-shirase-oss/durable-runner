@@ -1,0 +1,37 @@
+{
+  "scenario": "kill -9 drill: 16 clients submit (half immediate, half far-future) and cancel ~40% of their waiting runs while a maintenance thread compacts and backs up; SIGKILL at a random moment (20 rounds) or 0-30 ms after a compaction (6), a backup (5) or a 50-cancel burst (5); restart and verify after every round",
+  "command": "python3 -I perf/drill.py --rounds 20 --targeted 16 --clients 16",
+  "binary": "target/release/durable-server and durable-cli built with --locked from commit 7a2cd97 (fix/journal-and-security-2026-11-16); later commits change docs, CI and this script only",
+  "machine": {
+    "cpu": "Apple M2 Pro",
+    "memory_bytes": 34359738368,
+    "os": "macOS 27.2.1",
+    "load_average_at_start": "70.97 60.16 49.39 (very busy: other projects' work)"
+  },
+  "note": "Development observation on a busy laptop, not a capacity claim. Counts are what the harness acknowledged and verified.",
+  "totals": {
+    "rounds": 36,
+    "acked_submits": 25201,
+    "acked_cancels": 9119,
+    "lost": 0,
+    "dup": 0,
+    "id_mismatch": 0,
+    "cancels_lost": 0,
+    "compactions": 69,
+    "backups": 58,
+    "backups_restored_complete": 31,
+    "backups_checked": 31,
+    "visible_partial": 0,
+    "kills": {
+      "random": 20,
+      "after_compact": 6,
+      "after_backup": 5,
+      "after_cancels": 5
+    },
+    "final_sigterm_exit": 0,
+    "final_generation": 70
+  },
+  "failures": [],
+  "seed": 20261116,
+  "clients": 16
+}

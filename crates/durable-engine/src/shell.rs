@@ -19,7 +19,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{SyncSender, TrySendError};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
-use tokio::sync::{mpsc, oneshot, OwnedSemaphorePermit, Semaphore};
+use tokio::sync::{mpsc, oneshot, watch, OwnedSemaphorePermit, Semaphore};
 use tokio::task::{AbortHandle, JoinSet};
 
 /// What a handler can honestly report about an attempt.
@@ -123,6 +123,38 @@ pub struct Engine {
     tx: mpsc::Sender<Cmd>,
     read_tx: mpsc::Sender<Read>,
     health: Arc<Health>,
+    discarded_tail: Option<durable_journal::TornTail>,
+    /// Set once the actor has returned and the writer thread has released
+    /// the journal, with why it stopped.
+    stopped: watch::Receiver<Option<StopReason>>,
+    /// Set to ask the actor to drain and stop (`shutdown`).
+    drain: Arc<watch::Sender<bool>>,
+    reply_timeout: Duration,
+    admin_timeout: Duration,
+}
+
+/// Why the engine stopped.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StopReason {
+    /// `shutdown`: everything decided was made durable and answered, then
+    /// the writer released the journal.
+    Drained,
+    /// A journal write or fsync failed (or the writer died): memory was
+    /// ahead of disk, so held work failed and a restart replays.
+    Failed,
+    /// Every handle was dropped: the actor stopped without draining, like
+    /// a crash (nothing undecided was acknowledged).
+    Dropped,
+}
+
+/// Wait for the actor's answer, at most `limit`: a stuck journal must not
+/// hang the caller. A timed-out request may still complete.
+async fn answer<T>(rx: oneshot::Receiver<T>, limit: Duration) -> Result<T, EngineError> {
+    match tokio::time::timeout(limit, rx).await {
+        Ok(Ok(v)) => Ok(v),
+        Ok(Err(_)) => Err(EngineError::Stopped),
+        Err(_) => Err(EngineError::Timeout),
+    }
 }
 
 /// State the actor publishes for readiness, readable without a round trip
@@ -210,13 +242,13 @@ impl Engine {
             not_before,
             reply,
         })?;
-        rx.await.map_err(|_| EngineError::Stopped)?
+        answer(rx, self.reply_timeout).await?
     }
 
     pub async fn cancel(&self, run: RunId) -> Result<(), EngineError> {
         let (reply, rx) = oneshot::channel();
         self.send(Cmd::Cancel { run, reply })?;
-        rx.await.map_err(|_| EngineError::Stopped)?
+        answer(rx, self.reply_timeout).await?
     }
 
     /// Compact the journal: snapshot live state into a new generation,
@@ -224,14 +256,14 @@ impl Engine {
     pub async fn compact(&self) -> Result<u32, EngineError> {
         let (reply, rx) = oneshot::channel();
         self.send(Cmd::Compact { reply })?;
-        rx.await.map_err(|_| EngineError::Stopped)?
+        answer(rx, self.admin_timeout).await?
     }
 
     /// Consistent backup of the journal to `dest` (manifest copied last).
     pub async fn backup_to(&self, dest: std::path::PathBuf) -> Result<(), EngineError> {
         let (reply, rx) = oneshot::channel();
         self.send(Cmd::Backup { dest, reply })?;
-        rx.await.map_err(|_| EngineError::Stopped)?
+        answer(rx, self.admin_timeout).await?
     }
 
     /// One page of the live index in id order: at most
@@ -248,14 +280,14 @@ impl Engine {
             limit: limit.clamp(1, MAX_PAGE),
             reply,
         })?;
-        rx.await.map_err(|_| EngineError::Stopped)
+        answer(rx, self.reply_timeout).await
     }
 
     /// Bounded diagnostics — counts by state kind, never rows.
     pub async fn diag(&self) -> Result<crate::Diagnostics, EngineError> {
         let (reply, rx) = oneshot::channel();
         self.send_read(Read::Diag { reply })?;
-        rx.await.map_err(|_| EngineError::Stopped)
+        answer(rx, self.reply_timeout).await
     }
 
     /// Readiness: false once the actor has stopped or while free space is
@@ -282,10 +314,53 @@ impl Engine {
         self.tx.closed().await;
     }
 
+    /// Resolves once the engine has fully stopped: the actor has returned
+    /// and the writer thread has been joined, so the journal's lock is
+    /// free and another engine may open it. The future holds no handle, so
+    /// awaiting it after dropping every `Engine` waits for that shutdown
+    /// instead of keeping the engine alive. (If the actor panicked, it
+    /// resolves when the actor is gone; the writer then releases the
+    /// journal on its own thread.)
+    pub fn on_stop(&self) -> impl std::future::Future<Output = ()> + Send + 'static {
+        let mut stopped = self.stopped.clone();
+        async move {
+            let _ = stopped.wait_for(Option::is_some).await;
+        }
+    }
+
+    /// Drain and stop (SIGTERM): refuse new commands and anything still
+    /// queued (`Stopped`, nothing of it was decided), start no new handler
+    /// calls, hand every record already decided to the writer and wait for
+    /// its fsync, answer every caller it covers, then join the writer. In-
+    /// flight handler calls are abandoned: their runs stay journaled
+    /// running or reconciling and reconcile after a restart (cancelling
+    /// never undoes a remote effect). `Ok` once drained; `Timeout` if that
+    /// took longer than `limit`; `Stopped` if the engine stopped any other
+    /// way (a failed commit: restart replays).
+    pub async fn shutdown(&self, limit: Duration) -> Result<(), EngineError> {
+        self.drain.send_replace(true);
+        let mut stopped = self.stopped.clone();
+        let reason = match tokio::time::timeout(limit, stopped.wait_for(Option::is_some)).await {
+            Ok(Ok(r)) => *r,
+            Ok(Err(_)) => None, // the actor is gone without a report (a panic)
+            Err(_) => return Err(EngineError::Timeout),
+        };
+        match reason {
+            Some(StopReason::Drained) => Ok(()),
+            _ => Err(EngineError::Stopped),
+        }
+    }
+
+    /// The torn tail startup discarded (an incomplete final frame, never
+    /// acknowledged), so the operator's log can say so.
+    pub fn discarded_tail(&self) -> Option<durable_journal::TornTail> {
+        self.discarded_tail
+    }
+
     pub async fn inspect(&self, run: RunId) -> Result<Option<Run>, EngineError> {
         let (reply, rx) = oneshot::channel();
         self.send_read(Read::Inspect { run, reply })?;
-        rx.await.map_err(|_| EngineError::Stopped)
+        answer(rx, self.reply_timeout).await
     }
 }
 
@@ -325,6 +400,13 @@ pub struct ShellConfig {
     /// deleting superseded generations); `None` (the default) = only on
     /// request.
     pub compact_every: Option<Duration>,
+    /// How long a caller waits for the engine's answer to a submit, a
+    /// cancel or a read before it gets `Timeout` (a stuck fsync must not
+    /// hang every request).
+    pub reply_timeout: Duration,
+    /// The same for compaction and backup, which write a whole snapshot or
+    /// copy the journal.
+    pub admin_timeout: Duration,
 }
 
 impl Default for ShellConfig {
@@ -344,6 +426,8 @@ impl Default for ShellConfig {
             // Off until compaction is cheap and its error path is fatal
             // (D-018): an operator schedules it explicitly.
             compact_every: None,
+            reply_timeout: Duration::from_secs(10),
+            admin_timeout: Duration::from_secs(600),
         }
     }
 }
@@ -352,9 +436,12 @@ impl Default for ShellConfig {
 /// group-commit writer thread, then spawn the actor task. The returned
 /// handle is the only public interface — there is no path to the journal
 /// except through it.
-pub fn spawn(dir: &Path, registry: Registry, cfg: ShellConfig) -> Result<Engine, EngineError> {
+pub fn spawn(dir: &Path, registry: Registry, mut cfg: ShellConfig) -> Result<Engine, EngineError> {
+    cfg.group_commit = cfg.group_commit.clamped();
+    cfg.limits.validate().map_err(EngineError::Config)?;
     let mut core = EngineCore::open_with(dir, cfg.journal.clone())?;
     core.limits = cfg.limits;
+    let discarded_tail = core.discarded_tail();
     let (core, journal) = core.into_piped();
     let journal = journal.ok_or(EngineError::Piped)?;
     let writer = writer::spawn(journal, cfg.group_commit.clone())
@@ -367,11 +454,23 @@ pub fn spawn(dir: &Path, registry: Registry, cfg: ShellConfig) -> Result<Engine,
         health: health.clone(),
         errors: BTreeMap::new(),
     };
-    tokio::spawn(actor(core, registry, cfg, (rx, read_rx), mon, writer));
+    let (stopped_tx, stopped) = watch::channel(None);
+    let (drain, drain_rx) = watch::channel(false);
+    let (reply_timeout, admin_timeout) = (cfg.reply_timeout, cfg.admin_timeout);
+    tokio::spawn(async move {
+        // Every return path of the actor joins the writer first.
+        let reason = actor(core, registry, cfg, (rx, read_rx, drain_rx), mon, writer).await;
+        stopped_tx.send_replace(Some(reason));
+    });
     Ok(Engine {
         tx,
         read_tx,
         health,
+        discarded_tail,
+        stopped,
+        drain: Arc::new(drain),
+        reply_timeout,
+        admin_timeout,
     })
 }
 
@@ -710,14 +809,131 @@ async fn compaction_done(
     }
 }
 
+/// Resolves once a drain has been asked for; never if it cannot be (every
+/// handle, and with them the sender, is gone: the channels' `None` ends
+/// the actor then).
+async fn drain_requested(rx: &mut watch::Receiver<bool>) {
+    if rx.wait_for(|d| *d).await.is_err() {
+        std::future::pending::<()>().await;
+    }
+}
+
+/// A command still queued when the drain began: nothing of it was
+/// decided, so it is refused, never half done.
+fn refuse(cmd: Cmd) {
+    match cmd {
+        Cmd::Submit { reply, .. } => {
+            let _ = reply.send(Err(EngineError::Stopped));
+        }
+        Cmd::Cancel { reply, .. } => {
+            let _ = reply.send(Err(EngineError::Stopped));
+        }
+        Cmd::Compact { reply } => {
+            let _ = reply.send(Err(EngineError::Stopped));
+        }
+        Cmd::Backup { reply, .. } => {
+            let _ = reply.send(Err(EngineError::Stopped));
+        }
+    }
+}
+
+/// The drain (`Engine::shutdown`): take nothing new, make everything
+/// already decided durable, answer what it covers, start no handler call.
+/// True when everything decided reached disk.
+async fn drain(
+    core: &mut EngineCore,
+    pipe: &mut Pipeline,
+    status: &mut watch::Receiver<writer::WriterStatus>,
+    (rx, read_rx): (&mut mpsc::Receiver<Cmd>, &mut mpsc::Receiver<Read>),
+    pending_compaction: &mut Option<PendingCompaction>,
+    mon: &mut Monitor,
+) -> bool {
+    rx.close();
+    read_rx.close();
+    while let Ok(cmd) = rx.try_recv() {
+        refuse(cmd);
+    }
+    while read_rx.try_recv().is_ok() {} // their callers see `Stopped`
+    loop {
+        if core.is_poisoned() {
+            let err = status
+                .borrow()
+                .failed
+                .clone()
+                .unwrap_or_else(|| Arc::new(JournalError::Poisoned));
+            pipe.fail_held(&err);
+            if let Some(reply) = pending_compaction.take().and_then(|c| c.reply) {
+                let _ = reply.send(Err(EngineError::CommitFailed(err)));
+            }
+            return false;
+        }
+        pipe.collect(core);
+        if !pipe.flush() {
+            pipe.fail_held(&Arc::new(JournalError::Poisoned));
+            return false;
+        }
+        // Held handler calls and probes are dropped (their permits return):
+        // their records are durable, and restart reconciles them.
+        while pipe
+            .held
+            .front()
+            .is_some_and(|(needs, _)| *needs <= pipe.durable)
+        {
+            if let Some((_, Held::Reply(answer))) = pipe.held.pop_front() {
+                answer(None);
+            }
+        }
+        let flushed = pipe.outbound.is_empty() && pipe.durable >= core.last_index();
+        if flushed && pending_compaction.is_none() {
+            return true;
+        }
+        tokio::select! {
+            changed = status.changed() => match changed {
+                Ok(()) => {
+                    let st = status.borrow_and_update().clone();
+                    core.observe(&st);
+                    pipe.durable = st.durable;
+                }
+                Err(_) => {
+                    pipe.fail_held(&Arc::new(JournalError::Poisoned));
+                    return false;
+                }
+            },
+            r = compaction_done(pending_compaction) => {
+                if let Some(c) = pending_compaction.take() {
+                    let answer = match r {
+                        Ok(Ok(generation)) => {
+                            core.finish_compaction(&c.expired);
+                            Ok(generation)
+                        }
+                        Ok(Err(e)) => Err(EngineError::Journal(e)),
+                        Err(_) => Err(EngineError::Stopped),
+                    };
+                    match (c.reply, answer) {
+                        (Some(reply), answer) => {
+                            let _ = reply.send(answer);
+                        }
+                        (None, Err(e)) => mon.handled(&e),
+                        (None, Ok(_)) => {}
+                    }
+                }
+            }
+        }
+    }
+}
+
 async fn actor(
     mut core: EngineCore,
     registry: Registry,
     cfg: ShellConfig,
-    (mut rx, mut read_rx): (mpsc::Receiver<Cmd>, mpsc::Receiver<Read>),
+    (mut rx, mut read_rx, mut drain_rx): (
+        mpsc::Receiver<Cmd>,
+        mpsc::Receiver<Read>,
+        watch::Receiver<bool>,
+    ),
     mut mon: Monitor,
     writer: Writer,
-) {
+) -> StopReason {
     let mut ticker = tokio::time::interval(Duration::from_millis(cfg.tick_ms));
     let mut attempts: JoinSet<AttemptJoin> = JoinSet::new();
     let mut probes: JoinSet<ProbeJoin> = JoinSet::new();
@@ -791,7 +1007,7 @@ async fn actor(
                 let _ = reply.send(Err(EngineError::CommitFailed(err.clone())));
             }
             pipe.shutdown().await;
-            return;
+            return StopReason::Failed;
         }
         let (backlog_records, backlog_bytes) = pipe.backlog(&core);
         let accepting =
@@ -845,7 +1061,7 @@ async fn actor(
                 }
                 None => {
                     pipe.shutdown().await;
-                    return;
+                    return StopReason::Dropped;
                 }
             },
             read = read_rx.recv() => match read {
@@ -867,7 +1083,7 @@ async fn actor(
                 // Every handle is gone (the command channel closes with it).
                 None => {
                     pipe.shutdown().await;
-                    return;
+                    return StopReason::Dropped;
                 }
             },
             Some(Ok((run, step, outcome, permit))) = attempts.join_next() => {
@@ -926,6 +1142,27 @@ async fn actor(
             _ = ticker.tick() => {
                 let mut ex = exec!();
                 tick(&mut core, &mut ex);
+            }
+            () = drain_requested(&mut drain_rx) => {
+                let drained = drain(
+                    &mut core,
+                    &mut pipe,
+                    &mut status,
+                    (&mut rx, &mut read_rx),
+                    &mut pending_compaction,
+                    &mut mon,
+                )
+                .await;
+                // In-flight calls are abandoned (the JoinSets abort them on
+                // drop); their runs reconcile after a restart.
+                attempts.abort_all();
+                probes.abort_all();
+                pipe.shutdown().await;
+                return if drained {
+                    StopReason::Drained
+                } else {
+                    StopReason::Failed
+                };
             }
             () = scheduled(&mut compactor) => {
                 // Retention on a schedule; skipped while one is running.
@@ -1257,20 +1494,38 @@ mod tests {
     }
 
     /// Hangs mid-flight on its first call, answers every later one — the
-    /// shape of a worker killed between dispatch and reply.
+    /// shape of a worker killed between dispatch and reply. On that first
+    /// call it can freeze the engine's journal (free space to 0: nothing
+    /// more is journaled, the deadline sweep included) and say it was
+    /// called. Its probe is honest: the effect landed iff a call reached it.
     struct HangOnce {
         calls: Arc<std::sync::atomic::AtomicUsize>,
+        freeze: Option<Arc<std::sync::atomic::AtomicU64>>,
+        entered: Arc<tokio::sync::Notify>,
+    }
+    impl HangOnce {
+        fn new(calls: &Arc<std::sync::atomic::AtomicUsize>) -> Self {
+            Self {
+                calls: calls.clone(),
+                freeze: None,
+                entered: Arc::default(),
+            }
+        }
     }
     #[async_trait::async_trait]
     impl StepHandler for HangOnce {
         async fn execute(&self, _s: &StepSpec, _i: &[u8], _k: &str) -> Outcome {
             if self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+                if let Some(free) = &self.freeze {
+                    free.store(0, std::sync::atomic::Ordering::SeqCst);
+                }
+                self.entered.notify_one();
                 std::future::pending().await
             }
             Outcome::Checkpoint(b"ok".to_vec())
         }
         async fn probe(&self, _s: &StepSpec, _k: &str) -> bool {
-            true // reconcile finds the effect landed — never re-fires
+            self.calls.load(std::sync::atomic::Ordering::SeqCst) > 0
         }
     }
 
@@ -1372,45 +1627,80 @@ mod tests {
         panic!("run never reached state {kind}");
     }
 
+    /// Poll until the run is terminal, against a wall-clock deadline (not
+    /// a count of sleeps, which a loaded scheduler stretches).
+    async fn until_terminal_within(eng: &Engine, run: RunId, limit: Duration) -> RunState {
+        let deadline = tokio::time::Instant::now() + limit;
+        while tokio::time::Instant::now() < deadline {
+            if let Some(r) = eng.inspect(run).await.unwrap_or(None) {
+                if r.state.is_terminal() {
+                    return r.state;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        panic!("run never reached a terminal state within {limit:?}");
+    }
+
     /// kill -9 between dispatch and reply, then restart on the same
     /// journal: the orphaned Running attempt must reconcile — never sit
     /// `running` forever, and never blindly re-fire the remote call.
+    ///
+    /// Deterministic under load (review T2): the first engine is stopped
+    /// on the handler's own signal that it was called (not by catching a
+    /// 100 ms state window), its journal frozen at that moment so the
+    /// deadline sweep cannot move the run on first; the restart waits for
+    /// the first engine to release the journal (not a fixed sleep); and the
+    /// probe answers from whether the call happened (not always "found").
     #[tokio::test(flavor = "current_thread")]
     async fn restart_orphaned_running_run_reconciles() {
         let d = tempfile::tempdir().unwrap_or_else(|e| panic!("{e}"));
         let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let free = Arc::new(std::sync::atomic::AtomicU64::new(u64::MAX));
+        let probe_free = free.clone();
         let cfg = ShellConfig {
             tick_ms: 5,
             limits: fast_limits(),
             ..Default::default()
         };
+        let first = ShellConfig {
+            journal: JournalOptions {
+                space: durable_journal::SpaceProbe::new(move |_| {
+                    Ok(probe_free.load(std::sync::atomic::Ordering::SeqCst))
+                }),
+                ..JournalOptions::default()
+            },
+            ..cfg.clone()
+        };
         let run;
         {
+            let handler = HangOnce {
+                freeze: Some(free),
+                ..HangOnce::new(&calls)
+            };
+            let entered = handler.entered.clone();
             let mut reg = Registry::default();
-            reg.register(
-                "hang",
-                Arc::new(HangOnce {
-                    calls: calls.clone(),
-                }),
-            );
-            let eng = spawn(d.path(), reg, cfg.clone()).unwrap_or_else(|e| panic!("{e}"));
+            reg.register("hang", Arc::new(handler));
+            let eng = spawn(d.path(), reg, first).unwrap_or_else(|e| panic!("{e}"));
             run = eng
                 .submit(OperationKey("orphan-running".into()), spec1("hang"))
                 .await
                 .unwrap_or_else(|e| panic!("{e}"));
-            wait_state(&eng, run, "running").await;
+            // The call is in flight, so its dispatch is durable (D-014).
+            tokio::time::timeout(Duration::from_secs(30), entered.notified())
+                .await
+                .unwrap_or_else(|_| panic!("the handler was never called"));
+            let stopped = eng.on_stop();
             drop(eng); // the process dies mid-flight; the journal keeps Running
-            tokio::time::sleep(Duration::from_millis(50)).await; // actor exits, LOCK frees
+            tokio::time::timeout(Duration::from_secs(30), stopped)
+                .await
+                .unwrap_or_else(|_| panic!("the first engine never released the journal"));
         }
         let mut reg = Registry::default();
-        reg.register(
-            "hang",
-            Arc::new(HangOnce {
-                calls: calls.clone(),
-            }),
-        );
+        reg.register("hang", Arc::new(HangOnce::new(&calls)));
         let eng = spawn(d.path(), reg, cfg).unwrap_or_else(|e| panic!("{e}"));
-        assert!(matches!(until_done(&eng, run).await, RunState::Done));
+        let state = until_terminal_within(&eng, run, Duration::from_secs(30)).await;
+        assert!(matches!(state, RunState::Done), "{state:?}");
         assert_eq!(
             calls.load(std::sync::atomic::Ordering::SeqCst),
             1,
@@ -1447,8 +1737,11 @@ mod tests {
                 .await
                 .unwrap_or_else(|e| panic!("{e}"));
             wait_state(&eng, run, "reconciling").await;
+            let stopped = eng.on_stop();
             drop(eng); // probe#1 hangs forever — the crash window
-            tokio::time::sleep(Duration::from_millis(50)).await;
+            tokio::time::timeout(Duration::from_secs(30), stopped)
+                .await
+                .unwrap_or_else(|_| panic!("the first engine never released the journal"));
         }
         let mut reg = Registry::default();
         reg.register(
@@ -1950,6 +2243,91 @@ mod tests {
         assert_eq!(h.calls.load(SeqCst), 1);
     }
 
+    /// Review (still open): SIGTERM killed the process like a crash. A
+    /// drain answers what was already decided once its fsync returns,
+    /// refuses everything after, joins the writer, and loses nothing.
+    #[tokio::test]
+    async fn shutdown_drains_what_was_decided_and_refuses_the_rest() {
+        let d = tempfile::tempdir().unwrap_or_else(|e| panic!("{e}"));
+        let faults = Arc::new(Faults::default());
+        let eng = spawn(
+            d.path(),
+            echo_registry(),
+            piped(&faults, GroupCommit::default()),
+        )
+        .unwrap_or_else(|e| panic!("{e}"));
+        faults.hold_syncs();
+        let e = eng.clone();
+        let held = tokio::spawn(async move {
+            e.submit_at(OperationKey("held".into()), spec1("echo"), FAR)
+                .await
+        });
+        tokio::time::sleep(Duration::from_millis(30)).await; // its record is in the writer
+        let e = eng.clone();
+        let stop = tokio::spawn(async move { e.shutdown(Duration::from_secs(10)).await });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(
+            !stop.is_finished(),
+            "the drain waits for the covering fsync"
+        );
+        faults.release_syncs();
+        bounded(stop)
+            .await
+            .unwrap_or_else(|e| panic!("{e}"))
+            .unwrap_or_else(|e| panic!("drain: {e}"));
+        let run = bounded(held)
+            .await
+            .unwrap_or_else(|e| panic!("{e}"))
+            .unwrap_or_else(|e| panic!("the decided submit is acknowledged: {e}"));
+        assert!(matches!(
+            eng.submit_at(OperationKey("late".into()), spec1("echo"), FAR)
+                .await,
+            Err(EngineError::Stopped)
+        ));
+        let core = EngineCore::open(d.path()).unwrap_or_else(|e| panic!("the lock is free: {e}"));
+        assert!(core.run(run).is_some(), "the drained submit is durable");
+        assert_eq!(
+            core.runs().count(),
+            1,
+            "nothing after the drain was journaled"
+        );
+    }
+
+    /// Review (still open): the engine's replies were awaited with no
+    /// deadline, so a stuck fsync hung every request, reads included. A
+    /// caller now gets `Timeout` within the reply deadline; the stuck
+    /// submit may still commit later (its outcome was unknown, not
+    /// refused), and a retry with the same op_key finds it.
+    #[tokio::test]
+    async fn replies_have_a_deadline_while_the_journal_is_stuck() {
+        let d = tempfile::tempdir().unwrap_or_else(|e| panic!("{e}"));
+        let faults = Arc::new(Faults::default());
+        let cfg = ShellConfig {
+            reply_timeout: Duration::from_millis(300),
+            ..piped(&faults, GroupCommit::default())
+        };
+        let eng = spawn(d.path(), echo_registry(), cfg).unwrap_or_else(|e| panic!("{e}"));
+        let early = eng
+            .submit_at(OperationKey("early".into()), spec1("echo"), FAR)
+            .await
+            .unwrap_or_else(|e| panic!("{e}"));
+        faults.hold_syncs();
+        let r = bounded(eng.submit_at(OperationKey("stuck".into()), spec1("echo"), FAR)).await;
+        assert!(matches!(r, Err(EngineError::Timeout)), "{r:?}");
+        let r = bounded(eng.inspect(early)).await;
+        assert!(
+            matches!(r, Err(EngineError::Timeout)),
+            "a read waits on the stuck commit: {r:?}"
+        );
+        let r = bounded(eng.list(None, 10)).await;
+        assert!(matches!(r, Err(EngineError::Timeout)), "{r:?}");
+        faults.release_syncs();
+        let again = bounded(eng.submit_at(OperationKey("stuck".into()), spec1("echo"), FAR))
+            .await
+            .unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(again, RunId(2), "the timed-out submit committed once");
+    }
+
     /// Answers Lost once its gate opens; counts its probes (which find the
     /// effect).
     #[derive(Clone)]
@@ -2048,8 +2426,9 @@ mod tests {
         let diag = bounded(eng.diag()).await.unwrap_or_else(|e| panic!("{e}"));
         assert!(diag.largest_batch >= 50, "batch sizes: {diag:?}");
 
+        let stopped = eng.on_stop();
         drop(eng);
-        tokio::time::sleep(Duration::from_millis(50)).await;
+        bounded(stopped).await;
         let records = durable_journal::replay_dir(&durable_journal::gen_dir_path(d.path(), 1))
             .unwrap_or_else(|e| panic!("contiguous history replays: {e}"));
         let seqs: Vec<u64> = records.iter().map(|r| r.seq).collect();
@@ -2210,7 +2589,8 @@ mod tests {
 
     /// Reopen once the stopped engine's writer has released the lock.
     async fn reopen(dir: &Path) -> EngineCore {
-        for _ in 0..300 {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+        while tokio::time::Instant::now() < deadline {
             match EngineCore::open(dir) {
                 Ok(c) => return c,
                 Err(EngineError::Journal(JournalError::SecondWriter)) => {
@@ -2793,16 +3173,32 @@ mod tests {
             },
         )
         .unwrap_or_else(|e| panic!("{e}"));
-        // Flood a channel of capacity 1: submits either land or refuse —
-        // they never pile up unbounded, and nothing panics or hangs.
+        // Flood a channel of capacity 1 with 50 submits at once: each
+        // lands or is refused busy at once — they never pile up unbounded,
+        // and nothing panics or hangs. (On this single-threaded runtime the
+        // 50 tasks run before the actor drains the channel, so most are
+        // refused.)
+        let mut flood = tokio::task::JoinSet::new();
         for i in 0..50 {
-            match eng
-                .submit(OperationKey(format!("flood-{i}")), spec("none"))
-                .await
-            {
-                Ok(_) | Err(EngineError::Refused(_)) => {}
+            let eng = eng.clone();
+            flood.spawn(async move {
+                eng.submit(OperationKey(format!("flood-{i}")), spec("none"))
+                    .await
+            });
+        }
+        let (mut landed, mut busy) = (0, 0);
+        while let Some(r) = flood.join_next().await {
+            match r.unwrap_or_else(|e| panic!("{e}")) {
+                Ok(_) => landed += 1,
+                Err(EngineError::Refused(durable_domain::Refusal::ReserveExhausted)) => busy += 1,
                 Err(e) => panic!("{e}"),
             }
         }
+        assert_eq!(landed + busy, 50);
+        assert!(
+            busy >= 1,
+            "a full command channel must refuse, not queue ({landed} landed)"
+        );
+        assert!(landed >= 1, "the channel still admits what fits");
     }
 }

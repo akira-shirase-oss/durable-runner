@@ -71,18 +71,60 @@ struct Args {
     /// dispatch rate is at most 20 × this per second).
     #[arg(long, default_value_t = 64)]
     max_dispatch_per_tick: usize,
+    /// How long a submit, cancel or read waits for the engine before it is
+    /// answered 503 `timeout` (a stuck disk must not hang every request).
+    #[arg(long, default_value_t = 10_000)]
+    reply_timeout_ms: u64,
+    /// Serve reads (`GET /jobs`, `GET /jobs/{id}`) without a key. Refused
+    /// at startup unless `--listen` is a loopback address: anything that
+    /// can reach a non-loopback listener could read every op_key (D-037).
+    #[arg(long)]
+    open_reads: bool,
+    /// On SIGTERM or SIGINT: how long to let requests in flight finish,
+    /// and then how long the engine may take to make everything it
+    /// decided durable, before exiting non-zero instead of 0.
+    #[arg(long, default_value_t = 30)]
+    drain_timeout_secs: u64,
 }
 
 /// The environment variable holding the API key. Read from the
 /// environment, never from argv (argv is visible to every local user).
 const API_KEY_ENV: &str = "DURABLE_API_KEY";
+/// An optional second key that may only read (`GET /jobs`, `GET
+/// /jobs/{id}`): what the inspector or a dashboard should hold.
+const READ_KEY_ENV: &str = "DURABLE_READ_KEY";
 const MIN_API_KEY_LEN: usize = 32;
 /// Largest request body accepted on any route.
 const MAX_REQUEST_BYTES: usize = 256 * 1024;
 
+/// `name=URL`, where the URL is http or https with a host: the allowlist
+/// can only name HTTP endpoints.
 fn parse_handler(s: &str) -> Result<(String, String), String> {
     let (name, url) = s.split_once('=').ok_or("expected name=URL")?;
+    if name.is_empty() {
+        return Err("a handler needs a name before '='".into());
+    }
+    let parsed = reqwest::Url::parse(url).map_err(|e| format!("handler URL {url:?}: {e}"))?;
+    if !matches!(parsed.scheme(), "http" | "https") || parsed.host_str().is_none_or(str::is_empty) {
+        return Err(format!(
+            "handler URL {url:?} must be http:// or https:// with a host"
+        ));
+    }
     Ok((name.to_string(), url.to_string()))
+}
+
+/// The client every handler call goes through (D-039): it never follows a
+/// redirect (a 3xx is the handler's answer, a failed attempt, so a job's
+/// input and idempotency key go only to the registered URL), it ignores
+/// the proxy environment variables (nothing outside the allowlist can
+/// route calls), and it gives up connecting after 5 s.
+fn handler_client() -> Result<reqwest::Client> {
+    reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .no_proxy()
+        .connect_timeout(Duration::from_secs(5))
+        .build()
+        .context("build the handler HTTP client")
 }
 
 /// An allowlisted HTTP handler: POSTs `{input, idem_key}` to its URL and
@@ -194,36 +236,80 @@ fn sha256(bytes: &[u8]) -> [u8; 32] {
 struct App {
     engine: Engine,
     api_key: ApiKey,
+    /// A key that may only read; `None` if none is configured.
+    read_key: Option<ApiKey>,
+    /// Reads need no key (`--open-reads`, loopback listeners only).
+    open_reads: bool,
     /// Canonical backup directory; `None` disables `/admin/backup`.
     backup_root: Option<Arc<Path>>,
 }
 
+/// The bearer token a request carries: `<scheme> <token>`, the scheme
+/// case-insensitive (RFC 9110 §11.1), surrounding whitespace ignored.
+fn bearer(parts: &Parts) -> Option<&str> {
+    parts
+        .headers
+        .get(header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.trim().split_once(char::is_whitespace))
+        .and_then(|(scheme, token)| scheme.eq_ignore_ascii_case("bearer").then(|| token.trim()))
+}
+
+fn unauthorized() -> ApiError {
+    ApiError::new(
+        StatusCode::UNAUTHORIZED,
+        "unauthorized",
+        "missing or invalid API key (Authorization: Bearer <key>)",
+    )
+}
+
 /// Proof that the request carried the API key. Every mutating and admin
 /// handler takes this as its first extractor, so it runs before the body
-/// is parsed and the route cannot be reached without the key.
+/// is parsed and the route cannot be reached without the key. The
+/// read-only key is recognised and refused 403: it is valid, but not here.
 struct Authorized;
 
 impl FromRequestParts<App> for Authorized {
     type Rejection = ApiError;
 
     async fn from_request_parts(parts: &mut Parts, app: &App) -> Result<Self, Self::Rejection> {
-        // `<scheme> <token>`; the scheme is case-insensitive (RFC 9110
-        // §11.1) and surrounding whitespace is ignored.
-        let presented = parts
-            .headers
-            .get(header::AUTHORIZATION)
-            .and_then(|v| v.to_str().ok())
-            .and_then(|v| v.trim().split_once(char::is_whitespace))
-            .and_then(|(scheme, token)| {
-                scheme.eq_ignore_ascii_case("bearer").then(|| token.trim())
-            });
-        match presented {
-            Some(key) if app.api_key.verify(key) => Ok(Authorized),
-            _ => Err(ApiError::new(
-                StatusCode::UNAUTHORIZED,
-                "unauthorized",
-                "missing or invalid API key (Authorization: Bearer <key>)",
-            )),
+        let Some(key) = bearer(parts) else {
+            return Err(unauthorized());
+        };
+        if app.api_key.verify(key) {
+            return Ok(Authorized);
+        }
+        if app.read_key.as_ref().is_some_and(|k| k.verify(key)) {
+            return Err(ApiError::new(
+                StatusCode::FORBIDDEN,
+                "forbidden",
+                "this key may only read (DURABLE_READ_KEY); this route needs DURABLE_API_KEY",
+            ));
+        }
+        Err(unauthorized())
+    }
+}
+
+/// Proof that the request may read: the API key or the read-only key, or
+/// the server runs with `--open-reads` (loopback only). Taken first by
+/// every handler that shows runs (D-037).
+struct ReadAuthorized;
+
+impl FromRequestParts<App> for ReadAuthorized {
+    type Rejection = ApiError;
+
+    async fn from_request_parts(parts: &mut Parts, app: &App) -> Result<Self, Self::Rejection> {
+        if app.open_reads {
+            return Ok(ReadAuthorized);
+        }
+        match bearer(parts) {
+            Some(key)
+                if app.api_key.verify(key)
+                    || app.read_key.as_ref().is_some_and(|k| k.verify(key)) =>
+            {
+                Ok(ReadAuthorized)
+            }
+            _ => Err(unauthorized()),
         }
     }
 }
@@ -372,7 +458,15 @@ impl From<EngineError> for ApiError {
             EngineError::SnapshotOverBudget { .. } => {
                 Self::new(StatusCode::CONFLICT, "snapshot_over_budget", e.to_string())
             }
-            EngineError::Serde(_) | EngineError::Piped => Self::internal(&e),
+            EngineError::Timeout => Self::new(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "timeout",
+                "the engine did not answer in time; a submit may still commit, so retry with the \
+                 same op_key",
+            ),
+            EngineError::Serde(_) | EngineError::Piped | EngineError::Config(_) => {
+                Self::internal(&e)
+            }
         }
     }
 }
@@ -470,6 +564,7 @@ fn state_name(s: &RunState) -> String {
 }
 
 async fn inspect(
+    _: ReadAuthorized,
     State(app): State<App>,
     P(id): P<u64>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
@@ -510,6 +605,7 @@ struct ListQuery {
 }
 
 async fn list(
+    _: ReadAuthorized,
     State(app): State<App>,
     Q(q): Q<ListQuery>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
@@ -649,9 +745,11 @@ fn base64_decode(s: &str) -> Result<Vec<u8>, String> {
         .map_err(|e| e.to_string())
 }
 
-/// Every route. Reads (`/health`, `/ready`, `GET /jobs`, `GET /jobs/{id}`, the
-/// inspector) are open; every mutating and admin handler takes
-/// `Authorized`, so it is unreachable without the API key.
+/// Every route. `/health`, `/ready` and the inspector's static files are
+/// open (they show no runs). `GET /jobs` and `GET /jobs/{id}` take
+/// `ReadAuthorized` (either key, or `--open-reads`); every mutating and
+/// admin handler takes `Authorized`, so it is unreachable without the API
+/// key.
 fn router(app: App, ui_dir: Option<&Path>) -> Router {
     let mut router = Router::new()
         .route("/health", get(health))
@@ -667,14 +765,73 @@ fn router(app: App, ui_dir: Option<&Path>) -> Router {
         .layer(DefaultBodyLimit::max(MAX_REQUEST_BYTES))
         .with_state(app);
     if let Some(ui) = ui_dir {
-        router = router.nest_service(
-            "/inspector",
-            tower_http::services::ServeDir::new(ui)
-                .append_index_html_on_directories(true)
-                .not_found_service(tower_http::services::ServeFile::new(ui.join("index.html"))),
+        let csp = header::HeaderValue::from_str(&inspector_csp(ui)).unwrap_or(
+            header::HeaderValue::from_static("default-src 'none'; frame-ancestors 'none'"),
         );
+        let ui_routes = Router::new()
+            .nest_service(
+                "/inspector",
+                tower_http::services::ServeDir::new(ui)
+                    .append_index_html_on_directories(true)
+                    .not_found_service(tower_http::services::ServeFile::new(ui.join("index.html"))),
+            )
+            .layer(axum::middleware::map_response(move |mut res: Response| {
+                let csp = csp.clone();
+                async move {
+                    let h = res.headers_mut();
+                    h.insert(header::CONTENT_SECURITY_POLICY, csp);
+                    h.insert(
+                        header::X_CONTENT_TYPE_OPTIONS,
+                        header::HeaderValue::from_static("nosniff"),
+                    );
+                    h.insert(
+                        header::REFERRER_POLICY,
+                        header::HeaderValue::from_static("no-referrer"),
+                    );
+                    h.insert(
+                        header::X_FRAME_OPTIONS,
+                        header::HeaderValue::from_static("DENY"),
+                    );
+                    res
+                }
+            }));
+        router = router.merge(ui_routes);
     }
     router
+}
+
+/// The inspector's Content-Security-Policy: only its own files, and the
+/// inline bootstrap script SvelteKit writes into `index.html` by hash (no
+/// `'unsafe-inline'` scripts), calls to this origin only, no framing.
+fn inspector_csp(ui: &Path) -> String {
+    use base64::Engine as _;
+    let mut hashes = String::new();
+    match std::fs::read_to_string(ui.join("index.html")) {
+        Ok(html) => {
+            let mut rest = html.as_str();
+            while let Some(start) = rest.find("<script>") {
+                let body = &rest[start + "<script>".len()..];
+                let Some(end) = body.find("</script>") else {
+                    break;
+                };
+                let digest = sha256(&body.as_bytes()[..end]);
+                hashes.push_str(&format!(
+                    " 'sha256-{}'",
+                    base64::engine::general_purpose::STANDARD.encode(digest)
+                ));
+                rest = &body[end + "</script>".len()..];
+            }
+        }
+        Err(e) => eprintln!(
+            "durable-server: cannot read {}/index.html ({e}); the inspector will not run",
+            ui.display()
+        ),
+    }
+    format!(
+        "default-src 'none'; script-src 'self'{hashes}; style-src 'self' 'unsafe-inline'; \
+         img-src 'self' data:; font-src 'self'; connect-src 'self'; base-uri 'none'; \
+         form-action 'none'; frame-ancestors 'none'"
+    )
 }
 
 fn api_key_from_env() -> Result<ApiKey> {
@@ -688,6 +845,38 @@ fn api_key_from_env() -> Result<ApiKey> {
         anyhow::bail!("{API_KEY_ENV} must be at least {MIN_API_KEY_LEN} characters");
     }
     Ok(ApiKey::new(key.trim()))
+}
+
+/// The optional read-only key: at least as long as the API key, and not
+/// the same key (a read key that is also the admin key scopes nothing).
+fn read_key_from_env(api_key: &ApiKey) -> Result<Option<ApiKey>> {
+    let Ok(key) = std::env::var(READ_KEY_ENV) else {
+        return Ok(None);
+    };
+    let key = key.trim();
+    if key.len() < MIN_API_KEY_LEN {
+        anyhow::bail!("{READ_KEY_ENV} must be at least {MIN_API_KEY_LEN} characters");
+    }
+    if api_key.verify(key) {
+        anyhow::bail!("{READ_KEY_ENV} must differ from {API_KEY_ENV}");
+    }
+    Ok(Some(ApiKey::new(key)))
+}
+
+/// `--open-reads` is allowed only where nothing but this host can connect:
+/// a loopback IP address (a name such as `localhost` is not trusted to
+/// resolve to one).
+fn check_open_reads(listen: &str, open_reads: bool) -> Result<()> {
+    if !open_reads {
+        return Ok(());
+    }
+    match listen.parse::<std::net::SocketAddr>() {
+        Ok(a) if a.ip().is_loopback() => Ok(()),
+        _ => anyhow::bail!(
+            "--open-reads is allowed only on a loopback --listen (127.0.0.1 or [::1]); \
+             {listen} is reachable from elsewhere, so reads need DURABLE_API_KEY or DURABLE_READ_KEY"
+        ),
+    }
 }
 
 fn prepare_backup_root(dir: &Path) -> Result<Arc<Path>> {
@@ -708,6 +897,8 @@ fn prepare_backup_root(dir: &Path) -> Result<Arc<Path>> {
 async fn main() -> Result<()> {
     let args = Args::parse();
     let api_key = api_key_from_env()?;
+    let read_key = read_key_from_env(&api_key)?;
+    check_open_reads(&args.listen, args.open_reads)?;
     let backup_root = args
         .backup_root
         .as_deref()
@@ -723,6 +914,7 @@ async fn main() -> Result<()> {
         max_snapshot_bytes: args.max_snapshot_bytes,
         max_in_flight: args.max_in_flight.max(1),
         max_dispatch_per_tick: args.max_dispatch_per_tick.max(1),
+        reply_timeout: Duration::from_millis(args.reply_timeout_ms.max(1)),
         limits: durable_domain::Limits {
             max_live_runs: args.max_live_runs,
             max_index_bytes: args.max_index_bytes,
@@ -731,7 +923,7 @@ async fn main() -> Result<()> {
         ..Default::default()
     };
     let mut registry = Registry::default();
-    let client = reqwest::Client::new();
+    let client = handler_client()?;
     for (name, url) in &args.handlers {
         registry.register(
             name,
@@ -745,10 +937,19 @@ async fn main() -> Result<()> {
     }
     let engine =
         spawn(&args.journal, registry, cfg).map_err(|e| anyhow::anyhow!("engine open: {e}"))?;
+    if let Some(t) = engine.discarded_tail() {
+        eprintln!(
+            "durable-server: discarded a torn tail: {} bytes at offset {} (the log ended inside \
+             its last frame, which was never acknowledged)",
+            t.bytes, t.offset
+        );
+    }
     let stopped = engine.clone();
     let app = App {
         engine,
         api_key,
+        read_key,
+        open_reads: args.open_reads,
         backup_root,
     };
     let router = router(app, args.ui_dir.as_deref());
@@ -756,16 +957,73 @@ async fn main() -> Result<()> {
         .await
         .with_context(|| format!("bind {}", args.listen))?;
     eprintln!("durable-server listening on {}", args.listen);
+    let (stop_http, http_stopped) = tokio::sync::oneshot::channel::<()>();
+    let serve = axum::serve(listener, router)
+        .with_graceful_shutdown(async {
+            let _ = http_stopped.await;
+        })
+        .into_future();
+    tokio::pin!(serve);
     tokio::select! {
-        r = axum::serve(listener, router).into_future() => r?,
+        r = &mut serve => return r.context("serve"),
         () = stopped.closed() => {
             // The journal writer poisoned itself (a failed fsync is never
             // retried): exit non-zero so the supervisor restarts us and
             // startup replay decides what is durable.
             anyhow::bail!("engine stopped: journal writer poisoned; exiting so a restart replays");
         }
+        () = terminate() => {}
     }
+    // Drain (D-036): stop accepting, let requests in flight finish (each
+    // ack still waits for its fsync), then let the engine make everything
+    // it decided durable and release the journal. Exit 0 only if all of
+    // that happened; otherwise a restart replays, as after a crash.
+    eprintln!("durable-server: terminating: draining");
+    let limit = Duration::from_secs(args.drain_timeout_secs.max(1));
+    let _ = stop_http.send(());
+    match tokio::time::timeout(limit, &mut serve).await {
+        Ok(r) => r.context("serve")?,
+        Err(_) => eprintln!(
+            "durable-server: requests still open after {}s; closing them",
+            limit.as_secs()
+        ),
+    }
+    stopped
+        .shutdown(limit)
+        .await
+        .map_err(|e| anyhow::anyhow!("drain did not finish ({e}); a restart replays"))?;
+    eprintln!("durable-server: drained; exiting");
     Ok(())
+}
+
+/// Resolves on SIGTERM (a supervisor stopping us) or SIGINT (Ctrl-C).
+async fn terminate() {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{signal, SignalKind};
+        match signal(SignalKind::terminate()) {
+            Ok(mut term) => {
+                tokio::select! {
+                    _ = term.recv() => {}
+                    r = tokio::signal::ctrl_c() => {
+                        if r.is_err() {
+                            std::future::pending::<()>().await;
+                        }
+                    }
+                }
+            }
+            Err(e) => {
+                eprintln!("durable-server: cannot watch SIGTERM ({e}); only Ctrl-C drains");
+                if tokio::signal::ctrl_c().await.is_err() {
+                    std::future::pending::<()>().await;
+                }
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    if tokio::signal::ctrl_c().await.is_err() {
+        std::future::pending::<()>().await;
+    }
 }
 
 #[cfg(test)]
@@ -778,6 +1036,7 @@ mod tests {
     use tower::ServiceExt as _;
 
     const KEY: &str = "test-key-0123456789abcdef0123456789abcdef";
+    const READ_KEY: &str = "read-key-0123456789abcdef0123456789abcdef";
 
     struct Echo;
     #[async_trait::async_trait]
@@ -825,6 +1084,8 @@ mod tests {
         let app = App {
             engine,
             api_key: ApiKey::new(KEY),
+            read_key: Some(ApiKey::new(READ_KEY)),
+            open_reads: false,
             backup_root,
         };
         Harness {
@@ -904,7 +1165,7 @@ mod tests {
                 assert_eq!(v["code"], "unauthorized");
             }
         }
-        let (_, list) = call(&h.router, "GET", "/jobs", None, None).await;
+        let (_, list) = call(&h.router, "GET", "/jobs", Some(KEY), None).await;
         assert_eq!(list["runs"], json!([]), "refused submits journaled nothing");
         assert!(
             std::fs::read_dir(h.backups.path().join("root"))
@@ -916,7 +1177,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn the_key_is_accepted_and_reads_stay_open() {
+    async fn the_key_is_accepted_everywhere() {
         let h = harness(true);
         let (status, v) = call(
             &h.router,
@@ -928,14 +1189,121 @@ mod tests {
         .await;
         assert_eq!(status, StatusCode::OK, "{v}");
         assert_eq!(v["run_id"], 1);
-        let (status, _) = call(&h.router, "GET", "/jobs/1", None, None).await;
+        let (status, _) = call(&h.router, "GET", "/jobs/1", Some(KEY), None).await;
         assert_eq!(status, StatusCode::OK);
-        let (status, _) = call(&h.router, "GET", "/jobs", None, None).await;
+        let (status, _) = call(&h.router, "GET", "/jobs", Some(KEY), None).await;
         assert_eq!(status, StatusCode::OK);
         let (status, _) = call(&h.router, "GET", "/health", None, None).await;
         assert_eq!(status, StatusCode::OK);
         let (status, _) = call(&h.router, "GET", "/admin/diagnostics", Some(KEY), None).await;
         assert_eq!(status, StatusCode::OK);
+    }
+
+    /// Checklist (key scopes): the read-only key reads, and every
+    /// mutating and admin route refuses it 403 — a valid key, wrong scope.
+    #[tokio::test]
+    async fn the_read_key_reads_and_nothing_else() {
+        let h = harness(true);
+        let mut later = submit_body("k");
+        later["not_before"] = json!(9_999_999_999_999u64); // stays queued
+        let (status, _) = call(&h.router, "POST", "/jobs", Some(KEY), Some(later)).await;
+        assert_eq!(status, StatusCode::OK);
+        for uri in ["/jobs", "/jobs/1"] {
+            let (status, _) = call(&h.router, "GET", uri, Some(READ_KEY), None).await;
+            assert_eq!(status, StatusCode::OK, "GET {uri}");
+        }
+        let routes: [(&str, &str, Option<Value>); 5] = [
+            ("POST", "/jobs", Some(submit_body("r"))),
+            ("POST", "/jobs/1/cancel", None),
+            ("POST", "/admin/compact", None),
+            ("POST", "/admin/backup", Some(json!({ "name": "b" }))),
+            ("GET", "/admin/diagnostics", None),
+        ];
+        for (method, uri, body) in routes {
+            let (status, v) = call(&h.router, method, uri, Some(READ_KEY), body).await;
+            assert_eq!(
+                (status, v["code"].clone()),
+                (StatusCode::FORBIDDEN, json!("forbidden")),
+                "{method} {uri}"
+            );
+        }
+        let (_, v) = call(&h.router, "GET", "/jobs/1", Some(KEY), None).await;
+        assert_eq!(v["state"], "queued", "the read key cancelled nothing");
+    }
+
+    /// `--open-reads` serves reads without a key; it is refused at startup
+    /// unless the listen address is a loopback IP.
+    #[tokio::test]
+    async fn open_reads_are_loopback_only() {
+        for ok in ["127.0.0.1:58300", "[::1]:58300", "127.0.0.2:1"] {
+            check_open_reads(ok, true).unwrap_or_else(|e| panic!("{ok}: {e}"));
+        }
+        for bad in [
+            "0.0.0.0:58300",
+            "[::]:58300",
+            "10.0.0.5:58300",
+            "localhost:58300",
+        ] {
+            assert!(check_open_reads(bad, true).is_err(), "{bad}");
+            check_open_reads(bad, false).unwrap_or_else(|e| panic!("{bad}: {e}"));
+        }
+        let journal = tempfile::tempdir().unwrap_or_else(|e| panic!("{e}"));
+        let mut reg = Registry::default();
+        reg.register("step", Arc::new(Echo));
+        let engine =
+            spawn(journal.path(), reg, ShellConfig::default()).unwrap_or_else(|e| panic!("{e}"));
+        let r = router(
+            App {
+                engine,
+                api_key: ApiKey::new(KEY),
+                read_key: None,
+                open_reads: true,
+                backup_root: None,
+            },
+            None,
+        );
+        let (status, _) = call(&r, "GET", "/jobs", None, None).await;
+        assert_eq!(status, StatusCode::OK);
+        let (status, _) = call(&r, "POST", "/jobs", None, Some(submit_body("x"))).await;
+        assert_eq!(
+            status,
+            StatusCode::UNAUTHORIZED,
+            "writes still need the key"
+        );
+    }
+
+    /// Checklist P0: reads (`GET /jobs`, `GET /jobs/{id}`), which show every
+    /// op_key and state, were open on any listen address. They need the
+    /// key unless the server was started with `--open-reads` (loopback
+    /// only); liveness and readiness stay open.
+    #[tokio::test]
+    async fn reads_need_the_key_by_default() {
+        let h = harness(false);
+        let (status, _) = call(
+            &h.router,
+            "POST",
+            "/jobs",
+            Some(KEY),
+            Some(submit_body("r")),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        for uri in ["/jobs", "/jobs/1", "/jobs?order=desc&limit=5"] {
+            for key in [None, Some("wrong")] {
+                let (status, v) = call(&h.router, "GET", uri, key, None).await;
+                assert_eq!(
+                    (status, v["code"].clone()),
+                    (StatusCode::UNAUTHORIZED, json!("unauthorized")),
+                    "GET {uri} key={key:?}"
+                );
+            }
+            let (status, _) = call(&h.router, "GET", uri, Some(KEY), None).await;
+            assert_eq!(status, StatusCode::OK, "GET {uri} with the key");
+        }
+        for uri in ["/health", "/ready"] {
+            let (status, _) = call(&h.router, "GET", uri, None, None).await;
+            assert_eq!(status, StatusCode::OK, "{uri} stays open");
+        }
     }
 
     /// A backup goes only to `<backup-root>/<name>`: separators, `..`,
@@ -984,6 +1352,34 @@ mod tests {
             .path()
             .join("root/nightly-1/manifest.json")
             .exists());
+        // Checklist: a symlink planted under the root at a backup's name is
+        // an existing name (409), and nothing is written through it.
+        #[cfg(unix)]
+        {
+            let elsewhere = h.backups.path().join("elsewhere");
+            std::fs::create_dir(&elsewhere).unwrap_or_else(|e| panic!("{e}"));
+            std::os::unix::fs::symlink(&elsewhere, h.backups.path().join("root/planted"))
+                .unwrap_or_else(|e| panic!("{e}"));
+            let (status, v) = call(
+                &h.router,
+                "POST",
+                "/admin/backup",
+                Some(KEY),
+                Some(json!({ "name": "planted" })),
+            )
+            .await;
+            assert_eq!(
+                (status, v["code"].clone()),
+                (StatusCode::CONFLICT, json!("backup_exists"))
+            );
+            assert_eq!(
+                std::fs::read_dir(&elsewhere)
+                    .map(|d| d.count())
+                    .unwrap_or(1),
+                0,
+                "a backup was written through the symlink"
+            );
+        }
         let (status, v) = call(&h.router, "POST", "/admin/backup", Some(KEY), Some(ok)).await;
         assert_eq!(status, StatusCode::CONFLICT, "{v}");
         assert_eq!(v["code"], "backup_exists");
@@ -1106,13 +1502,13 @@ mod tests {
                 .filter_map(|r| r["id"].as_u64())
                 .collect()
         };
-        let (_, v) = call(&h.router, "GET", "/jobs?limit=2", None, None).await;
+        let (_, v) = call(&h.router, "GET", "/jobs?limit=2", Some(KEY), None).await;
         assert_eq!((ids(&v), v["next_after"].clone()), (vec![1, 2], json!(2)));
-        let (_, v) = call(&h.router, "GET", "/jobs?after=2&limit=2", None, None).await;
+        let (_, v) = call(&h.router, "GET", "/jobs?after=2&limit=2", Some(KEY), None).await;
         assert_eq!((ids(&v), v["next_after"].clone()), (vec![3, 4], json!(4)));
-        let (_, v) = call(&h.router, "GET", "/jobs?after=4&limit=2", None, None).await;
+        let (_, v) = call(&h.router, "GET", "/jobs?after=4&limit=2", Some(KEY), None).await;
         assert_eq!((ids(&v), v["next_after"].clone()), (vec![5], Value::Null));
-        let (status, v) = call(&h.router, "GET", "/jobs?limit=100000", None, None).await;
+        let (status, v) = call(&h.router, "GET", "/jobs?limit=100000", Some(KEY), None).await;
         assert_eq!(
             (status, ids(&v).len()),
             (StatusCode::OK, 5),
@@ -1144,13 +1540,20 @@ mod tests {
                 .filter_map(|r| r["id"].as_u64())
                 .collect()
         };
-        let (_, v) = call(&h.router, "GET", "/jobs?order=desc&limit=2", None, None).await;
+        let (_, v) = call(
+            &h.router,
+            "GET",
+            "/jobs?order=desc&limit=2",
+            Some(KEY),
+            None,
+        )
+        .await;
         assert_eq!((ids(&v), v["next_before"].clone()), (vec![5, 4], json!(4)));
         let (_, v) = call(
             &h.router,
             "GET",
             "/jobs?order=desc&before=4&limit=2",
-            None,
+            Some(KEY),
             None,
         )
         .await;
@@ -1159,7 +1562,7 @@ mod tests {
             &h.router,
             "GET",
             "/jobs?order=desc&before=2&limit=2",
-            None,
+            Some(KEY),
             None,
         )
         .await;
@@ -1213,7 +1616,7 @@ mod tests {
 
     fn http_handler(url: String) -> HttpHandler {
         HttpHandler {
-            client: reqwest::Client::new(),
+            client: handler_client().unwrap_or_else(|e| panic!("{e}")),
             url,
             timeout: Duration::from_secs(10),
             max_output: 1024,
@@ -1250,6 +1653,87 @@ mod tests {
         assert!(matches!(execute(&http_handler(url)).await, Outcome::Failed));
     }
 
+    /// A listener that answers every connection with `head` and counts
+    /// the connections it accepted.
+    async fn counting_handler(head: String) -> (String, Arc<std::sync::atomic::AtomicUsize>) {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .unwrap_or_else(|e| panic!("{e}"));
+        let addr = listener.local_addr().unwrap_or_else(|e| panic!("{e}"));
+        let seen = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let count = seen.clone();
+        tokio::spawn(async move {
+            while let Ok((mut sock, _)) = listener.accept().await {
+                count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let head = head.clone();
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 4096];
+                    let _ = sock.read(&mut buf).await;
+                    let _ = sock.write_all(head.as_bytes()).await;
+                });
+            }
+        });
+        (format!("http://{addr}/step"), seen)
+    }
+
+    /// Checklist: the handler client followed redirects, so a handler's
+    /// 307 re-POSTed the job's input and idempotency key to wherever it
+    /// pointed. A redirect is now an answer (a failed attempt), never
+    /// followed.
+    #[tokio::test]
+    async fn a_handler_redirect_is_not_followed() {
+        let ok = "HTTP/1.1 200 OK\r\ncontent-length: 2\r\n\r\n{}".to_string();
+        let (elsewhere, seen) = counting_handler(ok).await;
+        for code in [
+            "301 Moved Permanently",
+            "302 Found",
+            "307 Temporary Redirect",
+            "308 Permanent Redirect",
+        ] {
+            let head =
+                format!("HTTP/1.1 {code}\r\nlocation: {elsewhere}\r\ncontent-length: 0\r\n\r\n");
+            let (url, _) = counting_handler(head).await;
+            let h = http_handler(url);
+            assert!(matches!(execute(&h).await, Outcome::Failed), "{code}");
+            let step = StepSpec {
+                name: "s".into(),
+                handler: "h".into(),
+            };
+            assert!(
+                !h.probe(&step, "k/0").await,
+                "{code}: a redirected probe is not found"
+            );
+        }
+        assert_eq!(
+            seen.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "the redirect target was contacted"
+        );
+    }
+
+    /// Handler URLs must be http(s) with a host: a job can only ever reach
+    /// what the operator registered, over HTTP.
+    #[test]
+    fn handler_urls_must_be_http_or_https() {
+        for ok in [
+            "step=http://127.0.0.1:9/step",
+            "s=https://handlers.example/step",
+        ] {
+            parse_handler(ok).unwrap_or_else(|e| panic!("{ok}: {e}"));
+        }
+        for bad in [
+            "s=file:///etc/passwd",
+            "s=ftp://h/x",
+            "s=unix:/tmp/sock",
+            "s=http://",
+            "s=not a url",
+            "=http://h/x",
+        ] {
+            assert!(parse_handler(bad).is_err(), "{bad}");
+        }
+    }
+
     #[tokio::test]
     async fn reply_within_the_limit_is_checkpointed() {
         let url = raw_handler(
@@ -1270,6 +1754,131 @@ mod tests {
             args.compact_every_secs, 0,
             "scheduled compaction must be opt-in"
         );
+    }
+
+    /// Checklist: the inspector holds a key and renders op_keys. Its pages
+    /// are served with a CSP that allows only its own scripts (the inline
+    /// bootstrap by hash), no framing, nosniff and no referrer.
+    #[tokio::test]
+    async fn the_inspector_is_served_with_security_headers() {
+        let ui = tempfile::tempdir().unwrap_or_else(|e| panic!("{e}"));
+        let script = "\n\t\t\t\tconsole.log('boot');\n\t\t\t";
+        std::fs::write(
+            ui.path().join("index.html"),
+            format!("<!doctype html><html><body><script>{script}</script></body></html>"),
+        )
+        .unwrap_or_else(|e| panic!("{e}"));
+        std::fs::write(ui.path().join("app.js"), "export {}").unwrap_or_else(|e| panic!("{e}"));
+        let journal = tempfile::tempdir().unwrap_or_else(|e| panic!("{e}"));
+        let engine = spawn(journal.path(), Registry::default(), ShellConfig::default())
+            .unwrap_or_else(|e| panic!("{e}"));
+        let r = router(
+            App {
+                engine,
+                api_key: ApiKey::new(KEY),
+                read_key: None,
+                open_reads: false,
+                backup_root: None,
+            },
+            Some(ui.path()),
+        );
+        use base64::Engine as _;
+        let hash = base64::engine::general_purpose::STANDARD.encode(sha256(script.as_bytes()));
+        for uri in [
+            "/inspector/",
+            "/inspector/app.js",
+            "/inspector/runs/deep-link",
+        ] {
+            let res = r
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri(uri)
+                        .body(Body::empty())
+                        .unwrap_or_else(|e| panic!("{e}")),
+                )
+                .await
+                .unwrap_or_else(|e| panic!("{e}"));
+            // An unknown path gets the app shell (with ServeDir's 404).
+            assert!(
+                res.status().is_success() || uri.ends_with("deep-link"),
+                "{uri}"
+            );
+            let h = res.headers();
+            let get = |k: &str| {
+                h.get(k)
+                    .and_then(|v| v.to_str().ok())
+                    .unwrap_or("")
+                    .to_string()
+            };
+            assert_eq!(get("x-content-type-options"), "nosniff", "{uri}");
+            assert_eq!(get("referrer-policy"), "no-referrer", "{uri}");
+            let csp = get("content-security-policy");
+            for part in [
+                "default-src 'none'",
+                "frame-ancestors 'none'",
+                "connect-src 'self'",
+                &format!("script-src 'self' 'sha256-{hash}'"),
+            ] {
+                assert!(csp.contains(part), "{uri}: CSP {csp:?} lacks {part:?}");
+            }
+            let scripts = csp.split(';').find(|d| d.trim().starts_with("script-src"));
+            assert!(
+                scripts.is_some_and(|d| !d.contains("unsafe-inline")),
+                "{uri}: scripts must not be unsafe-inline: {csp}"
+            );
+        }
+    }
+
+    /// A full command channel is 503 `busy` (retry with the same op_key),
+    /// never a queue that grows.
+    #[test]
+    fn full_channel_refusal_is_503_busy() {
+        let e = ApiError::from(EngineError::Refused(
+            durable_domain::Refusal::ReserveExhausted,
+        ));
+        assert_eq!(
+            (e.status, e.code),
+            (StatusCode::SERVICE_UNAVAILABLE, "busy")
+        );
+    }
+
+    /// Checklist: the key is checked before the body is read. An
+    /// unauthenticated submit whose 250 KiB body never ends is refused 401
+    /// at once: the handler never waits on it.
+    #[tokio::test]
+    async fn an_unauthenticated_body_is_refused_unread() {
+        let h = harness(false);
+        let chunk = axum::body::Bytes::from(vec![b' '; 250 * 1024]);
+        let req = Request::builder()
+            .method("POST")
+            .uri("/jobs")
+            .header("content-type", "application/json")
+            .body(Body::new(Endless(Some(chunk))))
+            .unwrap_or_else(|e| panic!("{e}"));
+        let res = tokio::time::timeout(Duration::from_secs(5), h.router.clone().oneshot(req))
+            .await
+            .unwrap_or_else(|_| panic!("the server waited on an unauthenticated body"))
+            .unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    /// A request body that sends one chunk and then never ends.
+    struct Endless(Option<axum::body::Bytes>);
+
+    impl http_body::Body for Endless {
+        type Data = axum::body::Bytes;
+        type Error = std::io::Error;
+
+        fn poll_frame(
+            mut self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Option<Result<http_body::Frame<Self::Data>, Self::Error>>> {
+            match self.0.take() {
+                Some(b) => std::task::Poll::Ready(Some(Ok(http_body::Frame::data(b)))),
+                None => std::task::Poll::Pending,
+            }
+        }
     }
 
     #[test]
@@ -1332,6 +1941,8 @@ mod tests {
             App {
                 engine,
                 api_key: ApiKey::new(KEY),
+                read_key: None,
+                open_reads: false,
                 backup_root: None,
             },
             None,
@@ -1339,6 +1950,54 @@ mod tests {
         fail.store(true, std::sync::atomic::Ordering::SeqCst);
         let (status, v) = call(&r, "POST", "/jobs", Some(KEY), Some(submit_body("p"))).await;
         assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{v}");
+    }
+
+    /// Review (still open): with the journal's fsync stuck, every request
+    /// hung, open reads included. Submit and list answer 503 `timeout`
+    /// within the reply deadline instead.
+    #[tokio::test]
+    async fn a_stuck_journal_answers_503_timeout_within_the_deadline() {
+        let journal = tempfile::tempdir().unwrap_or_else(|e| panic!("{e}"));
+        let faults = Arc::new(durable_journal::faults::Faults::default());
+        let mut reg = Registry::default();
+        reg.register("step", Arc::new(Echo));
+        let cfg = ShellConfig {
+            tick_ms: 5,
+            reply_timeout: Duration::from_millis(300),
+            journal: durable_journal::JournalOptions {
+                faults: Some(faults.clone()),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let engine = spawn(journal.path(), reg, cfg).unwrap_or_else(|e| panic!("{e}"));
+        let r = router(
+            App {
+                engine,
+                api_key: ApiKey::new(KEY),
+                read_key: None,
+                open_reads: false,
+                backup_root: None,
+            },
+            None,
+        );
+        faults.hold_syncs();
+        let within = |f| tokio::time::timeout(Duration::from_secs(5), f);
+        let (status, v) = within(call(&r, "POST", "/jobs", Some(KEY), Some(submit_body("s"))))
+            .await
+            .unwrap_or_else(|_| panic!("submit hung"));
+        assert_eq!(
+            (status, v["code"].clone()),
+            (StatusCode::SERVICE_UNAVAILABLE, json!("timeout"))
+        );
+        let (status, v) = within(call(&r, "GET", "/jobs", Some(KEY), None))
+            .await
+            .unwrap_or_else(|_| panic!("list hung"));
+        assert_eq!(
+            (status, v["code"].clone()),
+            (StatusCode::SERVICE_UNAVAILABLE, json!("timeout"))
+        );
+        faults.release_syncs();
     }
 
     /// Auth schemes are case-insensitive (RFC 9110 §11.1), and the token
@@ -1372,12 +2031,12 @@ mod tests {
     #[tokio::test]
     async fn rejections_use_the_json_envelope() {
         let h = harness(false);
-        let (status, v) = call(&h.router, "GET", "/jobs?limit=-1", None, None).await;
+        let (status, v) = call(&h.router, "GET", "/jobs?limit=-1", Some(KEY), None).await;
         assert_eq!(
             (status, v["code"].clone()),
             (StatusCode::BAD_REQUEST, json!("bad_query"))
         );
-        let (status, v) = call(&h.router, "GET", "/jobs?after=abc", None, None).await;
+        let (status, v) = call(&h.router, "GET", "/jobs?after=abc", Some(KEY), None).await;
         assert_eq!(
             (status, v["code"].clone()),
             (StatusCode::BAD_REQUEST, json!("bad_query"))

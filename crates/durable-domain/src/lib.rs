@@ -207,6 +207,41 @@ pub enum Refusal {
 
 // -------------------------------------------------------------------- limits
 
+/// The widest a *stored* run may be (D-033). Stored runs — journal records
+/// and snapshots — are held to these when they are decoded, so a wider
+/// field is corruption, never an allocation. Steps and inputs have been
+/// admitted only up to these values since D0. Keys and names have been
+/// bounded only since D-013 (256 and 128 bytes), so their stored bound is
+/// wider: a run accepted before then must still load. Admission `Limits`
+/// may be tightened at will but never raised past these
+/// (`Limits::validate`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StoredBounds {
+    pub max_steps: u32,
+    pub max_input_bytes: usize,
+    pub max_key_bytes: usize,
+    pub max_name_bytes: usize,
+}
+
+pub const STORED: StoredBounds = StoredBounds {
+    max_steps: 64,
+    max_input_bytes: 64 * 1024,
+    max_key_bytes: 64 * 1024,
+    max_name_bytes: 64 * 1024,
+};
+
+impl StoredBounds {
+    /// Whether a stored run is within these bounds.
+    pub fn holds(&self, run: &Run) -> bool {
+        run.key.0.len() <= self.max_key_bytes
+            && run.spec.steps.len() <= self.max_steps as usize
+            && run.spec.input.len() <= self.max_input_bytes
+            && run.spec.steps.iter().all(|s| {
+                s.name.len() <= self.max_name_bytes && s.handler.len() <= self.max_name_bytes
+            })
+    }
+}
+
 /// Hard bounds on admission and execution (bounded everything).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Limits {
@@ -247,6 +282,25 @@ impl Default for Limits {
 }
 
 impl Limits {
+    /// Admission bounds may be tightened freely, but a run admitted past
+    /// the stored bounds would be refused when its snapshot is read back
+    /// (D-033): refuse such a configuration up front.
+    pub fn validate(&self) -> Result<(), String> {
+        let s = STORED;
+        if self.max_steps > s.max_steps
+            || self.max_input_bytes > s.max_input_bytes
+            || self.max_key_bytes > s.max_key_bytes
+            || self.max_name_bytes > s.max_name_bytes
+        {
+            return Err(format!(
+                "admission limits must stay within the stored bounds: at most {} steps, \
+                 {} input bytes, {} key bytes, {} name bytes",
+                s.max_steps, s.max_input_bytes, s.max_key_bytes, s.max_name_bytes
+            ));
+        }
+        Ok(())
+    }
+
     pub fn admits(&self, spec: &JobSpec) -> Result<(), Refusal> {
         let bad_name = |n: &str| n.is_empty() || n.len() > self.max_name_bytes;
         if spec.input.len() > self.max_input_bytes
@@ -767,6 +821,32 @@ mod tests {
         )
         .unwrap_or_else(|e| panic!("{e}"));
         assert!(matches!(s, RunState::RetryWaiting { attempt: 1, .. }));
+    }
+
+    #[test]
+    fn admission_limits_must_stay_within_the_stored_bounds() {
+        assert!(Limits::default().validate().is_ok());
+        let looser_key = Limits {
+            max_key_bytes: 1024, // looser than the default, within the stored bound
+            ..Limits::default()
+        };
+        assert!(looser_key.validate().is_ok());
+        for wide in [
+            Limits {
+                max_steps: STORED.max_steps + 1,
+                ..Limits::default()
+            },
+            Limits {
+                max_input_bytes: STORED.max_input_bytes + 1,
+                ..Limits::default()
+            },
+            Limits {
+                max_name_bytes: STORED.max_name_bytes + 1,
+                ..Limits::default()
+            },
+        ] {
+            assert!(wide.validate().is_err(), "{wide:?}");
+        }
     }
 
     #[test]

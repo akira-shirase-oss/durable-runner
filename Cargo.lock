@@ -272,8 +272,10 @@ dependencies = [
  "anyhow",
  "base64 0.22.1",
  "clap",
+ "durable-journal",
  "reqwest",
  "serde_json",
+ "tempfile",
  "tokio",
 ]
 
@@ -323,6 +325,7 @@ dependencies = [
  "durable-domain",
  "durable-engine",
  "durable-journal",
+ "http-body",
  "http-body-util",
  "reqwest",
  "ring",

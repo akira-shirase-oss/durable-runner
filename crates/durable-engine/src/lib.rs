@@ -59,6 +59,13 @@ pub enum EngineError {
     /// A compaction is already running; this request was not queued.
     #[error("a compaction is already running")]
     CompactionRunning,
+    /// The engine configuration is unusable (refused at spawn).
+    #[error("invalid configuration: {0}")]
+    Config(String),
+    /// The engine did not answer within the caller's deadline. The request
+    /// may still complete (a submit may commit): retry with the same key.
+    #[error("the engine did not answer in time")]
+    Timeout,
 }
 
 /// A journaled record: the run, the commit clock value, and the event.
@@ -98,6 +105,9 @@ pub struct Diagnostics {
     /// Superseded generations still on disk; retention deletes them after
     /// each successful compaction, so this stays 0 unless a delete failed.
     pub stale_generations: u32,
+    /// Bytes of an incomplete final frame the last startup discarded (a
+    /// torn tail, never acknowledged); 0 if the log ended cleanly.
+    pub discarded_tail_bytes: u64,
 }
 
 /// The index as snapshots before D-021 carried it (JSON, inputs as number
@@ -141,7 +151,7 @@ impl Pipe {
             .space
             .available(&self.root)
             .map_err(JournalError::SpaceProbe)?;
-        let need = 18 + payload.len() as u64; // frame header + payload
+        let need = (durable_journal::FRAME_HEADER_LEN + payload.len()) as u64;
         if available < self.reserve.saturating_add(need) {
             return Err(JournalError::NoSpace {
                 available,
@@ -214,6 +224,8 @@ pub struct EngineCore {
     /// so admission is O(1).
     live: usize,
     index_bytes: u64,
+    /// The torn tail the journal discarded when this core opened it.
+    discarded_tail: Option<durable_journal::TornTail>,
     pub limits: Limits,
     pub retry: RetryPolicy,
 }
@@ -235,6 +247,7 @@ impl EngineCore {
     pub fn open_with(dir: &Path, opts: JournalOptions) -> Result<Self, EngineError> {
         let journal = Journal::open_with(dir, opts)?;
         let generation = journal.generation();
+        let discarded_tail = journal.discarded_tail();
         let gdir = durable_journal::gen_dir_path(dir, generation);
         let mut core = Self {
             log: Log::Direct(journal),
@@ -243,6 +256,7 @@ impl EngineCore {
             next_run: 1,
             live: 0,
             index_bytes: 0,
+            discarded_tail,
             limits: Limits::default(),
             retry: RetryPolicy::default(),
         };
@@ -263,6 +277,15 @@ impl EngineCore {
                     core.install(next_run, runs);
                 } else {
                     let idx: LegacyIndex = serde_json::from_slice(&snap.payload)?;
+                    // No checksum here: hold every run to the stored bounds
+                    // the binary decoder applies (D-033).
+                    if let Some(r) = idx.runs.values().find(|r| !durable_domain::STORED.holds(r)) {
+                        return Err(JournalError::CorruptSnapshot(format!(
+                            "legacy snapshot: run {} is past the stored bounds",
+                            r.id.0
+                        ))
+                        .into());
+                    }
                     core.runs = idx
                         .runs
                         .into_iter()
@@ -772,7 +795,13 @@ impl EngineCore {
             largest_batch,
             largest_batch_bytes,
             stale_generations,
+            discarded_tail_bytes: self.discarded_tail.map_or(0, |t| t.bytes),
         }
+    }
+
+    /// The torn tail the journal discarded when this core opened it.
+    pub fn discarded_tail(&self) -> Option<durable_journal::TornTail> {
+        self.discarded_tail
     }
 
     /// Iterate the live index in id order (bounded by the index, never by
@@ -1251,6 +1280,53 @@ mod tests {
             .exists());
     }
 
+    /// A legacy `snapshot.json` has no checksum, so its runs are held to
+    /// the same stored bounds as the binary decoder's (checklist: crafted
+    /// sizes are refused, not loaded).
+    #[test]
+    fn legacy_snapshot_with_a_run_past_the_stored_bounds_is_refused() {
+        #[derive(Serialize)]
+        struct OldIndex {
+            runs: BTreeMap<RunId, Run>,
+            by_op: HashMap<OperationKey, RunId>,
+            next_run: u64,
+        }
+        let d = tempfile::tempdir().unwrap_or_else(|e| panic!("{e}"));
+        let mut wide = spec();
+        wide.steps = (0..durable_domain::STORED.max_steps + 1)
+            .map(|i| StepSpec {
+                name: format!("s{i}"),
+                handler: "noop".into(),
+            })
+            .collect();
+        let run = Run::accepted(RunId(7), OperationKey("legacy".into()), wide, 0);
+        let payload = serde_json::to_vec(&OldIndex {
+            runs: BTreeMap::from([(RunId(7), run)]),
+            by_op: HashMap::from([(OperationKey("legacy".into()), RunId(7))]),
+            next_run: 8,
+        })
+        .unwrap_or_else(|e| panic!("{e}"));
+        let g2 = durable_journal::gen_dir_path(d.path(), 2);
+        std::fs::create_dir_all(&g2).unwrap_or_else(|e| panic!("{e}"));
+        std::fs::write(g2.join("journal.log"), b"").unwrap_or_else(|e| panic!("{e}"));
+        let snap = durable_journal::Snapshot {
+            covered_seq: 0,
+            payload,
+        };
+        std::fs::write(
+            g2.join("snapshot.json"),
+            serde_json::to_vec(&snap).unwrap_or_else(|e| panic!("{e}")),
+        )
+        .unwrap_or_else(|e| panic!("{e}"));
+        std::fs::write(d.path().join("manifest.json"), "{\"generation\":2}")
+            .unwrap_or_else(|e| panic!("{e}"));
+        match EngineCore::open(d.path()) {
+            Err(EngineError::Journal(JournalError::CorruptSnapshot(_))) => {}
+            Err(e) => panic!("wrong error: {e}"),
+            Ok(_) => panic!("a run past the stored bounds was loaded"),
+        }
+    }
+
     /// The compaction view is consistent: a run changed after the plan was
     /// taken is copied, and the view still holds the state as planned.
     #[test]
@@ -1331,6 +1407,42 @@ mod tests {
             e.submit(OperationKey("n".repeat(300)), spec(), 2),
             Err(EngineError::Refused(Refusal::OverLimits))
         ));
+    }
+
+    /// Review T1, the reviewer's repro at engine level: 50 acknowledged
+    /// runs, then frame 26's length set past the end of the log. Startup
+    /// used to serve 25 of 50 and truncate the rest away; it must refuse
+    /// and leave every byte for a repair or a restore.
+    #[test]
+    fn damaged_frame_length_stops_startup_instead_of_dropping_runs() {
+        let (d, mut e) = open();
+        for i in 0..50 {
+            e.submit(OperationKey(format!("t1-{i}")), spec(), 0)
+                .unwrap_or_else(|e| panic!("{e}"));
+        }
+        drop(e);
+        let log = durable_journal::gen_dir_path(d.path(), 1).join("journal.log");
+        let mut bytes = std::fs::read(&log).unwrap_or_else(|e| panic!("{e}"));
+        let mut at = 0usize;
+        for _ in 0..25 {
+            let len =
+                u32::from_be_bytes([bytes[at + 2], bytes[at + 3], bytes[at + 4], bytes[at + 5]]);
+            at += durable_journal::FRAME_HEADER_LEN + len as usize;
+        }
+        let file_len = bytes.len() as u32;
+        for bad in [16 * 1024 * 1024 - 1, file_len] {
+            bytes[at + 2..at + 6].copy_from_slice(&bad.to_be_bytes());
+            std::fs::write(&log, &bytes).unwrap_or_else(|e| panic!("{e}"));
+            match EngineCore::open(d.path()) {
+                Err(EngineError::Journal(JournalError::Corrupt { seq: 26, .. })) => {}
+                Err(e) => panic!("wrong error: {e}"),
+                Ok(c) => panic!("started with {} of 50 runs", c.runs().count()),
+            }
+            assert!(
+                std::fs::read(&log).unwrap_or_else(|e| panic!("{e}")) == bytes,
+                "startup must not cut the log"
+            );
+        }
     }
 
     /// Review S2: a compacted generation whose snapshot is missing (a

@@ -3,6 +3,7 @@ name = "durable-journal"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+publish.workspace = true
 
 [dependencies]
 crc32fast = "1.4"

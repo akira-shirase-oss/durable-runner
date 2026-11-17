@@ -3,6 +3,7 @@ name = "durable-server"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+publish.workspace = true
 
 [dependencies]
 anyhow = "1"
@@ -22,6 +23,8 @@ tokio = { version = "1", features = ["macros", "net", "rt-multi-thread", "signal
 tower-http = { version = "0.6", features = ["fs"] }
 
 [dev-dependencies]
+durable-journal = { path = "../durable-journal", features = ["fault-injection"] }
+http-body = "1"
 http-body-util = "0.1"
 tempfile = "3"
 tokio = { version = "1", features = ["io-util"] }

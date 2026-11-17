@@ -2,7 +2,11 @@
 
 The second-developer path: from a fresh checkout to running, inspecting,
 backing up, and restoring a workflow. `examples/pilot/run.sh` performs
-this entire document as one script — it is the ship-gate rehearsal.
+this entire document as one script — it is the ship-gate rehearsal. It
+checks every step, exits non-zero on the first that fails, and takes its
+ports from `DURABLE_PILOT_PORT` (default 58330; the restored server uses
+that + 1, the pilot handler that - 10). `scripts/check.sh` is the whole
+gate, the same one CI runs (D-041).
 
 ## Build
 
@@ -79,20 +83,42 @@ target/release/durable-server \
   `snapshot.bin` stops startup (`snapshot is damaged`): restore from a
   backup.
 - **API key.** The server refuses to start without `DURABLE_API_KEY` (read
-  from the environment, never argv). Every mutating and admin route —
-  `POST /jobs`, `POST /jobs/{id}/cancel`, `POST /admin/compact`,
-  `POST /admin/backup`, `GET /admin/diagnostics` — needs
-  `Authorization: Bearer $DURABLE_API_KEY`, else `401 {"code":"unauthorized"}`.
-  Reads (`/health`, `GET /jobs`, `GET /jobs/{id}`, the inspector) are open.
-  The CLI sends the same variable; the inspector asks for it before cancel.
-  The pilot generates a fresh random key per run and exports it.
+  from the environment, never argv, at least 32 characters). Every
+  mutating and admin route — `POST /jobs`, `POST /jobs/{id}/cancel`,
+  `POST /admin/compact`, `POST /admin/backup`, `GET /admin/diagnostics` —
+  needs `Authorization: Bearer $DURABLE_API_KEY`, else `401
+  {"code":"unauthorized"}`.
+- **Reads need a key too** (D-037): `GET /jobs` and `GET /jobs/{id}` take
+  the API key or the optional read-only `DURABLE_READ_KEY` (at least 32
+  characters, different from the API key; it gets `403 forbidden` on
+  every other route). Give the inspector or a dashboard the read key, not
+  the admin key. `--open-reads` serves reads without a key, and is
+  refused at startup unless `--listen` is a loopback IP: never pass it
+  behind a reverse proxy, which makes loopback reachable. `/health`,
+  `/ready` and the inspector's static files are open. The CLI sends
+  `DURABLE_API_KEY` (reads fall back to `DURABLE_READ_KEY`); the
+  inspector asks for a key and sends it on every call. The pilot
+  generates a fresh random key per run and exports it.
 - **Backup root.** `--backup-root DIR` is the only place backups are
   written; without it `/admin/backup` answers `403 backups_disabled`.
 
-- `--handler name=URL` is the allowlist — repeatable; a submit naming a
-  handler outside it is refused 409 with `unregistered handler`.
+- **Stopping.** Send SIGTERM (or Ctrl-C). The server stops accepting,
+  lets requests in flight finish, makes everything it already decided
+  durable, releases the journal and exits 0; it exits non-zero if that
+  takes longer than `--drain-timeout-secs` (default 30, applied to the
+  requests and then to the engine), and a restart replays. Handler calls
+  in flight are abandoned and reconcile after the restart. Give the
+  supervisor at least twice the drain timeout (systemd
+  `TimeoutStopSec=70`).
+- `--handler name=URL` is the allowlist — repeatable, `http://` or
+  `https://` only; a submit naming a handler outside it is refused 409
+  with `unregistered handler`. Calls go only to that URL: redirects are
+  not followed (a 3xx fails the attempt) and the proxy environment
+  variables are ignored (D-039).
 - The journal directory is created on first run: `LOCK`, `manifest.json`,
-  `gen-00000N/{journal.log,snapshot.json}`. A second server on the same
+  `gen-00000N/{journal.log,snapshot.bin}`, owner-only (directories 0700,
+  files 0600; backups and restores too, D-038). Run the server as the
+  user that owns them. A second server on the same
   directory **fails startup** — the exclusive writer lock is held.
 - The inspector is at `http://127.0.0.1:58300/inspector/`: newest runs
   first, 50 per page, with newer/older controls.
@@ -131,6 +157,22 @@ the next attempt or the next server start removes.
 same run id, nothing re-executes. Cancel stops scheduling — it never
 undoes a remote effect already attempted.
 
+## Crash drills
+
+`perf/drill.py` kills the release server with SIGKILL, at random and
+right after compactions, backups and cancel bursts, while clients submit
+and cancel, then restarts it and checks that every acknowledged submit
+and cancel survived and that backups restore complete (D-042):
+
+```sh
+cargo build --release --locked -p durable-server -p durable-cli
+python3 -I perf/drill.py --rounds 20 --targeted 16 --clients 16 \
+  --out perf/results/<timestamp>-kill9-drill.json
+```
+
+It exits non-zero on any loss. `--port` (default 53400, and that + 1 for
+the restored server) moves it off ports in use.
+
 ## Restore
 
 ```sh
@@ -143,6 +185,14 @@ target/release/durable-server --journal data/restored --listen 127.0.0.1:58301 \
 The restored server replays snapshot + journal and rebuilds identical
 state — same run ids, same `finished_at`. Verified live by
 `examples/pilot/run.sh`.
+
+`restore` takes the target's journal lock for the whole copy, so it
+fails while a server runs on that directory, and no server can start on
+it half restored. It refuses a target that already holds a journal
+(move a damaged one aside first; it never merges two histories), and it
+copies only the backup's own regular files, refusing symlinks. An
+interrupted restore leaves generations without a manifest; a server
+refuses to start there, so remove the directory and restore again.
 
 ## What "honest" looks like in the output
 
@@ -166,7 +216,10 @@ state — same run ids, same `finished_at`. Verified live by
   `--reserve-bytes`, default 64 MiB, or a real ENOSPC — nothing was
   written), `unavailable` (free space could not be read), or
   `journal_unavailable` (a journal write failed and was rolled back, or
-  the writer is poisoned and the process is about to exit).
+  the writer is poisoned and the process is about to exit), or `timeout`
+  (the engine did not answer within `--reply-timeout-ms`, default 10 s,
+  e.g. a stuck disk; a submit may still commit, so retry with the same
+  `op_key`).
 - `GET /ready` — readiness, separate from `/health` (liveness): `503
   {"ready":false,"code":"no_space"}` while free space is below the
   reserve, `engine_stopped` once the engine has stopped. Point the load
@@ -183,3 +236,14 @@ state — same run ids, same `finished_at`. Verified live by
   of it was acknowledged. Run the server under a supervisor that restarts
   on failure (systemd `Restart=on-failure`) and startup replay recovers
   exactly the durable history.
+- Startup refused with `corrupt committed history at seq N: … (frame at
+  offset X)` — a committed frame is damaged (a header or payload
+  checksum, or a frame that does not fit the batch it was written in).
+  Nothing was cut: the log is exactly as found. Restore from a backup.
+  If the message ends `the damage lies inside the log's last batch` and
+  the host lost power, the damaged frames were in a batch whose fsync
+  had not returned, so none of them was acknowledged: copy the journal
+  aside, then truncate `journal.log` to offset X and start again.
+- `durable-server: discarded a torn tail: N bytes at offset X` at startup
+  — the log ended inside its last frame (a crash mid-write). That frame
+  was never acknowledged; every complete frame before it was kept.
