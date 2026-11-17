@@ -107,7 +107,8 @@ target/release/durable-server \
 - **Connections.** `--max-connections` (512) are served at once (keep
   it below `ulimit -n` less 64). A request head must arrive within
   `--header-timeout-ms` (10 s, idle keep-alive connections too), a body
-  within `--body-deadline-ms` (30 s), and each response write must make
+  within `--body-deadline-ms` (30 s; past it, `408 body_timeout`), and
+  each response write must make
   progress within `--write-stall-ms` (10 s). A connection gives at most
   `--max-requests-per-connection` (100) answers and lives at most
   `--max-connection-secs` (600) (D-045, D-049). What that proves, and no

@@ -744,7 +744,8 @@ convention; these seed the contract's prescribed directions.
     idle keep-alive connection, must arrive in time or the connection
     closes (hyper's `header_read_timeout` with a Tokio timer);
   - `--body-deadline-ms` (30 s): a whole request body, by tower-http's
-    `RequestBodyDeadline`, not reset by a trickle;
+    `RequestBodyDeadline`, not reset by a trickle; past it the answer is
+    `408 body_timeout` (it was 400, review V2);
   - graceful shutdown through hyper-util's `GracefulShutdown`, and every
     connection task in a `JoinSet`.
 

@@ -377,6 +377,13 @@ impl<T: serde::de::DeserializeOwned, S: Send + Sync> axum::extract::FromRequest<
     async fn from_request(req: axum::extract::Request, state: &S) -> Result<Self, Self::Rejection> {
         match Json::<T>::from_request(req, state).await {
             Ok(Json(v)) => Ok(J(v)),
+            // The body did not arrive within its deadline (D-045): a slow
+            // client, not a malformed request.
+            Err(r) if caused_by_body_deadline(&r) => Err(ApiError::new(
+                StatusCode::REQUEST_TIMEOUT,
+                "body_timeout",
+                "the request body did not arrive in time",
+            )),
             Err(r) => {
                 let status = r.status();
                 let code = match status {
@@ -388,6 +395,18 @@ impl<T: serde::de::DeserializeOwned, S: Send + Sync> axum::extract::FromRequest<
             }
         }
     }
+}
+
+/// Whether `e` (or anything it wraps) is the body deadline's timeout.
+fn caused_by_body_deadline(e: &(dyn std::error::Error + 'static)) -> bool {
+    let mut cur = Some(e);
+    while let Some(err) = cur {
+        if err.is::<tower_http::timeout::TimeoutError>() {
+            return true;
+        }
+        cur = err.source();
+    }
+    false
 }
 
 #[derive(Deserialize)]
@@ -2264,6 +2283,33 @@ mod tests {
             closed_within(&mut slow, Duration::from_secs(5)).await,
             "a stalled body held its connection"
         );
+    }
+
+    /// Review V2: a body cut off at its deadline was answered 400, as if it
+    /// were malformed. It is 408 `body_timeout`.
+    #[tokio::test]
+    async fn a_body_past_its_deadline_is_408() {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+        let limits = HttpLimits {
+            body_deadline: Duration::from_millis(300),
+            ..HttpLimits::default()
+        };
+        let (addr, _stop, _h) = serving(limits).await;
+        let mut slow = tokio::net::TcpStream::connect(addr)
+            .await
+            .unwrap_or_else(|e| panic!("{e}"));
+        let head = format!(
+            "POST /jobs HTTP/1.1\r\nhost: x\r\nauthorization: Bearer {KEY}\r\n\
+             content-type: application/json\r\ncontent-length: 1000\r\n\r\n{{\"op"
+        );
+        slow.write_all(head.as_bytes())
+            .await
+            .unwrap_or_else(|e| panic!("{e}"));
+        let mut reply = Vec::new();
+        let _ = tokio::time::timeout(Duration::from_secs(5), slow.read_to_end(&mut reply)).await;
+        let text = String::from_utf8_lossy(&reply);
+        assert!(text.starts_with("HTTP/1.1 408"), "{text}");
+        assert!(text.contains("\"code\":\"body_timeout\""), "{text}");
     }
 
     /// At most `max_connections` are served at once; the rest wait to be
