@@ -54,7 +54,17 @@ target/release/durable-server \
   `stale_generations` (0 unless a delete failed; the next compaction
   retries it). A compaction whose snapshot would exceed
   `--max-snapshot-bytes` (default 2 GiB) is refused `409
-  snapshot_over_budget` before anything is written. A damaged
+  snapshot_over_budget` before anything is written.
+- **Compaction stalls acks for as long as it writes.** The snapshot is
+  written by the journal writer itself, so appends queue behind it: every
+  submit, cancel and state change waits until the snapshot is written
+  and fsynced. The stall grows with the snapshot (about the live inputs
+  plus about 230 B per finished run). Measured on the development laptop
+  (not capacity): about 100 MiB of snapshot (100k live 1 KiB runs) took
+  0.10–0.35 s, and the longest submit during it waited 82–364 ms; about
+  820 MiB (800k runs) took 1.03 s, with a 934 ms submit. Schedule
+  compaction off-peak, or keep it manual, until the snapshot is written
+  on a helper thread (D-021, not built). A damaged
   `snapshot.bin` stops startup (`snapshot is damaged`): restore from a
   backup.
 - **API key.** The server refuses to start without `DURABLE_API_KEY` (read

@@ -144,6 +144,19 @@ convention; these seed the contract's prescribed directions.
      poisons and the process exits, and startup replay decides what is
      durable.
 
+  *Power loss inside a batch.* A batch is one write of many frames and one
+  fsync. If power fails before that fsync, the device may have persisted
+  any subset of the batch's blocks, not just a prefix. For example frames
+  k and k+2 may land while k+1 does not. Replay then finds a
+  complete-looking frame with a bad checksum or the wrong sequence number
+  before the tail and refuses `Corrupt`, so startup stops and needs a
+  manual repair (truncate the log at the first bad frame). No
+  acknowledged record is affected, because nothing in an unsynced batch
+  was acknowledged. Group commit widens the window from one frame to one
+  batch. Recording batch boundaries so replay could tell this apart from
+  real corruption is not built. Process death (kill -9, OOM) cannot cause
+  it: the kernel keeps every written byte.
+
   *The rules any batching (group commit) must keep*, tested one by one:
   (a) nothing a record decides (ack, read answer, handler call, probe)
   leaves the process before the fsync that covers it returns. Memory may
