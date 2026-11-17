@@ -361,6 +361,7 @@ impl Default for ShellConfig {
 /// except through it.
 pub fn spawn(dir: &Path, registry: Registry, mut cfg: ShellConfig) -> Result<Engine, EngineError> {
     cfg.group_commit = cfg.group_commit.clamped();
+    cfg.limits.validate().map_err(EngineError::Config)?;
     let mut core = EngineCore::open_with(dir, cfg.journal.clone())?;
     core.limits = cfg.limits;
     let discarded_tail = core.discarded_tail();

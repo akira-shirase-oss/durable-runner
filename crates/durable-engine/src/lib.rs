@@ -59,6 +59,9 @@ pub enum EngineError {
     /// A compaction is already running; this request was not queued.
     #[error("a compaction is already running")]
     CompactionRunning,
+    /// The engine configuration is unusable (refused at spawn).
+    #[error("invalid configuration: {0}")]
+    Config(String),
 }
 
 /// A journaled record: the run, the commit clock value, and the event.
@@ -270,6 +273,15 @@ impl EngineCore {
                     core.install(next_run, runs);
                 } else {
                     let idx: LegacyIndex = serde_json::from_slice(&snap.payload)?;
+                    // No checksum here: hold every run to the stored bounds
+                    // the binary decoder applies (D-033).
+                    if let Some(r) = idx.runs.values().find(|r| !durable_domain::STORED.holds(r)) {
+                        return Err(JournalError::CorruptSnapshot(format!(
+                            "legacy snapshot: run {} is past the stored bounds",
+                            r.id.0
+                        ))
+                        .into());
+                    }
                     core.runs = idx
                         .runs
                         .into_iter()
@@ -1262,6 +1274,53 @@ mod tests {
         assert!(durable_journal::gen_dir_path(d.path(), 3)
             .join("snapshot.bin")
             .exists());
+    }
+
+    /// A legacy `snapshot.json` has no checksum, so its runs are held to
+    /// the same stored bounds as the binary decoder's (checklist: crafted
+    /// sizes are refused, not loaded).
+    #[test]
+    fn legacy_snapshot_with_a_run_past_the_stored_bounds_is_refused() {
+        #[derive(Serialize)]
+        struct OldIndex {
+            runs: BTreeMap<RunId, Run>,
+            by_op: HashMap<OperationKey, RunId>,
+            next_run: u64,
+        }
+        let d = tempfile::tempdir().unwrap_or_else(|e| panic!("{e}"));
+        let mut wide = spec();
+        wide.steps = (0..durable_domain::STORED.max_steps + 1)
+            .map(|i| StepSpec {
+                name: format!("s{i}"),
+                handler: "noop".into(),
+            })
+            .collect();
+        let run = Run::accepted(RunId(7), OperationKey("legacy".into()), wide, 0);
+        let payload = serde_json::to_vec(&OldIndex {
+            runs: BTreeMap::from([(RunId(7), run)]),
+            by_op: HashMap::from([(OperationKey("legacy".into()), RunId(7))]),
+            next_run: 8,
+        })
+        .unwrap_or_else(|e| panic!("{e}"));
+        let g2 = durable_journal::gen_dir_path(d.path(), 2);
+        std::fs::create_dir_all(&g2).unwrap_or_else(|e| panic!("{e}"));
+        std::fs::write(g2.join("journal.log"), b"").unwrap_or_else(|e| panic!("{e}"));
+        let snap = durable_journal::Snapshot {
+            covered_seq: 0,
+            payload,
+        };
+        std::fs::write(
+            g2.join("snapshot.json"),
+            serde_json::to_vec(&snap).unwrap_or_else(|e| panic!("{e}")),
+        )
+        .unwrap_or_else(|e| panic!("{e}"));
+        std::fs::write(d.path().join("manifest.json"), "{\"generation\":2}")
+            .unwrap_or_else(|e| panic!("{e}"));
+        match EngineCore::open(d.path()) {
+            Err(EngineError::Journal(JournalError::CorruptSnapshot(_))) => {}
+            Err(e) => panic!("wrong error: {e}"),
+            Ok(_) => panic!("a run past the stored bounds was loaded"),
+        }
     }
 
     /// The compaction view is consistent: a run changed after the plan was

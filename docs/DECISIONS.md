@@ -484,3 +484,20 @@ convention; these seed the contract's prescribed directions.
   by restoring a backup taken before the upgrade. Frame headers start
   with a 0x00 byte and the engine's JSON payloads never contain one, so
   the forward check finds no false frames inside a payload.
+- **D-033 — Stored runs are held to stored bounds when decoded.** The
+  streaming snapshot decoder (D-028) bounded each count and length only by
+  the bytes left. Each `StepSpec` is 48 bytes in memory and 8 or more on
+  disk, so one corrupted step count could reserve about 6 times the rest
+  of the file; keys and names could be as long as the file. The checksum
+  is verified after decoding, so random damage reaches that code. Now
+  `durable_domain::STORED` names the widest a stored run may be: 64
+  steps and 64 KiB of input (admission has never allowed more, since
+  D0), and 64 KiB keys and names. Keys and names get a wider bound than
+  admission's 256 and 128 bytes because those bounds date only from
+  D-013: a run accepted before them, or under a looser configured bound,
+  must still load (`existing_over_long_key_still_deduplicates`). The
+  decoder refuses any field past these before allocating for it, and a
+  legacy `snapshot.json` (which has no checksum) has every run checked
+  against the same bounds. `Limits::validate` refuses, at spawn,
+  admission limits looser than the stored bounds, so the engine can never
+  accept a run that its own snapshot would refuse.

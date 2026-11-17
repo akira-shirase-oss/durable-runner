@@ -372,7 +372,9 @@ impl From<EngineError> for ApiError {
             EngineError::SnapshotOverBudget { .. } => {
                 Self::new(StatusCode::CONFLICT, "snapshot_over_budget", e.to_string())
             }
-            EngineError::Serde(_) | EngineError::Piped => Self::internal(&e),
+            EngineError::Serde(_) | EngineError::Piped | EngineError::Config(_) => {
+                Self::internal(&e)
+            }
         }
     }
 }

@@ -186,12 +186,19 @@ impl<R: Read> Src<'_, R> {
     fn u64(&mut self) -> Result<u64, String> {
         Ok(u64::from_be_bytes(self.fixed()?))
     }
-    fn bytes(&mut self) -> Result<Vec<u8>, String> {
+    /// A length-prefixed field of at most `max` bytes (and never more than
+    /// is left): a longer length is refused before anything is allocated.
+    fn bytes(&mut self, max: usize, what: &str) -> Result<Vec<u8>, String> {
         let n = self.u32()? as usize;
+        if n > max {
+            return Err(format!(
+                "{what} of {n} bytes is over the stored bound {max}"
+            ));
+        }
         self.take(n)
     }
-    fn string(&mut self) -> Result<String, String> {
-        String::from_utf8(self.bytes()?).map_err(|_| "string is not UTF-8".to_string())
+    fn string(&mut self, max: usize, what: &str) -> Result<String, String> {
+        String::from_utf8(self.bytes(max, what)?).map_err(|_| format!("{what} is not UTF-8"))
     }
 }
 
@@ -225,22 +232,33 @@ pub fn decode_from(r: &mut impl Read, len: u64) -> Result<Decoded, String> {
     if count > c.left / 26 {
         return Err(format!("{count} runs cannot fit in {} bytes", c.left));
     }
+    // Every count and length is held to the stored bounds as well as to
+    // the bytes left (D-033): the checksum is verified only after decoding,
+    // so a corrupted field reaches here, and must cost no more than a
+    // valid one could.
+    let b = durable_domain::STORED;
     let mut runs = BTreeMap::new();
     for _ in 0..count {
         let id = RunId(c.u64()?);
-        let key = OperationKey(c.string()?);
+        let key = OperationKey(c.string(b.max_key_bytes, "key")?);
         let version = c.u32()?;
-        let n_steps = c.u32()? as u64;
-        if n_steps > c.left / 8 {
+        let n_steps = c.u32()?;
+        if n_steps > b.max_steps {
+            return Err(format!(
+                "{n_steps} steps is over the stored bound {}",
+                b.max_steps
+            ));
+        }
+        if u64::from(n_steps) > c.left / 8 {
             return Err(format!("{n_steps} steps cannot fit"));
         }
         let mut steps = Vec::with_capacity(n_steps as usize);
         for _ in 0..n_steps {
-            let name = c.string()?;
-            let handler = c.string()?;
+            let name = c.string(b.max_name_bytes, "step name")?;
+            let handler = c.string(b.max_name_bytes, "handler name")?;
             steps.push(StepSpec { name, handler });
         }
-        let input = c.bytes()?;
+        let input = c.bytes(b.max_input_bytes, "input")?;
         let state = match c.u8()? {
             0 => RunState::Queued {
                 next_run_at: c.u64()?,
@@ -399,6 +417,63 @@ mod tests {
         let a: Vec<Run> = whole.1.values().map(|r| (**r).clone()).collect();
         let b: Vec<Run> = streamed.1.values().map(|r| (**r).clone()).collect();
         assert_eq!(a, b);
+    }
+
+    fn wide(steps: usize, key: usize, name: usize, input: usize) -> Arc<Run> {
+        Arc::new(Run {
+            id: RunId(1),
+            key: OperationKey("k".repeat(key)),
+            spec: JobSpec {
+                version: 1,
+                steps: (0..steps)
+                    .map(|_| StepSpec {
+                        name: "n".repeat(name),
+                        handler: "h".into(),
+                    })
+                    .collect(),
+                input: vec![7; input],
+            },
+            state: RunState::Queued { next_run_at: 0 },
+            finished_at: None,
+        })
+    }
+
+    /// Review T3: the decoder bounded counts and lengths only by the bytes
+    /// left, so one corrupted step count could reserve about 6 × the rest
+    /// of the file, and a key or name could be as long as the file. Every
+    /// count and length is now held to the stored bounds as well: a run
+    /// past them is refused, never allocated for.
+    #[test]
+    fn runs_wider_than_the_stored_bounds_are_refused() {
+        let b = durable_domain::STORED;
+        let cases = [
+            ("steps", wide(b.max_steps as usize + 1, 1, 1, 0)),
+            ("key", wide(1, b.max_key_bytes + 1, 1, 0)),
+            ("name", wide(1, 1, b.max_name_bytes + 1, 0)),
+            ("input", wide(1, 1, 1, b.max_input_bytes + 1)),
+        ];
+        for (what, run) in cases {
+            let v = View {
+                next_run: 2,
+                runs: vec![run],
+            };
+            let mut out = Vec::new();
+            encode(&v, &mut out).unwrap_or_else(|e| panic!("{e}"));
+            assert!(decode(&out).is_err(), "a run over the {what} bound decoded");
+        }
+        // At the bounds exactly, a run still decodes.
+        let v = View {
+            next_run: 2,
+            runs: vec![wide(
+                b.max_steps as usize,
+                b.max_key_bytes,
+                b.max_name_bytes,
+                b.max_input_bytes,
+            )],
+        };
+        let mut out = Vec::new();
+        encode(&v, &mut out).unwrap_or_else(|e| panic!("{e}"));
+        decode(&out).unwrap_or_else(|e| panic!("at the bounds: {e}"));
     }
 
     /// Every truncation and every flipped tag is refused, never misread.
