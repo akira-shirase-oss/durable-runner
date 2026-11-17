@@ -26,8 +26,8 @@ const args = Object.fromEntries(
 const scenario = process.argv[2];
 const ROOT = path.resolve(import.meta.dirname, '..');
 const SRV = `${ROOT}/target/release/durable-server`;
-const PORT = Number(args.port ?? 58400);
-const HPORT = Number(args.hport ?? 58401);
+const PORT = Number(args.port ?? 53340); // not 58400: that is Service Monitor's default port, and a harness must never collide with a running monitor
+const HPORT = Number(args.hport ?? 53341);
 const API = `http://127.0.0.1:${PORT}`;
 const INPUT_B64 = Buffer.from('load').toString('base64');
 // Mutating and admin routes need the API key; the spawned server reads it
