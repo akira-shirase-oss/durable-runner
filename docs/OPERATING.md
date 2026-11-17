@@ -268,3 +268,32 @@ refuses to start there, so remove the directory and restore again.
   whole of that batch, from its first frame at X, was dropped: its fsync
   never returned, so none of it was acknowledged (D-043). Every earlier
   batch was kept.
+
+## Known limits
+
+What this server does not do, so the deployment must (or must not rely on
+it):
+
+- **Exposure.** It caps connections and times heads and bodies (D-045),
+  but has no TLS, per-client rate limit or per-address connection cap.
+  For any non-local exposure, put a reverse proxy in front that does.
+  Never combine a proxy with `--open-reads`.
+- **Handler calls are unsigned.** A handler cannot tell a call came from
+  this runner except by network placement (D-039); keep handlers on a
+  private network.
+- **One op_key, one run.** Resubmitting an op_key returns its first run
+  even if the spec differs; there is no 409 for a changed spec.
+- **Keys.** One API key and one optional read-only key, read at startup:
+  rotating either needs a restart, and there is no cancel-only scope.
+- **Reads have no rate limit.** A key holder can fill the read queue
+  (bounded: 503 `busy`), never the write queue.
+- **Power loss inside the last batch** with the file's length on disk
+  stops startup (the batch cannot be told apart from damage); restore a
+  backup (see "What honest looks like" above for the one lossy repair).
+- **v1 logs.** A damaged length in the *last* frame of a log that holds
+  only v1 frames (written before D-032) still reads as a torn tail and
+  costs that one record. The window closes at the first v2 append.
+- **Compaction stalls acks** for as long as it writes (D-021), and is
+  opt-in for that reason.
+- **One host.** No replication or failover; durability is this disk's
+  fsync. Backups are the recovery path.
