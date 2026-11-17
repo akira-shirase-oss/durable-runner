@@ -1302,6 +1302,12 @@ pub fn sweep_partial_backups(root: &Path) -> Result<usize, JournalError> {
 /// backup's own regular files are copied — a symlink or special file in it
 /// is refused, never followed.
 pub fn restore_backup(from: &Path, to: &Path) -> Result<(), JournalError> {
+    restore_with(from, to, &|| {})
+}
+
+/// `restore_backup`, calling `mid_copy` once the files are copied and
+/// before anything is published (tests open the target there).
+fn restore_with(from: &Path, to: &Path, mid_copy: &dyn Fn()) -> Result<(), JournalError> {
     let manifest = from.join("manifest.json");
     match fs::symlink_metadata(&manifest) {
         Ok(m) if m.file_type().is_file() => {}
@@ -1334,6 +1340,7 @@ pub fn restore_backup(from: &Path, to: &Path) -> Result<(), JournalError> {
         }
     }
     let copied = copy_and_verify(from, to, generation, &list);
+    mid_copy();
     if let Err(e) = copied {
         // Nothing was published: take back what was copied, so the target
         // holds no generation a later restore or open would trip on.
@@ -2603,6 +2610,50 @@ mod tests {
             !gen_dir_path(&root, 1).exists(),
             "open recreated the generation"
         );
+    }
+
+    /// Review U4: the restore lock was unproven (with it removed, every
+    /// restore test still passed, because a live journal already has a
+    /// manifest). A server holding an *empty* target's lock refuses the
+    /// restore; and a server that tries to open the target while a restore
+    /// is copying into it is refused, so it never starts on half a journal.
+    #[test]
+    fn the_restore_lock_keeps_servers_out_and_restores_out_of_servers() {
+        let d = tempfile::tempdir().unwrap_or_else(|e| panic!("{e}"));
+        let backup = backup_of_three(d.path());
+        let held = d.path().join("held");
+        fs::create_dir(&held).unwrap_or_else(|e| panic!("{e}"));
+        let lock = File::create(held.join("LOCK")).unwrap_or_else(|e| panic!("{e}"));
+        fs2::FileExt::try_lock_exclusive(&lock).unwrap_or_else(|e| panic!("{e}"));
+        assert!(
+            matches!(
+                restore_backup(&backup, &held),
+                Err(JournalError::SecondWriter)
+            ),
+            "restored into a directory a server holds"
+        );
+        assert!(
+            !gen_dir_path(&held, 1).exists(),
+            "copied into a held directory"
+        );
+        drop(lock);
+
+        let to = d.path().join("to");
+        let opened = std::cell::Cell::new(None);
+        restore_with(&backup, &to, &|| {
+            opened.set(Some(matches!(
+                Journal::open(&to),
+                Err(JournalError::SecondWriter)
+            )));
+        })
+        .unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(
+            opened.get(),
+            Some(true),
+            "a server opened the target mid-restore"
+        );
+        let j = Journal::open(&to).unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(j.records_written(), 3);
     }
 
     /// A gen-1 journal whose log holds exactly `bytes` (hand-framed).
