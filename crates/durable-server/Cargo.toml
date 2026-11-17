@@ -26,7 +26,8 @@ tower-http = { version = "0.7", features = ["fs", "timeout"] }
 # Served directly (not axum::serve) for a header timeout, a connection cap
 # and graceful shutdown (D-045). Both are already in the graph via axum.
 hyper = { version = "1", features = ["server", "http1"] }
-hyper-util = { version = "0.1", features = ["server", "http1", "tokio", "service", "server-graceful"] }
+hyper-util = { version = "0.1", features = ["server", "http1", "tokio"] }
+tower = { version = "0.5", default-features = false, features = ["util"] }
 
 [dev-dependencies]
 durable-journal = { path = "../durable-journal", features = ["fault-injection"] }

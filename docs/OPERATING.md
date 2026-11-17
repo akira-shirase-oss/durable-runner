@@ -105,13 +105,18 @@ target/release/durable-server \
   written; without it `/admin/backup` answers `403 backups_disabled`.
 
 - **Connections.** `--max-connections` (512) are served at once (keep
-  it below `ulimit -n` less 64); a request head must arrive within
-  `--header-timeout-ms` (10 s, idle keep-alive connections too) and a
-  body within `--body-deadline-ms` (30 s) (D-045). That bounds one host's
-  worth of slow clients; it is not a defence on the open internet. For
-  any non-local exposure put a reverse proxy in front that terminates
-  TLS, rate-limits per client, caps connections per client address, and
-  limits slow responses.
+  it below `ulimit -n` less 64). A request head must arrive within
+  `--header-timeout-ms` (10 s, idle keep-alive connections too), a body
+  within `--body-deadline-ms` (30 s), and each response write must make
+  progress within `--write-stall-ms` (10 s). A connection gives at most
+  `--max-requests-per-connection` (100) answers and lives at most
+  `--max-connection-secs` (600) (D-045, D-049). What that proves, and no
+  more: a slow or non-reading client holds a slot for at most one of
+  those limits, then the slot frees. It does not stop many clients
+  holding every slot for that long, and nothing here is per client
+  address. For any non-local exposure, put a reverse proxy in front that
+  terminates TLS, rate-limits per client, caps connections per client
+  address, and buffers or times out slow responses.
 - **Stopping.** Send SIGTERM (or Ctrl-C). The server stops accepting,
   lets requests in flight finish, makes everything it already decided
   durable, releases the journal and exits 0. It exits non-zero if the

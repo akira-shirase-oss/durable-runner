@@ -789,3 +789,35 @@ convention; these seed the contract's prescribed directions.
   does not use it (a differential test in review found 0.22 and 0.23
   identical over 304,026 decodes). Removing it needs that upstream
   dependency to change.
+- **D-049 — A client that does not read cannot hold a connection.**
+  D-045's header timeout does not run while a response write is pending.
+  So a client that pipelined many requests, or asked for a large answer,
+  and never read kept its connection and its slot for ever. Review held
+  512 such clients against the defaults and `/health` still timed out
+  at t+25 s. Now:
+  - every connection's stream is wrapped so that a write (or flush) that
+    makes no progress for `--write-stall-ms` (10 s) fails with
+    `TimedOut`, which ends that connection; any progress restarts the
+    clock, and reads are untouched;
+  - a connection's `--max-requests-per-connection`-th answer (100)
+    carries `Connection: close`, so pipelining earns at most that many
+    answers per connection;
+  - a connection is closed after `--max-connection-secs` (600), once the
+    request in flight is answered, so a reader trickling just fast enough
+    to beat the stall clock cannot keep a slot for ever either;
+  - shutdown closes connections the same way (a graceful close per
+    connection), replacing hyper-util's `GracefulShutdown`.
+
+  Drilled on the release binary (`perf/results/2026-11-17T03-45-00Z-
+  non-reading-clients.json`). With 512 clients pipelining `GET /health`
+  without reading, `/health` answered at once throughout and all 512
+  were closed. With clients pipelining 275 KB answers, their connections
+  closed about 10 s after their writes stalled. With 400 of them against
+  256 connections, the first `/health` came at t+15 s, once the first
+  batch was closed. Until then the kernel's full accept queue refused it
+  (macOS caps that queue at 128). So a client that does not read holds a
+  slot for at most the write stall after its writes stop moving. One
+  that reads just fast enough holds it for at most the connection
+  lifetime. Neither limit is per client address: many such clients can
+  still fill every slot for that long, which is what the reverse proxy
+  is for.
