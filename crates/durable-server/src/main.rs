@@ -745,6 +745,13 @@ async fn main() -> Result<()> {
     }
     let engine =
         spawn(&args.journal, registry, cfg).map_err(|e| anyhow::anyhow!("engine open: {e}"))?;
+    if let Some(t) = engine.discarded_tail() {
+        eprintln!(
+            "durable-server: discarded a torn tail: {} bytes at offset {} (the log ended inside \
+             its last frame, which was never acknowledged)",
+            t.bytes, t.offset
+        );
+    }
     let stopped = engine.clone();
     let app = App {
         engine,

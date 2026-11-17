@@ -14,7 +14,7 @@
 | Crate | Role |
 |---|---|
 | `durable-domain` | Pure state machine: job/step identities, transitions, invalid-state list, limits. No I/O — enforced. |
-| `durable-journal` | Framed append-only store: format version, length, sequence, checksum per record; generation manifest; torn-tail detection; exclusive writer lock. |
+| `durable-journal` | Framed append-only store: frame v2 = version, length, sequence, batch length, payload checksum and a header checksum per record (D-032; v1 still read); generation manifest; torn-tail detection that never cuts more than an incomplete final frame; exclusive writer lock. |
 | `durable-engine` | Execution: step claims, per-attempt deadlines, bounded retries with capped jitter, cancellation, effect reconciliation. |
 | `durable-server` | Axum API + the coordinator loop (pure reducer + fake clock, bounded channels). |
 | `durable-cli` | Submit/inspect/cancel/backup/restore from a shell. |
@@ -42,7 +42,10 @@ attempt count) → finish → history becomes terminal. Dispatch is capped per
 tick; a call past its deadline is cancelled locally and reconciled.
 
 **Recovery:** read manifest → load snapshot → replay journal records in order →
-discard only a provably-torn tail append → rebuild index → serve.
+discard only a provably-torn tail (the file ends inside its last frame, whose
+header checks out, and nothing after it is a frame) → rebuild index → serve.
+Any other damage — a header checksum, a payload checksum, a frame that does
+not fit its batch — stops startup with the log untouched.
 
 **Compaction:** the actor takes a pointer view of the retained runs (copy-on-
 write) → the writer streams it as the binary index into the new generation's

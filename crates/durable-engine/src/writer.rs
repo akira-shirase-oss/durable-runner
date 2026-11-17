@@ -41,6 +41,18 @@ pub struct GroupCommit {
     pub max_batch_bytes: usize,
 }
 
+impl GroupCommit {
+    /// The bounds clamped so one batch always fits the u32 batch length
+    /// every frame records (D-032): at most 1 GiB of payload and 2^20
+    /// records (26 MiB of headers), or one record alone.
+    pub fn clamped(&self) -> Self {
+        Self {
+            max_batch_records: self.max_batch_records.clamp(1, 1 << 20),
+            max_batch_bytes: self.max_batch_bytes.min(1 << 30),
+        }
+    }
+}
+
 impl Default for GroupCommit {
     fn default() -> Self {
         Self {

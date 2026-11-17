@@ -8,10 +8,25 @@
 //! <dir>/gen-00000N/snapshot.bin   checksummed checkpoint written by compaction
 //! ```
 //!
-//! Frame: `[version u16][len u32][seq u64][crc32 u32][payload len]` — big
-//! endian headers. Replay trusts committed history absolutely: only a
-//! demonstrably incomplete *tail* frame may be discarded; corruption earlier
-//! in the file stops startup (contract §02).
+//! Frame v2 (D-032), big-endian:
+//!
+//! ```text
+//! [version u16 = 2][len u32][seq u64][batch_len u32][payload_crc u32]
+//! [header_crc u32 over the 22 bytes before it][payload: len bytes]
+//! ```
+//!
+//! `batch_len` is the byte length of the whole group commit (one write, one
+//! fsync) the frame was written in, headers included; the frames of a batch
+//! tile it exactly. Frame v1 (`[version u16 = 1][len u32][seq u64][crc32
+//! u32]`, no header checksum, no batch) is still read, so journals written
+//! before D-032 open; a log may hold v1 frames followed by v2 frames, never
+//! the reverse.
+//!
+//! Replay trusts committed history absolutely: only a demonstrably
+//! incomplete *tail* may be discarded — the file ends inside the last frame,
+//! whose header (when complete) checks out, and nothing that looks like a
+//! later frame follows it. That cut is never more than one frame, so never
+//! more than the last batch. Anything else stops startup (contract §02).
 
 use serde::{Deserialize, Serialize};
 use std::fs::{self, File, OpenOptions};
@@ -190,9 +205,21 @@ impl Default for JournalOptions {
     }
 }
 
-pub const FORMAT_VERSION: u16 = 1;
-const HEADER_LEN: usize = 2 + 4 + 8 + 4;
+/// The frame version this build writes (D-032).
+pub const FORMAT_VERSION: u16 = 2;
+/// The frame version journals before D-032 hold; read, never written.
+const V1: u16 = 1;
+/// v1 header: version, len, seq, payload crc.
+const V1_HEADER_LEN: usize = 2 + 4 + 8 + 4;
+/// v2 header: version, len, seq, batch_len, payload crc, header crc.
+pub const FRAME_HEADER_LEN: usize = 2 + 4 + 8 + 4 + 4 + 4;
+const HEADER_LEN: usize = FRAME_HEADER_LEN;
+/// The bytes the header checksum covers (everything before it).
+const HEADER_CRC_SPAN: usize = FRAME_HEADER_LEN - 4;
 const MAX_PAYLOAD: u64 = 16 * 1024 * 1024; // frames bigger than this are corruption
+/// The largest batch one write can carry: its length is a u32 in every
+/// frame header.
+pub const MAX_BATCH_FRAME_BYTES: u64 = u32::MAX as u64;
 
 #[derive(Debug, Error)]
 pub enum JournalError {
@@ -248,6 +275,20 @@ pub enum JournalError {
     /// A backup never merges into an existing directory.
     #[error("backup destination already exists")]
     BackupExists,
+    /// One batch must fit the u32 length every frame records; refused
+    /// before anything is written.
+    #[error("batch of {bytes} bytes is over the {MAX_BATCH_FRAME_BYTES}-byte frame limit")]
+    BatchTooLarge { bytes: u64 },
+}
+
+/// A torn tail `Journal::open` discarded: the file ended inside its last
+/// frame (never acknowledged, D-014).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TornTail {
+    /// Where the incomplete frame started (the log's new length).
+    pub offset: u64,
+    /// Bytes cut (always less than one frame).
+    pub bytes: u64,
 }
 
 /// One committed record as replayed: its sequence and payload.
@@ -289,6 +330,91 @@ fn crc(payload: &[u8]) -> u32 {
     h.finalize()
 }
 
+fn be_u32(b: &[u8]) -> u32 {
+    let mut a = [0u8; 4];
+    a.copy_from_slice(&b[..4]);
+    u32::from_be_bytes(a)
+}
+
+fn be_u64(b: &[u8]) -> u64 {
+    let mut a = [0u8; 8];
+    a.copy_from_slice(&b[..8]);
+    u64::from_be_bytes(a)
+}
+
+/// Append one v2 frame. `batch_len` is the byte length of the whole batch
+/// it is written in.
+fn put_frame(out: &mut Vec<u8>, seq: u64, batch_len: u32, payload: &[u8]) {
+    let start = out.len();
+    out.extend_from_slice(&FORMAT_VERSION.to_be_bytes());
+    out.extend_from_slice(&(payload.len() as u32).to_be_bytes());
+    out.extend_from_slice(&seq.to_be_bytes());
+    out.extend_from_slice(&batch_len.to_be_bytes());
+    out.extend_from_slice(&crc(payload).to_be_bytes());
+    let header_crc = crc(&out[start..]);
+    out.extend_from_slice(&header_crc.to_be_bytes());
+    out.extend_from_slice(payload);
+}
+
+/// Frame `payloads` (sequence numbers from `first_seq`) as one batch.
+fn frame_batch(first_seq: u64, payloads: &[Vec<u8>]) -> Result<Vec<u8>, JournalError> {
+    let mut total = 0u64;
+    for (i, p) in payloads.iter().enumerate() {
+        if p.len() as u64 > MAX_PAYLOAD {
+            return Err(JournalError::Corrupt {
+                seq: first_seq + i as u64,
+                why: "payload over cap".into(),
+            });
+        }
+        total += (HEADER_LEN + p.len()) as u64;
+    }
+    let batch_len =
+        u32::try_from(total).map_err(|_| JournalError::BatchTooLarge { bytes: total })?;
+    let mut bytes = Vec::with_capacity(total as usize);
+    for (i, p) in payloads.iter().enumerate() {
+        put_frame(&mut bytes, first_seq + i as u64, batch_len, p);
+    }
+    Ok(bytes)
+}
+
+/// Whether `region` holds anything that checks out as a frame: a v2 header
+/// with a valid header checksum, or a complete v1 frame with a valid
+/// payload checksum and a sequence number after `after_seq`. Frame headers
+/// start with a 0x00 byte, which the engine's JSON payloads never contain,
+/// so candidates inside a payload are rare and each costs one checksum.
+fn holds_a_frame(region: &[u8], after_seq: u64) -> bool {
+    let n = region.len();
+    let mut i = 0;
+    while i + V1_HEADER_LEN <= n {
+        if region[i] == 0 {
+            match region[i + 1] {
+                2 if i + HEADER_LEN <= n => {
+                    let h = &region[i..i + HEADER_LEN];
+                    if crc(&h[..HEADER_CRC_SPAN]) == be_u32(&h[HEADER_CRC_SPAN..]) {
+                        return true;
+                    }
+                }
+                1 => {
+                    let h = &region[i..i + V1_HEADER_LEN];
+                    let len = be_u32(&h[2..]) as usize;
+                    let seq = be_u64(&h[6..]);
+                    let end = i + V1_HEADER_LEN + len;
+                    if len > 0
+                        && seq > after_seq
+                        && end <= n
+                        && crc(&region[i + V1_HEADER_LEN..end]) == be_u32(&h[14..])
+                    {
+                        return true;
+                    }
+                }
+                _ => {}
+            }
+        }
+        i += 1;
+    }
+    false
+}
+
 /// Replay every committed record in a generation's journal.log, in order.
 /// A torn tail (the file ends inside a frame) is discarded; anything else
 /// wrong — bad version, bad checksum, a sequence gap, a truncated non-tail
@@ -320,6 +446,14 @@ pub struct Records {
     /// End of the last good frame.
     pos: u64,
     expected_seq: u64,
+    /// The current v2 batch: where it ends and the length its frames carry.
+    /// At `pos == batch_end` the next frame starts a new batch.
+    batch_end: u64,
+    batch_len: u32,
+    /// A v2 frame was read: a v1 frame after it is corruption.
+    seen_v2: bool,
+    /// Set when the reader stopped at a torn tail.
+    torn: Option<TornTail>,
     done: bool,
 }
 
@@ -331,6 +465,10 @@ impl Records {
             file_len,
             pos: 0,
             expected_seq: 1,
+            batch_end: 0,
+            batch_len: 0,
+            seen_v2: false,
+            torn: None,
             done: false,
         })
     }
@@ -340,56 +478,158 @@ impl Records {
         self.pos
     }
 
+    /// The torn tail the reader stopped at, if it stopped at one.
+    pub fn torn_tail(&self) -> Option<TornTail> {
+        self.torn
+    }
+
+    fn corrupt(&self, why: impl std::fmt::Display) -> JournalError {
+        // A hint for the one case an operator can repair by hand: damage
+        // confined to the last batch is what a power loss before its fsync
+        // leaves (D-014), and nothing in that batch was acknowledged then.
+        let hint = if self.pos < self.batch_end && self.file_len <= self.batch_end {
+            "; the damage lies inside the log's last batch"
+        } else {
+            ""
+        };
+        JournalError::Corrupt {
+            seq: self.expected_seq,
+            why: format!("{why} (frame at offset {}{hint})", self.pos),
+        }
+    }
+
+    /// Stop at a torn tail: the file ends inside the frame at `pos`.
+    fn tear(&mut self) -> Result<Option<u64>, JournalError> {
+        self.done = true;
+        self.torn = Some(TornTail {
+            offset: self.pos,
+            bytes: self.file_len - self.pos,
+        });
+        Ok(None)
+    }
+
+    /// A frame whose header checks out but whose payload runs past the end
+    /// is a torn tail only if nothing after its header looks like a frame:
+    /// a later frame means the length was damaged, not cut short. The
+    /// region is less than one frame (at most 16 MiB), read once.
+    fn tear_unless_followed(&mut self, header: usize) -> Result<Option<u64>, JournalError> {
+        let from = self.pos + header as u64;
+        let mut region = Vec::new();
+        self.r.seek(SeekFrom::Start(from))?;
+        (&mut self.r)
+            .take(self.file_len - from)
+            .read_to_end(&mut region)?;
+        if holds_a_frame(&region, self.expected_seq) {
+            return Err(
+                self.corrupt("length runs past the end of the log but a later frame follows it")
+            );
+        }
+        self.tear()
+    }
+
     /// Read the next committed frame's payload into `buf`; its sequence
     /// number, or `None` at the end (or at a torn tail).
     fn advance(&mut self, buf: &mut Vec<u8>) -> Result<Option<u64>, JournalError> {
-        if self.done || self.pos == self.file_len || self.file_len - self.pos < HEADER_LEN as u64 {
-            self.done = true; // the end, or a torn tail: fewer than HEADER_LEN bytes
-            return Ok(None);
-        }
-        let mut hdr = [0u8; HEADER_LEN];
-        self.r.read_exact(&mut hdr)?;
-        let version = u16::from_be_bytes([hdr[0], hdr[1]]);
-        let len = u32::from_be_bytes([hdr[2], hdr[3], hdr[4], hdr[5]]);
-        let mut seq_b = [0u8; 8];
-        seq_b.copy_from_slice(&hdr[6..14]);
-        let seq = u64::from_be_bytes(seq_b);
-        let want_crc = u32::from_be_bytes([hdr[14], hdr[15], hdr[16], hdr[17]]);
-        if version != FORMAT_VERSION {
-            return Err(JournalError::Corrupt {
-                seq,
-                why: format!("version {version}"),
-            });
-        }
-        if len as u64 > MAX_PAYLOAD {
-            return Err(JournalError::Corrupt {
-                seq,
-                why: format!("len {len} over cap"),
-            });
-        }
-        let frame_end = self.pos + HEADER_LEN as u64 + len as u64;
-        if frame_end > self.file_len {
-            // Torn tail: header complete, payload short — safe to discard.
+        if self.done || self.pos == self.file_len {
             self.done = true;
             return Ok(None);
+        }
+        if self.file_len - self.pos < V1_HEADER_LEN as u64 {
+            return self.tear(); // fewer bytes than any header
+        }
+        let mut hdr = [0u8; HEADER_LEN];
+        self.r.read_exact(&mut hdr[..V1_HEADER_LEN])?;
+        let version = u16::from_be_bytes([hdr[0], hdr[1]]);
+        match version {
+            FORMAT_VERSION => self.advance_v2(hdr, buf),
+            V1 if !self.seen_v2 => self.advance_v1(hdr, buf),
+            V1 => Err(self.corrupt("a v1 frame after v2 frames")),
+            v => Err(self.corrupt(format_args!("version {v}"))),
+        }
+    }
+
+    fn advance_v2(
+        &mut self,
+        mut hdr: [u8; HEADER_LEN],
+        buf: &mut Vec<u8>,
+    ) -> Result<Option<u64>, JournalError> {
+        if self.file_len - self.pos < HEADER_LEN as u64 {
+            return self.tear(); // an incomplete v2 header
+        }
+        self.r.read_exact(&mut hdr[V1_HEADER_LEN..])?;
+        if crc(&hdr[..HEADER_CRC_SPAN]) != be_u32(&hdr[HEADER_CRC_SPAN..]) {
+            // Length, sequence or batch damaged: never trusted, never cut.
+            return Err(self.corrupt("frame header checksum"));
+        }
+        let len = u64::from(be_u32(&hdr[2..]));
+        let seq = be_u64(&hdr[6..]);
+        let batch_len = be_u32(&hdr[14..]);
+        let want_crc = be_u32(&hdr[18..]);
+        if len > MAX_PAYLOAD {
+            return Err(self.corrupt(format_args!("len {len} over cap")));
+        }
+        if seq != self.expected_seq {
+            return Err(self.corrupt(format_args!("sequence {seq}")));
+        }
+        let frame_end = self.pos + HEADER_LEN as u64 + len;
+        if self.pos >= self.batch_end {
+            // The first frame of a batch: the batch must hold it.
+            if u64::from(batch_len) < HEADER_LEN as u64 + len {
+                return Err(self.corrupt("frame larger than its batch"));
+            }
+            self.batch_end = self.pos + u64::from(batch_len);
+            self.batch_len = batch_len;
+        } else if batch_len != self.batch_len || frame_end > self.batch_end {
+            return Err(self.corrupt("frame does not fit the batch it was written in"));
+        }
+        self.seen_v2 = true;
+        if frame_end > self.file_len {
+            return self.tear_unless_followed(HEADER_LEN);
         }
         buf.clear();
         buf.resize(len as usize, 0);
         self.r.read_exact(buf)?;
         if crc(buf) != want_crc {
-            return Err(JournalError::Corrupt {
-                seq,
-                why: "checksum".into(),
-            });
-        }
-        if seq != self.expected_seq {
-            return Err(JournalError::Corrupt {
-                seq,
-                why: format!("expected seq {}", self.expected_seq),
-            });
+            return Err(self.corrupt("payload checksum"));
         }
         self.expected_seq += 1;
         self.pos = frame_end;
+        Ok(Some(seq))
+    }
+
+    /// A pre-D-032 frame: no header checksum, so a length that runs past
+    /// the end is a tear only if its sequence is the expected one and
+    /// nothing after it looks like a frame.
+    fn advance_v1(
+        &mut self,
+        hdr: [u8; HEADER_LEN],
+        buf: &mut Vec<u8>,
+    ) -> Result<Option<u64>, JournalError> {
+        let len = u64::from(be_u32(&hdr[2..]));
+        let seq = be_u64(&hdr[6..]);
+        let want_crc = be_u32(&hdr[14..]);
+        if len > MAX_PAYLOAD {
+            return Err(self.corrupt(format_args!("len {len} over cap")));
+        }
+        let frame_end = self.pos + V1_HEADER_LEN as u64 + len;
+        if frame_end > self.file_len {
+            if seq != self.expected_seq {
+                return Err(self.corrupt(format_args!("sequence {seq}")));
+            }
+            return self.tear_unless_followed(V1_HEADER_LEN);
+        }
+        buf.clear();
+        buf.resize(len as usize, 0);
+        self.r.read_exact(buf)?;
+        if crc(buf) != want_crc {
+            return Err(self.corrupt("payload checksum"));
+        }
+        if seq != self.expected_seq {
+            return Err(self.corrupt(format_args!("sequence {seq}")));
+        }
+        self.expected_seq += 1;
+        self.pos = frame_end;
+        self.batch_end = frame_end; // v1 frames carry no batch
         Ok(Some(seq))
     }
 }
@@ -423,6 +663,8 @@ pub struct Journal {
     durable_len: u64,
     /// Set by a failed fsync or a failed rollback; refuses every append.
     poisoned: bool,
+    /// The torn tail this open discarded, if any.
+    discarded: Option<TornTail>,
     opts: JournalOptions,
     // Held for the process lifetime; the flock releases when this drops.
     _lock: File,
@@ -506,9 +748,13 @@ impl Journal {
             last_seq = seq;
         }
         let good_len = scan.good_len();
+        let discarded = scan.torn_tail();
         drop(scan);
         if file.metadata()?.len() != good_len {
-            file.set_len(good_len)?; // discard the demonstrably-torn tail
+            // Only a demonstrably torn tail reaches here: the file ended
+            // inside its last frame and nothing after it is a frame. Every
+            // other anomaly returned `Corrupt` above, leaving the log as is.
+            file.set_len(good_len)?;
             file.sync_data()?;
         }
         file.seek(SeekFrom::End(0))?;
@@ -520,6 +766,7 @@ impl Journal {
             next_seq,
             durable_len: good_len,
             poisoned: false,
+            discarded,
             opts,
             _lock: lock_file,
         })
@@ -564,11 +811,13 @@ impl Journal {
             });
         }
         let mut frame = Vec::with_capacity(HEADER_LEN + payload.len());
-        frame.extend_from_slice(&FORMAT_VERSION.to_be_bytes());
-        frame.extend_from_slice(&(payload.len() as u32).to_be_bytes());
-        frame.extend_from_slice(&self.next_seq.to_be_bytes());
-        frame.extend_from_slice(&crc(payload).to_be_bytes());
-        frame.extend_from_slice(payload);
+        // One frame is a batch of one: it was the only thing in its fsync.
+        put_frame(
+            &mut frame,
+            self.next_seq,
+            (HEADER_LEN + payload.len()) as u32,
+            payload,
+        );
         self.write_durably(&frame)?;
         let seq = self.next_seq;
         self.next_seq += 1;
@@ -588,29 +837,15 @@ impl Journal {
         if self.poisoned {
             return Err(JournalError::Poisoned);
         }
-        let total: usize = payloads.iter().map(|p| HEADER_LEN + p.len()).sum();
-        let mut bytes = Vec::with_capacity(total);
-        let mut seq = self.next_seq;
-        for payload in payloads {
-            if payload.len() as u64 > MAX_PAYLOAD {
-                return Err(JournalError::Corrupt {
-                    seq,
-                    why: "payload over cap".into(),
-                });
-            }
-            bytes.extend_from_slice(&FORMAT_VERSION.to_be_bytes());
-            bytes.extend_from_slice(&(payload.len() as u32).to_be_bytes());
-            bytes.extend_from_slice(&seq.to_be_bytes());
-            bytes.extend_from_slice(&crc(payload).to_be_bytes());
-            bytes.extend_from_slice(payload);
-            seq += 1;
-        }
         if payloads.is_empty() {
             return Ok(self.next_seq.saturating_sub(1));
         }
+        // Every frame records the batch's length, so replay can tell where
+        // the one write an fsync covered ends (D-032).
+        let bytes = frame_batch(self.next_seq, payloads)?;
         self.write_durably(&bytes)?;
-        self.next_seq = seq;
-        Ok(seq - 1)
+        self.next_seq += payloads.len() as u64;
+        Ok(self.next_seq - 1)
     }
 
     /// The options this journal was opened with.
@@ -621,6 +856,12 @@ impl Journal {
     /// Whether an earlier failure poisoned this writer.
     pub fn is_poisoned(&self) -> bool {
         self.poisoned
+    }
+
+    /// The torn tail `open` cut off (an incomplete final frame, never
+    /// acknowledged), for the operator's log.
+    pub fn discarded_tail(&self) -> Option<TornTail> {
+        self.discarded
     }
 
     /// Write then fsync `bytes` at the durable offset. On failure the log
@@ -1709,30 +1950,286 @@ mod tests {
         ));
     }
 
+    /// A JSON-like payload, as the engine writes (never a 0x00 byte).
+    fn record(i: usize) -> Vec<u8> {
+        format!("{{\"run\":{i},\"at\":1700000000000,\"event\":\"accepted-{i:04}\"}}").into_bytes()
+    }
+
+    /// A gen-1 log of `n` single-record appends; returns each frame's
+    /// start offset and the log path.
+    fn log_of(dir: &Path, n: usize) -> (Vec<u64>, PathBuf) {
+        let mut j = Journal::open(dir).unwrap_or_else(|e| panic!("{e}"));
+        let mut starts = Vec::new();
+        let mut at = 0u64;
+        for i in 0..n {
+            starts.push(at);
+            let p = record(i);
+            at += (HEADER_LEN + p.len()) as u64;
+            j.append(&p).unwrap_or_else(|e| panic!("{e}"));
+        }
+        (starts, gen_dir_path(dir, 1).join("journal.log"))
+    }
+
+    fn set_len_field(log: &Path, frame_start: u64, len: u32) {
+        let mut f = OpenOptions::new()
+            .write(true)
+            .open(log)
+            .unwrap_or_else(|e| panic!("{e}"));
+        f.seek(SeekFrom::Start(frame_start + 2))
+            .unwrap_or_else(|e| panic!("{e}"));
+        f.write_all(&len.to_be_bytes())
+            .unwrap_or_else(|e| panic!("{e}"));
+    }
+
+    /// Review T1 (high): a corrupted length field in a committed frame
+    /// that points past the end of the file was taken for a torn tail.
+    /// Startup dropped that record and every acknowledged one after it,
+    /// and truncated them away (the reviewer: 25 of 50 served, the log
+    /// cut from 10,181 to 5,081 bytes). A damaged length anywhere — the
+    /// first frame, the reviewer's frame 26, the last — must stop startup
+    /// with `Corrupt` and leave the log byte for byte as it was.
     #[test]
-    fn sequence_gap_is_corruption() {
+    fn corrupted_frame_length_stops_startup_and_leaves_the_log_unchanged() {
+        for target in [0usize, 25, 48, 49] {
+            let dir = tempfile::tempdir().unwrap_or_else(|e| panic!("{e}"));
+            let (starts, log) = log_of(dir.path(), 50);
+            let file_len = fs::metadata(&log).unwrap_or_else(|e| panic!("{e}")).len();
+            let real = record(target).len() as u32;
+            for bad in [
+                16 * 1024 * 1024 - 1, // the reviewer's value: under the cap, past the end
+                file_len as u32,      // the reviewer's other value
+                real + 1,             // just past its own payload
+                real * 3,
+            ] {
+                set_len_field(&log, starts[target], bad);
+                let before = fs::read(&log).unwrap_or_else(|e| panic!("{e}"));
+                match Journal::open(dir.path()) {
+                    Err(JournalError::Corrupt { .. }) => {}
+                    other => {
+                        panic!("frame {target} with length {bad}: expected Corrupt, got {other:?}")
+                    }
+                }
+                let after = fs::read(&log).unwrap_or_else(|e| panic!("{e}"));
+                assert!(
+                    before == after,
+                    "frame {target} with length {bad}: startup changed the log ({} -> {} bytes)",
+                    before.len(),
+                    after.len()
+                );
+            }
+        }
+    }
+
+    /// A genuine torn tail — the file ends inside the last frame, at any
+    /// byte — is still discarded, every complete frame before it is kept,
+    /// and the writer appends on a clean boundary.
+    #[test]
+    fn a_genuine_torn_tail_is_still_recovered_at_every_cut() {
+        let dir = tempfile::tempdir().unwrap_or_else(|e| panic!("{e}"));
+        let (starts, log) = log_of(dir.path(), 10);
+        let whole = fs::read(&log).unwrap_or_else(|e| panic!("{e}"));
+        let last = starts[9] as usize;
+        for cut in last + 1..whole.len() {
+            fs::write(&log, &whole[..cut]).unwrap_or_else(|e| panic!("{e}"));
+            {
+                let mut j = Journal::open(dir.path())
+                    .unwrap_or_else(|e| panic!("cut at {cut} of {}: {e}", whole.len()));
+                assert_eq!(j.records_written(), 9, "cut at {cut}");
+                assert_eq!(j.append(&record(9)).unwrap_or_else(|e| panic!("{e}")), 10);
+            }
+            let rs = replay_dir(&gen_dir_path(dir.path(), 1)).unwrap_or_else(|e| panic!("{e}"));
+            assert_eq!(rs.len(), 10, "cut at {cut}");
+            assert_eq!(rs[9].payload, record(9));
+        }
+    }
+
+    /// A batch torn by process death keeps its complete frames: the kernel
+    /// keeps written bytes in order, so the file ends inside one frame.
+    #[test]
+    fn a_batch_torn_mid_write_keeps_its_complete_frames() {
+        let dir = tempfile::tempdir().unwrap_or_else(|e| panic!("{e}"));
+        let log = gen_dir_path(dir.path(), 1).join("journal.log");
+        {
+            let mut j = Journal::open(dir.path()).unwrap_or_else(|e| panic!("{e}"));
+            j.append_batch(&(0..4).map(record).collect::<Vec<_>>())
+                .unwrap_or_else(|e| panic!("{e}"));
+            j.append_batch(&(4..9).map(record).collect::<Vec<_>>())
+                .unwrap_or_else(|e| panic!("{e}"));
+        }
+        let whole = fs::read(&log).unwrap_or_else(|e| panic!("{e}"));
+        let frame = |i: usize| (HEADER_LEN + record(i).len()) as u64;
+        let seventh: u64 = (0..6).map(frame).sum(); // inside the second batch
+        fs::write(&log, &whole[..seventh as usize + 5]).unwrap_or_else(|e| panic!("{e}"));
+        let j = Journal::open(dir.path()).unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(j.records_written(), 6);
+        assert_eq!(
+            fs::metadata(&log).unwrap_or_else(|e| panic!("{e}")).len(),
+            seventh
+        );
+    }
+
+    /// A gen-1 journal whose log holds exactly `bytes` (hand-framed).
+    fn journal_with_log(bytes: &[u8]) -> (tempfile::TempDir, PathBuf) {
         let dir = tempfile::tempdir().unwrap_or_else(|e| panic!("{e}"));
         let log = gen_dir_path(dir.path(), 1).join("journal.log");
         fs::create_dir_all(log.parent().unwrap_or_else(|| panic!("parent")))
             .unwrap_or_else(|e| panic!("{e}"));
         fs::write(dir.path().join("manifest.json"), "{\"generation\":1}")
             .unwrap_or_else(|e| panic!("{e}"));
+        fs::write(&log, bytes).unwrap_or_else(|e| panic!("{e}"));
+        (dir, log)
+    }
+
+    /// A frame as builds before D-032 wrote it.
+    fn v1_frame(out: &mut Vec<u8>, seq: u64, payload: &[u8]) {
+        out.extend_from_slice(&V1.to_be_bytes());
+        out.extend_from_slice(&(payload.len() as u32).to_be_bytes());
+        out.extend_from_slice(&seq.to_be_bytes());
+        out.extend_from_slice(&crc(payload).to_be_bytes());
+        out.extend_from_slice(payload);
+    }
+
+    #[test]
+    fn sequence_gap_is_corruption() {
         // Hand-frame two records with seq 1 then 3.
-        let mut file = File::create(&log).unwrap_or_else(|e| panic!("{e}"));
+        let mut bytes = Vec::new();
         for (seq, payload) in [(1u64, &b"a"[..]), (3u64, &b"b"[..])] {
-            let mut frame = Vec::new();
-            frame.extend_from_slice(&FORMAT_VERSION.to_be_bytes());
-            frame.extend_from_slice(&(payload.len() as u32).to_be_bytes());
-            frame.extend_from_slice(&seq.to_be_bytes());
-            frame.extend_from_slice(&crc(payload).to_be_bytes());
-            frame.extend_from_slice(payload);
-            file.write_all(&frame).unwrap_or_else(|e| panic!("{e}"));
+            put_frame(&mut bytes, seq, (HEADER_LEN + 1) as u32, payload);
         }
-        file.sync_data().unwrap_or_else(|e| panic!("{e}"));
-        drop(file);
+        let (dir, _log) = journal_with_log(&bytes);
         match Journal::open(dir.path()) {
-            Err(JournalError::Corrupt { seq: 3, .. }) => {}
-            other => panic!("expected Corrupt at seq 3, got {other:?}"),
+            Err(JournalError::Corrupt { seq: 2, why }) if why.contains("sequence 3") => {}
+            other => panic!("expected Corrupt where seq 2 belongs, got {other:?}"),
         }
+    }
+
+    /// D-032 migration: a journal written before frame v2 still opens and
+    /// replays; new appends are v2 frames after the v1 ones, and the mixed
+    /// log reopens.
+    #[test]
+    fn a_v1_journal_opens_and_continues_in_v2() {
+        let mut bytes = Vec::new();
+        for i in 0..5 {
+            v1_frame(&mut bytes, i as u64 + 1, &record(i));
+        }
+        let (dir, log) = journal_with_log(&bytes);
+        {
+            let mut j = Journal::open(dir.path()).unwrap_or_else(|e| panic!("{e}"));
+            assert_eq!(j.records_written(), 5);
+            assert_eq!(j.append(&record(5)).unwrap_or_else(|e| panic!("{e}")), 6);
+            j.append_batch(&[record(6), record(7)])
+                .unwrap_or_else(|e| panic!("{e}"));
+        }
+        let rs = replay_dir(&gen_dir_path(dir.path(), 1)).unwrap_or_else(|e| panic!("{e}"));
+        let want: Vec<Vec<u8>> = (0..8).map(record).collect();
+        assert_eq!(rs.into_iter().map(|r| r.payload).collect::<Vec<_>>(), want);
+        let on_disk = fs::read(&log).unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(
+            &on_disk[..bytes.len()],
+            &bytes[..],
+            "the v1 frames are untouched"
+        );
+        assert_eq!(on_disk[bytes.len() + 1], 2, "new frames are v2");
+        Journal::open(dir.path()).unwrap_or_else(|e| panic!("reopen: {e}"));
+    }
+
+    /// v1 frames carry no header checksum, so their length cannot be
+    /// trusted. The reviewer's repro on a v1 log: a length pointing past the
+    /// end with later frames behind it is corruption, not a torn tail.
+    #[test]
+    fn a_v1_frame_with_a_damaged_length_and_frames_after_it_stops_startup() {
+        let mut bytes = Vec::new();
+        let mut starts = Vec::new();
+        for i in 0..50 {
+            starts.push(bytes.len() as u64);
+            v1_frame(&mut bytes, i as u64 + 1, &record(i));
+        }
+        for bad in [16 * 1024 * 1024 - 1, bytes.len() as u32] {
+            let (dir, log) = journal_with_log(&bytes);
+            set_len_field(&log, starts[25], bad);
+            let before = fs::read(&log).unwrap_or_else(|e| panic!("{e}"));
+            assert!(
+                matches!(
+                    Journal::open(dir.path()),
+                    Err(JournalError::Corrupt { seq: 26, .. })
+                ),
+                "length {bad}"
+            );
+            assert!(before == fs::read(&log).unwrap_or_else(|e| panic!("{e}")));
+        }
+        // A v1 log torn inside its last frame is still a torn tail.
+        let (dir, log) = journal_with_log(&bytes[..bytes.len() - 3]);
+        let j = Journal::open(dir.path()).unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(j.records_written(), 49);
+        assert_eq!(
+            j.discarded_tail().map(|t| t.offset),
+            Some(starts[49]),
+            "the cut is reported"
+        );
+        assert_eq!(
+            fs::metadata(&log).unwrap_or_else(|e| panic!("{e}")).len(),
+            starts[49]
+        );
+    }
+
+    /// A damaged sequence number or batch length is caught by the header
+    /// checksum, wherever the frame is; so is a v1 frame after v2 ones.
+    #[test]
+    fn header_damage_and_impossible_layouts_are_corruption() {
+        let dir = tempfile::tempdir().unwrap_or_else(|e| panic!("{e}"));
+        let (starts, log) = log_of(dir.path(), 5);
+        let whole = fs::read(&log).unwrap_or_else(|e| panic!("{e}"));
+        for (field, at) in [("seq", 6usize), ("batch_len", 14), ("payload crc", 18)] {
+            for frame in [0usize, 2, 4] {
+                let mut bytes = whole.clone();
+                bytes[starts[frame] as usize + at + 1] ^= 0x10;
+                fs::write(&log, &bytes).unwrap_or_else(|e| panic!("{e}"));
+                assert!(
+                    matches!(Journal::open(dir.path()), Err(JournalError::Corrupt { .. })),
+                    "{field} damaged in frame {frame}"
+                );
+                assert!(bytes == fs::read(&log).unwrap_or_else(|e| panic!("{e}")));
+            }
+        }
+        // A v1 frame after a v2 one: no build writes that.
+        let mut bytes = whole.clone();
+        v1_frame(&mut bytes, 6, &record(5));
+        fs::write(&log, &bytes).unwrap_or_else(|e| panic!("{e}"));
+        assert!(matches!(
+            Journal::open(dir.path()),
+            Err(JournalError::Corrupt { .. })
+        ));
+        // A frame claiming a batch it does not fit (headers re-checksummed,
+        // so only the layout rule can catch it).
+        let mut bytes = Vec::new();
+        put_frame(&mut bytes, 1, 2 * (HEADER_LEN + 1) as u32, b"a");
+        put_frame(&mut bytes, 2, (HEADER_LEN + 1) as u32, b"b");
+        let (dir, _log) = journal_with_log(&bytes);
+        assert!(matches!(
+            Journal::open(dir.path()),
+            Err(JournalError::Corrupt { .. })
+        ));
+    }
+
+    /// Frames record their batch: a batch written in one call tiles its
+    /// length exactly, and a single append is a batch of one.
+    #[test]
+    fn frames_record_the_batch_they_were_written_in() {
+        let dir = tempfile::tempdir().unwrap_or_else(|e| panic!("{e}"));
+        let log = gen_dir_path(dir.path(), 1).join("journal.log");
+        {
+            let mut j = Journal::open(dir.path()).unwrap_or_else(|e| panic!("{e}"));
+            j.append(b"x").unwrap_or_else(|e| panic!("{e}"));
+            j.append_batch(&[b"ab".to_vec(), b"cde".to_vec()])
+                .unwrap_or_else(|e| panic!("{e}"));
+        }
+        let b = fs::read(&log).unwrap_or_else(|e| panic!("{e}"));
+        let batch_len = |at: usize| be_u32(&b[at + 14..]);
+        let one = HEADER_LEN + 1;
+        assert_eq!(batch_len(0) as usize, one);
+        let two = 2 * HEADER_LEN + 5;
+        assert_eq!(batch_len(one) as usize, two);
+        assert_eq!(batch_len(one + HEADER_LEN + 2) as usize, two);
+        assert_eq!(b.len(), one + two);
     }
 }

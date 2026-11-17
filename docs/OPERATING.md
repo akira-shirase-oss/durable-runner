@@ -183,3 +183,14 @@ state — same run ids, same `finished_at`. Verified live by
   of it was acknowledged. Run the server under a supervisor that restarts
   on failure (systemd `Restart=on-failure`) and startup replay recovers
   exactly the durable history.
+- Startup refused with `corrupt committed history at seq N: … (frame at
+  offset X)` — a committed frame is damaged (a header or payload
+  checksum, or a frame that does not fit the batch it was written in).
+  Nothing was cut: the log is exactly as found. Restore from a backup.
+  If the message ends `the damage lies inside the log's last batch` and
+  the host lost power, the damaged frames were in a batch whose fsync
+  had not returned, so none of them was acknowledged: copy the journal
+  aside, then truncate `journal.log` to offset X and start again.
+- `durable-server: discarded a torn tail: N bytes at offset X` at startup
+  — the log ended inside its last frame (a crash mid-write). That frame
+  was never acknowledged; every complete frame before it was kept.

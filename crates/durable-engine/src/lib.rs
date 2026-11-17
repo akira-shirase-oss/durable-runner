@@ -98,6 +98,9 @@ pub struct Diagnostics {
     /// Superseded generations still on disk; retention deletes them after
     /// each successful compaction, so this stays 0 unless a delete failed.
     pub stale_generations: u32,
+    /// Bytes of an incomplete final frame the last startup discarded (a
+    /// torn tail, never acknowledged); 0 if the log ended cleanly.
+    pub discarded_tail_bytes: u64,
 }
 
 /// The index as snapshots before D-021 carried it (JSON, inputs as number
@@ -141,7 +144,7 @@ impl Pipe {
             .space
             .available(&self.root)
             .map_err(JournalError::SpaceProbe)?;
-        let need = 18 + payload.len() as u64; // frame header + payload
+        let need = (durable_journal::FRAME_HEADER_LEN + payload.len()) as u64;
         if available < self.reserve.saturating_add(need) {
             return Err(JournalError::NoSpace {
                 available,
@@ -214,6 +217,8 @@ pub struct EngineCore {
     /// so admission is O(1).
     live: usize,
     index_bytes: u64,
+    /// The torn tail the journal discarded when this core opened it.
+    discarded_tail: Option<durable_journal::TornTail>,
     pub limits: Limits,
     pub retry: RetryPolicy,
 }
@@ -235,6 +240,7 @@ impl EngineCore {
     pub fn open_with(dir: &Path, opts: JournalOptions) -> Result<Self, EngineError> {
         let journal = Journal::open_with(dir, opts)?;
         let generation = journal.generation();
+        let discarded_tail = journal.discarded_tail();
         let gdir = durable_journal::gen_dir_path(dir, generation);
         let mut core = Self {
             log: Log::Direct(journal),
@@ -243,6 +249,7 @@ impl EngineCore {
             next_run: 1,
             live: 0,
             index_bytes: 0,
+            discarded_tail,
             limits: Limits::default(),
             retry: RetryPolicy::default(),
         };
@@ -772,7 +779,13 @@ impl EngineCore {
             largest_batch,
             largest_batch_bytes,
             stale_generations,
+            discarded_tail_bytes: self.discarded_tail.map_or(0, |t| t.bytes),
         }
+    }
+
+    /// The torn tail the journal discarded when this core opened it.
+    pub fn discarded_tail(&self) -> Option<durable_journal::TornTail> {
+        self.discarded_tail
     }
 
     /// Iterate the live index in id order (bounded by the index, never by
@@ -1331,6 +1344,42 @@ mod tests {
             e.submit(OperationKey("n".repeat(300)), spec(), 2),
             Err(EngineError::Refused(Refusal::OverLimits))
         ));
+    }
+
+    /// Review T1, the reviewer's repro at engine level: 50 acknowledged
+    /// runs, then frame 26's length set past the end of the log. Startup
+    /// used to serve 25 of 50 and truncate the rest away; it must refuse
+    /// and leave every byte for a repair or a restore.
+    #[test]
+    fn damaged_frame_length_stops_startup_instead_of_dropping_runs() {
+        let (d, mut e) = open();
+        for i in 0..50 {
+            e.submit(OperationKey(format!("t1-{i}")), spec(), 0)
+                .unwrap_or_else(|e| panic!("{e}"));
+        }
+        drop(e);
+        let log = durable_journal::gen_dir_path(d.path(), 1).join("journal.log");
+        let mut bytes = std::fs::read(&log).unwrap_or_else(|e| panic!("{e}"));
+        let mut at = 0usize;
+        for _ in 0..25 {
+            let len =
+                u32::from_be_bytes([bytes[at + 2], bytes[at + 3], bytes[at + 4], bytes[at + 5]]);
+            at += durable_journal::FRAME_HEADER_LEN + len as usize;
+        }
+        let file_len = bytes.len() as u32;
+        for bad in [16 * 1024 * 1024 - 1, file_len] {
+            bytes[at + 2..at + 6].copy_from_slice(&bad.to_be_bytes());
+            std::fs::write(&log, &bytes).unwrap_or_else(|e| panic!("{e}"));
+            match EngineCore::open(d.path()) {
+                Err(EngineError::Journal(JournalError::Corrupt { seq: 26, .. })) => {}
+                Err(e) => panic!("wrong error: {e}"),
+                Ok(c) => panic!("started with {} of 50 runs", c.runs().count()),
+            }
+            assert!(
+                std::fs::read(&log).unwrap_or_else(|e| panic!("{e}")) == bytes,
+                "startup must not cut the log"
+            );
+        }
     }
 
     /// Review S2: a compacted generation whose snapshot is missing (a

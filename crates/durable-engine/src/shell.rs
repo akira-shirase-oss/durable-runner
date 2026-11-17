@@ -123,6 +123,7 @@ pub struct Engine {
     tx: mpsc::Sender<Cmd>,
     read_tx: mpsc::Sender<Read>,
     health: Arc<Health>,
+    discarded_tail: Option<durable_journal::TornTail>,
 }
 
 /// State the actor publishes for readiness, readable without a round trip
@@ -282,6 +283,12 @@ impl Engine {
         self.tx.closed().await;
     }
 
+    /// The torn tail startup discarded (an incomplete final frame, never
+    /// acknowledged), so the operator's log can say so.
+    pub fn discarded_tail(&self) -> Option<durable_journal::TornTail> {
+        self.discarded_tail
+    }
+
     pub async fn inspect(&self, run: RunId) -> Result<Option<Run>, EngineError> {
         let (reply, rx) = oneshot::channel();
         self.send_read(Read::Inspect { run, reply })?;
@@ -352,9 +359,11 @@ impl Default for ShellConfig {
 /// group-commit writer thread, then spawn the actor task. The returned
 /// handle is the only public interface — there is no path to the journal
 /// except through it.
-pub fn spawn(dir: &Path, registry: Registry, cfg: ShellConfig) -> Result<Engine, EngineError> {
+pub fn spawn(dir: &Path, registry: Registry, mut cfg: ShellConfig) -> Result<Engine, EngineError> {
+    cfg.group_commit = cfg.group_commit.clamped();
     let mut core = EngineCore::open_with(dir, cfg.journal.clone())?;
     core.limits = cfg.limits;
+    let discarded_tail = core.discarded_tail();
     let (core, journal) = core.into_piped();
     let journal = journal.ok_or(EngineError::Piped)?;
     let writer = writer::spawn(journal, cfg.group_commit.clone())
@@ -372,6 +381,7 @@ pub fn spawn(dir: &Path, registry: Registry, cfg: ShellConfig) -> Result<Engine,
         tx,
         read_tx,
         health,
+        discarded_tail,
     })
 }
 

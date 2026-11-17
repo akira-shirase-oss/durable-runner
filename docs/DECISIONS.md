@@ -153,8 +153,9 @@ convention; these seed the contract's prescribed directions.
   manual repair (truncate the log at the first bad frame). No
   acknowledged record is affected, because nothing in an unsynced batch
   was acknowledged. Group commit widens the window from one frame to one
-  batch. Recording batch boundaries so replay could tell this apart from
-  real corruption is not built. Process death (kill -9, OOM) cannot cause
+  batch. Since D-032 every frame records its batch, and such a `Corrupt`
+  says the damage lies inside the log's last batch; replay still refuses
+  rather than guess. Process death (kill -9, OOM) cannot cause
   it: the kernel keeps every written byte.
 
   *The rules any batching (group commit) must keep*, tested one by one:
@@ -440,3 +441,46 @@ convention; these seed the contract's prescribed directions.
   about 3.9 one-step 1 KiB jobs/s with scheduled compaction. That is a
   real limit of keeping every finished key for a week on that host, not
   a measurement artefact.
+- **D-032 — Frame v2: a checksummed header and a recorded batch; a
+  damaged length stops startup.** The frame checksum covered only the
+  payload. Replay treated a length that pointed past the end of the log
+  as a torn tail, so one damaged 4-byte length in any committed frame (a
+  bad sector, a stray write) dropped that record and every acknowledged
+  one after it, and startup then truncated them away. Review reproduced
+  it on the release binary: 25 of 50 runs served, the log cut from 10,181
+  to 5,081 bytes. That broke non-negotiable 2: only a demonstrably
+  incomplete tail may be discarded. Now:
+  - Every new frame is v2: `version 2 | len u32 | seq u64 | batch_len u32
+    | payload_crc u32 | header_crc u32 | payload` (26-byte header, 8 more
+    than v1). The header checksum covers version, length, sequence,
+    batch length and payload checksum. A header that fails it is never
+    trusted and never cut: `Corrupt`, with the log left byte for byte.
+  - `batch_len` is the byte length of the group commit (one write, one
+    fsync) the frame was written in. The frames of a batch must tile it
+    exactly, a batch must be complete before the next one starts, and a
+    single `append` is a batch of one. So a damaged length is caught a
+    second way, and a `Corrupt` inside the log's last batch says so (the
+    one case a power loss before that batch's fsync explains, D-014).
+    `GroupCommit` is clamped so a batch always fits the u32.
+  - The only tail cut is a file that ends inside its last frame: fewer
+    bytes than a header, or a header that checks out whose payload runs
+    past the end, with nothing after the header that checks out as a
+    frame. That cut is less than one frame, so never more than the last
+    batch. Startup reports it (`durable-server: discarded a torn tail: N
+    bytes at offset X`, and `discarded_tail_bytes` in diagnostics).
+  - A full-length frame with a bad payload checksum is still refused, as
+    D-014 chose.
+
+  *Migration.* A v2 build reads v1 frames. An existing log keeps its v1
+  frames untouched and new appends go after them as v2; a log may hold v1
+  then v2, never v2 then v1 (that is `Corrupt`). The next compaction
+  starts a generation that holds only v2. A v1 frame has no header
+  checksum, so for v1 the length is trusted only as far as the forward
+  rule allows: a v1 length that runs past the end with a later valid
+  frame behind it is `Corrupt` (the reviewer's repro on a v1 log now
+  stops startup), and a damaged length in a v1 log's *last* frame is
+  still indistinguishable from a torn one. There is no downgrade: an
+  older binary refuses a v2 frame (`version 2`) and stops, so roll back
+  by restoring a backup taken before the upgrade. Frame headers start
+  with a 0x00 byte and the engine's JSON payloads never contain one, so
+  the forward check finds no false frames inside a payload.
