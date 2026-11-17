@@ -1302,12 +1302,23 @@ pub fn sweep_partial_backups(root: &Path) -> Result<usize, JournalError> {
 /// backup's own regular files are copied — a symlink or special file in it
 /// is refused, never followed.
 pub fn restore_backup(from: &Path, to: &Path) -> Result<(), JournalError> {
-    restore_with(from, to, &|| {})
+    restore_with(from, to, &|_| {})
 }
 
-/// `restore_backup`, calling `mid_copy` once the files are copied and
-/// before anything is published (tests open the target there).
-fn restore_with(from: &Path, to: &Path, mid_copy: &dyn Fn()) -> Result<(), JournalError> {
+/// What a restore has just done, for tests that check its order.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum RestoreStep {
+    /// Every file is copied and verified; nothing is published yet.
+    Copied,
+    /// A directory was fsynced.
+    Synced(PathBuf),
+    /// The manifest was renamed into place.
+    Published,
+}
+
+/// `restore_backup`, reporting each step to `step` (tests open the target
+/// at `Copied`, and check the order of fsyncs and the publish).
+fn restore_with(from: &Path, to: &Path, step: &dyn Fn(RestoreStep)) -> Result<(), JournalError> {
     let manifest = from.join("manifest.json");
     match fs::symlink_metadata(&manifest) {
         Ok(m) if m.file_type().is_file() => {}
@@ -1340,7 +1351,7 @@ fn restore_with(from: &Path, to: &Path, mid_copy: &dyn Fn()) -> Result<(), Journ
         }
     }
     let copied = copy_and_verify(from, to, generation, &list);
-    mid_copy();
+    step(RestoreStep::Copied);
     if let Err(e) = copied {
         // Nothing was published: take back what was copied, so the target
         // holds no generation a later restore or open would trip on.
@@ -1351,11 +1362,18 @@ fn restore_with(from: &Path, to: &Path, mid_copy: &dyn Fn()) -> Result<(), Journ
         }
         return Err(e);
     }
+    // The generations' entries in `to` are durable before the manifest
+    // that names them can be: otherwise a power loss could keep the
+    // manifest and lose its generation (review U10).
+    File::open(to)?.sync_data()?;
+    step(RestoreStep::Synced(to.to_path_buf()));
     // Manifest last, by rename: until it lands, `to` opens as nothing.
     let tmp = to.join("manifest.json.tmp");
     copy_file_durably(&manifest, &tmp)?;
     fs::rename(&tmp, to.join("manifest.json"))?;
+    step(RestoreStep::Published);
     File::open(to)?.sync_data()?;
+    step(RestoreStep::Synced(to.to_path_buf()));
     drop(lock);
     Ok(())
 }
@@ -2668,11 +2686,13 @@ mod tests {
 
         let to = d.path().join("to");
         let opened = std::cell::Cell::new(None);
-        restore_with(&backup, &to, &|| {
-            opened.set(Some(matches!(
-                Journal::open(&to),
-                Err(JournalError::SecondWriter)
-            )));
+        restore_with(&backup, &to, &|step| {
+            if step == RestoreStep::Copied {
+                opened.set(Some(matches!(
+                    Journal::open(&to),
+                    Err(JournalError::SecondWriter)
+                )));
+            }
         })
         .unwrap_or_else(|e| panic!("{e}"));
         assert_eq!(
@@ -2778,6 +2798,29 @@ mod tests {
         assert!(
             open_checked(&file, &seen).is_err(),
             "opened a replaced file"
+        );
+    }
+
+    /// Review U10: the generation directories' entries in the target were
+    /// not fsynced before the manifest's rename, so a power loss could keep
+    /// the manifest without its generation. The target directory must be
+    /// fsynced after the copies and before the publish.
+    #[test]
+    fn restore_makes_its_generations_durable_before_the_manifest() {
+        let d = tempfile::tempdir().unwrap_or_else(|e| panic!("{e}"));
+        let backup = backup_of_three(d.path());
+        let to = d.path().join("to");
+        let steps = std::cell::RefCell::new(Vec::new());
+        restore_with(&backup, &to, &|s| steps.borrow_mut().push(s))
+            .unwrap_or_else(|e| panic!("{e}"));
+        let steps = steps.into_inner();
+        let published = steps
+            .iter()
+            .position(|s| *s == RestoreStep::Published)
+            .unwrap_or_else(|| panic!("never published: {steps:?}"));
+        assert!(
+            steps[..published].contains(&RestoreStep::Synced(to.clone())),
+            "the target was not fsynced before the manifest's rename: {steps:?}"
         );
     }
 

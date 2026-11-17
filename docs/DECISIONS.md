@@ -717,7 +717,9 @@ convention; these seed the contract's prescribed directions.
     from before file lists is verified by structure and replay. Each
     source file is opened and then checked by `fstat` to be the very file
     `lstat` checked (device and inode), so a symlink swapped in between is
-    refused, not followed (review U9).
+    refused, not followed (review U9). The target directory is fsynced
+    after the copies and before the manifest's rename, so the manifest is
+    never durable without the generations it names (review U10).
   - First open now creates generation 1 and its log, then writes the
     manifest that names it, so a manifest naming a missing generation is
     always damage: `open` refuses it (`restore from a backup`) instead of
