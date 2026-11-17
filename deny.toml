@@ -1,0 +1,47 @@
+# cargo-deny: advisories, licenses, bans and sources for the whole
+# workspace. Run with `cargo deny --locked check` (scripts/check.sh and CI).
+
+[graph]
+# Check every target the workspace builds for, with default features.
+all-features = false
+
+[advisories]
+version = 2
+# Vulnerable, unmaintained and unsound crates all fail; a yanked crate too.
+unmaintained = "all"
+yanked = "deny"
+# Every ignore needs a reason and an expiry next to it. None today.
+ignore = []
+
+[licenses]
+version = 2
+# Permissive licenses only. CDLA-Permissive-2.0 is webpki-roots' data
+# licence (the Mozilla root store), pulled in by reqwest's rustls.
+allow = [
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-3-Clause",
+    "CDLA-Permissive-2.0",
+    "ISC",
+    "MIT",
+    "Unicode-3.0",
+    "Zlib",
+]
+confidence-threshold = 0.93
+
+[licenses.private]
+# The workspace's own crates are not published.
+ignore = true
+
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+# The workspace's path dependencies have no version; they are not
+# published, so that is not a wildcard on crates.io.
+allow-wildcard-paths = true
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []

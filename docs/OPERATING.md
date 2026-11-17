@@ -2,7 +2,11 @@
 
 The second-developer path: from a fresh checkout to running, inspecting,
 backing up, and restoring a workflow. `examples/pilot/run.sh` performs
-this entire document as one script — it is the ship-gate rehearsal.
+this entire document as one script — it is the ship-gate rehearsal. It
+checks every step, exits non-zero on the first that fails, and takes its
+ports from `DURABLE_PILOT_PORT` (default 58330; the restored server uses
+that + 1, the pilot handler that - 10). `scripts/check.sh` is the whole
+gate, the same one CI runs (D-041).
 
 ## Build
 

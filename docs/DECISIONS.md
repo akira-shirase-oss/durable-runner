@@ -622,3 +622,25 @@ convention; these seed the contract's prescribed directions.
   served (only `/inspector/…` is). The app's base is now `/inspector`, and
   every asset it references answers 200. Checked over HTTP (status codes
   and the served hash recomputed independently); not checked in a browser.
+- **D-041 — One gate, locally and on hosted CI.** There was no CI, no
+  `deny.toml` and no check script; `--locked` was not in the gate.
+  `scripts/check.sh` is now the gate, and `.github/workflows/ci.yml` runs
+  exactly that script on every push and pull request and daily (so a new
+  advisory fails without a push), on `ubuntu-latest`: fmt, clippy
+  `-D warnings --locked`, `cargo test --workspace --locked`, three
+  architecture checks (the domain crate does no I/O; nothing in
+  `crates/*/src` spawns a process; neither shipped binary's normal build
+  enables `fault-injection`), `cargo deny --locked check` (advisories
+  including unmaintained and yanked crates, permissive licences only,
+  wildcard and duplicate bans, crates.io as the only source), `npm ci`,
+  `npm audit --omit=dev --audit-level=moderate`, the inspector's type
+  check and build, and the pilot against the release build. The workflow
+  has `permissions: contents: read`, checks out without persisting
+  credentials, pins every action to a full commit SHA with its version
+  in a comment, uses no `pull_request_target`, and puts no `${{ }}`
+  inside a `run:`. Dependabot proposes weekly grouped updates for cargo,
+  npm and the actions. The workspace crates are marked `publish = false`
+  (they are not on crates.io), which is also what lets cargo-deny accept
+  their path dependencies. The pilot now checks every step and exits
+  non-zero on the first that fails, takes its ports from
+  `DURABLE_PILOT_PORT`, and ends with a SIGTERM drain that must exit 0.
