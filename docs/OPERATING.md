@@ -27,24 +27,35 @@ target/release/durable-server \
 - **Reserve.** `--reserve-bytes N` (default 64 MiB) must stay free on the
   journal filesystem; see "What honest looks like" for the 503s.
 - **Capacity.** `--max-live-runs` (100,000 non-terminal runs) and
-  `--max-index-bytes` (1 GiB of retained runs) bound the index; past them
+  `--max-index-bytes` (512 MiB of retained runs) bound the index; past them
   a submit is `503 at_capacity` (nothing journaled; retry with the same
   `op_key`). `--max-in-flight` (32 handler calls) and
   `--max-dispatch-per-tick` (64 per 50 ms tick) bound execution; raise
   them if dispatch is the bottleneck. `GET /admin/diagnostics` shows
   `active_runs` and `index_bytes`.
 
+  *Memory sizing (D-031).* Plan for a peak RSS of about
+  `2.6 × max_index_bytes + 100 MiB`. Measured, restart and steady state
+  run at 1.1–1.6 × the index; a compaction may add up to one snapshot's
+  size, as the review saw on the HTTP server. The 512 MiB default keeps
+  that within 1.5 GiB of a 2 GB host. On a bigger host raise
+  `--max-index-bytes` in proportion, and leave the OS at least 0.5 GiB.
+
   *Capacity arithmetic.* A run is charged `160 + key + Σ(48 + step name +
   handler name) + input` bytes while it is live. When it finishes its
   input is dropped at once and it becomes a dedup record (key, state,
   step count, finish time) charged `160 + key + Σ(48 + names)`. For a
   one-step job with a 20-byte key and a 1 KiB input that is about
-  1,250 B live and 230 B finished. The record stays until a compaction
-  runs at least seven days after the run finished (compaction is opt-in,
-  `--compact-every-secs`). So at a sustained R jobs/s, finished records
-  need about `R × 604,800 s × 230 B` of `--max-index-bytes` on top of the
-  live runs. Without scheduled compaction the records never leave, and
-  `503 at_capacity` comes once `max_index_bytes ÷ 230 B` jobs have run.
+  1,250 B live and 230 B finished. At the 512 MiB default that is about
+  430,000 such runs live at once, or about 2.3 million finished records.
+  A record stays until a compaction runs at least seven days after its run
+  finished (compaction is opt-in, `--compact-every-secs`). So at a
+  sustained R jobs/s, finished records need about `R × 604,800 s × 230 B`
+  of `--max-index-bytes` on top of the live runs. At the default and with
+  scheduled compaction, the seven-day dedup window sustains about 3.9
+  such jobs/s on a 2 GB host; more needs a bigger host. Without scheduled
+  compaction the records never leave, and `503 at_capacity` comes once
+  about `max_index_bytes ÷ 230 B` jobs have run.
 - **Retention.** Compaction runs only when asked (`durable compact`) unless
   you pass `--compact-every-secs N` (default 0 = off; see D-018 for why it
   is opt-in). Each compaction removes the dedup records of runs that

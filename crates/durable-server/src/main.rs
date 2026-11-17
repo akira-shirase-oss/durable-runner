@@ -61,8 +61,8 @@ struct Args {
     #[arg(long, default_value_t = 100_000)]
     max_live_runs: usize,
     /// Approximate bytes of all retained runs; beyond it submits are 503
-    /// `at_capacity`.
-    #[arg(long, default_value_t = 1024 * 1024 * 1024)]
+    /// `at_capacity`. Default 512 MiB, sized for a 2 GB host (D-031).
+    #[arg(long, default_value_t = durable_domain::Limits::default().max_index_bytes)]
     max_index_bytes: u64,
     /// Handler calls (attempts and probes) in flight at once.
     #[arg(long, default_value_t = 32)]
@@ -1419,6 +1419,16 @@ mod tests {
             (status, v["code"].clone()),
             (StatusCode::CONFLICT, json!("over_limits"))
         );
+    }
+
+    #[test]
+    fn server_index_bound_defaults_to_the_sized_domain_default() {
+        let args = Args::try_parse_from(["durable-server"]).unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(
+            args.max_index_bytes,
+            durable_domain::Limits::default().max_index_bytes
+        );
+        assert_eq!(args.max_index_bytes, 512 * 1024 * 1024);
     }
 
     #[test]

@@ -2650,10 +2650,32 @@ mod tests {
                     .unwrap_or_else(|e| panic!("{e}"));
             }
         }
+        if var("PROBE_FINISH").as_deref() == Some("1") {
+            // Finish every run (cancel), leaving only dedup records.
+            let mut id = 1;
+            while id <= runs as u64 {
+                let mut hs = Vec::new();
+                for _ in 0..512.min(runs as u64 + 1 - id) {
+                    let e = eng.clone();
+                    let run = RunId(id);
+                    hs.push(tokio::spawn(async move { e.cancel(run).await }));
+                    id += 1;
+                }
+                for h in hs {
+                    h.await
+                        .unwrap_or_else(|e| panic!("{e}"))
+                        .unwrap_or_else(|e| panic!("{e}"));
+                }
+            }
+        }
         if compact {
             eng.compact().await.unwrap_or_else(|e| panic!("{e}"));
         }
-        println!("FILLED runs={runs} input={input} compacted={compact}");
+        let diag = eng.diag().await.unwrap_or_else(|e| panic!("{e}"));
+        println!(
+            "FILLED runs={runs} input={input} compacted={compact} index_bytes={} active={}",
+            diag.index_bytes, diag.active_runs
+        );
     }
 
     /// Restart-memory probe, part 2: open `PROBE_DIR` (replay) and report.

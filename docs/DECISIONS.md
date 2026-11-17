@@ -421,3 +421,22 @@ convention; these seed the contract's prescribed directions.
   184 MB, against 1.0 GB live, and a restart from their snapshot took
   272 MiB. The `503` message says what frees room, and OPERATING gives
   the arithmetic.
+- **D-031 — The default index bound is sized for a 2 GB host.** With
+  restart streamed (D-028) and finished runs reduced to dedup records
+  (D-030), memory follows `index_bytes`. Measured with the restart probes
+  (`perf/results/2026-11-16T20-10-00Z-restart-memory-sizing.json`):
+  - Live 1 KiB runs: restart and steady state at 1.1–1.26 × the index.
+  - Finished dedup records: 1.55 × (272 MiB for 184 MB at 800k).
+  - Journal replay: its peak is bounded by the highest index the runtime
+    held, because replay passes through the same states.
+
+  This in-process probe saw no compaction spike, but the review saw RSS
+  rise by about one snapshot during compaction on the HTTP server, cause
+  not identified. The sizing rule allows for it: peak ≈
+  `2.6 × max_index_bytes + 100 MiB`, which must leave 0.5 GiB of a 2 GiB
+  host. So `max_index_bytes` defaults to 512 MiB, down from 1 GiB, and a
+  test pins the rule. OPERATING states the formula and the throughput
+  consequence: with the seven-day dedup window, a 2 GB host sustains
+  about 3.9 one-step 1 KiB jobs/s with scheduled compaction. That is a
+  real limit of keeping every finished key for a week on that host, not
+  a measurement artefact.
