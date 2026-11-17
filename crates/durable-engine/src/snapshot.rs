@@ -476,6 +476,60 @@ mod tests {
         decode(&out).unwrap_or_else(|e| panic!("at the bounds: {e}"));
     }
 
+    /// Review U5: the binary index is pinned to a golden file written from
+    /// its spec by an independent implementation (`durable-journal/tests/
+    /// fixtures/make_fixtures.py`): this build decodes it exactly and
+    /// encodes the same view to the same bytes.
+    #[test]
+    fn the_index_format_matches_its_golden_file() {
+        let golden: &[u8] = include_bytes!("../tests/fixtures/index.drix");
+        let want = View {
+            next_run: 3,
+            runs: vec![
+                Arc::new(Run {
+                    id: RunId(1),
+                    key: OperationKey("golden-1".into()),
+                    spec: JobSpec {
+                        version: 1,
+                        steps: vec![StepSpec {
+                            name: "a".into(),
+                            handler: "h".into(),
+                        }],
+                        input: vec![0x00, 0x01, 0xff],
+                    },
+                    state: RunState::Queued { next_run_at: 5 },
+                    finished_at: None,
+                }),
+                Arc::new(Run {
+                    id: RunId(2),
+                    key: OperationKey("golden-2".into()),
+                    spec: JobSpec {
+                        version: 2,
+                        steps: vec![StepSpec {
+                            name: "b".into(),
+                            handler: "h2".into(),
+                        }],
+                        input: Vec::new(),
+                    },
+                    state: RunState::Done,
+                    finished_at: Some(1_700_000_000_000),
+                }),
+            ],
+        };
+        let (next_run, runs) = decode(golden).unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(next_run, 3);
+        let got: Vec<Run> = runs.values().map(|r| (**r).clone()).collect();
+        let expect: Vec<Run> = want.runs.iter().map(|r| (**r).clone()).collect();
+        assert_eq!(got, expect);
+        let mut out = Vec::new();
+        encode(&want, &mut out).unwrap_or_else(|e| panic!("{e}"));
+        assert!(
+            out == golden,
+            "the index encoder no longer matches its golden file"
+        );
+        assert_eq!(encoded_len(&want), golden.len() as u64);
+    }
+
     /// Every truncation and every flipped tag is refused, never misread.
     #[test]
     fn malformed_input_is_refused() {

@@ -743,3 +743,18 @@ convention; these seed the contract's prescribed directions.
   sockets were closed. Not handled here, so a reverse proxy must do it for
   any non-local exposure: TLS, per-client rate limits, a cap on
   connections per client address, and slow-response (download) limits.
+- **D-046 — The on-disk formats are pinned by golden files.** Every
+  test wrote and read with the same build, so a change to a frame, a
+  checksum or the snapshot would pass the gate and then refuse every
+  existing journal at upgrade. The trigger could be a dependency bump
+  (crc32fast 1.5.5 added a SIMD path on this CPU) as easily as a code
+  change. `crates/durable-journal/tests/fixtures/` now holds a v1 log, a
+  v2 log (a single append, then a batch of two) and a `snapshot.bin`;
+  `crates/durable-engine/tests/fixtures/index.drix` holds a binary index
+  with a queued and a finished run. They were written by
+  `make_fixtures.py` from the formats' specs, with Python's zlib, an
+  implementation independent of the Rust code. The tests require the
+  readers to return exactly the expected records and the writers to
+  produce the same bytes, spell out the first v2 header, and check
+  CRC-32's standard check value (`0xCBF43926` for `"123456789"`).
+  Regenerate the files only for a deliberate, versioned format change.

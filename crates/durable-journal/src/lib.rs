@@ -2656,6 +2656,76 @@ mod tests {
         assert_eq!(j.records_written(), 3);
     }
 
+    const GOLDEN: [&[u8]; 3] = [
+        br#"{"run":1,"event":"golden-0"}"#,
+        br#"{"run":2,"event":"golden-1"}"#,
+        br#"{"run":3,"event":"golden-2"}"#,
+    ];
+
+    /// Review U5: every test wrote and read with the same build, so a change
+    /// to a frame, a checksum or the snapshot (a dependency bump: crc32fast
+    /// gained a new SIMD path) would pass the gate and then refuse every
+    /// existing journal. These fixtures were written from the formats'
+    /// specs by an independent implementation (`tests/fixtures/
+    /// make_fixtures.py`, Python's zlib); this build must read them exactly
+    /// and write them byte for byte.
+    #[test]
+    fn the_on_disk_formats_match_their_golden_files() {
+        assert_eq!(crc(b"123456789"), 0xCBF4_3926, "CRC-32 (IEEE) check value");
+        let v1: &[u8] = include_bytes!("../tests/fixtures/v1.log");
+        let v2: &[u8] = include_bytes!("../tests/fixtures/v2.log");
+        let snap: &[u8] = include_bytes!("../tests/fixtures/snapshot.bin");
+        // The first v2 header, spelled out: version 2, len 28, seq 1,
+        // batch 54, payload crc, header crc.
+        assert_eq!(
+            &v2[..26],
+            &[
+                0x00, 0x02, 0x00, 0x00, 0x00, 0x1c, 0, 0, 0, 0, 0, 0, 0, 0x01, 0x00, 0x00, 0x00,
+                0x36, 0x89, 0xdd, 0xfc, 0xc9, 0xb8, 0x0f, 0x93, 0xa3
+            ]
+        );
+        for (name, log) in [("v1", v1), ("v2", v2)] {
+            let (dir, _) = journal_with_log(log);
+            let got: Vec<Vec<u8>> = replay_dir(&gen_dir_path(dir.path(), 1))
+                .unwrap_or_else(|e| panic!("{name}: {e}"))
+                .into_iter()
+                .map(|r| r.payload)
+                .collect();
+            assert_eq!(got, GOLDEN.map(<[u8]>::to_vec), "{name} payloads");
+        }
+        // This build writes exactly the golden v2 log.
+        let d = tempfile::tempdir().unwrap_or_else(|e| panic!("{e}"));
+        {
+            let mut j = Journal::open(d.path()).unwrap_or_else(|e| panic!("{e}"));
+            j.append(GOLDEN[0]).unwrap_or_else(|e| panic!("{e}"));
+            j.append_batch(&[GOLDEN[1].to_vec(), GOLDEN[2].to_vec()])
+                .unwrap_or_else(|e| panic!("{e}"));
+        }
+        let written = fs::read(gen_dir_path(d.path(), 1).join("journal.log"))
+            .unwrap_or_else(|e| panic!("{e}"));
+        assert!(
+            written == v2,
+            "the v2 writer no longer matches its golden file"
+        );
+        // The snapshot frame, both ways.
+        let sd = tempfile::tempdir().unwrap_or_else(|e| panic!("{e}"));
+        fs::write(sd.path().join("snapshot.bin"), snap).unwrap_or_else(|e| panic!("{e}"));
+        let loaded = load_snapshot(sd.path())
+            .unwrap_or_else(|e| panic!("{e}"))
+            .unwrap_or_else(|| panic!("no snapshot"));
+        assert_eq!(
+            (loaded.covered_seq, loaded.payload.as_slice()),
+            (7, &b"golden snapshot payload"[..])
+        );
+        let wd = tempfile::tempdir().unwrap_or_else(|e| panic!("{e}"));
+        write_snapshot(&wd.path().join(""), &loaded).unwrap_or_else(|e| panic!("{e}"));
+        let rewritten = fs::read(wd.path().join("snapshot.bin")).unwrap_or_else(|e| panic!("{e}"));
+        assert!(
+            rewritten == snap,
+            "the snapshot writer no longer matches its golden file"
+        );
+    }
+
     /// A gen-1 journal whose log holds exactly `bytes` (hand-framed).
     fn journal_with_log(bytes: &[u8]) -> (tempfile::TempDir, PathBuf) {
         let dir = tempfile::tempdir().unwrap_or_else(|e| panic!("{e}"));
