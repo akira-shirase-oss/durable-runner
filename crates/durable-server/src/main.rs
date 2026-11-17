@@ -814,7 +814,7 @@ fn inspector_csp(ui: &Path) -> String {
                 let Some(end) = body.find("</script>") else {
                     break;
                 };
-                let digest = sha256(body[..end].as_bytes());
+                let digest = sha256(&body.as_bytes()[..end]);
                 hashes.push_str(&format!(
                     " 'sha256-{}'",
                     base64::engine::general_purpose::STANDARD.encode(digest)
