@@ -90,6 +90,18 @@ struct Args {
     /// A request body must arrive in full within this many ms.
     #[arg(long, default_value_t = 30_000)]
     body_deadline_ms: u64,
+    /// A response write that makes no progress for this many ms closes the
+    /// connection (a client that does not read its responses).
+    #[arg(long, default_value_t = 10_000)]
+    write_stall_ms: u64,
+    /// A connection is closed after this many seconds, once the request in
+    /// flight is answered (keep-alive clients reconnect).
+    #[arg(long, default_value_t = 600)]
+    max_connection_secs: u64,
+    /// A connection's this-many-th answer says `Connection: close`, so a
+    /// client pipelining requests gets at most this many per connection.
+    #[arg(long, default_value_t = 100)]
+    max_requests_per_connection: usize,
     /// On SIGTERM or SIGINT: how long to let requests in flight finish,
     /// and then how long the engine may take to make everything it
     /// decided durable, before exiting non-zero instead of 0.
@@ -365,6 +377,13 @@ impl<T: serde::de::DeserializeOwned, S: Send + Sync> axum::extract::FromRequest<
     async fn from_request(req: axum::extract::Request, state: &S) -> Result<Self, Self::Rejection> {
         match Json::<T>::from_request(req, state).await {
             Ok(Json(v)) => Ok(J(v)),
+            // The body did not arrive within its deadline (D-045): a slow
+            // client, not a malformed request.
+            Err(r) if caused_by_body_deadline(&r) => Err(ApiError::new(
+                StatusCode::REQUEST_TIMEOUT,
+                "body_timeout",
+                "the request body did not arrive in time",
+            )),
             Err(r) => {
                 let status = r.status();
                 let code = match status {
@@ -376,6 +395,18 @@ impl<T: serde::de::DeserializeOwned, S: Send + Sync> axum::extract::FromRequest<
             }
         }
     }
+}
+
+/// Whether `e` (or anything it wraps) is the body deadline's timeout.
+fn caused_by_body_deadline(e: &(dyn std::error::Error + 'static)) -> bool {
+    let mut cur = Some(e);
+    while let Some(err) = cur {
+        if err.is::<tower_http::timeout::TimeoutError>() {
+            return true;
+        }
+        cur = err.source();
+    }
+    false
 }
 
 #[derive(Deserialize)]
@@ -1001,6 +1032,9 @@ async fn main() -> Result<()> {
         max_connections: args.max_connections.max(1),
         header_timeout: Duration::from_millis(args.header_timeout_ms.max(1)),
         body_deadline: Duration::from_millis(args.body_deadline_ms.max(1)),
+        write_stall: Duration::from_millis(args.write_stall_ms.max(1)),
+        max_lifetime: Duration::from_secs(args.max_connection_secs.max(1)),
+        max_requests: args.max_requests_per_connection.max(1),
     };
     let serve = serve_http(listener, router, limits, http_stopped);
     tokio::pin!(serve);
@@ -1054,6 +1088,15 @@ struct HttpLimits {
     max_connections: usize,
     header_timeout: Duration,
     body_deadline: Duration,
+    /// A response write that makes no progress for this long closes the
+    /// connection (a client that does not read).
+    write_stall: Duration,
+    /// A connection is asked to close after this long (after the request
+    /// in flight), however busy it is.
+    max_lifetime: Duration,
+    /// The last request a connection serves carries `Connection: close`:
+    /// a client pipelining thousands of requests gets this many answers.
+    max_requests: usize,
 }
 
 impl Default for HttpLimits {
@@ -1063,15 +1106,21 @@ impl Default for HttpLimits {
             max_connections: 512,
             header_timeout: Duration::from_secs(10),
             body_deadline: Duration::from_secs(30),
+            write_stall: Duration::from_secs(10),
+            max_lifetime: Duration::from_secs(600),
+            max_requests: 100,
         }
     }
 }
 
 /// Serve `router` on `listener` until `stop` fires, then let the requests
-/// in flight finish (D-045). Every connection holds one of
+/// in flight finish (D-045, D-049). Every connection holds one of
 /// `max_connections` permits (the rest wait in the kernel's accept queue);
 /// a request head (and an idle keep-alive connection waiting for one) must
-/// arrive within `header_timeout`; a request body within `body_deadline`.
+/// arrive within `header_timeout`; a request body within `body_deadline`;
+/// a response write must make progress within `write_stall`; and a
+/// connection is closed after `max_lifetime`, once its request in flight
+/// is answered.
 async fn serve_http(
     listener: tokio::net::TcpListener,
     router: Router,
@@ -1080,10 +1129,8 @@ async fn serve_http(
 ) -> std::io::Result<()> {
     use hyper_util::rt::{TokioIo, TokioTimer};
     let permits = Arc::new(tokio::sync::Semaphore::new(limits.max_connections.max(1)));
-    let graceful = hyper_util::server::graceful::GracefulShutdown::new();
-    let service = hyper_util::service::TowerToHyperService::new(
-        tower_http::timeout::RequestBodyDeadline::new(router, limits.body_deadline),
-    );
+    let (closing_tx, closing) = tokio::sync::watch::channel(false);
+    let service = tower_http::timeout::RequestBodyDeadline::new(router, limits.body_deadline);
     let mut conns = tokio::task::JoinSet::new();
     let mut accept_failing = false;
     loop {
@@ -1120,22 +1167,160 @@ async fn serve_http(
             },
             _ = &mut stop => break,
         };
+        let io = TokioIo::new(StallGuard::new(stream, limits.write_stall));
+        // The connection's `max_requests`-th answer says `Connection:
+        // close`, so pipelining cannot keep one connection busy for ever.
+        let svc = service.clone();
+        let served = std::sync::atomic::AtomicUsize::new(0);
+        let max_requests = limits.max_requests.max(1);
+        let per_conn = Arc::new((svc, served));
+        let handler =
+            hyper::service::service_fn(move |req: hyper::Request<hyper::body::Incoming>| {
+                let per_conn = per_conn.clone();
+                async move {
+                    let (svc, served) = &*per_conn;
+                    let n = served.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+                    let mut res = tower::ServiceExt::oneshot(svc.clone(), req).await?;
+                    if n >= max_requests {
+                        res.headers_mut().insert(
+                            header::CONNECTION,
+                            header::HeaderValue::from_static("close"),
+                        );
+                    }
+                    Ok::<_, std::convert::Infallible>(res)
+                }
+            });
         let conn = hyper::server::conn::http1::Builder::new()
             .timer(TokioTimer::new())
             .header_read_timeout(limits.header_timeout)
-            .serve_connection(TokioIo::new(stream), service.clone());
-        let conn = graceful.watch(conn);
+            .serve_connection(io, handler);
+        let mut closing = closing.clone();
+        let lifetime = limits.max_lifetime;
         conns.spawn(async move {
             let _permit = permit;
-            // A connection error (a reset, a timed-out head) ends only
-            // that connection.
+            let mut conn = std::pin::pin!(conn);
+            // A connection error (a reset, a timed-out head, a stalled
+            // write) ends only that connection.
+            tokio::select! {
+                _ = conn.as_mut() => return,
+                _ = closing.wait_for(|c| *c) => {}
+                () = tokio::time::sleep(lifetime) => {}
+            }
+            // Shutting down, or the connection is old: answer the request
+            // in flight (bounded by the deadlines above), then close.
+            conn.as_mut().graceful_shutdown();
             let _ = conn.await;
         });
     }
     drop(listener); // stop accepting: new connections are refused
-    graceful.shutdown().await; // in-flight requests finish, idle ones close
-    while conns.join_next().await.is_some() {}
+    closing_tx.send_replace(true); // in-flight requests finish, idle ones close
+    while let Some(done) = conns.join_next().await {
+        if let Err(e) = done {
+            eprintln!("durable-server: a connection task failed: {e}");
+        }
+    }
     Ok(())
+}
+
+/// A connection's stream whose writes fail with `TimedOut` once they have
+/// made no progress for `stall`: a client that stops reading its
+/// responses would otherwise hold the connection for ever, since hyper's
+/// header timeout does not run while a write is pending (review V1).
+/// Reads pass through; any write progress restarts the clock.
+struct StallGuard<S> {
+    inner: S,
+    stall: Duration,
+    timer: Option<std::pin::Pin<Box<tokio::time::Sleep>>>,
+}
+
+impl<S> StallGuard<S> {
+    fn new(inner: S, stall: Duration) -> Self {
+        Self {
+            inner,
+            stall,
+            timer: None,
+        }
+    }
+
+    fn guard<T>(
+        &mut self,
+        cx: &mut std::task::Context<'_>,
+        op: impl FnOnce(
+            std::pin::Pin<&mut S>,
+            &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<T>>,
+    ) -> std::task::Poll<std::io::Result<T>>
+    where
+        S: Unpin,
+    {
+        use std::future::Future as _;
+        use std::task::Poll;
+        match op(std::pin::Pin::new(&mut self.inner), cx) {
+            Poll::Ready(r) => {
+                self.timer = None;
+                Poll::Ready(r)
+            }
+            Poll::Pending => {
+                let stall = self.stall;
+                let timer = self
+                    .timer
+                    .get_or_insert_with(|| Box::pin(tokio::time::sleep(stall)));
+                match timer.as_mut().poll(cx) {
+                    Poll::Ready(()) => Poll::Ready(Err(std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        "the client stopped reading",
+                    ))),
+                    Poll::Pending => Poll::Pending,
+                }
+            }
+        }
+    }
+}
+
+impl<S: tokio::io::AsyncRead + Unpin> tokio::io::AsyncRead for StallGuard<S> {
+    fn poll_read(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.inner).poll_read(cx, buf)
+    }
+}
+
+impl<S: tokio::io::AsyncWrite + Unpin> tokio::io::AsyncWrite for StallGuard<S> {
+    fn poll_write(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        self.guard(cx, |io, cx| io.poll_write(cx, buf))
+    }
+
+    fn poll_write_vectored(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        bufs: &[std::io::IoSlice<'_>],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        self.guard(cx, |io, cx| io.poll_write_vectored(cx, bufs))
+    }
+
+    fn is_write_vectored(&self) -> bool {
+        self.inner.is_write_vectored()
+    }
+
+    fn poll_flush(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        self.guard(cx, |io, cx| io.poll_flush(cx))
+    }
+
+    fn poll_shutdown(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        self.guard(cx, |io, cx| io.poll_shutdown(cx))
+    }
 }
 
 /// Resolves on SIGTERM (a supervisor stopping us) or SIGINT (Ctrl-C).
@@ -2100,6 +2285,33 @@ mod tests {
         );
     }
 
+    /// Review V2: a body cut off at its deadline was answered 400, as if it
+    /// were malformed. It is 408 `body_timeout`.
+    #[tokio::test]
+    async fn a_body_past_its_deadline_is_408() {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+        let limits = HttpLimits {
+            body_deadline: Duration::from_millis(300),
+            ..HttpLimits::default()
+        };
+        let (addr, _stop, _h) = serving(limits).await;
+        let mut slow = tokio::net::TcpStream::connect(addr)
+            .await
+            .unwrap_or_else(|e| panic!("{e}"));
+        let head = format!(
+            "POST /jobs HTTP/1.1\r\nhost: x\r\nauthorization: Bearer {KEY}\r\n\
+             content-type: application/json\r\ncontent-length: 1000\r\n\r\n{{\"op"
+        );
+        slow.write_all(head.as_bytes())
+            .await
+            .unwrap_or_else(|e| panic!("{e}"));
+        let mut reply = Vec::new();
+        let _ = tokio::time::timeout(Duration::from_secs(5), slow.read_to_end(&mut reply)).await;
+        let text = String::from_utf8_lossy(&reply);
+        assert!(text.starts_with("HTTP/1.1 408"), "{text}");
+        assert!(text.contains("\"code\":\"body_timeout\""), "{text}");
+    }
+
     /// At most `max_connections` are served at once; the rest wait to be
     /// accepted, and a slot frees when a held connection times out.
     #[tokio::test]
@@ -2175,6 +2387,123 @@ mod tests {
                 "{bad:?}"
             );
         }
+    }
+
+    /// Review V1: the header timeout does not run while a response write is
+    /// pending, so a client that pipelines requests and never reads held
+    /// its connection, and its slot, for ever. A write that makes no
+    /// progress within the write-stall deadline closes the connection.
+    #[tokio::test]
+    async fn a_client_that_never_reads_does_not_hold_a_slot() {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+        let limits = HttpLimits {
+            max_connections: 1,
+            header_timeout: Duration::from_secs(60),
+            write_stall: Duration::from_millis(300),
+            max_requests: usize::MAX, // the stall alone must free the slot
+            ..HttpLimits::default()
+        };
+        let (addr, _stop, _h) = serving(limits).await;
+        let sock = tokio::net::TcpSocket::new_v4().unwrap_or_else(|e| panic!("{e}"));
+        sock.set_recv_buffer_size(1024)
+            .unwrap_or_else(|e| panic!("{e}"));
+        let stalled = sock.connect(addr).await.unwrap_or_else(|e| panic!("{e}"));
+        let (_reader, mut writer) = stalled.into_split(); // never read
+        let flood = tokio::spawn(async move {
+            let one = b"GET /health HTTP/1.1\r\nhost: x\r\n\r\n";
+            let many: Vec<u8> = one
+                .iter()
+                .copied()
+                .cycle()
+                .take(one.len() * 20_000)
+                .collect();
+            let _ = writer.write_all(&many).await; // blocks once the server stops reading
+            writer
+        });
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        let mut probe = tokio::net::TcpStream::connect(addr)
+            .await
+            .unwrap_or_else(|e| panic!("{e}"));
+        probe
+            .write_all(b"GET /health HTTP/1.1\r\nhost: x\r\nconnection: close\r\n\r\n")
+            .await
+            .unwrap_or_else(|e| panic!("{e}"));
+        let mut reply = Vec::new();
+        tokio::time::timeout(Duration::from_secs(5), probe.read_to_end(&mut reply))
+            .await
+            .unwrap_or_else(|_| panic!("a client that never reads held the only slot"))
+            .unwrap_or_else(|e| panic!("{e}"));
+        assert!(
+            reply.starts_with(b"HTTP/1.1 200"),
+            "{}",
+            String::from_utf8_lossy(&reply)
+        );
+        flood.abort();
+    }
+
+    /// A connection that keeps making progress is still closed at its
+    /// lifetime (after the request in flight), so a trickling reader
+    /// cannot keep a slot for ever either.
+    #[tokio::test]
+    async fn a_connection_is_closed_at_its_lifetime() {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+        let limits = HttpLimits {
+            max_lifetime: Duration::from_millis(500),
+            ..HttpLimits::default()
+        };
+        let (addr, _stop, _h) = serving(limits).await;
+        let mut s = tokio::net::TcpStream::connect(addr)
+            .await
+            .unwrap_or_else(|e| panic!("{e}"));
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        let mut buf = [0u8; 4096];
+        loop {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "a busy connection outlived its lifetime"
+            );
+            if s.write_all(b"GET /health HTTP/1.1\r\nhost: x\r\n\r\n")
+                .await
+                .is_err()
+            {
+                break; // closed
+            }
+            match tokio::time::timeout(Duration::from_secs(2), s.read(&mut buf)).await {
+                Ok(Ok(0)) | Ok(Err(_)) => break, // closed
+                Ok(Ok(_)) => {}
+                Err(_) => panic!("no answer"),
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
+
+    /// A client that pipelines many requests on one connection gets at most
+    /// `max_requests` answers; the last says `Connection: close`.
+    #[tokio::test]
+    async fn requests_per_connection_are_capped() {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+        let limits = HttpLimits {
+            max_requests: 5,
+            ..HttpLimits::default()
+        };
+        let (addr, _stop, _h) = serving(limits).await;
+        let mut s = tokio::net::TcpStream::connect(addr)
+            .await
+            .unwrap_or_else(|e| panic!("{e}"));
+        let one = b"GET /health HTTP/1.1\r\nhost: x\r\n\r\n";
+        let many: Vec<u8> = one.iter().copied().cycle().take(one.len() * 20).collect();
+        s.write_all(&many).await.unwrap_or_else(|e| panic!("{e}"));
+        let mut all = Vec::new();
+        tokio::time::timeout(Duration::from_secs(5), s.read_to_end(&mut all))
+            .await
+            .unwrap_or_else(|_| panic!("the connection stayed open past its request cap"))
+            .unwrap_or_else(|e| panic!("{e}"));
+        let text = String::from_utf8_lossy(&all);
+        assert_eq!(text.matches("HTTP/1.1 200").count(), 5, "{text}");
+        assert!(
+            text.to_ascii_lowercase().contains("connection: close"),
+            "{text}"
+        );
     }
 
     /// A full command channel is 503 `busy` (retry with the same op_key),
