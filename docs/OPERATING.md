@@ -93,8 +93,10 @@ target/release/durable-server \
   characters, different from the API key; it gets `403 forbidden` on
   every other route). Give the inspector or a dashboard the read key, not
   the admin key. `--open-reads` serves reads without a key, and is
-  refused at startup unless `--listen` is a loopback IP: never pass it
-  behind a reverse proxy, which makes loopback reachable. `/health`,
+  refused at startup unless `--listen` is a loopback IP, and even then
+  answers a request without a key only if its `Host` is `localhost` or a
+  loopback IP (DNS rebinding, D-047): never pass it behind a reverse
+  proxy, which makes loopback reachable. `/health`,
   `/ready` and the inspector's static files are open. The CLI sends
   `DURABLE_API_KEY` (reads fall back to `DURABLE_READ_KEY`); the
   inspector asks for a key and sends it on every call. The pilot

@@ -309,7 +309,10 @@ impl FromRequestParts<App> for ReadAuthorized {
     type Rejection = ApiError;
 
     async fn from_request_parts(parts: &mut Parts, app: &App) -> Result<Self, Self::Rejection> {
-        if app.open_reads {
+        // Open reads answer only requests addressed to a loopback name: a
+        // page in the operator's browser can rebind its own name to
+        // 127.0.0.1, and its requests then carry that name as Host (D-047).
+        if app.open_reads && loopback_host(parts) {
             return Ok(ReadAuthorized);
         }
         match bearer(parts) {
@@ -873,6 +876,29 @@ fn read_key_from_env(api_key: &ApiKey) -> Result<Option<ApiKey>> {
     Ok(Some(ApiKey::new(key)))
 }
 
+/// Whether the request's `Host` is a loopback name: `localhost`, or an IP
+/// literal in 127.0.0.0/8 or `::1`, with or without a port. A missing or
+/// unparsable Host is not.
+fn loopback_host(parts: &Parts) -> bool {
+    let Some(host) = parts
+        .headers
+        .get(header::HOST)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.parse::<axum::http::uri::Authority>().ok())
+    else {
+        return false;
+    };
+    let name = host.host();
+    let name = name
+        .strip_prefix('[')
+        .and_then(|n| n.strip_suffix(']'))
+        .unwrap_or(name);
+    name.eq_ignore_ascii_case("localhost")
+        || name
+            .parse::<std::net::IpAddr>()
+            .is_ok_and(|ip| ip.is_loopback())
+}
+
 /// `--open-reads` is allowed only where nothing but this host can connect:
 /// a loopback IP address (a name such as `localhost` is not trusted to
 /// resolve to one).
@@ -1363,8 +1389,45 @@ mod tests {
             },
             None,
         );
-        let (status, _) = call(&r, "GET", "/jobs", None, None).await;
-        assert_eq!(status, StatusCode::OK);
+        let get = |host: Option<&'static str>| {
+            let r = r.clone();
+            async move {
+                let mut req = Request::builder().uri("/jobs");
+                if let Some(h) = host {
+                    req = req.header("host", h);
+                }
+                r.oneshot(req.body(Body::empty()).unwrap_or_else(|e| panic!("{e}")))
+                    .await
+                    .unwrap_or_else(|e| panic!("{e}"))
+                    .status()
+            }
+        };
+        for host in [
+            "127.0.0.1:58300",
+            "localhost:58300",
+            "localhost",
+            "[::1]:58300",
+        ] {
+            assert_eq!(get(Some(host)).await, StatusCode::OK, "Host {host}");
+        }
+        // Review U6: DNS rebinding. A page in the operator's browser can
+        // point its own name at 127.0.0.1; its requests then carry that
+        // name as Host. Open reads answer only loopback Hosts.
+        for host in [
+            "attacker.example",
+            "attacker.example:58300",
+            "127.0.0.1.attacker.example",
+            "10.0.0.5:58300",
+        ] {
+            assert_eq!(
+                get(Some(host)).await,
+                StatusCode::UNAUTHORIZED,
+                "Host {host}"
+            );
+        }
+        assert_eq!(get(None).await, StatusCode::UNAUTHORIZED, "no Host");
+        let (status, _) = call(&r, "GET", "/jobs", Some(KEY), None).await;
+        assert_eq!(status, StatusCode::OK, "the key reads whatever the Host");
         let (status, _) = call(&r, "POST", "/jobs", None, Some(submit_body("x"))).await;
         assert_eq!(
             status,

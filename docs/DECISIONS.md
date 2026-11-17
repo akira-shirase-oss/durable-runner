@@ -758,3 +758,12 @@ convention; these seed the contract's prescribed directions.
   produce the same bytes, spell out the first v2 header, and check
   CRC-32's standard check value (`0xCBF43926` for `"123456789"`).
   Regenerate the files only for a deliberate, versioned format change.
+- **D-047 — Open reads answer only loopback Hosts.** D-037 limited
+  `--open-reads` to a loopback listener, but checked no `Host`. A page
+  in the operator's browser can rebind its own DNS name to 127.0.0.1
+  (DNS rebinding); its requests then reach the listener with that name as
+  `Host`, and could read every op_key and state. With `--open-reads`, a
+  request without a key is now answered only if its `Host` is
+  `localhost` or a loopback IP literal (127.0.0.0/8, `::1`), with or
+  without a port; any other Host, or none, needs a key (401). A request
+  with a valid key reads whatever its Host.
