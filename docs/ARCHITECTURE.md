@@ -93,5 +93,7 @@ crates/        durable-domain, durable-journal, durable-engine,
 apps/inspect/  SvelteKit inspection UI
 docs/          END_GOAL, ARCHITECTURE, ROADMAP, DECISIONS, modules/
 fixtures/      torn-tail + crash-model fixtures, handler test server
-perf/          submit/replay/stall/compaction scenarios + results
+perf/          submit/replay/stall/compaction scenarios, drill.py (kill -9
+               drills with compactions, backups and cancels) + results
+scripts/       check.sh: the gate, the same one .github/workflows/ci.yml runs
 ```

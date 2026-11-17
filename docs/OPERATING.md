@@ -157,6 +157,22 @@ the next attempt or the next server start removes.
 same run id, nothing re-executes. Cancel stops scheduling — it never
 undoes a remote effect already attempted.
 
+## Crash drills
+
+`perf/drill.py` kills the release server with SIGKILL, at random and
+right after compactions, backups and cancel bursts, while clients submit
+and cancel, then restarts it and checks that every acknowledged submit
+and cancel survived and that backups restore complete (D-042):
+
+```sh
+cargo build --release --locked -p durable-server -p durable-cli
+python3 -I perf/drill.py --rounds 20 --targeted 16 --clients 16 \
+  --out perf/results/<timestamp>-kill9-drill.json
+```
+
+It exits non-zero on any loss. `--port` (default 53400, and that + 1 for
+the restored server) moves it off ports in use.
+
 ## Restore
 
 ```sh

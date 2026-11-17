@@ -644,3 +644,25 @@ convention; these seed the contract's prescribed directions.
   their path dependencies. The pilot now checks every step and exits
   non-zero on the first that fails, takes its ports from
   `DURABLE_PILOT_PORT`, and ends with a SIGTERM drain that must exit 0.
+- **D-042 — A kill -9 drill harness, and this round's result.** The
+  drills were run by hand before. `perf/drill.py` (standard library
+  only) now runs them: one persistent journal, 16 clients submitting
+  (half run at once through a local handler, half wait far in the
+  future) and cancelling about 40% of their acknowledged waiting runs,
+  a thread compacting and backing up, and a SIGKILL either at a random
+  moment or 0–30 ms after a compaction, a backup or a 50-cancel burst.
+  After every restart it checks everything acknowledged so far: each
+  submit present under its op_key, a resubmit returning the same run id,
+  each acknowledged cancel still `cancelled`, the round's last completed
+  backup restoring (through `durable-cli restore`, onto a second server)
+  with every run acknowledged before it was requested, and no half
+  backup under a visible name. It ends with SIGTERM, which must exit 0.
+
+  Result on the release build of this round's code
+  (`perf/results/2026-11-17T02-28-00Z-kill9-drill.json`; Apple M2 Pro,
+  load average 50–70, a development observation): 36 kills (20 random, 6
+  after a compaction, 5 after a backup, 5 after a cancel burst), 25,201
+  acknowledged submits and 9,119 acknowledged cancels, **0 lost, 0
+  duplicated, 0 id mismatches, 0 cancels lost**, 69 compactions, 58
+  backups, 31 of 31 checked backups restored complete, 0 visible partial
+  backups, final generation 70, and the closing SIGTERM exited 0.
