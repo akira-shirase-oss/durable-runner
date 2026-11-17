@@ -2315,7 +2315,14 @@ mod tests {
         std::fs::set_permissions(d.path(), std::fs::Permissions::from_mode(0o300))
             .unwrap_or_else(|e| panic!("{e}"));
         if std::fs::File::open(d.path()).is_ok() {
-            eprintln!("skipped: this user ignores directory permissions");
+            // Root ignores directory permissions: never pass silently.
+            drop(guard);
+            assert!(
+                std::env::var_os("DURABLE_ALLOW_PERMISSION_SKIP").is_some(),
+                "this test needs a user that honours directory permissions (not root); \
+                 run it unprivileged, or set DURABLE_ALLOW_PERMISSION_SKIP=1 to skip it explicitly"
+            );
+            eprintln!("SKIPPED (explicitly): directory permissions are ignored here");
             return;
         }
         assert!(bounded(eng.compact()).await.is_err());
