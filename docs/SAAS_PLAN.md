@@ -22,7 +22,7 @@ Decisions already made (2026-11-13, by the maintainer):
 
 - No authentication: the server listens on localhost (`--listen 127.0.0.1:58300`, `docs/OPERATING.md`).
 - Handlers are a static allowlist given as flags at startup (`--handler step=http://…`, D-003, D-008).
-- API: `/jobs`, `/jobs/{id}`, `/jobs/{id}/cancel`, `/health`, `/admin/backup`, `/admin/compact`, `/admin/diagnostics`.
+- API: `/jobs`, `/jobs/{id}`, `/jobs/{id}/spec`, `/jobs/{id}/cancel`, `/health`, `/admin/backup`, `/admin/compact`, `/admin/diagnostics`.
 - Data: one framed append-only journal with one writer is the only authority (D-001/D-006); the in-memory index is
   rebuilt, never authoritative. No database queue, no Redis.
 - UI: a one-page SvelteKit inspector (`apps/inspector`).

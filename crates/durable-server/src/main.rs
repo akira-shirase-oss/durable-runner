@@ -671,6 +671,31 @@ async fn inspect(
     })))
 }
 
+/// The spec a run was submitted with (its steps and input), for the API-key holder only
+/// (D-051): a controller that resubmits the same work under a new op_key needs it, and
+/// the input may be customer content, so the read key does not reveal it.
+async fn spec(
+    _: Authorized,
+    State(app): State<App>,
+    P(id): P<u64>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    use base64::Engine as _;
+    let run = app
+        .engine
+        .inspect(RunId(id))
+        .await?
+        .ok_or_else(|| ApiError::new(StatusCode::NOT_FOUND, "not_found", "no such run"))?;
+    Ok(Json(serde_json::json!({
+        "id": run.id.0,
+        "key": run.key.0,
+        "spec": {
+            "version": run.spec.version,
+            "steps": run.spec.steps,
+            "input_b64": base64::engine::general_purpose::STANDARD.encode(&run.spec.input),
+        },
+    })))
+}
+
 async fn cancel(
     _: Authorized,
     State(app): State<App>,
@@ -848,6 +873,7 @@ fn router(app: App, ui_dir: Option<&Path>) -> Router {
         .route("/ready", get(ready))
         .route("/jobs", post(submit).get(list))
         .route("/jobs/{id}", get(inspect))
+        .route("/jobs/{id}/spec", get(spec))
         .route("/jobs/{id}/cancel", post(cancel))
         .route("/admin/compact", post(compact))
         .route("/admin/backup", post(backup))
@@ -1519,8 +1545,9 @@ mod tests {
     #[tokio::test]
     async fn mutating_and_admin_routes_require_the_api_key() {
         let h = harness(true);
-        let routes: [(&str, &str, Option<Value>); 5] = [
+        let routes: [(&str, &str, Option<Value>); 6] = [
             ("POST", "/jobs", Some(submit_body("k"))),
+            ("GET", "/jobs/1/spec", None),
             ("POST", "/jobs/1/cancel", None),
             ("POST", "/admin/compact", None),
             ("POST", "/admin/backup", Some(json!({ "name": "b" }))),
@@ -1584,8 +1611,9 @@ mod tests {
             let (status, _) = call(&h.router, "GET", uri, Some(READ_KEY), None).await;
             assert_eq!(status, StatusCode::OK, "GET {uri}");
         }
-        let routes: [(&str, &str, Option<Value>); 5] = [
+        let routes: [(&str, &str, Option<Value>); 6] = [
             ("POST", "/jobs", Some(submit_body("r"))),
+            ("GET", "/jobs/1/spec", None),
             ("POST", "/jobs/1/cancel", None),
             ("POST", "/admin/compact", None),
             ("POST", "/admin/backup", Some(json!({ "name": "b" }))),
@@ -1601,6 +1629,34 @@ mod tests {
         }
         let (_, v) = call(&h.router, "GET", "/jobs/1", Some(KEY), None).await;
         assert_eq!(v["state"], "queued", "the read key cancelled nothing");
+    }
+
+    /// D-051: the API key reads back exactly the spec a run was submitted with, so a
+    /// controller can resubmit the same work under a new op_key; a missing run is 404.
+    #[tokio::test]
+    async fn the_api_key_reads_back_a_runs_submitted_spec() {
+        let h = harness(true);
+        let mut body = submit_body("spec-1");
+        body["not_before"] = json!(9_999_999_999_999u64); // stays queued
+        let (status, v) = call(&h.router, "POST", "/jobs", Some(KEY), Some(body.clone())).await;
+        assert_eq!(status, StatusCode::OK, "{v}");
+        let id = v["run_id"].as_u64().unwrap_or_else(|| panic!("{v}"));
+        let (status, v) = call(
+            &h.router,
+            "GET",
+            &format!("/jobs/{id}/spec"),
+            Some(KEY),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{v}");
+        assert_eq!(v["key"], "spec-1");
+        assert_eq!(
+            v["spec"], body["spec"],
+            "the spec round-trips to a submit body"
+        );
+        let (status, _) = call(&h.router, "GET", "/jobs/999/spec", Some(KEY), None).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
     }
 
     /// `--open-reads` serves reads without a key; it is refused at startup

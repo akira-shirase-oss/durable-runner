@@ -65,6 +65,7 @@ delete every superseded `gen-*` directory (retention). Runs on `POST
 | `GET /jobs?order=desc&before=&limit=` | read key or API key (same) | newest first; `next_before` continues (the inspector's view) |
 | `GET /jobs/{id}` | read key or API key (same) | inspect a run |
 | `POST /jobs` | API key | submit (dedup by `op_key`) |
+| `GET /jobs/{id}/spec` | API key only | the steps and input a run was submitted with, as a submit body's `spec` (D-051) |
 | `POST /jobs/{id}/cancel` | API key | cancel (stops scheduling, never undoes) |
 | `POST /admin/compact` | API key | compact into a new generation |
 | `POST /admin/backup {name}` | API key | backup to `<backup-root>/<name>` only |

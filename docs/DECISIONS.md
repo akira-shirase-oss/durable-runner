@@ -842,3 +842,15 @@ convention; these seed the contract's prescribed directions.
   and a lost reply's probe names the attempt it reconciles. Asked for by
   an observability add-on that integrates through this public contract
   only, as any customer would.
+- **D-051 — The API key reads back a run's submitted spec.** A
+  controller that recovers a failed run resubmits the same work under a
+  new `op_key` (an `op_key` returns its first run, so the old key cannot
+  be reused). It needs the run's steps and input, which `GET /jobs/{id}`
+  does not return. `GET /jobs/{id}/spec` answers `{id, key, spec}` with
+  `spec` in the submit body's shape (`version`, `steps`, `input_b64`), so
+  it round-trips. It takes the API key only: the input may be customer
+  content, and the read key exists to show state without it (D-037). A
+  run whose history expired (D-005) answers 404, like inspect. Additive,
+  tested (the route is in both key tests, and the spec round-trips), and
+  the engine is unchanged. Asked for by the same observability add-on's
+  controlled recovery, through this public contract only.
