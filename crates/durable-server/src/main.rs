@@ -97,9 +97,34 @@ const MIN_API_KEY_LEN: usize = 32;
 /// Largest request body accepted on any route.
 const MAX_REQUEST_BYTES: usize = 256 * 1024;
 
+/// `name=URL`, where the URL is http or https with a host: the allowlist
+/// can only name HTTP endpoints.
 fn parse_handler(s: &str) -> Result<(String, String), String> {
     let (name, url) = s.split_once('=').ok_or("expected name=URL")?;
+    if name.is_empty() {
+        return Err("a handler needs a name before '='".into());
+    }
+    let parsed = reqwest::Url::parse(url).map_err(|e| format!("handler URL {url:?}: {e}"))?;
+    if !matches!(parsed.scheme(), "http" | "https") || parsed.host_str().is_none_or(str::is_empty) {
+        return Err(format!(
+            "handler URL {url:?} must be http:// or https:// with a host"
+        ));
+    }
     Ok((name.to_string(), url.to_string()))
+}
+
+/// The client every handler call goes through (D-039): it never follows a
+/// redirect (a 3xx is the handler's answer, a failed attempt, so a job's
+/// input and idempotency key go only to the registered URL), it ignores
+/// the proxy environment variables (nothing outside the allowlist can
+/// route calls), and it gives up connecting after 5 s.
+fn handler_client() -> Result<reqwest::Client> {
+    reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .no_proxy()
+        .connect_timeout(Duration::from_secs(5))
+        .build()
+        .context("build the handler HTTP client")
 }
 
 /// An allowlisted HTTP handler: POSTs `{input, idem_key}` to its URL and
@@ -839,7 +864,7 @@ async fn main() -> Result<()> {
         ..Default::default()
     };
     let mut registry = Registry::default();
-    let client = reqwest::Client::new();
+    let client = handler_client()?;
     for (name, url) in &args.handlers {
         registry.register(
             name,
@@ -1504,7 +1529,7 @@ mod tests {
 
     fn http_handler(url: String) -> HttpHandler {
         HttpHandler {
-            client: reqwest::Client::new(),
+            client: handler_client().unwrap_or_else(|e| panic!("{e}")),
             url,
             timeout: Duration::from_secs(10),
             max_output: 1024,
@@ -1539,6 +1564,87 @@ mod tests {
         )
         .await;
         assert!(matches!(execute(&http_handler(url)).await, Outcome::Failed));
+    }
+
+    /// A listener that answers every connection with `head` and counts
+    /// the connections it accepted.
+    async fn counting_handler(head: String) -> (String, Arc<std::sync::atomic::AtomicUsize>) {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .unwrap_or_else(|e| panic!("{e}"));
+        let addr = listener.local_addr().unwrap_or_else(|e| panic!("{e}"));
+        let seen = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let count = seen.clone();
+        tokio::spawn(async move {
+            while let Ok((mut sock, _)) = listener.accept().await {
+                count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let head = head.clone();
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 4096];
+                    let _ = sock.read(&mut buf).await;
+                    let _ = sock.write_all(head.as_bytes()).await;
+                });
+            }
+        });
+        (format!("http://{addr}/step"), seen)
+    }
+
+    /// Checklist: the handler client followed redirects, so a handler's
+    /// 307 re-POSTed the job's input and idempotency key to wherever it
+    /// pointed. A redirect is now an answer (a failed attempt), never
+    /// followed.
+    #[tokio::test]
+    async fn a_handler_redirect_is_not_followed() {
+        let ok = "HTTP/1.1 200 OK\r\ncontent-length: 2\r\n\r\n{}".to_string();
+        let (elsewhere, seen) = counting_handler(ok).await;
+        for code in [
+            "301 Moved Permanently",
+            "302 Found",
+            "307 Temporary Redirect",
+            "308 Permanent Redirect",
+        ] {
+            let head =
+                format!("HTTP/1.1 {code}\r\nlocation: {elsewhere}\r\ncontent-length: 0\r\n\r\n");
+            let (url, _) = counting_handler(head).await;
+            let h = http_handler(url);
+            assert!(matches!(execute(&h).await, Outcome::Failed), "{code}");
+            let step = StepSpec {
+                name: "s".into(),
+                handler: "h".into(),
+            };
+            assert!(
+                !h.probe(&step, "k/0").await,
+                "{code}: a redirected probe is not found"
+            );
+        }
+        assert_eq!(
+            seen.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "the redirect target was contacted"
+        );
+    }
+
+    /// Handler URLs must be http(s) with a host: a job can only ever reach
+    /// what the operator registered, over HTTP.
+    #[test]
+    fn handler_urls_must_be_http_or_https() {
+        for ok in [
+            "step=http://127.0.0.1:9/step",
+            "s=https://handlers.example/step",
+        ] {
+            parse_handler(ok).unwrap_or_else(|e| panic!("{ok}: {e}"));
+        }
+        for bad in [
+            "s=file:///etc/passwd",
+            "s=ftp://h/x",
+            "s=unix:/tmp/sock",
+            "s=http://",
+            "s=not a url",
+            "=http://h/x",
+        ] {
+            assert!(parse_handler(bad).is_err(), "{bad}");
+        }
     }
 
     #[tokio::test]

@@ -327,3 +327,89 @@ async fn open_reads_off_loopback_refuses_startup() {
     )
     .await;
 }
+
+/// A listener that answers every connection with `reply` and counts them.
+async fn counting(reply: &'static str) -> (u16, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
+    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+    let l = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .unwrap_or_else(|e| panic!("{e}"));
+    let port = l.local_addr().unwrap_or_else(|e| panic!("{e}")).port();
+    let seen = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let count = seen.clone();
+    tokio::spawn(async move {
+        while let Ok((mut s, _)) = l.accept().await {
+            count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            tokio::spawn(async move {
+                let mut buf = [0u8; 8192];
+                let _ = s.read(&mut buf).await;
+                let _ = s.write_all(reply.as_bytes()).await;
+            });
+        }
+    });
+    (port, seen)
+}
+
+/// Checklist: the handler client honoured HTTP_PROXY and friends, so an
+/// environment variable could route every job's input through a proxy.
+/// Handler calls go straight to the registered URL.
+#[tokio::test]
+async fn handler_calls_ignore_proxy_environment_variables() {
+    use std::sync::atomic::Ordering::SeqCst;
+    let (proxy, via_proxy) =
+        counting("HTTP/1.1 502 Bad Gateway\r\ncontent-length: 0\r\n\r\n").await;
+    let (handler, direct) = counting("HTTP/1.1 200 OK\r\ncontent-length: 2\r\n\r\n{}").await;
+    let d = tempfile::tempdir().unwrap_or_else(|e| panic!("{e}"));
+    let port = free_port();
+    let base = format!("http://127.0.0.1:{port}");
+    let proxy_url = format!("http://127.0.0.1:{proxy}");
+    let mut server = Command::new(env!("CARGO_BIN_EXE_durable-server"))
+        .arg("--journal")
+        .arg(d.path().join("journal"))
+        .args(["--listen", &format!("127.0.0.1:{port}")])
+        .args([
+            "--handler",
+            &format!("step=http://127.0.0.1:{handler}/step"),
+        ])
+        .env("DURABLE_API_KEY", KEY)
+        .env("HTTP_PROXY", &proxy_url)
+        .env("http_proxy", &proxy_url)
+        .env("HTTPS_PROXY", &proxy_url)
+        .env("ALL_PROXY", &proxy_url)
+        .env("all_proxy", &proxy_url)
+        .env_remove("NO_PROXY")
+        .env_remove("no_proxy")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap_or_else(|e| panic!("{e}"));
+    let c = reqwest::Client::builder()
+        .no_proxy()
+        .build()
+        .unwrap_or_else(|e| panic!("{e}"));
+    wait_healthy(&c, &base).await;
+    let body = serde_json::json!({
+        "op_key": "proxy-check",
+        "spec": { "version": 1, "steps": [{ "name": "a", "handler": "step" }], "input_b64": "aGk=" },
+    });
+    let r = c
+        .post(format!("{base}/jobs"))
+        .bearer_auth(KEY)
+        .json(&body)
+        .send()
+        .await
+        .unwrap_or_else(|e| panic!("{e}"));
+    assert!(r.status().is_success(), "{}", r.status());
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while direct.load(SeqCst) + via_proxy.load(SeqCst) == 0 && Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    let _ = server.kill();
+    let _ = server.wait();
+    assert_eq!(
+        via_proxy.load(SeqCst),
+        0,
+        "a handler call went through the proxy"
+    );
+    assert!(direct.load(SeqCst) >= 1, "the handler was never called");
+}

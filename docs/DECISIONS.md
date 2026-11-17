@@ -593,3 +593,16 @@ convention; these seed the contract's prescribed directions.
   generation), best effort: a path this user may not chmod is left as it
   is rather than stopping startup. Unix only; elsewhere the modes are
   the platform's.
+- **D-039 — The handler client follows no redirect and no proxy.** The
+  client was `reqwest::Client::new()`. It followed redirects, so a
+  handler's 307 or 308 re-POSTed the job's input and idempotency key to
+  wherever the `Location` pointed, outside the allowlist. It honoured
+  `HTTP_PROXY`, `HTTPS_PROXY` and `ALL_PROXY`, so the environment could
+  route every call, input included, through a proxy. And `--handler`
+  accepted any URL scheme. Now the client never follows a redirect (a
+  3xx is the handler's answer: the attempt fails and is retried under the
+  same idempotency key; a 3xx probe is "not found"), ignores the proxy
+  variables, and gives up connecting after 5 s. `--handler` accepts only
+  `http://` or `https://` URLs with a host. Signing calls so a handler
+  can tell they come from this runner is not built; it belongs with the
+  SaaS handler registry (SAAS_PLAN S2).

@@ -106,8 +106,11 @@ target/release/durable-server \
   in flight are abandoned and reconcile after the restart. Give the
   supervisor at least twice the drain timeout (systemd
   `TimeoutStopSec=70`).
-- `--handler name=URL` is the allowlist — repeatable; a submit naming a
-  handler outside it is refused 409 with `unregistered handler`.
+- `--handler name=URL` is the allowlist — repeatable, `http://` or
+  `https://` only; a submit naming a handler outside it is refused 409
+  with `unregistered handler`. Calls go only to that URL: redirects are
+  not followed (a 3xx fails the attempt) and the proxy environment
+  variables are ignored (D-039).
 - The journal directory is created on first run: `LOCK`, `manifest.json`,
   `gen-00000N/{journal.log,snapshot.bin}`, owner-only (directories 0700,
   files 0600; backups and restores too, D-038). Run the server as the
