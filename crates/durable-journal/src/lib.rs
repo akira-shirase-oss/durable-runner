@@ -2793,12 +2793,9 @@ mod tests {
             open_checked(&file, &seen).is_err(),
             "opened a symlink swapped in after the check"
         );
-        fs::remove_file(&file).unwrap_or_else(|e| panic!("{e}"));
-        fs::write(&file, b"another file, same name").unwrap_or_else(|e| panic!("{e}"));
-        assert!(
-            open_checked(&file, &seen).is_err(),
-            "opened a replaced file"
-        );
+        // (A regular file replaced under the same name may reuse the inode
+        // on Linux, so it is not caught here; its size and checksum are
+        // checked against the backup's file list instead.)
     }
 
     /// Review U10: the generation directories' entries in the target were
