@@ -71,6 +71,10 @@ struct Args {
     /// dispatch rate is at most 20 × this per second).
     #[arg(long, default_value_t = 64)]
     max_dispatch_per_tick: usize,
+    /// How long a submit, cancel or read waits for the engine before it is
+    /// answered 503 `timeout` (a stuck disk must not hang every request).
+    #[arg(long, default_value_t = 10_000)]
+    reply_timeout_ms: u64,
 }
 
 /// The environment variable holding the API key. Read from the
@@ -372,6 +376,12 @@ impl From<EngineError> for ApiError {
             EngineError::SnapshotOverBudget { .. } => {
                 Self::new(StatusCode::CONFLICT, "snapshot_over_budget", e.to_string())
             }
+            EngineError::Timeout => Self::new(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "timeout",
+                "the engine did not answer in time; a submit may still commit, so retry with the \
+                 same op_key",
+            ),
             EngineError::Serde(_) | EngineError::Piped | EngineError::Config(_) => {
                 Self::internal(&e)
             }
@@ -725,6 +735,7 @@ async fn main() -> Result<()> {
         max_snapshot_bytes: args.max_snapshot_bytes,
         max_in_flight: args.max_in_flight.max(1),
         max_dispatch_per_tick: args.max_dispatch_per_tick.max(1),
+        reply_timeout: Duration::from_millis(args.reply_timeout_ms.max(1)),
         limits: durable_domain::Limits {
             max_live_runs: args.max_live_runs,
             max_index_bytes: args.max_index_bytes,
@@ -1348,6 +1359,52 @@ mod tests {
         fail.store(true, std::sync::atomic::Ordering::SeqCst);
         let (status, v) = call(&r, "POST", "/jobs", Some(KEY), Some(submit_body("p"))).await;
         assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{v}");
+    }
+
+    /// Review (still open): with the journal's fsync stuck, every request
+    /// hung, open reads included. Submit and list answer 503 `timeout`
+    /// within the reply deadline instead.
+    #[tokio::test]
+    async fn a_stuck_journal_answers_503_timeout_within_the_deadline() {
+        let journal = tempfile::tempdir().unwrap_or_else(|e| panic!("{e}"));
+        let faults = Arc::new(durable_journal::faults::Faults::default());
+        let mut reg = Registry::default();
+        reg.register("step", Arc::new(Echo));
+        let cfg = ShellConfig {
+            tick_ms: 5,
+            reply_timeout: Duration::from_millis(300),
+            journal: durable_journal::JournalOptions {
+                faults: Some(faults.clone()),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let engine = spawn(journal.path(), reg, cfg).unwrap_or_else(|e| panic!("{e}"));
+        let r = router(
+            App {
+                engine,
+                api_key: ApiKey::new(KEY),
+                backup_root: None,
+            },
+            None,
+        );
+        faults.hold_syncs();
+        let within = |f| tokio::time::timeout(Duration::from_secs(5), f);
+        let (status, v) = within(call(&r, "POST", "/jobs", Some(KEY), Some(submit_body("s"))))
+            .await
+            .unwrap_or_else(|_| panic!("submit hung"));
+        assert_eq!(
+            (status, v["code"].clone()),
+            (StatusCode::SERVICE_UNAVAILABLE, json!("timeout"))
+        );
+        let (status, v) = within(call(&r, "GET", "/jobs", Some(KEY), None))
+            .await
+            .unwrap_or_else(|_| panic!("list hung"));
+        assert_eq!(
+            (status, v["code"].clone()),
+            (StatusCode::SERVICE_UNAVAILABLE, json!("timeout"))
+        );
+        faults.release_syncs();
     }
 
     /// Auth schemes are case-insensitive (RFC 9110 §11.1), and the token

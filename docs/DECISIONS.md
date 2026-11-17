@@ -517,3 +517,16 @@ convention; these seed the contract's prescribed directions.
   manifest instead of starting a new journal there: first open writes
   the manifest before any generation, so that layout is only damage or
   an interrupted restore. Remove it and restore again.
+- **D-035 — Every engine reply has a deadline.** The `Engine` handle
+  awaited the actor's answer with no deadline. Acks and reads are held
+  until their covering fsync (D-014), so a stuck disk (an fsync that
+  never returns) hung every request, open reads included, and the
+  connections piled up. Now each answer is awaited at most
+  `reply_timeout` (submit, cancel, inspect, list, diagnostics; default
+  10 s, `--reply-timeout-ms`) or `admin_timeout` (compact and backup,
+  600 s), and the caller then gets `EngineError::Timeout`, HTTP 503
+  `timeout`. A timeout is an unknown outcome, not a refusal: a timed-out
+  submit can still commit once the disk answers, so the message says to
+  retry with the same op_key, which dedup turns into the same run. The
+  engine's own state is unchanged by a timeout: nothing is cancelled, and
+  the held answer is dropped when it is released.

@@ -174,7 +174,10 @@ refuses to start there, so remove the directory and restore again.
   `--reserve-bytes`, default 64 MiB, or a real ENOSPC — nothing was
   written), `unavailable` (free space could not be read), or
   `journal_unavailable` (a journal write failed and was rolled back, or
-  the writer is poisoned and the process is about to exit).
+  the writer is poisoned and the process is about to exit), or `timeout`
+  (the engine did not answer within `--reply-timeout-ms`, default 10 s,
+  e.g. a stuck disk; a submit may still commit, so retry with the same
+  `op_key`).
 - `GET /ready` — readiness, separate from `/health` (liveness): `503
   {"ready":false,"code":"no_space"}` while free space is below the
   reserve, `engine_stopped` once the engine has stopped. Point the load

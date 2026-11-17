@@ -127,6 +127,18 @@ pub struct Engine {
     /// Becomes true once the actor has returned and the writer thread has
     /// released the journal.
     stopped: watch::Receiver<bool>,
+    reply_timeout: Duration,
+    admin_timeout: Duration,
+}
+
+/// Wait for the actor's answer, at most `limit`: a stuck journal must not
+/// hang the caller. A timed-out request may still complete.
+async fn answer<T>(rx: oneshot::Receiver<T>, limit: Duration) -> Result<T, EngineError> {
+    match tokio::time::timeout(limit, rx).await {
+        Ok(Ok(v)) => Ok(v),
+        Ok(Err(_)) => Err(EngineError::Stopped),
+        Err(_) => Err(EngineError::Timeout),
+    }
 }
 
 /// State the actor publishes for readiness, readable without a round trip
@@ -214,13 +226,13 @@ impl Engine {
             not_before,
             reply,
         })?;
-        rx.await.map_err(|_| EngineError::Stopped)?
+        answer(rx, self.reply_timeout).await?
     }
 
     pub async fn cancel(&self, run: RunId) -> Result<(), EngineError> {
         let (reply, rx) = oneshot::channel();
         self.send(Cmd::Cancel { run, reply })?;
-        rx.await.map_err(|_| EngineError::Stopped)?
+        answer(rx, self.reply_timeout).await?
     }
 
     /// Compact the journal: snapshot live state into a new generation,
@@ -228,14 +240,14 @@ impl Engine {
     pub async fn compact(&self) -> Result<u32, EngineError> {
         let (reply, rx) = oneshot::channel();
         self.send(Cmd::Compact { reply })?;
-        rx.await.map_err(|_| EngineError::Stopped)?
+        answer(rx, self.admin_timeout).await?
     }
 
     /// Consistent backup of the journal to `dest` (manifest copied last).
     pub async fn backup_to(&self, dest: std::path::PathBuf) -> Result<(), EngineError> {
         let (reply, rx) = oneshot::channel();
         self.send(Cmd::Backup { dest, reply })?;
-        rx.await.map_err(|_| EngineError::Stopped)?
+        answer(rx, self.admin_timeout).await?
     }
 
     /// One page of the live index in id order: at most
@@ -252,14 +264,14 @@ impl Engine {
             limit: limit.clamp(1, MAX_PAGE),
             reply,
         })?;
-        rx.await.map_err(|_| EngineError::Stopped)
+        answer(rx, self.reply_timeout).await
     }
 
     /// Bounded diagnostics — counts by state kind, never rows.
     pub async fn diag(&self) -> Result<crate::Diagnostics, EngineError> {
         let (reply, rx) = oneshot::channel();
         self.send_read(Read::Diag { reply })?;
-        rx.await.map_err(|_| EngineError::Stopped)
+        answer(rx, self.reply_timeout).await
     }
 
     /// Readiness: false once the actor has stopped or while free space is
@@ -309,7 +321,7 @@ impl Engine {
     pub async fn inspect(&self, run: RunId) -> Result<Option<Run>, EngineError> {
         let (reply, rx) = oneshot::channel();
         self.send_read(Read::Inspect { run, reply })?;
-        rx.await.map_err(|_| EngineError::Stopped)
+        answer(rx, self.reply_timeout).await
     }
 }
 
@@ -349,6 +361,13 @@ pub struct ShellConfig {
     /// deleting superseded generations); `None` (the default) = only on
     /// request.
     pub compact_every: Option<Duration>,
+    /// How long a caller waits for the engine's answer to a submit, a
+    /// cancel or a read before it gets `Timeout` (a stuck fsync must not
+    /// hang every request).
+    pub reply_timeout: Duration,
+    /// The same for compaction and backup, which write a whole snapshot or
+    /// copy the journal.
+    pub admin_timeout: Duration,
 }
 
 impl Default for ShellConfig {
@@ -368,6 +387,8 @@ impl Default for ShellConfig {
             // Off until compaction is cheap and its error path is fatal
             // (D-018): an operator schedules it explicitly.
             compact_every: None,
+            reply_timeout: Duration::from_secs(10),
+            admin_timeout: Duration::from_secs(600),
         }
     }
 }
@@ -395,6 +416,7 @@ pub fn spawn(dir: &Path, registry: Registry, mut cfg: ShellConfig) -> Result<Eng
         errors: BTreeMap::new(),
     };
     let (stopped_tx, stopped) = watch::channel(false);
+    let (reply_timeout, admin_timeout) = (cfg.reply_timeout, cfg.admin_timeout);
     tokio::spawn(async move {
         // Every return path of the actor joins the writer first.
         actor(core, registry, cfg, (rx, read_rx), mon, writer).await;
@@ -406,6 +428,8 @@ pub fn spawn(dir: &Path, registry: Registry, mut cfg: ShellConfig) -> Result<Eng
         health,
         discarded_tail,
         stopped,
+        reply_timeout,
+        admin_timeout,
     })
 }
 
@@ -2038,6 +2062,41 @@ mod tests {
         assert!(seen.is_some(), "the held read answers once durable");
         assert!(matches!(until_done(&eng, run).await, RunState::Done));
         assert_eq!(h.calls.load(SeqCst), 1);
+    }
+
+    /// Review (still open): the engine's replies were awaited with no
+    /// deadline, so a stuck fsync hung every request, reads included. A
+    /// caller now gets `Timeout` within the reply deadline; the stuck
+    /// submit may still commit later (its outcome was unknown, not
+    /// refused), and a retry with the same op_key finds it.
+    #[tokio::test]
+    async fn replies_have_a_deadline_while_the_journal_is_stuck() {
+        let d = tempfile::tempdir().unwrap_or_else(|e| panic!("{e}"));
+        let faults = Arc::new(Faults::default());
+        let cfg = ShellConfig {
+            reply_timeout: Duration::from_millis(300),
+            ..piped(&faults, GroupCommit::default())
+        };
+        let eng = spawn(d.path(), echo_registry(), cfg).unwrap_or_else(|e| panic!("{e}"));
+        let early = eng
+            .submit_at(OperationKey("early".into()), spec1("echo"), FAR)
+            .await
+            .unwrap_or_else(|e| panic!("{e}"));
+        faults.hold_syncs();
+        let r = bounded(eng.submit_at(OperationKey("stuck".into()), spec1("echo"), FAR)).await;
+        assert!(matches!(r, Err(EngineError::Timeout)), "{r:?}");
+        let r = bounded(eng.inspect(early)).await;
+        assert!(
+            matches!(r, Err(EngineError::Timeout)),
+            "a read waits on the stuck commit: {r:?}"
+        );
+        let r = bounded(eng.list(None, 10)).await;
+        assert!(matches!(r, Err(EngineError::Timeout)), "{r:?}");
+        faults.release_syncs();
+        let again = bounded(eng.submit_at(OperationKey("stuck".into()), spec1("echo"), FAR))
+            .await
+            .unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(again, RunId(2), "the timed-out submit committed once");
     }
 
     /// Answers Lost once its gate opens; counts its probes (which find the

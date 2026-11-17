@@ -62,6 +62,10 @@ pub enum EngineError {
     /// The engine configuration is unusable (refused at spawn).
     #[error("invalid configuration: {0}")]
     Config(String),
+    /// The engine did not answer within the caller's deadline. The request
+    /// may still complete (a submit may commit): retry with the same key.
+    #[error("the engine did not answer in time")]
+    Timeout,
 }
 
 /// A journaled record: the run, the commit clock value, and the event.
