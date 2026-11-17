@@ -75,6 +75,11 @@ struct Args {
     /// answered 503 `timeout` (a stuck disk must not hang every request).
     #[arg(long, default_value_t = 10_000)]
     reply_timeout_ms: u64,
+    /// Serve reads (`GET /jobs`, `GET /jobs/{id}`) without a key. Refused
+    /// at startup unless `--listen` is a loopback address: anything that
+    /// can reach a non-loopback listener could read every op_key (D-037).
+    #[arg(long)]
+    open_reads: bool,
     /// On SIGTERM or SIGINT: how long to let requests in flight finish,
     /// and then how long the engine may take to make everything it
     /// decided durable, before exiting non-zero instead of 0.
@@ -85,6 +90,9 @@ struct Args {
 /// The environment variable holding the API key. Read from the
 /// environment, never from argv (argv is visible to every local user).
 const API_KEY_ENV: &str = "DURABLE_API_KEY";
+/// An optional second key that may only read (`GET /jobs`, `GET
+/// /jobs/{id}`): what the inspector or a dashboard should hold.
+const READ_KEY_ENV: &str = "DURABLE_READ_KEY";
 const MIN_API_KEY_LEN: usize = 32;
 /// Largest request body accepted on any route.
 const MAX_REQUEST_BYTES: usize = 256 * 1024;
@@ -203,36 +211,80 @@ fn sha256(bytes: &[u8]) -> [u8; 32] {
 struct App {
     engine: Engine,
     api_key: ApiKey,
+    /// A key that may only read; `None` if none is configured.
+    read_key: Option<ApiKey>,
+    /// Reads need no key (`--open-reads`, loopback listeners only).
+    open_reads: bool,
     /// Canonical backup directory; `None` disables `/admin/backup`.
     backup_root: Option<Arc<Path>>,
 }
 
+/// The bearer token a request carries: `<scheme> <token>`, the scheme
+/// case-insensitive (RFC 9110 §11.1), surrounding whitespace ignored.
+fn bearer(parts: &Parts) -> Option<&str> {
+    parts
+        .headers
+        .get(header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.trim().split_once(char::is_whitespace))
+        .and_then(|(scheme, token)| scheme.eq_ignore_ascii_case("bearer").then(|| token.trim()))
+}
+
+fn unauthorized() -> ApiError {
+    ApiError::new(
+        StatusCode::UNAUTHORIZED,
+        "unauthorized",
+        "missing or invalid API key (Authorization: Bearer <key>)",
+    )
+}
+
 /// Proof that the request carried the API key. Every mutating and admin
 /// handler takes this as its first extractor, so it runs before the body
-/// is parsed and the route cannot be reached without the key.
+/// is parsed and the route cannot be reached without the key. The
+/// read-only key is recognised and refused 403: it is valid, but not here.
 struct Authorized;
 
 impl FromRequestParts<App> for Authorized {
     type Rejection = ApiError;
 
     async fn from_request_parts(parts: &mut Parts, app: &App) -> Result<Self, Self::Rejection> {
-        // `<scheme> <token>`; the scheme is case-insensitive (RFC 9110
-        // §11.1) and surrounding whitespace is ignored.
-        let presented = parts
-            .headers
-            .get(header::AUTHORIZATION)
-            .and_then(|v| v.to_str().ok())
-            .and_then(|v| v.trim().split_once(char::is_whitespace))
-            .and_then(|(scheme, token)| {
-                scheme.eq_ignore_ascii_case("bearer").then(|| token.trim())
-            });
-        match presented {
-            Some(key) if app.api_key.verify(key) => Ok(Authorized),
-            _ => Err(ApiError::new(
-                StatusCode::UNAUTHORIZED,
-                "unauthorized",
-                "missing or invalid API key (Authorization: Bearer <key>)",
-            )),
+        let Some(key) = bearer(parts) else {
+            return Err(unauthorized());
+        };
+        if app.api_key.verify(key) {
+            return Ok(Authorized);
+        }
+        if app.read_key.as_ref().is_some_and(|k| k.verify(key)) {
+            return Err(ApiError::new(
+                StatusCode::FORBIDDEN,
+                "forbidden",
+                "this key may only read (DURABLE_READ_KEY); this route needs DURABLE_API_KEY",
+            ));
+        }
+        Err(unauthorized())
+    }
+}
+
+/// Proof that the request may read: the API key or the read-only key, or
+/// the server runs with `--open-reads` (loopback only). Taken first by
+/// every handler that shows runs (D-037).
+struct ReadAuthorized;
+
+impl FromRequestParts<App> for ReadAuthorized {
+    type Rejection = ApiError;
+
+    async fn from_request_parts(parts: &mut Parts, app: &App) -> Result<Self, Self::Rejection> {
+        if app.open_reads {
+            return Ok(ReadAuthorized);
+        }
+        match bearer(parts) {
+            Some(key)
+                if app.api_key.verify(key)
+                    || app.read_key.as_ref().is_some_and(|k| k.verify(key)) =>
+            {
+                Ok(ReadAuthorized)
+            }
+            _ => Err(unauthorized()),
         }
     }
 }
@@ -487,6 +539,7 @@ fn state_name(s: &RunState) -> String {
 }
 
 async fn inspect(
+    _: ReadAuthorized,
     State(app): State<App>,
     P(id): P<u64>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
@@ -527,6 +580,7 @@ struct ListQuery {
 }
 
 async fn list(
+    _: ReadAuthorized,
     State(app): State<App>,
     Q(q): Q<ListQuery>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
@@ -666,9 +720,11 @@ fn base64_decode(s: &str) -> Result<Vec<u8>, String> {
         .map_err(|e| e.to_string())
 }
 
-/// Every route. Reads (`/health`, `/ready`, `GET /jobs`, `GET /jobs/{id}`, the
-/// inspector) are open; every mutating and admin handler takes
-/// `Authorized`, so it is unreachable without the API key.
+/// Every route. `/health`, `/ready` and the inspector's static files are
+/// open (they show no runs). `GET /jobs` and `GET /jobs/{id}` take
+/// `ReadAuthorized` (either key, or `--open-reads`); every mutating and
+/// admin handler takes `Authorized`, so it is unreachable without the API
+/// key.
 fn router(app: App, ui_dir: Option<&Path>) -> Router {
     let mut router = Router::new()
         .route("/health", get(health))
@@ -707,6 +763,38 @@ fn api_key_from_env() -> Result<ApiKey> {
     Ok(ApiKey::new(key.trim()))
 }
 
+/// The optional read-only key: at least as long as the API key, and not
+/// the same key (a read key that is also the admin key scopes nothing).
+fn read_key_from_env(api_key: &ApiKey) -> Result<Option<ApiKey>> {
+    let Ok(key) = std::env::var(READ_KEY_ENV) else {
+        return Ok(None);
+    };
+    let key = key.trim();
+    if key.len() < MIN_API_KEY_LEN {
+        anyhow::bail!("{READ_KEY_ENV} must be at least {MIN_API_KEY_LEN} characters");
+    }
+    if api_key.verify(key) {
+        anyhow::bail!("{READ_KEY_ENV} must differ from {API_KEY_ENV}");
+    }
+    Ok(Some(ApiKey::new(key)))
+}
+
+/// `--open-reads` is allowed only where nothing but this host can connect:
+/// a loopback IP address (a name such as `localhost` is not trusted to
+/// resolve to one).
+fn check_open_reads(listen: &str, open_reads: bool) -> Result<()> {
+    if !open_reads {
+        return Ok(());
+    }
+    match listen.parse::<std::net::SocketAddr>() {
+        Ok(a) if a.ip().is_loopback() => Ok(()),
+        _ => anyhow::bail!(
+            "--open-reads is allowed only on a loopback --listen (127.0.0.1 or [::1]); \
+             {listen} is reachable from elsewhere, so reads need DURABLE_API_KEY or DURABLE_READ_KEY"
+        ),
+    }
+}
+
 fn prepare_backup_root(dir: &Path) -> Result<Arc<Path>> {
     std::fs::create_dir_all(dir)
         .with_context(|| format!("create backup root {}", dir.display()))?;
@@ -725,6 +813,8 @@ fn prepare_backup_root(dir: &Path) -> Result<Arc<Path>> {
 async fn main() -> Result<()> {
     let args = Args::parse();
     let api_key = api_key_from_env()?;
+    let read_key = read_key_from_env(&api_key)?;
+    check_open_reads(&args.listen, args.open_reads)?;
     let backup_root = args
         .backup_root
         .as_deref()
@@ -774,6 +864,8 @@ async fn main() -> Result<()> {
     let app = App {
         engine,
         api_key,
+        read_key,
+        open_reads: args.open_reads,
         backup_root,
     };
     let router = router(app, args.ui_dir.as_deref());
@@ -860,6 +952,7 @@ mod tests {
     use tower::ServiceExt as _;
 
     const KEY: &str = "test-key-0123456789abcdef0123456789abcdef";
+    const READ_KEY: &str = "read-key-0123456789abcdef0123456789abcdef";
 
     struct Echo;
     #[async_trait::async_trait]
@@ -907,6 +1000,8 @@ mod tests {
         let app = App {
             engine,
             api_key: ApiKey::new(KEY),
+            read_key: Some(ApiKey::new(READ_KEY)),
+            open_reads: false,
             backup_root,
         };
         Harness {
@@ -986,7 +1081,7 @@ mod tests {
                 assert_eq!(v["code"], "unauthorized");
             }
         }
-        let (_, list) = call(&h.router, "GET", "/jobs", None, None).await;
+        let (_, list) = call(&h.router, "GET", "/jobs", Some(KEY), None).await;
         assert_eq!(list["runs"], json!([]), "refused submits journaled nothing");
         assert!(
             std::fs::read_dir(h.backups.path().join("root"))
@@ -998,7 +1093,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn the_key_is_accepted_and_reads_stay_open() {
+    async fn the_key_is_accepted_everywhere() {
         let h = harness(true);
         let (status, v) = call(
             &h.router,
@@ -1010,14 +1105,121 @@ mod tests {
         .await;
         assert_eq!(status, StatusCode::OK, "{v}");
         assert_eq!(v["run_id"], 1);
-        let (status, _) = call(&h.router, "GET", "/jobs/1", None, None).await;
+        let (status, _) = call(&h.router, "GET", "/jobs/1", Some(KEY), None).await;
         assert_eq!(status, StatusCode::OK);
-        let (status, _) = call(&h.router, "GET", "/jobs", None, None).await;
+        let (status, _) = call(&h.router, "GET", "/jobs", Some(KEY), None).await;
         assert_eq!(status, StatusCode::OK);
         let (status, _) = call(&h.router, "GET", "/health", None, None).await;
         assert_eq!(status, StatusCode::OK);
         let (status, _) = call(&h.router, "GET", "/admin/diagnostics", Some(KEY), None).await;
         assert_eq!(status, StatusCode::OK);
+    }
+
+    /// Checklist (key scopes): the read-only key reads, and every
+    /// mutating and admin route refuses it 403 — a valid key, wrong scope.
+    #[tokio::test]
+    async fn the_read_key_reads_and_nothing_else() {
+        let h = harness(true);
+        let mut later = submit_body("k");
+        later["not_before"] = json!(9_999_999_999_999u64); // stays queued
+        let (status, _) = call(&h.router, "POST", "/jobs", Some(KEY), Some(later)).await;
+        assert_eq!(status, StatusCode::OK);
+        for uri in ["/jobs", "/jobs/1"] {
+            let (status, _) = call(&h.router, "GET", uri, Some(READ_KEY), None).await;
+            assert_eq!(status, StatusCode::OK, "GET {uri}");
+        }
+        let routes: [(&str, &str, Option<Value>); 5] = [
+            ("POST", "/jobs", Some(submit_body("r"))),
+            ("POST", "/jobs/1/cancel", None),
+            ("POST", "/admin/compact", None),
+            ("POST", "/admin/backup", Some(json!({ "name": "b" }))),
+            ("GET", "/admin/diagnostics", None),
+        ];
+        for (method, uri, body) in routes {
+            let (status, v) = call(&h.router, method, uri, Some(READ_KEY), body).await;
+            assert_eq!(
+                (status, v["code"].clone()),
+                (StatusCode::FORBIDDEN, json!("forbidden")),
+                "{method} {uri}"
+            );
+        }
+        let (_, v) = call(&h.router, "GET", "/jobs/1", Some(KEY), None).await;
+        assert_eq!(v["state"], "queued", "the read key cancelled nothing");
+    }
+
+    /// `--open-reads` serves reads without a key; it is refused at startup
+    /// unless the listen address is a loopback IP.
+    #[tokio::test]
+    async fn open_reads_are_loopback_only() {
+        for ok in ["127.0.0.1:58300", "[::1]:58300", "127.0.0.2:1"] {
+            check_open_reads(ok, true).unwrap_or_else(|e| panic!("{ok}: {e}"));
+        }
+        for bad in [
+            "0.0.0.0:58300",
+            "[::]:58300",
+            "10.0.0.5:58300",
+            "localhost:58300",
+        ] {
+            assert!(check_open_reads(bad, true).is_err(), "{bad}");
+            check_open_reads(bad, false).unwrap_or_else(|e| panic!("{bad}: {e}"));
+        }
+        let journal = tempfile::tempdir().unwrap_or_else(|e| panic!("{e}"));
+        let mut reg = Registry::default();
+        reg.register("step", Arc::new(Echo));
+        let engine =
+            spawn(journal.path(), reg, ShellConfig::default()).unwrap_or_else(|e| panic!("{e}"));
+        let r = router(
+            App {
+                engine,
+                api_key: ApiKey::new(KEY),
+                read_key: None,
+                open_reads: true,
+                backup_root: None,
+            },
+            None,
+        );
+        let (status, _) = call(&r, "GET", "/jobs", None, None).await;
+        assert_eq!(status, StatusCode::OK);
+        let (status, _) = call(&r, "POST", "/jobs", None, Some(submit_body("x"))).await;
+        assert_eq!(
+            status,
+            StatusCode::UNAUTHORIZED,
+            "writes still need the key"
+        );
+    }
+
+    /// Checklist P0: reads (`GET /jobs`, `GET /jobs/{id}`), which show every
+    /// op_key and state, were open on any listen address. They need the
+    /// key unless the server was started with `--open-reads` (loopback
+    /// only); liveness and readiness stay open.
+    #[tokio::test]
+    async fn reads_need_the_key_by_default() {
+        let h = harness(false);
+        let (status, _) = call(
+            &h.router,
+            "POST",
+            "/jobs",
+            Some(KEY),
+            Some(submit_body("r")),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        for uri in ["/jobs", "/jobs/1", "/jobs?order=desc&limit=5"] {
+            for key in [None, Some("wrong")] {
+                let (status, v) = call(&h.router, "GET", uri, key, None).await;
+                assert_eq!(
+                    (status, v["code"].clone()),
+                    (StatusCode::UNAUTHORIZED, json!("unauthorized")),
+                    "GET {uri} key={key:?}"
+                );
+            }
+            let (status, _) = call(&h.router, "GET", uri, Some(KEY), None).await;
+            assert_eq!(status, StatusCode::OK, "GET {uri} with the key");
+        }
+        for uri in ["/health", "/ready"] {
+            let (status, _) = call(&h.router, "GET", uri, None, None).await;
+            assert_eq!(status, StatusCode::OK, "{uri} stays open");
+        }
     }
 
     /// A backup goes only to `<backup-root>/<name>`: separators, `..`,
@@ -1188,13 +1390,13 @@ mod tests {
                 .filter_map(|r| r["id"].as_u64())
                 .collect()
         };
-        let (_, v) = call(&h.router, "GET", "/jobs?limit=2", None, None).await;
+        let (_, v) = call(&h.router, "GET", "/jobs?limit=2", Some(KEY), None).await;
         assert_eq!((ids(&v), v["next_after"].clone()), (vec![1, 2], json!(2)));
-        let (_, v) = call(&h.router, "GET", "/jobs?after=2&limit=2", None, None).await;
+        let (_, v) = call(&h.router, "GET", "/jobs?after=2&limit=2", Some(KEY), None).await;
         assert_eq!((ids(&v), v["next_after"].clone()), (vec![3, 4], json!(4)));
-        let (_, v) = call(&h.router, "GET", "/jobs?after=4&limit=2", None, None).await;
+        let (_, v) = call(&h.router, "GET", "/jobs?after=4&limit=2", Some(KEY), None).await;
         assert_eq!((ids(&v), v["next_after"].clone()), (vec![5], Value::Null));
-        let (status, v) = call(&h.router, "GET", "/jobs?limit=100000", None, None).await;
+        let (status, v) = call(&h.router, "GET", "/jobs?limit=100000", Some(KEY), None).await;
         assert_eq!(
             (status, ids(&v).len()),
             (StatusCode::OK, 5),
@@ -1226,13 +1428,20 @@ mod tests {
                 .filter_map(|r| r["id"].as_u64())
                 .collect()
         };
-        let (_, v) = call(&h.router, "GET", "/jobs?order=desc&limit=2", None, None).await;
+        let (_, v) = call(
+            &h.router,
+            "GET",
+            "/jobs?order=desc&limit=2",
+            Some(KEY),
+            None,
+        )
+        .await;
         assert_eq!((ids(&v), v["next_before"].clone()), (vec![5, 4], json!(4)));
         let (_, v) = call(
             &h.router,
             "GET",
             "/jobs?order=desc&before=4&limit=2",
-            None,
+            Some(KEY),
             None,
         )
         .await;
@@ -1241,7 +1450,7 @@ mod tests {
             &h.router,
             "GET",
             "/jobs?order=desc&before=2&limit=2",
-            None,
+            Some(KEY),
             None,
         )
         .await;
@@ -1414,6 +1623,8 @@ mod tests {
             App {
                 engine,
                 api_key: ApiKey::new(KEY),
+                read_key: None,
+                open_reads: false,
                 backup_root: None,
             },
             None,
@@ -1446,6 +1657,8 @@ mod tests {
             App {
                 engine,
                 api_key: ApiKey::new(KEY),
+                read_key: None,
+                open_reads: false,
                 backup_root: None,
             },
             None,
@@ -1500,12 +1713,12 @@ mod tests {
     #[tokio::test]
     async fn rejections_use_the_json_envelope() {
         let h = harness(false);
-        let (status, v) = call(&h.router, "GET", "/jobs?limit=-1", None, None).await;
+        let (status, v) = call(&h.router, "GET", "/jobs?limit=-1", Some(KEY), None).await;
         assert_eq!(
             (status, v["code"].clone()),
             (StatusCode::BAD_REQUEST, json!("bad_query"))
         );
-        let (status, v) = call(&h.router, "GET", "/jobs?after=abc", None, None).await;
+        let (status, v) = call(&h.router, "GET", "/jobs?after=abc", Some(KEY), None).await;
         assert_eq!(
             (status, v["code"].clone()),
             (StatusCode::BAD_REQUEST, json!("bad_query"))

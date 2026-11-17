@@ -61,17 +61,19 @@ delete every superseded `gen-*` directory (retention). Runs on `POST
 |---|---|---|
 | `GET /health` | open | liveness |
 | `GET /ready` | open | readiness: 503 `no_space` / `engine_stopped` |
-| `GET /jobs?after=&limit=` | open | one page of runs, ids ascending (limit 100 default, 1000 max); `next_after` continues |
-| `GET /jobs?order=desc&before=&limit=` | open | newest first; `next_before` continues (the inspector's view) |
-| `GET /jobs/{id}` | open | inspect a run |
+| `GET /jobs?after=&limit=` | read key or API key (open only with `--open-reads` on loopback) | one page of runs, ids ascending (limit 100 default, 1000 max); `next_after` continues |
+| `GET /jobs?order=desc&before=&limit=` | read key or API key (same) | newest first; `next_before` continues (the inspector's view) |
+| `GET /jobs/{id}` | read key or API key (same) | inspect a run |
 | `POST /jobs` | API key | submit (dedup by `op_key`) |
 | `POST /jobs/{id}/cancel` | API key | cancel (stops scheduling, never undoes) |
 | `POST /admin/compact` | API key | compact into a new generation |
 | `POST /admin/backup {name}` | API key | backup to `<backup-root>/<name>` only |
 | `GET /admin/diagnostics` | API key | bounded counts |
-| `/inspector/` | open (cancel needs the key) | SvelteKit UI |
+| `/inspector/` | static files open; the UI sends its key on every call | SvelteKit UI |
 
-The key is `DURABLE_API_KEY`, compared as SHA-256 digests in constant time.
+The key is `DURABLE_API_KEY`; the optional `DURABLE_READ_KEY` may only read
+(403 on every other route, D-037). Both are compared as SHA-256 digests in
+constant time.
 Request bodies are capped at 256 KiB; operation keys at 256 bytes and step
 and handler names at 128 (non-empty, no control characters in keys); a
 handler reply is read only up to the 256 KiB output limit.

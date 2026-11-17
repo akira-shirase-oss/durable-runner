@@ -2,8 +2,9 @@
 //! for live operations; `restore` is an offline filesystem operation on a
 //! stopped journal (the same layout backup produces).
 //!
-//! Mutating and admin commands send `Authorization: Bearer $DURABLE_API_KEY`
-//! — the same variable the server reads its key from.
+//! Every command sends `Authorization: Bearer $DURABLE_API_KEY` — the same
+//! variable the server reads its key from. Reads (`inspect`, `list`) fall
+//! back to `$DURABLE_READ_KEY` when no API key is set.
 
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
@@ -103,6 +104,15 @@ fn authed(rb: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
     }
 }
 
+/// Attach a key that may read: the API key, else the read-only key. The
+/// server refuses reads without one (401) unless it runs `--open-reads`.
+fn read_authed(rb: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+    match std::env::var("DURABLE_API_KEY").or_else(|_| std::env::var("DURABLE_READ_KEY")) {
+        Ok(key) => rb.bearer_auth(key.trim()),
+        Err(_) => rb,
+    }
+}
+
 async fn check(resp: reqwest::Response) -> Result<serde_json::Value> {
     let status = resp.status();
     let body: serde_json::Value = resp.json().await.unwrap_or(json!({}));
@@ -152,8 +162,7 @@ async fn main() -> Result<()> {
         }
         Cmd::Inspect { run } => {
             let v = check(
-                client
-                    .get(format!("{}/jobs/{run}", args.server))
+                read_authed(client.get(format!("{}/jobs/{run}", args.server)))
                     .send()
                     .await?,
             )
@@ -189,8 +198,7 @@ async fn main() -> Result<()> {
                 q.push(("limit", l.to_string()));
             }
             let v = check(
-                client
-                    .get(format!("{}/jobs", args.server))
+                read_authed(client.get(format!("{}/jobs", args.server)))
                     .query(&q)
                     .send()
                     .await?,

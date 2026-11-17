@@ -48,7 +48,7 @@ done
 echo "inspect -> $S"
 
 step "list + inspector page"
-curl -s "http://127.0.0.1:$SRV_PORT/jobs"; echo
+curl -s -H "Authorization: Bearer $DURABLE_API_KEY" "http://127.0.0.1:$SRV_PORT/jobs"; echo
 echo "inspector -> http://127.0.0.1:$SRV_PORT/inspector/ ($(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:$SRV_PORT/inspector/))"
 
 step "kill -9 the server mid-life, restart against the same journal"

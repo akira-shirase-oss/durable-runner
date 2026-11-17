@@ -72,6 +72,8 @@ convention; these seed the contract's prescribed directions.
   compares digests in constant time (`subtle`), before the body is parsed.
   Reads stay open on purpose for the loopback pilot and the read-only
   inspector; the SaaS plan must gate them per tenant before exposure.
+  (Superseded for reads by D-037: they need a key unless opened on
+  loopback.)
   Backups take a plain name and land only in `<--backup-root>/<name>`
   (no separators, no leading `.`, at most 64 characters); without a root
   backups are disabled, and an existing name is refused rather than merged
@@ -555,3 +557,27 @@ convention; these seed the contract's prescribed directions.
   Proven by a process test that sends SIGTERM to the release-shaped
   binary under concurrent submits: exit 0, and every acknowledged run is
   there after restart.
+- **D-037 — Reads need a key unless they are open on loopback; a read-only
+  key.** D-011 left `GET /jobs` and `GET /jobs/{id}` open for the loopback
+  pilot and the inspector. They show every op_key and run state, on any
+  listen address, and SAAS_PLAN puts the server behind a reverse proxy,
+  where even a loopback listener is reachable from outside. The decision:
+  reads need a key **by default, wherever the server listens**. With
+  `--open-reads` they need none, and that flag is refused at startup
+  unless `--listen` is a loopback IP address (`127.0.0.0/8` or `::1`; a
+  name such as `localhost` is not trusted to resolve to one). So reads
+  need the key whenever the listener is not loopback, with no way to opt
+  out, and a loopback listener is open only if the operator says so,
+  knowing nothing proxies to it. `/health`, `/ready` and the inspector's
+  static files stay open: they show no runs.
+
+  A second, optional key, `DURABLE_READ_KEY` (at least 32 characters, not
+  the API key), may read and nothing else: every mutating and admin route
+  answers it `403 forbidden`, so it is a valid key in the wrong scope,
+  where an unknown key gets 401. This is the key to give the inspector or
+  a dashboard instead of the admin key. The CLI sends `DURABLE_API_KEY`
+  on every call and falls back to `DURABLE_READ_KEY` for reads; the
+  inspector sends the key it holds on reads as well as on cancel.
+  Startup now has process tests: no API key, a 31-character one, a short
+  read key, a read key equal to the API key, and `--open-reads` on
+  `0.0.0.0` each exit non-zero without listening.

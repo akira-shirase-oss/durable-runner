@@ -16,18 +16,29 @@ export interface RunPage {
 	next_before: number | null;
 }
 
+function bearer(apiKey: string): Record<string, string> {
+	return apiKey ? { authorization: `Bearer ${apiKey}` } : {};
+}
+
 // `GET /jobs?order=desc` pages newest first (at most 1000 per page);
-// `before` continues from the previous page's `next_before`.
-export async function listRuns(before: number | null = null, limit = 50): Promise<RunPage> {
+// `before` continues from the previous page's `next_before`. Reads need a
+// key — the server's read-only key (DURABLE_READ_KEY) or its API key —
+// unless the server runs with --open-reads on loopback.
+export async function listRuns(
+	apiKey: string,
+	before: number | null = null,
+	limit = 50,
+): Promise<RunPage> {
 	const q = new URLSearchParams({ order: 'desc', limit: String(limit) });
 	if (before !== null) q.set('before', String(before));
-	const r = await fetch(`${API}/jobs?${q}`);
+	const r = await fetch(`${API}/jobs?${q}`, { headers: bearer(apiKey) });
+	if (r.status === 401) throw new Error('viewing runs needs the server read key or API key (enter it above)');
 	if (!r.ok) throw new Error(`list failed: ${r.status}`);
 	return (await r.json()) as RunPage;
 }
 
-// Reads are open; cancel (like every mutating route) needs the server's
-// API key. It lives only in this tab's sessionStorage, never in the build.
+// The key lives only in this tab's sessionStorage, never in the build.
+// The read key views; cancel (like every mutating route) needs the API key.
 const KEY_SLOT = 'durable-api-key';
 
 export function loadApiKey(): string {
@@ -48,8 +59,8 @@ export function saveApiKey(key: string): void {
 }
 
 export async function cancelRun(id: number, apiKey: string): Promise<void> {
-	const headers: Record<string, string> = apiKey ? { authorization: `Bearer ${apiKey}` } : {};
-	const r = await fetch(`${API}/jobs/${id}/cancel`, { method: 'POST', headers });
+	const r = await fetch(`${API}/jobs/${id}/cancel`, { method: 'POST', headers: bearer(apiKey) });
 	if (r.status === 401) throw new Error('cancel needs the server API key (enter it above)');
+	if (r.status === 403) throw new Error('this key may only read; cancel needs the server API key');
 	if (!r.ok) throw new Error(`cancel failed: ${r.status}`);
 }

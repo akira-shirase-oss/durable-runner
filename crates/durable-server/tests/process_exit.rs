@@ -148,6 +148,7 @@ async fn failed_manifest_swap_exits_the_process_and_loses_nothing() {
     for id in &acked {
         let s = c
             .get(format!("{base}/jobs/{id}"))
+            .bearer_auth(KEY)
             .send()
             .await
             .map(|r| r.status().as_u16())
@@ -246,4 +247,83 @@ async fn sigterm_drains_in_flight_work_and_exits_zero() {
     }
     let _ = server.kill();
     let _ = server.wait();
+}
+
+/// Run the server with `env` (and nothing inherited for the keys) and
+/// extra `args`; it must exit non-zero on its own, before serving, with
+/// `why` on stderr.
+async fn refuses_to_start(env: &[(&str, &str)], args: &[&str], why: &str) {
+    let d = tempfile::tempdir().unwrap_or_else(|e| panic!("{e}"));
+    let port = free_port();
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_durable-server"));
+    cmd.arg("--journal").arg(d.path().join("journal"));
+    if !args.contains(&"--listen") {
+        cmd.args(["--listen", &format!("127.0.0.1:{port}")]);
+    }
+    cmd.args(args)
+        .env_remove("DURABLE_API_KEY")
+        .env_remove("DURABLE_READ_KEY")
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped());
+    for (k, v) in env {
+        cmd.env(k, v);
+    }
+    let mut child = cmd.spawn().unwrap_or_else(|e| panic!("{e}"));
+    let Some(status) = exit_within(&mut child, Duration::from_secs(10)).await else {
+        let _ = child.kill();
+        let _ = child.wait();
+        panic!("the server kept running ({args:?}); it must refuse: {why}");
+    };
+    let mut err = String::new();
+    if let Some(mut e) = child.stderr.take() {
+        let _ = std::io::Read::read_to_string(&mut e, &mut err);
+    }
+    assert!(!status.success(), "{args:?}: exit {status}");
+    assert!(err.contains(why), "stderr does not say {why:?}: {err}");
+    let listened = args
+        .iter()
+        .position(|a| *a == "--listen")
+        .and_then(|i| args.get(i + 1))
+        .and_then(|l| l.rsplit(':').next())
+        .and_then(|p| p.parse::<u16>().ok())
+        .unwrap_or(port);
+    assert!(
+        std::net::TcpStream::connect(("127.0.0.1", listened)).is_err(),
+        "something listens on the refused server's port"
+    );
+}
+
+/// Checklist: a missing or short API key refuses startup — the server
+/// never serves with no key or a guessable one; and a read-only key must
+/// be long and different from the admin key.
+#[tokio::test]
+async fn a_missing_or_short_key_refuses_startup() {
+    refuses_to_start(&[], &[], "DURABLE_API_KEY is not set").await;
+    let short = "k".repeat(31);
+    refuses_to_start(&[("DURABLE_API_KEY", &short)], &[], "at least 32").await;
+    refuses_to_start(
+        &[("DURABLE_API_KEY", KEY), ("DURABLE_READ_KEY", &short)],
+        &[],
+        "DURABLE_READ_KEY must be at least 32",
+    )
+    .await;
+    refuses_to_start(
+        &[("DURABLE_API_KEY", KEY), ("DURABLE_READ_KEY", KEY)],
+        &[],
+        "must differ",
+    )
+    .await;
+}
+
+/// Checklist P0: unauthenticated reads only on a loopback listener.
+#[tokio::test]
+async fn open_reads_off_loopback_refuses_startup() {
+    let port = free_port();
+    let listen = format!("0.0.0.0:{port}");
+    refuses_to_start(
+        &[("DURABLE_API_KEY", KEY)],
+        &["--open-reads", "--listen", &listen],
+        "--open-reads is allowed only on a loopback",
+    )
+    .await;
 }

@@ -79,13 +79,22 @@ target/release/durable-server \
   `snapshot.bin` stops startup (`snapshot is damaged`): restore from a
   backup.
 - **API key.** The server refuses to start without `DURABLE_API_KEY` (read
-  from the environment, never argv). Every mutating and admin route —
-  `POST /jobs`, `POST /jobs/{id}/cancel`, `POST /admin/compact`,
-  `POST /admin/backup`, `GET /admin/diagnostics` — needs
-  `Authorization: Bearer $DURABLE_API_KEY`, else `401 {"code":"unauthorized"}`.
-  Reads (`/health`, `GET /jobs`, `GET /jobs/{id}`, the inspector) are open.
-  The CLI sends the same variable; the inspector asks for it before cancel.
-  The pilot generates a fresh random key per run and exports it.
+  from the environment, never argv, at least 32 characters). Every
+  mutating and admin route — `POST /jobs`, `POST /jobs/{id}/cancel`,
+  `POST /admin/compact`, `POST /admin/backup`, `GET /admin/diagnostics` —
+  needs `Authorization: Bearer $DURABLE_API_KEY`, else `401
+  {"code":"unauthorized"}`.
+- **Reads need a key too** (D-037): `GET /jobs` and `GET /jobs/{id}` take
+  the API key or the optional read-only `DURABLE_READ_KEY` (at least 32
+  characters, different from the API key; it gets `403 forbidden` on
+  every other route). Give the inspector or a dashboard the read key, not
+  the admin key. `--open-reads` serves reads without a key, and is
+  refused at startup unless `--listen` is a loopback IP: never pass it
+  behind a reverse proxy, which makes loopback reachable. `/health`,
+  `/ready` and the inspector's static files are open. The CLI sends
+  `DURABLE_API_KEY` (reads fall back to `DURABLE_READ_KEY`); the
+  inspector asks for a key and sends it on every call. The pilot
+  generates a fresh random key per run and exports it.
 - **Backup root.** `--backup-root DIR` is the only place backups are
   written; without it `/admin/backup` answers `403 backups_disabled`.
 
