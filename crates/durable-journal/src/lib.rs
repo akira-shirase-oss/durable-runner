@@ -1397,6 +1397,22 @@ struct BackupFile {
 
 const BACKUP_LIST: &str = "backup.json";
 
+/// `backup.json` as read: every field required.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ListedBackup {
+    generation: u32,
+    files: Vec<ListedFile>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ListedFile {
+    path: String,
+    bytes: u64,
+    crc32: u32,
+}
+
 /// The generation number of a canonical `gen-NNNNNN` name (`gen-+1`,
 /// `gen-1` and the like are not generations).
 fn canonical_gen(name: &str) -> Option<u32> {
@@ -1423,8 +1439,22 @@ fn backup_list(from: &Path, generation: u32) -> Result<BackupList, JournalError>
     let bad = |why: String| JournalError::BadBackup(why);
     let list = match fs::read(from.join(BACKUP_LIST)) {
         Ok(bytes) => {
-            let list: BackupList = serde_json::from_slice(&bytes)
+            // A list this build wrote has a checksum for every file: one
+            // without (`null`, missing) is refused, never skipped.
+            let listed: ListedBackup = serde_json::from_slice(&bytes)
                 .map_err(|e| bad(format!("{BACKUP_LIST} unreadable: {e}")))?;
+            let list = BackupList {
+                generation: listed.generation,
+                files: listed
+                    .files
+                    .into_iter()
+                    .map(|f| BackupFile {
+                        path: f.path,
+                        bytes: f.bytes,
+                        crc32: Some(f.crc32),
+                    })
+                    .collect(),
+            };
             if list.generation != generation {
                 return Err(bad(format!(
                     "{BACKUP_LIST} lists generation {}, the manifest names {generation}",
@@ -1469,7 +1499,11 @@ fn backup_list(from: &Path, generation: u32) -> Result<BackupList, JournalError>
             "{named} was made by a compaction but has no snapshot"
         )));
     }
+    let mut seen = std::collections::HashSet::new();
     for f in &list.files {
+        if !seen.insert(f.path.as_str()) {
+            return Err(bad(format!("{BACKUP_LIST} lists {} twice", f.path)));
+        }
         let ok = f
             .path
             .split_once('/')
@@ -2635,6 +2669,41 @@ mod tests {
             restore_backup(&backup, &to2).is_err(),
             "restored a truncated backup"
         );
+    }
+
+    /// Review V2: a file list with a duplicate entry failed as a raw
+    /// `io: File exists`, and `"crc32": null` silently skipped the check
+    /// of a listed file. Both are named refusals now.
+    #[test]
+    fn a_file_list_with_duplicates_or_missing_checksums_is_refused() {
+        let d = tempfile::tempdir().unwrap_or_else(|e| panic!("{e}"));
+        let backup = backup_of_three(d.path());
+        let list_path = backup.join(BACKUP_LIST);
+        let original = fs::read_to_string(&list_path).unwrap_or_else(|e| panic!("{e}"));
+        let mut list: serde_json::Value =
+            serde_json::from_str(&original).unwrap_or_else(|e| panic!("{e}"));
+        let first = list["files"][0].clone();
+        list["files"]
+            .as_array_mut()
+            .unwrap_or_else(|| panic!("files"))
+            .push(first);
+        fs::write(&list_path, list.to_string()).unwrap_or_else(|e| panic!("{e}"));
+        match restore_backup(&backup, &d.path().join("dup")) {
+            Err(JournalError::BadBackup(why)) => assert!(why.contains("twice"), "{why}"),
+            other => panic!("a duplicate entry: {other:?}"),
+        }
+        let mut list: serde_json::Value =
+            serde_json::from_str(&original).unwrap_or_else(|e| panic!("{e}"));
+        list["files"][0]["crc32"] = serde_json::Value::Null;
+        fs::write(&list_path, list.to_string()).unwrap_or_else(|e| panic!("{e}"));
+        assert!(
+            matches!(
+                restore_backup(&backup, &d.path().join("null")),
+                Err(JournalError::BadBackup(_))
+            ),
+            "a listed file without a checksum was restored"
+        );
+        assert!(!d.path().join("null").join("manifest.json").exists());
     }
 
     /// The same for a live journal: a manifest naming a generation that is

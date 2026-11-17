@@ -720,6 +720,9 @@ convention; these seed the contract's prescribed directions.
     refused, not followed (review U9). The target directory is fsynced
     after the copies and before the manifest's rename, so the manifest is
     never durable without the generations it names (review U10).
+    `backup.json` is parsed strictly: every entry needs its size and
+    CRC-32 (`null` or missing is refused, not skipped), unknown fields
+    are refused, and a path listed twice is a named refusal (review V2).
   - First open now creates generation 1 and its log, then writes the
     manifest that names it, so a manifest naming a missing generation is
     always damage: `open` refuses it (`restore from a backup`) instead of
