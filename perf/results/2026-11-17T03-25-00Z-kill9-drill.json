@@ -1,0 +1,36 @@
+{
+  "scenario": "perf/drill.py: 16 clients submit and cancel while compactions and backups run; SIGKILL at random (20) or 0-30 ms after a compaction, backup or cancel burst (16); full check after every restart",
+  "command": "python3 -I perf/drill.py --rounds 20 --targeted 16 --clients 16",
+  "binary": "release durable-server and durable-cli built --locked from b22fc1b (fix/security-review-2026-11-16: includes D-043 whole-batch tears, D-044 verified restores, D-045 connection limits)",
+  "machine": {
+    "cpu": "Apple M2 Pro",
+    "os": "macOS 27.2.1",
+    "load_average": "35-86 (busy)"
+  },
+  "note": "Development observation on a busy laptop, not a capacity claim.",
+  "totals": {
+    "rounds": 36,
+    "acked_submits": 20801,
+    "acked_cancels": 7261,
+    "lost": 0,
+    "dup": 0,
+    "id_mismatch": 0,
+    "cancels_lost": 0,
+    "compactions": 62,
+    "backups": 60,
+    "backups_restored_complete": 28,
+    "backups_checked": 28,
+    "visible_partial": 0,
+    "kills": {
+      "random": 20,
+      "after_compact": 6,
+      "after_backup": 5,
+      "after_cancels": 5
+    },
+    "final_sigterm_exit": 0,
+    "final_generation": 64
+  },
+  "failures": [],
+  "seed": 20261116,
+  "clients": 16
+}
