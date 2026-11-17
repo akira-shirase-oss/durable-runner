@@ -239,11 +239,17 @@ refuses to start there, so remove the directory and restore again.
 - Startup refused with `corrupt committed history at seq N: … (frame at
   offset X)` — a committed frame is damaged (a header or payload
   checksum, or a frame that does not fit the batch it was written in).
-  Nothing was cut: the log is exactly as found. Restore from a backup.
-  If the message ends `the damage lies inside the log's last batch` and
-  the host lost power, the damaged frames were in a batch whose fsync
-  had not returned, so none of them was acknowledged: copy the journal
-  aside, then truncate `journal.log` to offset X and start again.
+  Nothing was cut: the log is exactly as found. **Restore from a
+  backup.** Do not truncate the log at the reported frame offset: that
+  can leave part of a batch behind, and frames after it may have been
+  acknowledged. If the message ends `the damage lies inside the log's
+  last batch, which starts at offset B`, the host lost power and you
+  have no backup, the one lossy repair is: copy the journal aside, then
+  truncate `journal.log` to B (the start of that batch, never X). That
+  drops the whole last batch; its records were acknowledged only if its
+  fsync returned before the power cut, which the log cannot tell.
 - `durable-server: discarded a torn tail: N bytes at offset X` at startup
-  — the log ended inside its last frame (a crash mid-write). That frame
-  was never acknowledged; every complete frame before it was kept.
+  — the log ended inside its last group commit (a crash mid-write). The
+  whole of that batch, from its first frame at X, was dropped: its fsync
+  never returned, so none of it was acknowledged (D-043). Every earlier
+  batch was kept.

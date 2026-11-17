@@ -23,10 +23,12 @@
 //! the reverse.
 //!
 //! Replay trusts committed history absolutely: only a demonstrably
-//! incomplete *tail* may be discarded — the file ends inside the last frame,
-//! whose header (when complete) checks out, and nothing that looks like a
-//! later frame follows it. That cut is never more than one frame, so never
-//! more than the last batch. Anything else stops startup (contract §02).
+//! incomplete *tail* may be discarded. For v2 that is a last batch whose
+//! recorded extent is not all on disk (its first frame's header checks
+//! out, or is itself cut short): the whole batch goes, from its first frame,
+//! because its fsync never returned (D-043). For v1, the file ends inside
+//! the last frame and nothing after it looks like a frame. Anything else
+//! stops startup (contract §02).
 
 use serde::{Deserialize, Serialize};
 use std::fs::{self, File, OpenOptions};
@@ -454,8 +456,10 @@ pub struct Records {
     /// End of the last good frame.
     pos: u64,
     expected_seq: u64,
-    /// The current v2 batch: where it ends and the length its frames carry.
-    /// At `pos == batch_end` the next frame starts a new batch.
+    /// The current v2 batch: where it starts and ends, and the length its
+    /// frames carry. At `pos == batch_end` the next frame starts a new
+    /// batch. A batch is read only once the whole of it is on disk.
+    batch_start: u64,
     batch_end: u64,
     batch_len: u32,
     /// A v2 frame was read: a v1 frame after it is corruption.
@@ -473,6 +477,7 @@ impl Records {
             file_len,
             pos: 0,
             expected_seq: 1,
+            batch_start: 0,
             batch_end: 0,
             batch_len: 0,
             seen_v2: false,
@@ -492,13 +497,17 @@ impl Records {
     }
 
     fn corrupt(&self, why: impl std::fmt::Display) -> JournalError {
-        // A hint for the one case an operator can repair by hand: damage
-        // confined to the last batch is what a power loss before its fsync
-        // leaves (D-014), and nothing in that batch was acknowledged then.
-        let hint = if self.pos < self.batch_end && self.file_len <= self.batch_end {
-            "; the damage lies inside the log's last batch"
+        // Damage inside the log's last batch is what a power loss can leave
+        // when the file's length reached the disk but some of the batch's
+        // data did not (D-014). Say where that batch starts; OPERATING says
+        // what (little) an operator may do about it.
+        let hint = if self.pos < self.batch_end && self.file_len == self.batch_end {
+            format!(
+                "; the damage lies inside the log's last batch, which starts at offset {}",
+                self.batch_start
+            )
         } else {
-            ""
+            String::new()
         };
         JournalError::Corrupt {
             seq: self.expected_seq,
@@ -506,7 +515,9 @@ impl Records {
         }
     }
 
-    /// Stop at a torn tail: the file ends inside the frame at `pos`.
+    /// Stop at a torn tail starting at `pos`: for v2 always a batch's first
+    /// frame, so the whole incomplete batch goes (its fsync never returned,
+    /// so nothing in it was acknowledged); for v1, the last frame.
     fn tear(&mut self) -> Result<Option<u64>, JournalError> {
         self.done = true;
         self.torn = Some(TornTail {
@@ -542,7 +553,13 @@ impl Records {
             self.done = true;
             return Ok(None);
         }
+        // Inside a batch every byte is on disk (checked at its first
+        // frame), so a short remainder there is damage, not a tear.
+        let mid_batch = self.pos < self.batch_end;
         if self.file_len - self.pos < V1_HEADER_LEN as u64 {
+            if mid_batch {
+                return Err(self.corrupt("a batch ends inside a frame header"));
+            }
             return self.tear(); // fewer bytes than any header
         }
         let mut hdr = [0u8; HEADER_LEN];
@@ -561,7 +578,11 @@ impl Records {
         mut hdr: [u8; HEADER_LEN],
         buf: &mut Vec<u8>,
     ) -> Result<Option<u64>, JournalError> {
+        let mid_batch = self.pos < self.batch_end;
         if self.file_len - self.pos < HEADER_LEN as u64 {
+            if mid_batch {
+                return Err(self.corrupt("a batch ends inside a frame header"));
+            }
             return self.tear(); // an incomplete v2 header
         }
         self.r.read_exact(&mut hdr[V1_HEADER_LEN..])?;
@@ -580,20 +601,27 @@ impl Records {
             return Err(self.corrupt(format_args!("sequence {seq}")));
         }
         let frame_end = self.pos + HEADER_LEN as u64 + len;
-        if self.pos >= self.batch_end {
+        if !mid_batch {
             // The first frame of a batch: the batch must hold it.
             if u64::from(batch_len) < HEADER_LEN as u64 + len {
                 return Err(self.corrupt("frame larger than its batch"));
             }
-            self.batch_end = self.pos + u64::from(batch_len);
+            let batch_end = self.pos + u64::from(batch_len);
+            if batch_end > self.file_len {
+                // The log ends before this batch does (its header checks
+                // out, so its length is the one written): the batch's one
+                // write never finished, so its fsync never returned and
+                // nothing in it was acknowledged. It goes whole, from its
+                // first frame, never frame by frame (review U1).
+                return self.tear();
+            }
+            self.batch_start = self.pos;
+            self.batch_end = batch_end;
             self.batch_len = batch_len;
         } else if batch_len != self.batch_len || frame_end > self.batch_end {
             return Err(self.corrupt("frame does not fit the batch it was written in"));
         }
         self.seen_v2 = true;
-        if frame_end > self.file_len {
-            return self.tear_unless_followed(HEADER_LEN);
-        }
         buf.clear();
         buf.resize(len as usize, 0);
         self.r.read_exact(buf)?;
@@ -2212,10 +2240,14 @@ mod tests {
         }
     }
 
-    /// A batch torn by process death keeps its complete frames: the kernel
-    /// keeps written bytes in order, so the file ends inside one frame.
+    /// A batch torn by a crash before its fsync returned was never
+    /// acknowledged, whatever part of it reached the disk. Replay drops the
+    /// whole batch, back to its first frame, not just its last partial
+    /// frame (review U1): keeping its complete frames let the next batch
+    /// start inside the old one's recorded extent, and the restart after
+    /// that refused the journal.
     #[test]
-    fn a_batch_torn_mid_write_keeps_its_complete_frames() {
+    fn a_batch_torn_mid_write_is_dropped_whole() {
         let dir = tempfile::tempdir().unwrap_or_else(|e| panic!("{e}"));
         let log = gen_dir_path(dir.path(), 1).join("journal.log");
         {
@@ -2227,14 +2259,71 @@ mod tests {
         }
         let whole = fs::read(&log).unwrap_or_else(|e| panic!("{e}"));
         let frame = |i: usize| (HEADER_LEN + record(i).len()) as u64;
+        let first_batch: u64 = (0..4).map(frame).sum();
         let seventh: u64 = (0..6).map(frame).sum(); // inside the second batch
         fs::write(&log, &whole[..seventh as usize + 5]).unwrap_or_else(|e| panic!("{e}"));
         let j = Journal::open(dir.path()).unwrap_or_else(|e| panic!("{e}"));
-        assert_eq!(j.records_written(), 6);
+        assert_eq!(j.records_written(), 4, "the torn batch is dropped whole");
+        assert_eq!(
+            j.discarded_tail(),
+            Some(TornTail {
+                offset: first_batch,
+                bytes: seventh + 5 - first_batch
+            })
+        );
         assert_eq!(
             fs::metadata(&log).unwrap_or_else(|e| panic!("{e}")).len(),
-            seventh
+            first_batch
         );
+    }
+
+    /// Review U1, at every cut: a log torn anywhere inside its last two
+    /// batches opens, takes a new batch, and opens again with exactly the
+    /// complete batches plus the new one. (Before, a cut after a batch's
+    /// first frame survived the first restart and bricked the second.)
+    #[test]
+    fn every_torn_batch_reopens_after_more_appends() {
+        let dir = tempfile::tempdir().unwrap_or_else(|e| panic!("{e}"));
+        let log = gen_dir_path(dir.path(), 1).join("journal.log");
+        let batches: [std::ops::Range<usize>; 3] = [0..3, 3..7, 7..12];
+        {
+            let mut j = Journal::open(dir.path()).unwrap_or_else(|e| panic!("{e}"));
+            for b in batches.clone() {
+                j.append_batch(&b.map(record).collect::<Vec<_>>())
+                    .unwrap_or_else(|e| panic!("{e}"));
+            }
+        }
+        let whole = fs::read(&log).unwrap_or_else(|e| panic!("{e}"));
+        let frame = |i: usize| HEADER_LEN + record(i).len();
+        let ends: Vec<usize> = batches
+            .iter()
+            .map(|b| (0..b.end).map(frame).sum())
+            .collect();
+        let after = [record(100), record(101)];
+        for cut in ends[0]..whole.len() {
+            let complete = ends.iter().take_while(|e| **e <= cut).count();
+            let kept = batches[complete - 1].end;
+            fs::write(&log, &whole[..cut]).unwrap_or_else(|e| panic!("{e}"));
+            {
+                let mut j = Journal::open(dir.path())
+                    .unwrap_or_else(|e| panic!("cut {cut}: first restart: {e}"));
+                assert_eq!(j.records_written(), kept as u64, "cut {cut}");
+                j.append_batch(&after)
+                    .unwrap_or_else(|e| panic!("cut {cut}: {e}"));
+            }
+            let j = Journal::open(dir.path())
+                .unwrap_or_else(|e| panic!("cut {cut}: second restart: {e}"));
+            assert_eq!(j.records_written(), kept as u64 + 2, "cut {cut}");
+            drop(j);
+            let got: Vec<Vec<u8>> = replay_dir(&gen_dir_path(dir.path(), 1))
+                .unwrap_or_else(|e| panic!("cut {cut}: {e}"))
+                .into_iter()
+                .map(|r| r.payload)
+                .collect();
+            let mut want: Vec<Vec<u8>> = (0..kept).map(record).collect();
+            want.extend(after.iter().cloned());
+            assert_eq!(got, want, "cut {cut}");
+        }
     }
 
     /// A gen-1 journal whose log holds exactly `bytes` (hand-framed).
