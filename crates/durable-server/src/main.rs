@@ -12,7 +12,9 @@ use axum::{
 };
 use clap::Parser;
 use durable_domain::{JobSpec, Millis, OperationKey, RunId, RunState, StepSpec};
-use durable_engine::shell::{spawn, Engine, Order, Outcome, Registry, ShellConfig, StepHandler};
+use durable_engine::shell::{
+    spawn, Call, Engine, Order, Outcome, Registry, ShellConfig, StepHandler,
+};
 use durable_engine::EngineError;
 use serde::Deserialize;
 use std::path::{Path, PathBuf};
@@ -179,21 +181,37 @@ async fn read_bounded(
     Ok(Some(body))
 }
 
-#[async_trait::async_trait]
-impl StepHandler for HttpHandler {
-    async fn execute(&self, _step: &StepSpec, input: &[u8], idem_key: &str) -> Outcome {
+/// The headers that tell a handler which call it is answering (D-050): the
+/// run `GET /jobs/{id}` describes, the step's index, and the attempt (for a
+/// probe, the attempt being reconciled). Numbers only: nothing the handler
+/// was not already told by the idempotency key, and no secret.
+const RUN_ID_HEADER: &str = "x-durable-run-id";
+const STEP_HEADER: &str = "x-durable-step";
+const ATTEMPT_HEADER: &str = "x-durable-attempt";
+
+fn with_call(req: reqwest::RequestBuilder, call: Option<Call>) -> reqwest::RequestBuilder {
+    match call {
+        Some(c) => req
+            .header(RUN_ID_HEADER, c.run.0)
+            .header(STEP_HEADER, c.step.0)
+            .header(ATTEMPT_HEADER, c.attempt),
+        None => req,
+    }
+}
+
+impl HttpHandler {
+    async fn call(&self, call: Option<Call>, input: &[u8], idem_key: &str) -> Outcome {
         let body = serde_json::json!({
             "input": input,
             "idem_key": idem_key,
         });
-        let res = self
+        let req = self
             .client
             .post(&self.url)
             .header("x-idempotency-key", idem_key)
             .json(&body)
-            .timeout(self.timeout)
-            .send()
-            .await;
+            .timeout(self.timeout);
+        let res = with_call(req, call).send().await;
         match res {
             Ok(r) if r.status().is_success() => match read_bounded(r, self.max_output).await {
                 Ok(Some(b)) => Outcome::Checkpoint(b),
@@ -214,15 +232,42 @@ impl StepHandler for HttpHandler {
     /// Probe asks the handler whether the call under `idem_key` landed.
     /// `GET {url}?idem_key=…` → 200 means found; anything else is unknown
     /// → reported as not-found honestly (default trait behaviour).
-    async fn probe(&self, _step: &StepSpec, idem_key: &str) -> bool {
-        self.client
+    async fn ask(&self, call: Option<Call>, idem_key: &str) -> bool {
+        let req = self
+            .client
             .get(&self.url)
             .query(&[("idem_key", idem_key)])
-            .timeout(self.timeout)
+            .timeout(self.timeout);
+        with_call(req, call)
             .send()
             .await
             .map(|r| r.status().is_success())
             .unwrap_or(false)
+    }
+}
+
+#[async_trait::async_trait]
+impl StepHandler for HttpHandler {
+    async fn execute(&self, _step: &StepSpec, input: &[u8], idem_key: &str) -> Outcome {
+        self.call(None, input, idem_key).await
+    }
+
+    async fn probe(&self, _step: &StepSpec, idem_key: &str) -> bool {
+        self.ask(None, idem_key).await
+    }
+
+    async fn execute_call(
+        &self,
+        call: Call,
+        _step: &StepSpec,
+        input: &[u8],
+        idem_key: &str,
+    ) -> Outcome {
+        self.call(Some(call), input, idem_key).await
+    }
+
+    async fn probe_call(&self, call: Call, _step: &StepSpec, idem_key: &str) -> bool {
+        self.ask(Some(call), idem_key).await
     }
 }
 
@@ -2073,6 +2118,129 @@ mod tests {
             seen.load(std::sync::atomic::Ordering::SeqCst),
             0,
             "the redirect target was contacted"
+        );
+    }
+
+    /// D-050: every handler call says which run, step and attempt it is
+    /// answering. Driven through the real engine: step 0 fails once (so its
+    /// retry is attempt 2), step 1's reply is lost (it answers after the
+    /// timeout), and the probe that reconciles it names that attempt.
+    #[tokio::test]
+    async fn handler_calls_name_their_run_step_and_attempt() {
+        type Seen = Arc<std::sync::Mutex<Vec<[String; 4]>>>;
+        fn seen_call(seen: &Seen, method: &str, h: &axum::http::HeaderMap) -> [String; 4] {
+            let get = |n: &str| {
+                h.get(n)
+                    .and_then(|v| v.to_str().ok())
+                    .unwrap_or("-")
+                    .to_string()
+            };
+            let call = [
+                method.to_string(),
+                get(RUN_ID_HEADER),
+                get(STEP_HEADER),
+                get(ATTEMPT_HEADER),
+            ];
+            seen.lock()
+                .unwrap_or_else(|e| panic!("{e}"))
+                .push(call.clone());
+            call
+        }
+        async fn post(
+            axum::extract::State(seen): axum::extract::State<Seen>,
+            h: axum::http::HeaderMap,
+        ) -> (StatusCode, &'static str) {
+            let [_, _, step, attempt] = seen_call(&seen, "POST", &h);
+            match (step.as_str(), attempt.as_str()) {
+                ("0", "1") => (StatusCode::INTERNAL_SERVER_ERROR, "{}"),
+                ("1", "1") => {
+                    tokio::time::sleep(Duration::from_secs(2)).await;
+                    (StatusCode::OK, "{}")
+                }
+                _ => (StatusCode::OK, "{}"),
+            }
+        }
+        async fn probe(
+            axum::extract::State(seen): axum::extract::State<Seen>,
+            h: axum::http::HeaderMap,
+        ) -> StatusCode {
+            seen_call(&seen, "GET", &h);
+            StatusCode::OK
+        }
+        let seen: Seen = Arc::default();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .unwrap_or_else(|e| panic!("{e}"));
+        let addr = listener.local_addr().unwrap_or_else(|e| panic!("{e}"));
+        let handler_app = Router::new()
+            .route("/step", axum::routing::post(post).get(probe))
+            .with_state(seen.clone());
+        tokio::spawn(async move { axum::serve(listener, handler_app).await });
+
+        let journal = tempfile::tempdir().unwrap_or_else(|e| panic!("{e}"));
+        let mut reg = Registry::default();
+        reg.register(
+            "step",
+            Arc::new(HttpHandler {
+                client: handler_client().unwrap_or_else(|e| panic!("{e}")),
+                url: format!("http://{addr}/step"),
+                timeout: Duration::from_millis(300),
+                max_output: 1024,
+            }),
+        );
+        let cfg = ShellConfig {
+            tick_ms: 5,
+            ..Default::default()
+        };
+        let engine = spawn(journal.path(), reg, cfg).unwrap_or_else(|e| panic!("{e}"));
+        let step = |name: &str| durable_domain::StepSpec {
+            name: name.into(),
+            handler: "step".into(),
+        };
+        let run = engine
+            .submit(
+                durable_domain::OperationKey("calls/1".into()),
+                durable_domain::JobSpec {
+                    version: 1,
+                    steps: vec![step("a"), step("b")],
+                    input: b"in".to_vec(),
+                },
+            )
+            .await
+            .unwrap_or_else(|e| panic!("{e}"));
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+        loop {
+            let state = engine
+                .inspect(run)
+                .await
+                .unwrap_or_else(|e| panic!("{e}"))
+                .map(|r| r.state);
+            if state == Some(durable_domain::RunState::Done) {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the run did not finish: {state:?}"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let id = run.0.to_string();
+        let row = |m: &str, step: &str, attempt: &str| {
+            [
+                m.to_string(),
+                id.clone(),
+                step.to_string(),
+                attempt.to_string(),
+            ]
+        };
+        assert_eq!(
+            *seen.lock().unwrap_or_else(|e| panic!("{e}")),
+            vec![
+                row("POST", "0", "1"),
+                row("POST", "0", "2"),
+                row("POST", "1", "1"),
+                row("GET", "1", "1"),
+            ]
         );
     }
 

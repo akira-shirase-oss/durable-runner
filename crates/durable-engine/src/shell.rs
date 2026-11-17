@@ -34,6 +34,17 @@ pub enum Outcome {
     Lost,
 }
 
+/// Which call a handler is answering: the run, the step and the attempt
+/// (for a probe, the attempt being reconciled). The HTTP handler forwards it
+/// as headers (D-050), so a handler, or a proxy in front of one, can tie a
+/// call to the run that `GET /jobs/{id}` describes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Call {
+    pub run: RunId,
+    pub step: StepIndex,
+    pub attempt: u32,
+}
+
 /// An allowlisted step handler. Only registered names may execute — the
 /// registry, not the job spec, is the trust boundary.
 #[async_trait::async_trait]
@@ -44,6 +55,22 @@ pub trait StepHandler: Send + Sync {
     /// really check override this.
     async fn probe(&self, _step: &StepSpec, _idem_key: &str) -> bool {
         false
+    }
+    /// What the engine calls: [`StepHandler::execute`], told which call this
+    /// is. Default: the call is ignored.
+    async fn execute_call(
+        &self,
+        _call: Call,
+        step: &StepSpec,
+        input: &[u8],
+        idem_key: &str,
+    ) -> Outcome {
+        self.execute(step, input, idem_key).await
+    }
+    /// What the engine calls to reconcile: [`StepHandler::probe`], told which
+    /// call it reconciles. Default: the call is ignored.
+    async fn probe_call(&self, _call: Call, step: &StepSpec, idem_key: &str) -> bool {
+        self.probe(step, idem_key).await
     }
 }
 
@@ -1269,9 +1296,12 @@ impl Exec<'_> {
         permit: OwnedSemaphorePermit,
     ) {
         let Some(r) = core.run(run) else { return };
-        if !matches!(r.state, RunState::Running { step: s, .. } if s == step) {
-            return;
-        }
+        let attempt = match r.state {
+            RunState::Running {
+                step: s, attempt, ..
+            } if s == step => attempt,
+            _ => return,
+        };
         let Some(sspec) = r.spec.steps.get(step.0 as usize).cloned() else {
             return;
         };
@@ -1280,8 +1310,9 @@ impl Exec<'_> {
         };
         let idem = idem_key(&r.key, step);
         let input = r.spec.input.clone();
+        let call = Call { run, step, attempt };
         let handle = self.attempts.spawn(async move {
-            let outcome = handler.execute(&sspec, &input, &idem).await;
+            let outcome = handler.execute_call(call, &sspec, &input, &idem).await;
             (run, step, outcome, permit)
         });
         self.live.insert((run, step), handle);
@@ -1332,9 +1363,10 @@ impl Exec<'_> {
         permit: OwnedSemaphorePermit,
     ) {
         let Some(r) = core.run(run) else { return };
-        if !matches!(r.state, RunState::Reconciling { step: s, .. } if s == step) {
-            return; // the run moved on while the probe waited
-        }
+        let attempt = match r.state {
+            RunState::Reconciling { step: s, attempt } if s == step => attempt,
+            _ => return, // the run moved on while the probe waited
+        };
         let Some(sspec) = r.spec.steps.get(step.0 as usize).cloned() else {
             return;
         };
@@ -1348,8 +1380,9 @@ impl Exec<'_> {
             return;
         };
         let idem = idem_key(&r.key, step);
+        let call = Call { run, step, attempt };
         self.probes.spawn(async move {
-            let found = handler.probe(&sspec, &idem).await;
+            let found = handler.probe_call(call, &sspec, &idem).await;
             (run, step, found, permit)
         });
     }

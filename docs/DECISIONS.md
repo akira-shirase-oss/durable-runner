@@ -825,3 +825,20 @@ convention; these seed the contract's prescribed directions.
   lifetime. Neither limit is per client address: many such clients can
   still fill every slot for that long, which is what the reverse proxy
   is for.
+
+- **D-050 — A handler call says which run, step and attempt it is.** A
+  handler was told only `{input, idem_key}` (`idem_key` is
+  `<op_key>/<step index>`), so a handler, or a proxy in front of one that
+  records what the runner did, could not tie a call to the run `GET
+  /jobs/{id}` describes, nor tell attempt 2 from attempt 1 after its own
+  restart. Every call now carries `x-durable-run-id`, `x-durable-step`
+  (the step's index) and `x-durable-attempt`; a reconcile probe carries
+  the attempt it reconciles. They are numbers the journal already holds,
+  carry no secret and nothing about the job the call did not imply, and
+  change nothing in what the runner decides. Handlers that ignore them
+  are unaffected. The engine calls `StepHandler::execute_call` /
+  `probe_call`, whose defaults ignore the call, so other handlers did
+  not change. Tested through the real engine: a retry carries attempt 2,
+  and a lost reply's probe names the attempt it reconciles. Asked for by
+  an observability add-on that integrates through this public contract
+  only, as any customer would.
