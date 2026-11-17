@@ -1018,17 +1018,29 @@ async fn main() -> Result<()> {
     eprintln!("durable-server: terminating: draining");
     let limit = Duration::from_secs(args.drain_timeout_secs.max(1));
     let _ = stop_http.send(());
-    match tokio::time::timeout(limit, &mut serve).await {
-        Ok(r) => r.context("serve")?,
-        Err(_) => eprintln!(
-            "durable-server: requests still open after {}s; closing them",
-            limit.as_secs()
-        ),
-    }
+    let cut = match tokio::time::timeout(limit, &mut serve).await {
+        Ok(r) => {
+            r.context("serve")?;
+            false
+        }
+        Err(_) => {
+            eprintln!(
+                "durable-server: requests still open after {}s; closing them",
+                limit.as_secs()
+            );
+            true
+        }
+    };
+    // The engine drains either way: what it decided becomes durable.
     stopped
         .shutdown(limit)
         .await
         .map_err(|e| anyhow::anyhow!("drain did not finish ({e}); a restart replays"))?;
+    if cut {
+        // Nothing durable is at risk, but a client lost its response:
+        // that is not a clean stop (D-036).
+        anyhow::bail!("drained the engine, but requests were still open at the drain timeout");
+    }
     eprintln!("durable-server: drained; exiting");
     Ok(())
 }

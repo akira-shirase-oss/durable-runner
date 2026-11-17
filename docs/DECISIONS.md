@@ -549,7 +549,11 @@ convention; these seed the contract's prescribed directions.
      a compaction or backup already queued finish, and joins the writer,
      which releases the journal lock;
   3. exits 0 only if all of that happened within the drain timeout, and
-     non-zero otherwise (a restart then replays, as after a crash).
+     non-zero otherwise (a restart then replays, as after a crash). A
+     request still open when step 1's timeout ran out also exits
+     non-zero, after the engine has drained: nothing durable is at risk,
+     but a client lost its response (review U7; the first version exited
+     0 then).
 
   Handler calls in flight are abandoned, not awaited. Their runs are
   journaled running or reconciling, and after a restart they reconcile

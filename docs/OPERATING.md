@@ -114,9 +114,10 @@ target/release/durable-server \
   limits slow responses.
 - **Stopping.** Send SIGTERM (or Ctrl-C). The server stops accepting,
   lets requests in flight finish, makes everything it already decided
-  durable, releases the journal and exits 0; it exits non-zero if that
-  takes longer than `--drain-timeout-secs` (default 30, applied to the
-  requests and then to the engine), and a restart replays. Handler calls
+  durable, releases the journal and exits 0. It exits non-zero if the
+  requests in flight are not done within `--drain-timeout-secs`
+  (default 30; they are cut, after which the engine still drains), or if
+  the engine's drain takes longer than that again (a restart replays). Handler calls
   in flight are abandoned and reconcile after the restart. Give the
   supervisor at least twice the drain timeout (systemd
   `TimeoutStopSec=70`).

@@ -413,3 +413,60 @@ async fn handler_calls_ignore_proxy_environment_variables() {
     );
     assert!(direct.load(SeqCst) >= 1, "the handler was never called");
 }
+
+/// Review U7: SIGTERM with a request still open when the drain timeout
+/// ran out exited 0, though OPERATING says that is a non-zero exit. The
+/// engine still drains (nothing durable is at risk), but a response was
+/// cut, so the exit says so.
+#[tokio::test]
+async fn sigterm_with_a_request_still_open_exits_non_zero() {
+    use tokio::io::AsyncWriteExt as _;
+    let d = tempfile::tempdir().unwrap_or_else(|e| panic!("{e}"));
+    let port = free_port();
+    let base = format!("http://127.0.0.1:{port}");
+    let c = reqwest::Client::new();
+    let mut server = Command::new(env!("CARGO_BIN_EXE_durable-server"))
+        .arg("--journal")
+        .arg(d.path().join("journal"))
+        .args(["--listen", &format!("127.0.0.1:{port}")])
+        .args(["--handler", "step=http://127.0.0.1:9/unused"])
+        .args(["--drain-timeout-secs", "1"])
+        .args([
+            "--body-deadline-ms",
+            "60000",
+            "--header-timeout-ms",
+            "60000",
+        ])
+        .env("DURABLE_API_KEY", KEY)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap_or_else(|e| panic!("{e}"));
+    wait_healthy(&c, &base).await;
+    // A submit whose body never finishes: its handler is in flight.
+    let mut sock = tokio::net::TcpStream::connect(("127.0.0.1", port))
+        .await
+        .unwrap_or_else(|e| panic!("{e}"));
+    let head = format!(
+        "POST /jobs HTTP/1.1\r\nhost: x\r\nauthorization: Bearer {KEY}\r\n\
+         content-type: application/json\r\ncontent-length: 1000\r\n\r\n{{\"op"
+    );
+    sock.write_all(head.as_bytes())
+        .await
+        .unwrap_or_else(|e| panic!("{e}"));
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    signal(&server, "-TERM");
+    let status = match exit_within(&mut server, Duration::from_secs(20)).await {
+        Some(s) => s,
+        None => {
+            let _ = server.kill();
+            let _ = server.wait();
+            panic!("the server did not exit within 20 s of SIGTERM");
+        }
+    };
+    drop(sock);
+    assert!(
+        !status.success(),
+        "a drain that timed out with a request open must not exit 0: {status}"
+    );
+}
