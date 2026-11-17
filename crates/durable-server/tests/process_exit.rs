@@ -11,6 +11,9 @@ use std::time::{Duration, Instant};
 
 const KEY: &str = "process-test-key-0123456789abcdef0123456789";
 
+/// Set to skip the permission-based proofs where permissions are ignored.
+const SKIP_ENV: &str = "DURABLE_ALLOW_PERMISSION_SKIP";
+
 /// A free loopback port outside the ranges other local services use.
 fn free_port() -> u16 {
     loop {
@@ -96,7 +99,15 @@ async fn failed_manifest_swap_exits_the_process_and_loses_nothing() {
         drop(guard);
         let _ = server.kill();
         let _ = server.wait();
-        eprintln!("skipped: this user ignores directory permissions");
+        // Root (e.g. a CI container) ignores directory permissions, so the
+        // EACCES this proof relies on never happens. Never pass silently:
+        // fail unless the skip is explicitly asked for.
+        assert!(
+            std::env::var_os(SKIP_ENV).is_some(),
+            "this test needs a user that honours directory permissions (not root); \
+             run it unprivileged, or set {SKIP_ENV}=1 to skip it explicitly"
+        );
+        eprintln!("SKIPPED (explicitly, {SKIP_ENV}=1): directory permissions are ignored here");
         return;
     }
     let compact = c

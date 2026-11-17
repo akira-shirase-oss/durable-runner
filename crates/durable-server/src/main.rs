@@ -61,8 +61,8 @@ struct Args {
     #[arg(long, default_value_t = 100_000)]
     max_live_runs: usize,
     /// Approximate bytes of all retained runs; beyond it submits are 503
-    /// `at_capacity`.
-    #[arg(long, default_value_t = 1024 * 1024 * 1024)]
+    /// `at_capacity`. Default 512 MiB, sized for a 2 GB host (D-031).
+    #[arg(long, default_value_t = durable_domain::Limits::default().max_index_bytes)]
     max_index_bytes: u64,
     /// Handler calls (attempts and probes) in flight at once.
     #[arg(long, default_value_t = 32)]
@@ -340,7 +340,10 @@ impl From<EngineError> for ApiError {
             EngineError::Refused(Refusal::AtCapacity) => Self::new(
                 StatusCode::SERVICE_UNAVAILABLE,
                 "at_capacity",
-                "the runner holds as many runs as it is configured to; retry later with the same op_key",
+                "the runner holds as many runs as it is configured to (--max-live-runs, \
+                 --max-index-bytes); finished runs free their input at once, and their small \
+                 dedup records leave when a compaction runs after seven days; retry later with \
+                 the same op_key",
             ),
             EngineError::Refused(Refusal::OverLimits) => Self::new(
                 StatusCode::CONFLICT,
@@ -361,6 +364,11 @@ impl From<EngineError> for ApiError {
             // failed after: either way nothing was acknowledged.
             EngineError::Journal(j) => Self::journal(j, &e),
             EngineError::CommitFailed(j) => Self::journal(j, &e),
+            EngineError::CompactionRunning => Self::new(
+                StatusCode::CONFLICT,
+                "compaction_running",
+                "a compaction is already running; wait for it to finish",
+            ),
             EngineError::SnapshotOverBudget { .. } => {
                 Self::new(StatusCode::CONFLICT, "snapshot_over_budget", e.to_string())
             }
@@ -1416,6 +1424,16 @@ mod tests {
             (status, v["code"].clone()),
             (StatusCode::CONFLICT, json!("over_limits"))
         );
+    }
+
+    #[test]
+    fn server_index_bound_defaults_to_the_sized_domain_default() {
+        let args = Args::try_parse_from(["durable-server"]).unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(
+            args.max_index_bytes,
+            durable_domain::Limits::default().max_index_bytes
+        );
+        assert_eq!(args.max_index_bytes, 512 * 1024 * 1024);
     }
 
     #[test]

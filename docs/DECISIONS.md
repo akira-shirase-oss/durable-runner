@@ -144,6 +144,19 @@ convention; these seed the contract's prescribed directions.
      poisons and the process exits, and startup replay decides what is
      durable.
 
+  *Power loss inside a batch.* A batch is one write of many frames and one
+  fsync. If power fails before that fsync, the device may have persisted
+  any subset of the batch's blocks, not just a prefix. For example frames
+  k and k+2 may land while k+1 does not. Replay then finds a
+  complete-looking frame with a bad checksum or the wrong sequence number
+  before the tail and refuses `Corrupt`, so startup stops and needs a
+  manual repair (truncate the log at the first bad frame). No
+  acknowledged record is affected, because nothing in an unsynced batch
+  was acknowledged. Group commit widens the window from one frame to one
+  batch. Recording batch boundaries so replay could tell this apart from
+  real corruption is not built. Process death (kill -9, OOM) cannot cause
+  it: the kernel keeps every written byte.
+
   *The rules any batching (group commit) must keep*, tested one by one:
   (a) nothing a record decides (ack, read answer, handler call, probe)
   leaves the process before the fsync that covers it returns. Memory may
@@ -323,8 +336,10 @@ convention; these seed the contract's prescribed directions.
   non-terminal runs) and `max_index_bytes` (1 GiB, an approximation:
   payloads plus a fixed per-run and per-step overhead). The core keeps
   both counts current, so the check is O(1), and refuses past them with
-  `AtCapacity` (503 `at_capacity`) before journaling; finishing or
-  expiring runs frees room. Duplicate submits still return their
+  `AtCapacity` (503 `at_capacity`) before journaling. Finishing a run
+  frees its live-run slot (and, since D-030, its input bytes); its dedup
+  record's bytes return only when a compaction expires it after seven
+  days. Duplicate submits still return their
   original run. The server exposes `--max-live-runs`,
   `--max-index-bytes`, `--max-in-flight` and `--max-dispatch-per-tick`.
   Diagnostics report `active_runs` and `index_bytes`.
@@ -354,3 +369,74 @@ convention; these seed the contract's prescribed directions.
   parent directory is fsynced. The next attempt at that name removes a
   stale partial first. The server sweeps every `.*.partial` from the
   backup root at startup.
+- **D-028 — Restart streams the snapshot and the journal.** Every poison
+  exit (D-009, D-015, D-019) recovers by restarting, so restart must fit
+  the host. `load_snapshot` read the whole `snapshot.bin`, then copied
+  its payload, then decoded the index while the copy was alive. Review
+  measured 2.7 GB at 800k runs. Journal replay collected every record
+  into a `Vec` before applying any of them, and with compaction off by
+  default (D-018) that is the common path: 4.3 GB at 800k. Now:
+  - The snapshot is decoded straight from a buffered reader with a
+    running CRC. `SnapshotReader::finish` verifies the checksum before
+    the decoded index is used, and a length that disagrees with the
+    header is refused before reading.
+  - The decoder bounds every allocation by the bytes left.
+  - `Journal::open` verifies the log frame by frame with one reused
+    buffer.
+  - The engine replays through `records()`, one record at a time.
+
+  Measured restart peak RSS in a separate process (load 9-28,
+  `perf/results/2026-11-16T18-40-00Z-restart-memory.json`):
+
+  | 1 KiB runs | from snapshot | from journal |
+  |---|---|---|
+  | 100k | 342 -> 135 MiB | 547 -> 153 MiB |
+  | 800k | 2,716 -> 1,057 MiB | 4,334 -> 1,200 MiB |
+
+  Restart memory is now the index itself, about 1.3 KB per queued 1 KiB
+  run. The default index bound is sized against that in D-030.
+- **D-029 — A compacted generation without its snapshot stops startup.**
+  A generation above 1 whose `snapshot.bin` (and legacy `snapshot.json`)
+  was missing used to open as empty state, silently: every compacted run
+  vanished, run ids restarted at 1, and every op_key would re-execute. No
+  crash causes this, because compaction writes and fsyncs the snapshot
+  before the manifest names the generation; it takes a deletion, a
+  partial copy, or filesystem damage. D-021 already treats a damaged
+  snapshot as fatal, and now a missing one is too
+  (`snapshot is damaged: generation N has no snapshot`): restore from a
+  backup.
+- **D-030 — A finished run keeps only a dedup record.** Index-byte
+  capacity came back only when runs expired, which takes seven days and a
+  compaction, and compaction is opt-in. Finished runs kept their full
+  inputs, so with defaults about 860k 1 KiB jobs filled the bound and the
+  runner refused work forever. Review reproduced it: every run done,
+  `active_runs 0`, still `503 at_capacity` after a compaction. The
+  contract keeps live inputs and dedup dependencies, not finished inputs.
+  So when a run becomes terminal its input is dropped and its bytes leave
+  the capacity count at once. It keeps key, state, step count and finish
+  time, which is everything dedup and inspection use, charged
+  `160 + key + Σ(48 + names)` (about 230 B for a one-step job). Replay
+  does the same, and a snapshot from an older build has its finished
+  inputs dropped at load. Measured at 800k finished runs: `index_bytes`
+  184 MB, against 1.0 GB live, and a restart from their snapshot took
+  272 MiB. The `503` message says what frees room, and OPERATING gives
+  the arithmetic.
+- **D-031 — The default index bound is sized for a 2 GB host.** With
+  restart streamed (D-028) and finished runs reduced to dedup records
+  (D-030), memory follows `index_bytes`. Measured with the restart probes
+  (`perf/results/2026-11-16T20-10-00Z-restart-memory-sizing.json`):
+  - Live 1 KiB runs: restart and steady state at 1.1–1.26 × the index.
+  - Finished dedup records: 1.55 × (272 MiB for 184 MB at 800k).
+  - Journal replay: its peak is bounded by the highest index the runtime
+    held, because replay passes through the same states.
+
+  This in-process probe saw no compaction spike, but the review saw RSS
+  rise by about one snapshot during compaction on the HTTP server, cause
+  not identified. The sizing rule allows for it: peak ≈
+  `2.6 × max_index_bytes + 100 MiB`, which must leave 0.5 GiB of a 2 GiB
+  host. So `max_index_bytes` defaults to 512 MiB, down from 1 GiB, and a
+  test pins the rule. OPERATING states the formula and the throughput
+  consequence: with the seven-day dedup window, a 2 GB host sustains
+  about 3.9 one-step 1 KiB jobs/s with scheduled compaction. That is a
+  real limit of keeping every finished key for a week on that host, not
+  a measurement artefact.

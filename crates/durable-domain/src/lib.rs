@@ -238,7 +238,10 @@ impl Default for Limits {
             max_key_bytes: 256,
             max_name_bytes: 128,
             max_live_runs: 100_000,
-            max_index_bytes: 1024 * 1024 * 1024,
+            // Sized for a 2 GB host (D-031): peak RSS has been measured at
+            // up to 1.6 × index bytes, plus up to one snapshot during a
+            // compaction, plus ~100 MiB.
+            max_index_bytes: 512 * 1024 * 1024,
         }
     }
 }
@@ -777,6 +780,21 @@ mod tests {
         let mut empty = spec();
         empty.steps.clear();
         assert_eq!(Limits::default().admits(&empty), Err(Refusal::OverLimits));
+    }
+
+    /// D-031's sizing rule for the default index bound: the worst peak it
+    /// allows (2.6 × max_index_bytes + 100 MiB: restart and steady state
+    /// measured at up to 1.6 ×, plus up to one snapshot during a
+    /// compaction) must leave 0.5 GiB of a 2 GiB host to the OS.
+    #[test]
+    fn default_index_bound_fits_a_2_gb_host() {
+        let bound = Limits::default().max_index_bytes as f64;
+        let worst_peak = 2.6 * bound + 100.0 * 1024.0 * 1024.0;
+        let budget = 1.5 * 1024.0 * 1024.0 * 1024.0;
+        assert!(
+            worst_peak <= budget,
+            "default max_index_bytes {bound} allows a {worst_peak} B peak over {budget} B"
+        );
     }
 
     #[test]

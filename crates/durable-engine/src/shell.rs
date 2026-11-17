@@ -826,9 +826,8 @@ async fn actor(
                 }
                 Some(Cmd::Compact { reply }) => {
                     if pending_compaction.is_some() {
-                        let _ = reply.send(Err(EngineError::Refused(
-                            durable_domain::Refusal::ReserveExhausted,
-                        )));
+                        // Not "busy": retrying cannot help until it finishes.
+                        let _ = reply.send(Err(EngineError::CompactionRunning));
                     } else {
                         match start_compaction(&mut core, &mut pipe, cfg.max_snapshot_bytes, Some(reply)) {
                             Ok(p) => pending_compaction = Some(p),
@@ -1780,7 +1779,13 @@ mod tests {
         let probe_free = free.clone();
         let cfg = ShellConfig {
             tick_ms: 5,
-            limits: fast_limits(),
+            // A deadline long enough that no scheduler delay lets the sweep
+            // reconcile the run before the disk is "filled" (review S5):
+            // the sweep is what recovers it once space returns.
+            limits: Limits {
+                max_step_deadline_ms: 1500,
+                ..Limits::default()
+            },
             journal: JournalOptions {
                 reserve_bytes: 4096,
                 space: durable_journal::SpaceProbe::new(move |_| Ok(probe_free.load(SeqCst))),
@@ -1819,7 +1824,16 @@ mod tests {
         ));
 
         free.store(1 << 20, SeqCst);
-        assert!(matches!(until_done(&eng, run).await, RunState::Done));
+        // Reconciled after the 1.5 s deadline; allow generously for load.
+        let mut state = None;
+        for _ in 0..1000 {
+            state = eng.inspect(run).await.unwrap_or(None).map(|r| r.state);
+            if state.as_ref().is_some_and(RunState::is_terminal) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(matches!(state, Some(RunState::Done)), "{state:?}");
         assert!(eng.readiness().ready);
     }
 
@@ -2300,7 +2314,14 @@ mod tests {
         std::fs::set_permissions(d.path(), std::fs::Permissions::from_mode(0o300))
             .unwrap_or_else(|e| panic!("{e}"));
         if std::fs::File::open(d.path()).is_ok() {
-            eprintln!("skipped: this user ignores directory permissions");
+            // Root ignores directory permissions: never pass silently.
+            drop(guard);
+            assert!(
+                std::env::var_os("DURABLE_ALLOW_PERMISSION_SKIP").is_some(),
+                "this test needs a user that honours directory permissions (not root); \
+                 run it unprivileged, or set DURABLE_ALLOW_PERMISSION_SKIP=1 to skip it explicitly"
+            );
+            eprintln!("SKIPPED (explicitly): directory permissions are ignored here");
             return;
         }
         assert!(bounded(eng.compact()).await.is_err());
@@ -2586,6 +2607,128 @@ mod tests {
         for h in reads {
             let _ = bounded(h).await; // reads may be refused busy; never the submit
         }
+    }
+
+    /// Restart-memory probe, part 1 (review S1): fill `PROBE_DIR` with
+    /// `PROBE_RUNS` queued runs of `PROBE_INPUT` bytes, compacting at the
+    /// end if `PROBE_COMPACT=1`. Part 2 (`restart_probe_open`) runs in a
+    /// separate process so `/usr/bin/time -l` sees only the restart.
+    #[tokio::test(flavor = "current_thread")]
+    #[ignore = "measurement probe: run explicitly, in release mode"]
+    async fn restart_probe_fill() {
+        let var = |k: &str| std::env::var(k).ok();
+        let dir =
+            std::path::PathBuf::from(var("PROBE_DIR").unwrap_or_else(|| panic!("set PROBE_DIR")));
+        let runs: usize = var("PROBE_RUNS")
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(100_000);
+        let input: usize = var("PROBE_INPUT")
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(1024);
+        let compact = var("PROBE_COMPACT").as_deref() == Some("1");
+        let limits = Limits {
+            max_live_runs: usize::MAX,
+            max_index_bytes: u64::MAX,
+            ..Limits::default()
+        };
+        let cfg = ShellConfig {
+            cmd_capacity: 4096,
+            max_outbox_records: 1 << 20,
+            limits,
+            ..Default::default()
+        };
+        let eng = spawn(&dir, echo_registry(), cfg).unwrap_or_else(|e| panic!("{e}"));
+        let payload: Vec<u8> = (0..input).map(|i| (i * 7 % 251) as u8).collect();
+        let mut next = 0;
+        while next < runs {
+            let mut hs = Vec::new();
+            for _ in 0..512.min(runs - next) {
+                let e = eng.clone();
+                let mut s = spec1("echo");
+                s.input = payload.clone();
+                let k = OperationKey(format!("restart-{next}"));
+                hs.push(tokio::spawn(async move { e.submit_at(k, s, FAR).await }));
+                next += 1;
+            }
+            for h in hs {
+                h.await
+                    .unwrap_or_else(|e| panic!("{e}"))
+                    .unwrap_or_else(|e| panic!("{e}"));
+            }
+        }
+        if var("PROBE_FINISH").as_deref() == Some("1") {
+            // Finish every run (cancel), leaving only dedup records.
+            let mut id = 1;
+            while id <= runs as u64 {
+                let mut hs = Vec::new();
+                for _ in 0..512.min(runs as u64 + 1 - id) {
+                    let e = eng.clone();
+                    let run = RunId(id);
+                    hs.push(tokio::spawn(async move { e.cancel(run).await }));
+                    id += 1;
+                }
+                for h in hs {
+                    h.await
+                        .unwrap_or_else(|e| panic!("{e}"))
+                        .unwrap_or_else(|e| panic!("{e}"));
+                }
+            }
+        }
+        if compact {
+            eng.compact().await.unwrap_or_else(|e| panic!("{e}"));
+        }
+        let diag = eng.diag().await.unwrap_or_else(|e| panic!("{e}"));
+        println!(
+            "FILLED runs={runs} input={input} compacted={compact} index_bytes={} active={}",
+            diag.index_bytes, diag.active_runs
+        );
+    }
+
+    /// Restart-memory probe, part 2: open `PROBE_DIR` (replay) and report.
+    #[test]
+    #[ignore = "measurement probe: run explicitly, in release mode"]
+    fn restart_probe_open() {
+        let dir = std::env::var("PROBE_DIR").unwrap_or_else(|_| panic!("set PROBE_DIR"));
+        let t = std::time::Instant::now();
+        let core = EngineCore::open(Path::new(&dir)).unwrap_or_else(|e| panic!("{e}"));
+        println!(
+            "OPENED runs={} open_s={:.2}",
+            core.runs().count(),
+            t.elapsed().as_secs_f64()
+        );
+    }
+
+    /// A second compaction requested while one is still running is told so
+    /// with a stable conflict, not "busy, retry": retrying cannot help until
+    /// the first one finishes.
+    #[tokio::test(flavor = "current_thread")]
+    async fn second_compaction_while_one_runs_is_a_conflict() {
+        let d = tempfile::tempdir().unwrap_or_else(|e| panic!("{e}"));
+        let faults = Arc::new(Faults::default());
+        let eng = spawn(
+            d.path(),
+            echo_registry(),
+            piped(&faults, GroupCommit::default()),
+        )
+        .unwrap_or_else(|e| panic!("{e}"));
+        faults.hold_syncs();
+        let held = submit_many(&eng, "hold", 1); // the writer waits in this fsync
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        let e = eng.clone();
+        let first = tokio::spawn(async move { e.compact().await });
+        tokio::time::sleep(Duration::from_millis(30)).await; // queued behind the batch
+        let second = bounded(eng.compact()).await;
+        assert!(
+            matches!(second, Err(EngineError::CompactionRunning)),
+            "{second:?}"
+        );
+        faults.release_syncs();
+        join_all(held).await;
+        let generation = bounded(first)
+            .await
+            .unwrap_or_else(|e| panic!("{e}"))
+            .unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(generation, 2);
     }
 
     /// A failed fsync must stop the engine — never retry it, never keep

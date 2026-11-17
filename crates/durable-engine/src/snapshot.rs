@@ -17,7 +17,7 @@
 
 use durable_domain::{JobSpec, OperationKey, Run, RunId, RunState, StepIndex, StepSpec};
 use std::collections::BTreeMap;
-use std::io::{self, Write};
+use std::io::{self, Read, Write};
 use std::sync::Arc;
 
 pub const MAGIC: &[u8; 4] = b"DRIX";
@@ -143,57 +143,75 @@ pub fn encode(v: &View, w: &mut dyn Write) -> io::Result<()> {
     Ok(())
 }
 
-/// A bounds-checked reader: every read fails rather than run past the end.
-struct Cursor<'a> {
-    buf: &'a [u8],
+/// A bounds-checked streaming reader: every read fails rather than run
+/// past the payload's declared length, and nothing is allocated for a
+/// length that does not fit in what is left. Memory stays one field.
+struct Src<'a, R: Read> {
+    r: &'a mut R,
+    left: u64,
 }
 
-impl<'a> Cursor<'a> {
-    fn take(&mut self, n: usize) -> Result<&'a [u8], String> {
-        if n > self.buf.len() {
-            return Err(format!(
-                "truncated: wanted {n} bytes, {} left",
-                self.buf.len()
-            ));
+impl<R: Read> Src<'_, R> {
+    fn take(&mut self, n: usize) -> Result<Vec<u8>, String> {
+        if n as u64 > self.left {
+            return Err(format!("truncated: wanted {n} bytes, {} left", self.left));
         }
-        let (head, rest) = self.buf.split_at(n);
-        self.buf = rest;
-        Ok(head)
+        let mut v = vec![0u8; n];
+        self.r
+            .read_exact(&mut v)
+            .map_err(|e| format!("read: {e}"))?;
+        self.left -= n as u64;
+        Ok(v)
+    }
+    fn fixed<const N: usize>(&mut self) -> Result<[u8; N], String> {
+        if N as u64 > self.left {
+            return Err(format!("truncated: wanted {N} bytes, {} left", self.left));
+        }
+        let mut a = [0u8; N];
+        self.r
+            .read_exact(&mut a)
+            .map_err(|e| format!("read: {e}"))?;
+        self.left -= N as u64;
+        Ok(a)
     }
     fn u8(&mut self) -> Result<u8, String> {
-        Ok(self.take(1)?[0])
+        Ok(self.fixed::<1>()?[0])
     }
     fn u16(&mut self) -> Result<u16, String> {
-        let b = self.take(2)?;
-        Ok(u16::from_be_bytes([b[0], b[1]]))
+        Ok(u16::from_be_bytes(self.fixed()?))
     }
     fn u32(&mut self) -> Result<u32, String> {
-        let b = self.take(4)?;
-        Ok(u32::from_be_bytes([b[0], b[1], b[2], b[3]]))
+        Ok(u32::from_be_bytes(self.fixed()?))
     }
     fn u64(&mut self) -> Result<u64, String> {
-        let b = self.take(8)?;
-        let mut a = [0u8; 8];
-        a.copy_from_slice(b);
-        Ok(u64::from_be_bytes(a))
+        Ok(u64::from_be_bytes(self.fixed()?))
     }
-    fn bytes(&mut self) -> Result<&'a [u8], String> {
+    fn bytes(&mut self) -> Result<Vec<u8>, String> {
         let n = self.u32()? as usize;
         self.take(n)
     }
     fn string(&mut self) -> Result<String, String> {
-        let b = self.bytes()?;
-        String::from_utf8(b.to_vec()).map_err(|_| "string is not UTF-8".to_string())
+        String::from_utf8(self.bytes()?).map_err(|_| "string is not UTF-8".to_string())
     }
 }
 
 /// The decoded index: `next_run` and every retained run by id.
 pub type Decoded = (u64, BTreeMap<RunId, Arc<Run>>);
 
-/// Decode a binary index; any malformation is an error, never a guess.
+/// Decode a binary index held in memory; any malformation is an error.
 pub fn decode(bytes: &[u8]) -> Result<Decoded, String> {
-    let mut c = Cursor { buf: bytes };
-    if c.take(4)? != MAGIC {
+    let mut r = bytes;
+    decode_from(&mut r, bytes.len() as u64)
+}
+
+/// Decode a binary index of exactly `len` bytes streamed from `r` — the
+/// restart path reads `snapshot.bin` through this, so memory is the index
+/// being built plus one field, never the whole file (D-028). Any
+/// malformation is an error, never a guess; the caller still verifies the
+/// checksum before using the result.
+pub fn decode_from(r: &mut impl Read, len: u64) -> Result<Decoded, String> {
+    let mut c = Src { r, left: len };
+    if &c.fixed::<4>()? != MAGIC {
         return Err("not a binary index".into());
     }
     let version = c.u16()?;
@@ -204,25 +222,25 @@ pub fn decode(bytes: &[u8]) -> Result<Decoded, String> {
     let count = c.u64()?;
     // Every run takes at least 26 bytes: refuse an impossible count before
     // reserving anything for it.
-    if count > (c.buf.len() / 26) as u64 {
-        return Err(format!("{count} runs cannot fit in {} bytes", c.buf.len()));
+    if count > c.left / 26 {
+        return Err(format!("{count} runs cannot fit in {} bytes", c.left));
     }
     let mut runs = BTreeMap::new();
     for _ in 0..count {
         let id = RunId(c.u64()?);
         let key = OperationKey(c.string()?);
         let version = c.u32()?;
-        let n_steps = c.u32()? as usize;
-        if n_steps > c.buf.len() / 8 {
+        let n_steps = c.u32()? as u64;
+        if n_steps > c.left / 8 {
             return Err(format!("{n_steps} steps cannot fit"));
         }
-        let mut steps = Vec::with_capacity(n_steps);
+        let mut steps = Vec::with_capacity(n_steps as usize);
         for _ in 0..n_steps {
             let name = c.string()?;
             let handler = c.string()?;
             steps.push(StepSpec { name, handler });
         }
-        let input = c.bytes()?.to_vec();
+        let input = c.bytes()?;
         let state = match c.u8()? {
             0 => RunState::Queued {
                 next_run_at: c.u64()?,
@@ -268,8 +286,8 @@ pub fn decode(bytes: &[u8]) -> Result<Decoded, String> {
             return Err(format!("run {} appears twice", id.0));
         }
     }
-    if !c.buf.is_empty() {
-        return Err(format!("{} trailing bytes", c.buf.len()));
+    if c.left != 0 {
+        return Err(format!("{} trailing bytes", c.left));
     }
     Ok((next_run, runs))
 }
@@ -351,6 +369,36 @@ mod tests {
         let back: Vec<Run> = runs.values().map(|r| (**r).clone()).collect();
         let want: Vec<Run> = v.runs.iter().map(|r| (**r).clone()).collect();
         assert_eq!(back, want);
+    }
+
+    /// A reader that hands over one byte per call: streaming decode must
+    /// not depend on how reads are split.
+    struct Trickle<'a>(&'a [u8]);
+    impl Read for Trickle<'_> {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            match (self.0.split_first(), buf.first_mut()) {
+                (Some((b, rest)), Some(slot)) => {
+                    *slot = *b;
+                    self.0 = rest;
+                    Ok(1)
+                }
+                _ => Ok(0),
+            }
+        }
+    }
+
+    #[test]
+    fn streamed_decode_matches_in_memory_decode() {
+        let v = every_state();
+        let mut out = Vec::new();
+        encode(&v, &mut out).unwrap_or_else(|e| panic!("{e}"));
+        let whole = decode(&out).unwrap_or_else(|e| panic!("{e}"));
+        let streamed =
+            decode_from(&mut Trickle(&out), out.len() as u64).unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(whole.0, streamed.0);
+        let a: Vec<Run> = whole.1.values().map(|r| (**r).clone()).collect();
+        let b: Vec<Run> = streamed.1.values().map(|r| (**r).clone()).collect();
+        assert_eq!(a, b);
     }
 
     /// Every truncation and every flipped tag is refused, never misread.

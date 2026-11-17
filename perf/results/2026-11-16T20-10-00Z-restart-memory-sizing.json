@@ -1,0 +1,119 @@
+{
+  "machine": {
+    "host": "maintainer laptop",
+    "platform": "darwin/arm64",
+    "cpu": "Apple M2 Pro",
+    "cores": 12,
+    "mem_gb": 32,
+    "date": "2026-11-16",
+    "note": "second, quieter run (load 10-20) of the restart-memory probes, plus finished-run and compaction measurements; development observation, not capacity"
+  },
+  "scenario": "restart-memory and index sizing (review S1, S3)",
+  "method": "restart_probe_fill (PROBE_FINISH=1 cancels every run; fill process measured too) then restart_probe_open in a separate process, both under /usr/bin/time -l",
+  "commits": {
+    "before": "3da25ef + probes",
+    "after": "e9e5bc8 (streamed restart + finished-run dedup records) + probes"
+  },
+  "restart_quiet_rerun": [
+    {
+      "variant": "before",
+      "runs": 100000,
+      "compacted": true,
+      "load_1m": 10.2,
+      "restart_peak_rss_mib": 342,
+      "open_s": 0.06
+    },
+    {
+      "variant": "before",
+      "runs": 100000,
+      "compacted": false,
+      "load_1m": 10.2,
+      "restart_peak_rss_mib": 548,
+      "open_s": 1.58
+    },
+    {
+      "variant": "before",
+      "runs": 800000,
+      "compacted": true,
+      "load_1m": 16.2,
+      "restart_peak_rss_mib": 2716,
+      "open_s": 0.57
+    },
+    {
+      "variant": "before",
+      "runs": 800000,
+      "compacted": false,
+      "load_1m": 15.8,
+      "restart_peak_rss_mib": 4331,
+      "open_s": 12.31
+    },
+    {
+      "variant": "after",
+      "runs": 100000,
+      "compacted": true,
+      "load_1m": 14.9,
+      "restart_peak_rss_mib": 135,
+      "open_s": 0.07
+    },
+    {
+      "variant": "after",
+      "runs": 100000,
+      "compacted": false,
+      "load_1m": 13.8,
+      "restart_peak_rss_mib": 153,
+      "open_s": 1.14
+    },
+    {
+      "variant": "after",
+      "runs": 800000,
+      "compacted": true,
+      "load_1m": 9.7,
+      "restart_peak_rss_mib": 1057,
+      "open_s": 0.54
+    },
+    {
+      "variant": "after",
+      "runs": 800000,
+      "compacted": false,
+      "load_1m": 20.3,
+      "restart_peak_rss_mib": 1201,
+      "open_s": 9.05
+    }
+  ],
+  "sizing_800k_1KiB": [
+    {
+      "kind": "live",
+      "compacted": false,
+      "index_bytes": 1003088890,
+      "load_1m": 32.4,
+      "fill_process_peak_mib": 1098,
+      "restart_peak_rss_mib": 1172
+    },
+    {
+      "kind": "live",
+      "compacted": true,
+      "index_bytes": 1003088890,
+      "load_1m": 22.0,
+      "fill_process_peak_mib": 1081,
+      "restart_peak_rss_mib": 1057
+    },
+    {
+      "kind": "finished",
+      "compacted": false,
+      "index_bytes": 183888890,
+      "load_1m": 14.3,
+      "fill_process_peak_mib": 1098,
+      "restart_peak_rss_mib": 1201
+    },
+    {
+      "kind": "finished",
+      "compacted": true,
+      "index_bytes": 183888890,
+      "load_1m": 9.2,
+      "fill_process_peak_mib": 1099,
+      "restart_peak_rss_mib": 272
+    }
+  ],
+  "reading": "Peak RSS / index_bytes: about 1.1-1.26 for live 1 KiB runs (restart and steady state), and 1.55 for finished-run dedup records (272 MiB for 184 MB, including a small baseline). Replaying an uncompacted journal passes through the states the runtime went through, so its peak is bounded by the highest index the runtime held (here every run was live before any finished). This in-process probe saw no compaction spike; the review saw RSS rise by about one snapshot during compaction on the HTTP server (cause not identified). The default bound allows for that: 2.6 x max_index_bytes + 100 MiB <= 1.5 GiB on a 2 GiB host, giving max_index_bytes = 512 MiB.",
+  "verdict": "sizing derived from measurement; no capacity claim"
+}

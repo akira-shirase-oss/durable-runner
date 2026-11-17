@@ -56,6 +56,9 @@ pub enum EngineError {
     /// index with the admission limits).
     #[error("snapshot would be {bytes} bytes, over the {budget}-byte budget")]
     SnapshotOverBudget { bytes: u64, budget: u64 },
+    /// A compaction is already running; this request was not queued.
+    #[error("a compaction is already running")]
+    CompactionRunning,
 }
 
 /// A journaled record: the run, the commit clock value, and the event.
@@ -231,7 +234,8 @@ impl EngineCore {
     /// `open` with explicit journal options.
     pub fn open_with(dir: &Path, opts: JournalOptions) -> Result<Self, EngineError> {
         let journal = Journal::open_with(dir, opts)?;
-        let gdir = durable_journal::gen_dir_path(dir, journal.generation());
+        let generation = journal.generation();
+        let gdir = durable_journal::gen_dir_path(dir, generation);
         let mut core = Self {
             log: Log::Direct(journal),
             runs: BTreeMap::new(),
@@ -242,30 +246,53 @@ impl EngineCore {
             limits: Limits::default(),
             retry: RetryPolicy::default(),
         };
-        if let Some(snap) = durable_journal::load_snapshot(&gdir)? {
-            if snap.payload.starts_with(snapshot::MAGIC) {
+        match durable_journal::open_snapshot(&gdir)? {
+            // Streamed: the index is decoded straight from a buffered reader
+            // and the checksum verified before the result is used (D-028).
+            Some(durable_journal::SnapshotSource::Binary(mut r)) => {
+                let len = r.remaining();
                 let (next_run, runs) =
-                    snapshot::decode(&snap.payload).map_err(JournalError::CorruptSnapshot)?;
-                // Dedup keys are exactly the retained runs' keys.
-                core.by_op = runs.values().map(|r| (r.key.clone(), r.id)).collect();
-                core.runs = runs;
-                core.next_run = next_run;
-            } else {
-                let idx: LegacyIndex = serde_json::from_slice(&snap.payload)?;
-                core.runs = idx
-                    .runs
-                    .into_iter()
-                    .map(|(id, r)| (id, Arc::new(r)))
-                    .collect();
-                core.by_op = idx.by_op;
-                core.next_run = idx.next_run;
+                    snapshot::decode_from(&mut r, len).map_err(JournalError::CorruptSnapshot)?;
+                r.finish()?;
+                core.install(next_run, runs);
             }
+            Some(durable_journal::SnapshotSource::Legacy(snap)) => {
+                if snap.payload.starts_with(snapshot::MAGIC) {
+                    let (next_run, runs) =
+                        snapshot::decode(&snap.payload).map_err(JournalError::CorruptSnapshot)?;
+                    core.install(next_run, runs);
+                } else {
+                    let idx: LegacyIndex = serde_json::from_slice(&snap.payload)?;
+                    core.runs = idx
+                        .runs
+                        .into_iter()
+                        .map(|(id, r)| (id, Arc::new(r)))
+                        .collect();
+                    core.by_op = idx.by_op;
+                    core.next_run = idx.next_run;
+                }
+            }
+            // Only compaction makes a generation above 1, and it writes the
+            // snapshot before the manifest names it: a missing one is
+            // damage, never "empty state" (D-029).
+            None if generation > 1 => {
+                return Err(JournalError::CorruptSnapshot(format!(
+                    "generation {generation} has no snapshot; every compacted generation \
+                     must have one (restore from a backup)"
+                ))
+                .into());
+            }
+            None => {}
         }
+        // One record at a time: restart memory is the index, not the log.
         let mut max_run = core.next_run.saturating_sub(1);
-        for r in durable_journal::replay_dir(&gdir)? {
-            let env: Envelope = serde_json::from_slice(&r.payload)?;
-            max_run = max_run.max(env.run);
-            core.apply_committed(RunId(env.run), env.event, env.at)?;
+        if let Some(records) = durable_journal::records(&gdir)? {
+            for r in records {
+                let r = r?;
+                let env: Envelope = serde_json::from_slice(&r.payload)?;
+                max_run = max_run.max(env.run);
+                core.apply_committed(RunId(env.run), env.event, env.at)?;
+            }
         }
         core.next_run = max_run + 1;
         core.recount();
@@ -433,8 +460,22 @@ impl EngineCore {
         }
     }
 
+    /// Take a decoded snapshot as the index; dedup keys are exactly the
+    /// retained runs' keys.
+    fn install(&mut self, next_run: u64, runs: BTreeMap<RunId, Arc<Run>>) {
+        self.by_op = runs.values().map(|r| (r.key.clone(), r.id)).collect();
+        self.runs = runs;
+        self.next_run = next_run;
+    }
+
     /// Recompute the admission counters from the index (after replay).
     fn recount(&mut self) {
+        // Snapshots from before D-030 kept finished runs' inputs.
+        for r in self.runs.values_mut() {
+            if r.state.is_terminal() && !r.spec.input.is_empty() {
+                Arc::make_mut(r).spec.input = Vec::new();
+            }
+        }
         self.live = self
             .runs
             .values()
@@ -503,6 +544,11 @@ impl EngineCore {
         }
         if state.is_terminal() && !run.state.is_terminal() {
             self.live = self.live.saturating_sub(1);
+            // A finished run keeps only what dedup and inspection need (key,
+            // state, step count, finish time): its input goes, and so do its
+            // bytes from the capacity bound (D-030). Replay does the same.
+            let input = std::mem::take(&mut run.spec.input);
+            self.index_bytes = self.index_bytes.saturating_sub(input.len() as u64);
         }
         run.state = state;
         Ok(effects)
@@ -1285,6 +1331,69 @@ mod tests {
             e.submit(OperationKey("n".repeat(300)), spec(), 2),
             Err(EngineError::Refused(Refusal::OverLimits))
         ));
+    }
+
+    /// Review S2: a compacted generation whose snapshot is missing (a
+    /// deletion, a partial copy, filesystem damage — no crash can cause
+    /// it) used to start as empty state: every run gone, run ids reused,
+    /// every op_key re-executing. It must stop startup instead.
+    #[test]
+    fn missing_snapshot_of_a_compacted_generation_stops_startup() {
+        let (d, mut e) = open();
+        for i in 0..50 {
+            e.submit(OperationKey(format!("s2-{i}")), spec(), 0)
+                .unwrap_or_else(|e| panic!("{e}"));
+        }
+        let generation = e.compact(1).unwrap_or_else(|e| panic!("{e}"));
+        drop(e);
+        let snap = durable_journal::gen_dir_path(d.path(), generation).join("snapshot.bin");
+        std::fs::remove_file(&snap).unwrap_or_else(|e| panic!("{e}"));
+        match EngineCore::open(d.path()) {
+            Err(EngineError::Journal(JournalError::CorruptSnapshot(why))) => {
+                assert!(why.contains("no snapshot"), "{why}");
+            }
+            Err(e) => panic!("wrong error: {e}"),
+            Ok(c) => panic!("started with {} of 50 runs", c.runs().count()),
+        }
+    }
+
+    /// Review S3: index-byte capacity came back only when runs expired (a
+    /// compaction after 7 days), so a runner whose every run was done still
+    /// answered at_capacity. Finishing a run keeps only what dedup and
+    /// inspection need — its input goes — and frees those bytes at once.
+    #[test]
+    fn finishing_runs_frees_index_capacity() {
+        let (d, mut e) = open();
+        let input = vec![7u8; 4096];
+        let job = || {
+            let mut s = spec();
+            s.input = input.clone();
+            s
+        };
+        let first = e
+            .submit(OperationKey("cap-0".into()), job(), 0)
+            .unwrap_or_else(|e| panic!("{e}"));
+        e.limits.max_index_bytes = e.diagnostics().index_bytes + 1000; // room for no second job
+        assert!(matches!(
+            e.submit(OperationKey("cap-1".into()), job(), 0),
+            Err(EngineError::Refused(Refusal::AtCapacity))
+        ));
+        e.cancel(first, 1).unwrap_or_else(|e| panic!("{e}"));
+        e.submit(OperationKey("cap-1".into()), job(), 2)
+            .unwrap_or_else(|e| panic!("a finished run must free its input's bytes: {e}"));
+        // The finished run keeps its dedup identity and its summary.
+        let again = e
+            .submit(OperationKey("cap-0".into()), job(), 3)
+            .unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(again, first);
+        let r = e.run(first).unwrap_or_else(|| panic!("tombstone kept"));
+        assert!(r.spec.input.is_empty() && r.spec.steps.len() == 2);
+        // Replay reproduces the same accounting.
+        let bytes = e.diagnostics().index_bytes;
+        drop(e);
+        let e = EngineCore::open(d.path()).unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(e.diagnostics().index_bytes, bytes);
+        assert!(e.run(first).is_some_and(|r| r.spec.input.is_empty()));
     }
 
     #[test]
