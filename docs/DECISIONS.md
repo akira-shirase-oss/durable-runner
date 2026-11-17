@@ -776,3 +776,16 @@ convention; these seed the contract's prescribed directions.
   `localhost` or a loopback IP literal (127.0.0.0/8, `::1`), with or
   without a port; any other Host, or none, needs a key (401). A request
   with a valid key reads whatever its Host.
+- **D-048 — Input is canonical base64, refused with a stable message.**
+  The only base64 test was one valid `"aGk="`, and a refusal echoed the
+  decoder's own error text, which base64 0.23 changed. A test now
+  round-trips all 256 byte values through the submit route, and refuses
+  missing padding, non-zero trailing bits, stray characters and a
+  trailing newline with 400 `bad_input` and one fixed message. Our crates
+  now ask base64 for `std` only, without its SIMD `unsafe` code. That
+  does not remove the code from the binary: hyper-util (through reqwest)
+  depends on base64 with its default features, so Cargo's feature
+  unification still enables `simd-unsafe`. Base64's `STANDARD` engine
+  does not use it (a differential test in review found 0.22 and 0.23
+  identical over 304,026 decodes). Removing it needs that upstream
+  dependency to change.

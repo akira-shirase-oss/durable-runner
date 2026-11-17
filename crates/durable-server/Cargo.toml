@@ -9,7 +9,9 @@ publish.workspace = true
 anyhow = "1"
 async-trait = "0.1"
 axum = "0.8"
-base64 = "0.23"
+# Only `std`: this workspace does not ask for base64's SIMD `unsafe` code
+# (hyper-util, through reqwest, still turns base64's defaults on; D-048).
+base64 = { version = "0.23", default-features = false, features = ["std"] }
 clap = { version = "4", features = ["derive"] }
 durable-domain = { path = "../durable-domain" }
 durable-engine = { path = "../durable-engine" }

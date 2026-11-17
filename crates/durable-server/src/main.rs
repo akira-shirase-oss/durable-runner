@@ -751,11 +751,14 @@ async fn backup(
     }
 }
 
+/// Canonical, padded standard base64 (RFC 4648 §4); anything else is
+/// refused with one stable message, not the decoder's own text (which
+/// changes between versions).
 fn base64_decode(s: &str) -> Result<Vec<u8>, String> {
     use base64::Engine as _;
     base64::engine::general_purpose::STANDARD
         .decode(s)
-        .map_err(|e| e.to_string())
+        .map_err(|_| "input_b64 must be canonical standard base64 (RFC 4648, padded)".to_string())
 }
 
 /// Every route. `/health`, `/ready` and the inspector's static files are
@@ -2135,6 +2138,43 @@ mod tests {
             "{}",
             String::from_utf8_lossy(&reply)
         );
+    }
+
+    /// Review U11: base64 behaviour was checked by one valid input. Every
+    /// byte value round-trips, and non-canonical input (missing padding,
+    /// non-zero trailing bits, stray characters) is 400 `bad_input` with
+    /// a stable message that does not echo the decoder's own text.
+    #[tokio::test]
+    async fn input_is_canonical_standard_base64() {
+        use base64::Engine as _;
+        let all: Vec<u8> = (0..=255).collect();
+        let encoded = base64::engine::general_purpose::STANDARD.encode(&all);
+        assert_eq!(
+            base64_decode(&encoded).unwrap_or_else(|e| panic!("{e}")),
+            all
+        );
+        let h = harness(false);
+        let mut ok = submit_body("b64-all");
+        ok["spec"]["input_b64"] = json!(encoded);
+        let (status, v) = call(&h.router, "POST", "/jobs", Some(KEY), Some(ok)).await;
+        assert_eq!(status, StatusCode::OK, "{v}");
+        for (i, bad) in ["aGk", "aGl=", "aG k=", "aGk==", "####", "aGk=\n"]
+            .iter()
+            .enumerate()
+        {
+            let mut body = submit_body(&format!("b64-bad-{i}"));
+            body["spec"]["input_b64"] = json!(bad);
+            let (status, v) = call(&h.router, "POST", "/jobs", Some(KEY), Some(body)).await;
+            assert_eq!(
+                (status, v["code"].clone()),
+                (StatusCode::BAD_REQUEST, json!("bad_input")),
+                "{bad:?}: {v}"
+            );
+            assert_eq!(
+                v["error"], "input_b64 must be canonical standard base64 (RFC 4648, padded)",
+                "{bad:?}"
+            );
+        }
     }
 
     /// A full command channel is 503 `busy` (retry with the same op_key),

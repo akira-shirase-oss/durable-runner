@@ -7,7 +7,9 @@ publish.workspace = true
 
 [dependencies]
 anyhow = "1"
-base64 = "0.23"
+# Only `std`: this workspace does not ask for base64's SIMD `unsafe` code
+# (hyper-util, through reqwest, still turns base64's defaults on; D-048).
+base64 = { version = "0.23", default-features = false, features = ["std"] }
 clap = { version = "4", features = ["derive"] }
 durable-journal = { path = "../durable-journal" }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
