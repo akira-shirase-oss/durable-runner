@@ -765,14 +765,73 @@ fn router(app: App, ui_dir: Option<&Path>) -> Router {
         .layer(DefaultBodyLimit::max(MAX_REQUEST_BYTES))
         .with_state(app);
     if let Some(ui) = ui_dir {
-        router = router.nest_service(
-            "/inspector",
-            tower_http::services::ServeDir::new(ui)
-                .append_index_html_on_directories(true)
-                .not_found_service(tower_http::services::ServeFile::new(ui.join("index.html"))),
+        let csp = header::HeaderValue::from_str(&inspector_csp(ui)).unwrap_or(
+            header::HeaderValue::from_static("default-src 'none'; frame-ancestors 'none'"),
         );
+        let ui_routes = Router::new()
+            .nest_service(
+                "/inspector",
+                tower_http::services::ServeDir::new(ui)
+                    .append_index_html_on_directories(true)
+                    .not_found_service(tower_http::services::ServeFile::new(ui.join("index.html"))),
+            )
+            .layer(axum::middleware::map_response(move |mut res: Response| {
+                let csp = csp.clone();
+                async move {
+                    let h = res.headers_mut();
+                    h.insert(header::CONTENT_SECURITY_POLICY, csp);
+                    h.insert(
+                        header::X_CONTENT_TYPE_OPTIONS,
+                        header::HeaderValue::from_static("nosniff"),
+                    );
+                    h.insert(
+                        header::REFERRER_POLICY,
+                        header::HeaderValue::from_static("no-referrer"),
+                    );
+                    h.insert(
+                        header::X_FRAME_OPTIONS,
+                        header::HeaderValue::from_static("DENY"),
+                    );
+                    res
+                }
+            }));
+        router = router.merge(ui_routes);
     }
     router
+}
+
+/// The inspector's Content-Security-Policy: only its own files, and the
+/// inline bootstrap script SvelteKit writes into `index.html` by hash (no
+/// `'unsafe-inline'` scripts), calls to this origin only, no framing.
+fn inspector_csp(ui: &Path) -> String {
+    use base64::Engine as _;
+    let mut hashes = String::new();
+    match std::fs::read_to_string(ui.join("index.html")) {
+        Ok(html) => {
+            let mut rest = html.as_str();
+            while let Some(start) = rest.find("<script>") {
+                let body = &rest[start + "<script>".len()..];
+                let Some(end) = body.find("</script>") else {
+                    break;
+                };
+                let digest = sha256(body[..end].as_bytes());
+                hashes.push_str(&format!(
+                    " 'sha256-{}'",
+                    base64::engine::general_purpose::STANDARD.encode(digest)
+                ));
+                rest = &body[end + "</script>".len()..];
+            }
+        }
+        Err(e) => eprintln!(
+            "durable-server: cannot read {}/index.html ({e}); the inspector will not run",
+            ui.display()
+        ),
+    }
+    format!(
+        "default-src 'none'; script-src 'self'{hashes}; style-src 'self' 'unsafe-inline'; \
+         img-src 'self' data:; font-src 'self'; connect-src 'self'; base-uri 'none'; \
+         form-action 'none'; frame-ancestors 'none'"
+    )
 }
 
 fn api_key_from_env() -> Result<ApiKey> {
@@ -1695,6 +1754,80 @@ mod tests {
             args.compact_every_secs, 0,
             "scheduled compaction must be opt-in"
         );
+    }
+
+    /// Checklist: the inspector holds a key and renders op_keys. Its pages
+    /// are served with a CSP that allows only its own scripts (the inline
+    /// bootstrap by hash), no framing, nosniff and no referrer.
+    #[tokio::test]
+    async fn the_inspector_is_served_with_security_headers() {
+        let ui = tempfile::tempdir().unwrap_or_else(|e| panic!("{e}"));
+        let script = "\n\t\t\t\tconsole.log('boot');\n\t\t\t";
+        std::fs::write(
+            ui.path().join("index.html"),
+            format!("<!doctype html><html><body><script>{script}</script></body></html>"),
+        )
+        .unwrap_or_else(|e| panic!("{e}"));
+        std::fs::write(ui.path().join("app.js"), "export {}").unwrap_or_else(|e| panic!("{e}"));
+        let journal = tempfile::tempdir().unwrap_or_else(|e| panic!("{e}"));
+        let engine = spawn(journal.path(), Registry::default(), ShellConfig::default())
+            .unwrap_or_else(|e| panic!("{e}"));
+        let r = router(
+            App {
+                engine,
+                api_key: ApiKey::new(KEY),
+                read_key: None,
+                open_reads: false,
+                backup_root: None,
+            },
+            Some(ui.path()),
+        );
+        use base64::Engine as _;
+        let hash = base64::engine::general_purpose::STANDARD.encode(sha256(script.as_bytes()));
+        for uri in [
+            "/inspector/",
+            "/inspector/app.js",
+            "/inspector/runs/deep-link",
+        ] {
+            let res = r
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri(uri)
+                        .body(Body::empty())
+                        .unwrap_or_else(|e| panic!("{e}")),
+                )
+                .await
+                .unwrap_or_else(|e| panic!("{e}"));
+            // An unknown path gets the app shell (with ServeDir's 404).
+            assert!(
+                res.status().is_success() || uri.ends_with("deep-link"),
+                "{uri}"
+            );
+            let h = res.headers();
+            let get = |k: &str| {
+                h.get(k)
+                    .and_then(|v| v.to_str().ok())
+                    .unwrap_or("")
+                    .to_string()
+            };
+            assert_eq!(get("x-content-type-options"), "nosniff", "{uri}");
+            assert_eq!(get("referrer-policy"), "no-referrer", "{uri}");
+            let csp = get("content-security-policy");
+            for part in [
+                "default-src 'none'",
+                "frame-ancestors 'none'",
+                "connect-src 'self'",
+                &format!("script-src 'self' 'sha256-{hash}'"),
+            ] {
+                assert!(csp.contains(part), "{uri}: CSP {csp:?} lacks {part:?}");
+            }
+            let scripts = csp.split(';').find(|d| d.trim().starts_with("script-src"));
+            assert!(
+                scripts.is_some_and(|d| !d.contains("unsafe-inline")),
+                "{uri}: scripts must not be unsafe-inline: {csp}"
+            );
+        }
     }
 
     /// A full command channel is 503 `busy` (retry with the same op_key),

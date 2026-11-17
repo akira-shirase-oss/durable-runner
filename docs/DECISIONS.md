@@ -606,3 +606,19 @@ convention; these seed the contract's prescribed directions.
   `http://` or `https://` URLs with a host. Signing calls so a handler
   can tell they come from this runner is not built; it belongs with the
   SaaS handler registry (SAAS_PLAN S2).
+- **D-040 — The inspector is served with a strict CSP, and boots under
+  its mount.** The inspector holds a key (D-037) and renders op_keys,
+  which clients choose. Svelte renders them as escaped text, but nothing
+  limited what the page could load or run. Every `/inspector` response
+  now carries `Content-Security-Policy: default-src 'none'; script-src
+  'self' 'sha256-…'` (the hash of each inline bootstrap script in
+  `index.html`, computed when the server starts, so scripts are never
+  `'unsafe-inline'`), `connect-src 'self'`, `frame-ancestors 'none'`,
+  `base-uri 'none'`, `form-action 'none'`, plus `X-Content-Type-Options:
+  nosniff`, `X-Frame-Options: DENY` and `Referrer-Policy: no-referrer`.
+  Styles stay `'self' 'unsafe-inline'`. While checking this, the built
+  inspector turned out never to boot: SvelteKit's fallback page cannot use
+  relative asset paths, so `index.html` loaded `/_app/…`, which is not
+  served (only `/inspector/…` is). The app's base is now `/inspector`, and
+  every asset it references answers 200. Checked over HTTP (status codes
+  and the served hash recomputed independently); not checked in a browser.
