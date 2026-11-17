@@ -89,6 +89,14 @@ target/release/durable-server \
 - **Backup root.** `--backup-root DIR` is the only place backups are
   written; without it `/admin/backup` answers `403 backups_disabled`.
 
+- **Stopping.** Send SIGTERM (or Ctrl-C). The server stops accepting,
+  lets requests in flight finish, makes everything it already decided
+  durable, releases the journal and exits 0; it exits non-zero if that
+  takes longer than `--drain-timeout-secs` (default 30, applied to the
+  requests and then to the engine), and a restart replays. Handler calls
+  in flight are abandoned and reconcile after the restart. Give the
+  supervisor at least twice the drain timeout (systemd
+  `TimeoutStopSec=70`).
 - `--handler name=URL` is the allowlist — repeatable; a submit naming a
   handler outside it is refused 409 with `unregistered handler`.
 - The journal directory is created on first run: `LOCK`, `manifest.json`,

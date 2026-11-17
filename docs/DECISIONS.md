@@ -530,3 +530,28 @@ convention; these seed the contract's prescribed directions.
   retry with the same op_key, which dedup turns into the same run. The
   engine's own state is unchanged by a timeout: nothing is cancelled, and
   the held answer is dropped when it is released.
+- **D-036 — SIGTERM drains; exit 0 means nothing decided was left
+  behind.** SIGTERM (what systemd and most supervisors send to stop a
+  service) killed the server like a crash. Nothing acknowledged was lost,
+  because restart replays, but every request in flight was cut off, and
+  a planned stop looked like a failure. Now SIGTERM or SIGINT:
+  1. stops accepting connections and lets the requests in flight finish
+     (each ack still waits for its covering fsync), for at most
+     `--drain-timeout-secs` (default 30);
+  2. asks the engine to drain (`Engine::shutdown`). The actor closes its
+     channels and refuses anything still queued (`Stopped`, 503
+     `engine_stopped`: nothing of it was decided). It starts no new
+     handler call, hands every record it already decided to the writer,
+     waits for the fsync, answers every caller those records cover, lets
+     a compaction or backup already queued finish, and joins the writer,
+     which releases the journal lock;
+  3. exits 0 only if all of that happened within the drain timeout, and
+     non-zero otherwise (a restart then replays, as after a crash).
+
+  Handler calls in flight are abandoned, not awaited. Their runs are
+  journaled running or reconciling, and after a restart they reconcile
+  through the probe as after a crash: cancelling a local call never
+  undoes a remote effect, so waiting for them would only delay the stop.
+  Proven by a process test that sends SIGTERM to the release-shaped
+  binary under concurrent submits: exit 0, and every acknowledged run is
+  there after restart.

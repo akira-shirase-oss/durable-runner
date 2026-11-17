@@ -75,6 +75,11 @@ struct Args {
     /// answered 503 `timeout` (a stuck disk must not hang every request).
     #[arg(long, default_value_t = 10_000)]
     reply_timeout_ms: u64,
+    /// On SIGTERM or SIGINT: how long to let requests in flight finish,
+    /// and then how long the engine may take to make everything it
+    /// decided durable, before exiting non-zero instead of 0.
+    #[arg(long, default_value_t = 30)]
+    drain_timeout_secs: u64,
 }
 
 /// The environment variable holding the API key. Read from the
@@ -776,16 +781,73 @@ async fn main() -> Result<()> {
         .await
         .with_context(|| format!("bind {}", args.listen))?;
     eprintln!("durable-server listening on {}", args.listen);
+    let (stop_http, http_stopped) = tokio::sync::oneshot::channel::<()>();
+    let serve = axum::serve(listener, router)
+        .with_graceful_shutdown(async {
+            let _ = http_stopped.await;
+        })
+        .into_future();
+    tokio::pin!(serve);
     tokio::select! {
-        r = axum::serve(listener, router).into_future() => r?,
+        r = &mut serve => return r.context("serve"),
         () = stopped.closed() => {
             // The journal writer poisoned itself (a failed fsync is never
             // retried): exit non-zero so the supervisor restarts us and
             // startup replay decides what is durable.
             anyhow::bail!("engine stopped: journal writer poisoned; exiting so a restart replays");
         }
+        () = terminate() => {}
     }
+    // Drain (D-036): stop accepting, let requests in flight finish (each
+    // ack still waits for its fsync), then let the engine make everything
+    // it decided durable and release the journal. Exit 0 only if all of
+    // that happened; otherwise a restart replays, as after a crash.
+    eprintln!("durable-server: terminating: draining");
+    let limit = Duration::from_secs(args.drain_timeout_secs.max(1));
+    let _ = stop_http.send(());
+    match tokio::time::timeout(limit, &mut serve).await {
+        Ok(r) => r.context("serve")?,
+        Err(_) => eprintln!(
+            "durable-server: requests still open after {}s; closing them",
+            limit.as_secs()
+        ),
+    }
+    stopped
+        .shutdown(limit)
+        .await
+        .map_err(|e| anyhow::anyhow!("drain did not finish ({e}); a restart replays"))?;
+    eprintln!("durable-server: drained; exiting");
     Ok(())
+}
+
+/// Resolves on SIGTERM (a supervisor stopping us) or SIGINT (Ctrl-C).
+async fn terminate() {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{signal, SignalKind};
+        match signal(SignalKind::terminate()) {
+            Ok(mut term) => {
+                tokio::select! {
+                    _ = term.recv() => {}
+                    r = tokio::signal::ctrl_c() => {
+                        if r.is_err() {
+                            std::future::pending::<()>().await;
+                        }
+                    }
+                }
+            }
+            Err(e) => {
+                eprintln!("durable-server: cannot watch SIGTERM ({e}); only Ctrl-C drains");
+                if tokio::signal::ctrl_c().await.is_err() {
+                    std::future::pending::<()>().await;
+                }
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    if tokio::signal::ctrl_c().await.is_err() {
+        std::future::pending::<()>().await;
+    }
 }
 
 #[cfg(test)]

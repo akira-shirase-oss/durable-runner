@@ -14,12 +14,13 @@ const KEY: &str = "process-test-key-0123456789abcdef0123456789";
 /// Set to skip the permission-based proofs where permissions are ignored.
 const SKIP_ENV: &str = "DURABLE_ALLOW_PERMISSION_SKIP";
 
-/// A free loopback port outside the ranges other local services use.
+/// A free loopback port outside the ranges other local services use
+/// (55432, 56000-62999, which holds 58000-58099 and 58400).
 fn free_port() -> u16 {
     loop {
         let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap_or_else(|e| panic!("{e}"));
         let port = l.local_addr().unwrap_or_else(|e| panic!("{e}")).port();
-        if port != 55432 && !(58000..=58099).contains(&port) {
+        if port != 55432 && !(56000..=62999).contains(&port) {
             return port;
         }
     }
@@ -152,6 +153,96 @@ async fn failed_manifest_swap_exits_the_process_and_loses_nothing() {
             .map(|r| r.status().as_u16())
             .unwrap_or(0);
         assert_eq!(s, 200, "acknowledged run {id} lost on restart");
+    }
+    let _ = server.kill();
+    let _ = server.wait();
+}
+
+/// Wait for the child to exit, at most `limit`.
+async fn exit_within(child: &mut Child, limit: Duration) -> Option<std::process::ExitStatus> {
+    let deadline = Instant::now() + limit;
+    while Instant::now() < deadline {
+        if let Some(s) = child.try_wait().unwrap_or_else(|e| panic!("{e}")) {
+            return Some(s);
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    None
+}
+
+fn signal(child: &Child, sig: &str) {
+    let ok = Command::new("kill")
+        .args([sig, &child.id().to_string()])
+        .status()
+        .unwrap_or_else(|e| panic!("{e}"))
+        .success();
+    assert!(ok, "kill {sig} failed");
+}
+
+/// Review (still open): SIGTERM killed the server like a crash. It must
+/// drain: stop accepting, let every request in flight finish (each
+/// acknowledged submit durable), flush the batch the writer holds, and exit
+/// 0 — and nothing acknowledged may be missing after a restart.
+#[tokio::test]
+async fn sigterm_drains_in_flight_work_and_exits_zero() {
+    let d = tempfile::tempdir().unwrap_or_else(|e| panic!("{e}"));
+    let journal = d.path().join("journal");
+    let port = free_port();
+    let base = format!("http://127.0.0.1:{port}");
+    let c = reqwest::Client::new();
+    let mut server = start(&journal, port);
+    wait_healthy(&c, &base).await;
+
+    let mut acked = Vec::new();
+    for i in 0..5 {
+        acked.extend(submit(&c, &base, &format!("before-{i}")).await);
+    }
+    assert_eq!(acked.len(), 5);
+    // Clients keep submitting while the signal lands.
+    let mut clients = tokio::task::JoinSet::new();
+    for t in 0..4 {
+        let (c, base) = (c.clone(), base.clone());
+        clients.spawn(async move {
+            let mut ids = Vec::new();
+            for i in 0..10_000 {
+                match submit(&c, &base, &format!("during-{t}-{i}")).await {
+                    Some(id) => ids.push(id),
+                    None => break, // refused or connection closed: the drain began
+                }
+            }
+            ids
+        });
+    }
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    signal(&server, "-TERM");
+    let status = match exit_within(&mut server, Duration::from_secs(20)).await {
+        Some(s) => s,
+        None => {
+            let _ = server.kill();
+            let _ = server.wait();
+            panic!("the server did not exit within 20 s of SIGTERM");
+        }
+    };
+    while let Some(ids) = clients.join_next().await {
+        acked.extend(ids.unwrap_or_else(|e| panic!("{e}")));
+    }
+    assert!(status.success(), "SIGTERM must drain and exit 0: {status}");
+    assert!(
+        acked.len() > 5,
+        "no submit was in flight when the signal landed"
+    );
+
+    let mut server = start(&journal, port);
+    wait_healthy(&c, &base).await;
+    for id in &acked {
+        let s = c
+            .get(format!("{base}/jobs/{id}"))
+            .bearer_auth(KEY)
+            .send()
+            .await
+            .map(|r| r.status().as_u16())
+            .unwrap_or(0);
+        assert_eq!(s, 200, "acknowledged run {id} lost across SIGTERM");
     }
     let _ = server.kill();
     let _ = server.wait();
