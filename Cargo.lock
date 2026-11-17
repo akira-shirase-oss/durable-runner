@@ -327,6 +327,8 @@ dependencies = [
  "durable-journal",
  "http-body",
  "http-body-util",
+ "hyper",
+ "hyper-util",
  "reqwest",
  "ring",
  "serde",

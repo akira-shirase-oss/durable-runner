@@ -43,9 +43,19 @@ step "build"
 if command -v brew >/dev/null 2>&1; then
   export PATH="$(brew --prefix rustup)/bin:$PATH" # the pinned toolchain on macOS
 fi
-cargo build --release --locked -p durable-server -p durable-cli 2>&1 | tail -1
-SRV=$ROOT/target/release/durable-server
-CLI="$ROOT/target/release/durable-cli --server http://127.0.0.1:$SRV_PORT"
+# The binaries live wherever cargo builds them: honour CARGO_TARGET_DIR and
+# .cargo/config (per-worktree target dirs), never assume $ROOT/target.
+if ! BUILD=$(cargo build --release --locked -p durable-server -p durable-cli 2>&1); then
+  printf '%s\n' "$BUILD" >&2
+  fail "the release build failed (full output above)"
+fi
+printf '%s\n' "$BUILD" | tail -1
+TARGET=$(cargo metadata --format-version 1 --no-deps --locked \
+  | python3 -I -c 'import json, sys; print(json.load(sys.stdin)["target_directory"])')
+BIN=$TARGET/release
+[ -x "$BIN/durable-server" ] && [ -x "$BIN/durable-cli" ] || fail "no release binaries in $BIN"
+SRV=$BIN/durable-server
+CLI="$BIN/durable-cli --server http://127.0.0.1:$SRV_PORT"
 SERVE=("$SRV" --journal "$WORK/journal" --listen "127.0.0.1:$SRV_PORT"
   --backup-root "$WORK/backups" --handler "step=http://127.0.0.1:$HND_PORT/step")
 
@@ -97,16 +107,16 @@ $CLI compact
 $CLI backup --name pilot          # lands in $WORK/backups/pilot, nowhere else
 
 step "restore on a second server instance (different port + journal dir)"
-"$ROOT/target/release/durable-cli" restore --from "$WORK/backups/pilot" --to "$WORK/journal" \
+"$BIN/durable-cli" restore --from "$WORK/backups/pilot" --to "$WORK/journal" \
   && fail "restore into the live journal was not refused"
 kill -9 "$SRV_PID"
 wait "$SRV_PID" 2>/dev/null || true
-"$ROOT/target/release/durable-cli" restore --from "$WORK/backups/pilot" --to "$WORK/restored"
+"$BIN/durable-cli" restore --from "$WORK/backups/pilot" --to "$WORK/restored"
 "$SRV" --journal "$WORK/restored" --listen "127.0.0.1:$RSRV_PORT" \
   --handler "step=http://127.0.0.1:$HND_PORT/step" >"$WORK/restored.log" 2>&1 &
 RSRV_PID=$!
 healthy "$RSRV_PORT"
-RCLI="$ROOT/target/release/durable-cli --server http://127.0.0.1:$RSRV_PORT"
+RCLI="$BIN/durable-cli --server http://127.0.0.1:$RSRV_PORT"
 R=$($RCLI inspect --run "$ID")
 echo "restored inspect -> $R"
 echo "$R" | grep -q '"done"' || fail "the restored run is not done"

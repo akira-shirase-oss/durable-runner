@@ -105,6 +105,13 @@ class Api:
         return 0, None
 
 
+def target_directory():
+    """Where cargo puts this workspace's builds (honours CARGO_TARGET_DIR)."""
+    out = subprocess.run(["cargo", "metadata", "--format-version", "1", "--no-deps", "--locked"],
+                         cwd=ROOT, capture_output=True, check=True)
+    return json.loads(out.stdout)["target_directory"]
+
+
 def submit_body(op_key, delayed):
     b = {
         "op_key": op_key,
@@ -159,8 +166,9 @@ def main():
     ap.add_argument("--targeted", type=int, default=15, help="kills 0-30 ms after compact/backup/cancel burst")
     ap.add_argument("--clients", type=int, default=16)
     ap.add_argument("--port", type=int, default=53400)
-    ap.add_argument("--binary", default=os.path.join(ROOT, "target/release/durable-server"))
-    ap.add_argument("--cli", default=os.path.join(ROOT, "target/release/durable-cli"))
+    release = os.path.join(target_directory(), "release")
+    ap.add_argument("--binary", default=os.path.join(release, "durable-server"))
+    ap.add_argument("--cli", default=os.path.join(release, "durable-cli"))
     ap.add_argument("--out")
     args = ap.parse_args()
     rnd = random.Random(int(os.environ.get("DRILL_SEED", "20261116")))

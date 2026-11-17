@@ -93,8 +93,10 @@ target/release/durable-server \
   characters, different from the API key; it gets `403 forbidden` on
   every other route). Give the inspector or a dashboard the read key, not
   the admin key. `--open-reads` serves reads without a key, and is
-  refused at startup unless `--listen` is a loopback IP: never pass it
-  behind a reverse proxy, which makes loopback reachable. `/health`,
+  refused at startup unless `--listen` is a loopback IP, and even then
+  answers a request without a key only if its `Host` is `localhost` or a
+  loopback IP (DNS rebinding, D-047): never pass it behind a reverse
+  proxy, which makes loopback reachable. `/health`,
   `/ready` and the inspector's static files are open. The CLI sends
   `DURABLE_API_KEY` (reads fall back to `DURABLE_READ_KEY`); the
   inspector asks for a key and sends it on every call. The pilot
@@ -102,11 +104,20 @@ target/release/durable-server \
 - **Backup root.** `--backup-root DIR` is the only place backups are
   written; without it `/admin/backup` answers `403 backups_disabled`.
 
+- **Connections.** `--max-connections` (512) are served at once (keep
+  it below `ulimit -n` less 64); a request head must arrive within
+  `--header-timeout-ms` (10 s, idle keep-alive connections too) and a
+  body within `--body-deadline-ms` (30 s) (D-045). That bounds one host's
+  worth of slow clients; it is not a defence on the open internet. For
+  any non-local exposure put a reverse proxy in front that terminates
+  TLS, rate-limits per client, caps connections per client address, and
+  limits slow responses.
 - **Stopping.** Send SIGTERM (or Ctrl-C). The server stops accepting,
   lets requests in flight finish, makes everything it already decided
-  durable, releases the journal and exits 0; it exits non-zero if that
-  takes longer than `--drain-timeout-secs` (default 30, applied to the
-  requests and then to the engine), and a restart replays. Handler calls
+  durable, releases the journal and exits 0. It exits non-zero if the
+  requests in flight are not done within `--drain-timeout-secs`
+  (default 30; they are cut, after which the engine still drains), or if
+  the engine's drain takes longer than that again (a restart replays). Handler calls
   in flight are abandoned and reconcile after the restart. Give the
   supervisor at least twice the drain timeout (systemd
   `TimeoutStopSec=70`).
@@ -186,7 +197,11 @@ The restored server replays snapshot + journal and rebuilds identical
 state — same run ids, same `finished_at`. Verified live by
 `examples/pilot/run.sh`.
 
-`restore` takes the target's journal lock for the whole copy, so it
+`restore` first checks the backup against its own `backup.json` (every
+file's size and checksum, and the generation its manifest names), then
+checks that generation replays; a backup that fails any check is refused
+and nothing is left in the target (D-044). It takes the target's journal
+lock for the whole copy, so it
 fails while a server runs on that directory, and no server can start on
 it half restored. It refuses a target that already holds a journal
 (move a damaged one aside first; it never merges two histories), and it
@@ -239,11 +254,46 @@ refuses to start there, so remove the directory and restore again.
 - Startup refused with `corrupt committed history at seq N: … (frame at
   offset X)` — a committed frame is damaged (a header or payload
   checksum, or a frame that does not fit the batch it was written in).
-  Nothing was cut: the log is exactly as found. Restore from a backup.
-  If the message ends `the damage lies inside the log's last batch` and
-  the host lost power, the damaged frames were in a batch whose fsync
-  had not returned, so none of them was acknowledged: copy the journal
-  aside, then truncate `journal.log` to offset X and start again.
+  Nothing was cut: the log is exactly as found. **Restore from a
+  backup.** Do not truncate the log at the reported frame offset: that
+  can leave part of a batch behind, and frames after it may have been
+  acknowledged. If the message ends `the damage lies inside the log's
+  last batch, which starts at offset B`, the host lost power and you
+  have no backup, the one lossy repair is: copy the journal aside, then
+  truncate `journal.log` to B (the start of that batch, never X). That
+  drops the whole last batch; its records were acknowledged only if its
+  fsync returned before the power cut, which the log cannot tell.
 - `durable-server: discarded a torn tail: N bytes at offset X` at startup
-  — the log ended inside its last frame (a crash mid-write). That frame
-  was never acknowledged; every complete frame before it was kept.
+  — the log ended inside its last group commit (a crash mid-write). The
+  whole of that batch, from its first frame at X, was dropped: its fsync
+  never returned, so none of it was acknowledged (D-043). Every earlier
+  batch was kept.
+
+## Known limits
+
+What this server does not do, so the deployment must (or must not rely on
+it):
+
+- **Exposure.** It caps connections and times heads and bodies (D-045),
+  but has no TLS, per-client rate limit or per-address connection cap.
+  For any non-local exposure, put a reverse proxy in front that does.
+  Never combine a proxy with `--open-reads`.
+- **Handler calls are unsigned.** A handler cannot tell a call came from
+  this runner except by network placement (D-039); keep handlers on a
+  private network.
+- **One op_key, one run.** Resubmitting an op_key returns its first run
+  even if the spec differs; there is no 409 for a changed spec.
+- **Keys.** One API key and one optional read-only key, read at startup:
+  rotating either needs a restart, and there is no cancel-only scope.
+- **Reads have no rate limit.** A key holder can fill the read queue
+  (bounded: 503 `busy`), never the write queue.
+- **Power loss inside the last batch** with the file's length on disk
+  stops startup (the batch cannot be told apart from damage); restore a
+  backup (see "What honest looks like" above for the one lossy repair).
+- **v1 logs.** A damaged length in the *last* frame of a log that holds
+  only v1 frames (written before D-032) still reads as a torn tail and
+  costs that one record. The window closes at the first v2 append.
+- **Compaction stalls acks** for as long as it writes (D-021), and is
+  opt-in for that reason.
+- **One host.** No replication or failover; durability is this disk's
+  fsync. Backups are the recovery path.

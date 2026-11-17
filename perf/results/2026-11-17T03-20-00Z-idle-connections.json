@@ -1,0 +1,23 @@
+{
+  "scenario": "300 sockets each send a partial request head and go quiet, against a release server with RLIMIT_NOFILE 256 and --header-timeout-ms 3000 (default --max-connections 512); /health sampled every 1.5 s",
+  "binary": "target/release/durable-server built --locked from fix/security-review-2026-11-16 (the U2 commit)",
+  "machine": {
+    "cpu": "Apple M2 Pro",
+    "os": "macOS 27.2.1",
+    "note": "busy development laptop; observation, not capacity"
+  },
+  "result": [
+    "held 300 partial-request sockets",
+    "t+  0.0s /health -> 200 in 3.08s",
+    "t+  4.6s /health -> 200 in 0.00s",
+    "t+  6.1s /health -> 200 in 0.00s",
+    "t+  7.6s /health -> 200 in 0.00s",
+    "t+  9.1s /health -> 200 in 0.00s",
+    "t+ 10.6s /health -> 200 in 0.00s",
+    "t+ 12.1s /health -> 200 in 0.00s",
+    "t+ 13.6s /health -> 200 in 0.00s",
+    "after 15.1s the server had closed 300 of 300"
+  ],
+  "before": "Review on e4f08fe (axum::serve, no timer): with 300 held sockets /health timed out, and the partial requests were still held after 35 s.",
+  "reading": "The first /health waited for the header timeout to free descriptors (3.08 s), then answered at once; the server closed all 300 held sockets. With the 10 s default the wait is at most about 10 s."
+}

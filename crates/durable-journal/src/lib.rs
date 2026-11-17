@@ -23,10 +23,12 @@
 //! the reverse.
 //!
 //! Replay trusts committed history absolutely: only a demonstrably
-//! incomplete *tail* may be discarded — the file ends inside the last frame,
-//! whose header (when complete) checks out, and nothing that looks like a
-//! later frame follows it. That cut is never more than one frame, so never
-//! more than the last batch. Anything else stops startup (contract §02).
+//! incomplete *tail* may be discarded. For v2 that is a last batch whose
+//! recorded extent is not all on disk (its first frame's header checks
+//! out, or is itself cut short): the whole batch goes, from its first frame,
+//! because its fsync never returned (D-043). For v1, the file ends inside
+//! the last frame and nothing after it looks like a frame. Anything else
+//! stops startup (contract §02).
 
 use serde::{Deserialize, Serialize};
 use std::fs::{self, File, OpenOptions};
@@ -454,8 +456,10 @@ pub struct Records {
     /// End of the last good frame.
     pos: u64,
     expected_seq: u64,
-    /// The current v2 batch: where it ends and the length its frames carry.
-    /// At `pos == batch_end` the next frame starts a new batch.
+    /// The current v2 batch: where it starts and ends, and the length its
+    /// frames carry. At `pos == batch_end` the next frame starts a new
+    /// batch. A batch is read only once the whole of it is on disk.
+    batch_start: u64,
     batch_end: u64,
     batch_len: u32,
     /// A v2 frame was read: a v1 frame after it is corruption.
@@ -473,6 +477,7 @@ impl Records {
             file_len,
             pos: 0,
             expected_seq: 1,
+            batch_start: 0,
             batch_end: 0,
             batch_len: 0,
             seen_v2: false,
@@ -492,13 +497,17 @@ impl Records {
     }
 
     fn corrupt(&self, why: impl std::fmt::Display) -> JournalError {
-        // A hint for the one case an operator can repair by hand: damage
-        // confined to the last batch is what a power loss before its fsync
-        // leaves (D-014), and nothing in that batch was acknowledged then.
-        let hint = if self.pos < self.batch_end && self.file_len <= self.batch_end {
-            "; the damage lies inside the log's last batch"
+        // Damage inside the log's last batch is what a power loss can leave
+        // when the file's length reached the disk but some of the batch's
+        // data did not (D-014). Say where that batch starts; OPERATING says
+        // what (little) an operator may do about it.
+        let hint = if self.pos < self.batch_end && self.file_len == self.batch_end {
+            format!(
+                "; the damage lies inside the log's last batch, which starts at offset {}",
+                self.batch_start
+            )
         } else {
-            ""
+            String::new()
         };
         JournalError::Corrupt {
             seq: self.expected_seq,
@@ -506,7 +515,9 @@ impl Records {
         }
     }
 
-    /// Stop at a torn tail: the file ends inside the frame at `pos`.
+    /// Stop at a torn tail starting at `pos`: for v2 always a batch's first
+    /// frame, so the whole incomplete batch goes (its fsync never returned,
+    /// so nothing in it was acknowledged); for v1, the last frame.
     fn tear(&mut self) -> Result<Option<u64>, JournalError> {
         self.done = true;
         self.torn = Some(TornTail {
@@ -542,7 +553,13 @@ impl Records {
             self.done = true;
             return Ok(None);
         }
+        // Inside a batch every byte is on disk (checked at its first
+        // frame), so a short remainder there is damage, not a tear.
+        let mid_batch = self.pos < self.batch_end;
         if self.file_len - self.pos < V1_HEADER_LEN as u64 {
+            if mid_batch {
+                return Err(self.corrupt("a batch ends inside a frame header"));
+            }
             return self.tear(); // fewer bytes than any header
         }
         let mut hdr = [0u8; HEADER_LEN];
@@ -561,7 +578,11 @@ impl Records {
         mut hdr: [u8; HEADER_LEN],
         buf: &mut Vec<u8>,
     ) -> Result<Option<u64>, JournalError> {
+        let mid_batch = self.pos < self.batch_end;
         if self.file_len - self.pos < HEADER_LEN as u64 {
+            if mid_batch {
+                return Err(self.corrupt("a batch ends inside a frame header"));
+            }
             return self.tear(); // an incomplete v2 header
         }
         self.r.read_exact(&mut hdr[V1_HEADER_LEN..])?;
@@ -580,20 +601,27 @@ impl Records {
             return Err(self.corrupt(format_args!("sequence {seq}")));
         }
         let frame_end = self.pos + HEADER_LEN as u64 + len;
-        if self.pos >= self.batch_end {
+        if !mid_batch {
             // The first frame of a batch: the batch must hold it.
             if u64::from(batch_len) < HEADER_LEN as u64 + len {
                 return Err(self.corrupt("frame larger than its batch"));
             }
-            self.batch_end = self.pos + u64::from(batch_len);
+            let batch_end = self.pos + u64::from(batch_len);
+            if batch_end > self.file_len {
+                // The log ends before this batch does (its header checks
+                // out, so its length is the one written): the batch's one
+                // write never finished, so its fsync never returned and
+                // nothing in it was acknowledged. It goes whole, from its
+                // first frame, never frame by frame (review U1).
+                return self.tear();
+            }
+            self.batch_start = self.pos;
+            self.batch_end = batch_end;
             self.batch_len = batch_len;
         } else if batch_len != self.batch_len || frame_end > self.batch_end {
             return Err(self.corrupt("frame does not fit the batch it was written in"));
         }
         self.seen_v2 = true;
-        if frame_end > self.file_len {
-            return self.tear_unless_followed(HEADER_LEN);
-        }
         buf.clear();
         buf.resize(len as usize, 0);
         self.r.read_exact(buf)?;
@@ -709,20 +737,26 @@ impl Journal {
         tighten(&lock_path, FILE_MODE);
         tighten(&manifest_path_of(dir), FILE_MODE);
 
-        // Manifest: keep the last valid one; create generation 1 on first open.
+        // Manifest: keep the last valid one. First open creates generation
+        // 1 and its log, then the manifest that names it (D-044), so a
+        // manifest naming a generation that is not there is damage.
         let manifest_path = dir.join("manifest.json");
-        let generation = match fs::read_to_string(&manifest_path) {
-            Ok(text) => {
+        let (generation, fresh) = match fs::read_to_string(&manifest_path) {
+            Ok(text) => (
                 serde_json::from_str::<Manifest>(&text)
                     .map_err(|e| JournalError::Manifest(e.to_string()))?
-                    .generation
-            }
+                    .generation,
+                false,
+            ),
             Err(e) if e.kind() == io::ErrorKind::NotFound => {
-                // First open writes the manifest before any generation, so
-                // generations without one are damage or an interrupted
-                // restore — never a fresh journal to start over in.
+                // Without a manifest, the only generation a crash can leave
+                // is first open's own: an empty gen-000001. Anything else is
+                // damage or an interrupted restore, never a fresh journal.
                 for entry in fs::read_dir(dir)? {
-                    if parse_gen(&entry?.file_name()).is_some() {
+                    let entry = entry?;
+                    if parse_gen(&entry.file_name()).is_some()
+                        && !(entry.path() == gen_dir_path(dir, 1) && is_unused_gen(&entry.path()))
+                    {
                         return Err(JournalError::Manifest(
                             "generation directories but no manifest.json: a damaged journal \
                              or an interrupted restore (remove it and restore again)"
@@ -730,17 +764,18 @@ impl Journal {
                         ));
                     }
                 }
-                let m = Manifest { generation: 1 };
-                let tmp = dir.join("manifest.json.tmp");
-                write_private(&tmp, &serde_json::to_vec(&m).map_err(io::Error::other)?)?;
-                fs::rename(&tmp, &manifest_path)?;
-                sync_dir(&opts, dir)?;
-                1
+                (1, true)
             }
             Err(e) => return Err(e.into()),
         };
 
         let gdir = gen_dir_path(dir, generation);
+        if !fresh && !gdir.join("journal.log").is_file() {
+            return Err(JournalError::Manifest(format!(
+                "generation {generation}, which manifest.json names, has no journal.log: \
+                 restore from a backup (a journal that was never used can be deleted)"
+            )));
+        }
         let gen_existed = gdir.exists();
         private_dir_all(&gdir)?;
         tighten(&gdir, DIR_MODE);
@@ -757,6 +792,14 @@ impl Journal {
         }
         if !gen_existed {
             sync_dir(&opts, dir)?; // the generation directory's entry
+        }
+        if fresh {
+            // Only now, with generation 1 durable, may the manifest name it.
+            let m = Manifest { generation: 1 };
+            let tmp = dir.join("manifest.json.tmp");
+            write_private(&tmp, &serde_json::to_vec(&m).map_err(io::Error::other)?)?;
+            fs::rename(&tmp, &manifest_path)?;
+            sync_dir(&opts, dir)?;
         }
 
         // Verify committed history frame by frame (one payload buffer, never
@@ -1140,22 +1183,37 @@ impl Journal {
             Err(e) => return Err(e.into()),
         }
         private_dir(&partial)?;
+        let mut list = BackupList {
+            generation: self.generation,
+            files: Vec::new(),
+        };
         for entry in fs::read_dir(&self.root)? {
             let entry = entry?;
             let gname = entry.file_name();
             let Some(n) = gname.to_str() else { continue };
-            if n.starts_with("gen-") && entry.file_type()?.is_dir() {
+            if canonical_gen(n).is_some() && entry.file_type()?.is_dir() {
                 let gd = partial.join(n);
                 private_dir(&gd)?;
                 for f in SNAPSHOT_FILES {
                     let src = entry.path().join(f);
                     if src.exists() {
-                        copy_file_durably(&src, &gd.join(f))?;
+                        let (bytes, crc32) = copy_file_durably(&src, &gd.join(f))?;
+                        list.files.push(BackupFile {
+                            path: format!("{n}/{f}"),
+                            bytes,
+                            crc32: Some(crc32),
+                        });
                     }
                 }
                 File::open(&gd)?.sync_data()?;
             }
         }
+        // What restore verifies against (D-044): every file, its size and
+        // checksum, and the generation the manifest names.
+        write_private(
+            &partial.join(BACKUP_LIST),
+            &serde_json::to_vec_pretty(&list).map_err(io::Error::other)?,
+        )?;
         #[cfg(any(test, feature = "fault-injection"))]
         if self
             .opts
@@ -1244,6 +1302,23 @@ pub fn sweep_partial_backups(root: &Path) -> Result<usize, JournalError> {
 /// backup's own regular files are copied — a symlink or special file in it
 /// is refused, never followed.
 pub fn restore_backup(from: &Path, to: &Path) -> Result<(), JournalError> {
+    restore_with(from, to, &|_| {})
+}
+
+/// What a restore has just done, for tests that check its order.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum RestoreStep {
+    /// Every file is copied and verified; nothing is published yet.
+    Copied,
+    /// A directory was fsynced.
+    Synced(PathBuf),
+    /// The manifest was renamed into place.
+    Published,
+}
+
+/// `restore_backup`, reporting each step to `step` (tests open the target
+/// at `Copied`, and check the order of fsyncs and the publish).
+fn restore_with(from: &Path, to: &Path, step: &dyn Fn(RestoreStep)) -> Result<(), JournalError> {
     let manifest = from.join("manifest.json");
     match fs::symlink_metadata(&manifest) {
         Ok(m) if m.file_type().is_file() => {}
@@ -1259,6 +1334,10 @@ pub fn restore_backup(from: &Path, to: &Path) -> Result<(), JournalError> {
         }
         Err(e) => return Err(e.into()),
     }
+    let generation = read_manifest(from)?.ok_or_else(|| {
+        JournalError::BadBackup("manifest.json disappeared during the restore".into())
+    })?;
+    let list = backup_list(from, generation)?;
     private_dir_all(to)?;
     let lock = private(OpenOptions::new().read(true).write(true).create(true))
         .truncate(false)
@@ -1271,54 +1350,255 @@ pub fn restore_backup(from: &Path, to: &Path) -> Result<(), JournalError> {
             return Err(JournalError::RestoreTargetNotEmpty);
         }
     }
-    for entry in fs::read_dir(from)? {
-        let entry = entry?;
-        let name = entry.file_name();
-        if parse_gen(&name).is_none() {
-            continue;
-        }
-        if !entry.file_type()?.is_dir() {
-            return Err(JournalError::BadBackup(format!(
-                "{} is not a directory",
-                name.to_string_lossy()
-            )));
-        }
-        let gd = to.join(&name);
-        private_dir(&gd)?;
-        for f in fs::read_dir(entry.path())? {
-            let f = f?;
-            let fname = f.file_name();
-            let known = SNAPSHOT_FILES.iter().any(|k| fname == *k);
-            if !known {
-                continue; // a leftover `.tmp`: never part of a generation
+    let copied = copy_and_verify(from, to, generation, &list);
+    step(RestoreStep::Copied);
+    if let Err(e) = copied {
+        // Nothing was published: take back what was copied, so the target
+        // holds no generation a later restore or open would trip on.
+        for f in &list.files {
+            if let Some((g, _)) = f.path.split_once('/') {
+                let _ = fs::remove_dir_all(to.join(g));
             }
-            if !f.file_type()?.is_file() {
-                return Err(JournalError::BadBackup(format!(
-                    "{}/{} is not a regular file",
-                    name.to_string_lossy(),
-                    fname.to_string_lossy()
-                )));
-            }
-            copy_file_durably(&f.path(), &gd.join(&fname))?;
         }
-        File::open(&gd)?.sync_data()?;
+        return Err(e);
     }
+    // The generations' entries in `to` are durable before the manifest
+    // that names them can be: otherwise a power loss could keep the
+    // manifest and lose its generation (review U10).
+    File::open(to)?.sync_data()?;
+    step(RestoreStep::Synced(to.to_path_buf()));
     // Manifest last, by rename: until it lands, `to` opens as nothing.
     let tmp = to.join("manifest.json.tmp");
     copy_file_durably(&manifest, &tmp)?;
     fs::rename(&tmp, to.join("manifest.json"))?;
+    step(RestoreStep::Published);
     File::open(to)?.sync_data()?;
+    step(RestoreStep::Synced(to.to_path_buf()));
     drop(lock);
     Ok(())
 }
 
+/// A backup's file list (`backup.json`, D-044): each file with its size and
+/// CRC-32, and the generation its manifest names.
+#[derive(Debug, Serialize, Deserialize)]
+struct BackupList {
+    generation: u32,
+    files: Vec<BackupFile>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct BackupFile {
+    /// `gen-NNNNNN/<file>`.
+    path: String,
+    bytes: u64,
+    /// `None` only for a backup made before file lists existed.
+    crc32: Option<u32>,
+}
+
+const BACKUP_LIST: &str = "backup.json";
+
+/// The generation number of a canonical `gen-NNNNNN` name (`gen-+1`,
+/// `gen-1` and the like are not generations).
+fn canonical_gen(name: &str) -> Option<u32> {
+    let g = parse_gen(std::ffi::OsStr::new(name))?;
+    (format!("gen-{g:06}") == name).then_some(g)
+}
+
+/// A first open's leftover: `gen-000001` holding nothing, or only an empty
+/// `journal.log`.
+fn is_unused_gen(gdir: &Path) -> bool {
+    let Ok(entries) = fs::read_dir(gdir) else {
+        return false;
+    };
+    entries.flatten().all(|e| {
+        e.file_name() == "journal.log" && e.metadata().is_ok_and(|m| m.is_file() && m.len() == 0)
+    })
+}
+
+/// What a restore copies: the backup's `backup.json`, or, for a backup made
+/// before file lists, every generation file it holds (sizes only). Either
+/// way it must hold the generation the manifest names, with its log, and
+/// a snapshot if that generation was made by a compaction.
+fn backup_list(from: &Path, generation: u32) -> Result<BackupList, JournalError> {
+    let bad = |why: String| JournalError::BadBackup(why);
+    let list = match fs::read(from.join(BACKUP_LIST)) {
+        Ok(bytes) => {
+            let list: BackupList = serde_json::from_slice(&bytes)
+                .map_err(|e| bad(format!("{BACKUP_LIST} unreadable: {e}")))?;
+            if list.generation != generation {
+                return Err(bad(format!(
+                    "{BACKUP_LIST} lists generation {}, the manifest names {generation}",
+                    list.generation
+                )));
+            }
+            list
+        }
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {
+            let mut files = Vec::new();
+            for entry in fs::read_dir(from)? {
+                let entry = entry?;
+                let name = entry.file_name();
+                let Some(n) = name.to_str().filter(|n| canonical_gen(n).is_some()) else {
+                    continue;
+                };
+                for f in SNAPSHOT_FILES {
+                    match fs::symlink_metadata(entry.path().join(f)) {
+                        Ok(m) => files.push(BackupFile {
+                            path: format!("{n}/{f}"),
+                            bytes: m.len(),
+                            crc32: None,
+                        }),
+                        Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+                        Err(e) => return Err(e.into()),
+                    }
+                }
+            }
+            BackupList { generation, files }
+        }
+        Err(e) => return Err(e.into()),
+    };
+    let named = format!("gen-{generation:06}");
+    let has = |f: &str| list.files.iter().any(|x| x.path == format!("{named}/{f}"));
+    if !has("journal.log") {
+        return Err(bad(format!(
+            "it does not hold {named}/journal.log, the generation its manifest names"
+        )));
+    }
+    if generation > 1 && !has("snapshot.bin") && !has("snapshot.json") {
+        return Err(bad(format!(
+            "{named} was made by a compaction but has no snapshot"
+        )));
+    }
+    for f in &list.files {
+        let ok = f
+            .path
+            .split_once('/')
+            .is_some_and(|(g, file)| canonical_gen(g).is_some() && SNAPSHOT_FILES.contains(&file));
+        if !ok {
+            return Err(bad(format!("{BACKUP_LIST} lists {:?}", f.path)));
+        }
+    }
+    // Nothing may sit in a generation that the list does not account for
+    // (a planted file or symlink is tampering, not part of the backup).
+    for entry in fs::read_dir(from)? {
+        let entry = entry?;
+        let name = entry.file_name();
+        let Some(g) = name.to_str().filter(|n| n.starts_with("gen-")) else {
+            continue;
+        };
+        if !entry.file_type()?.is_dir() {
+            return Err(bad(format!("{g} is not a directory")));
+        }
+        for f in fs::read_dir(entry.path())? {
+            let path = format!("{g}/{}", f?.file_name().to_string_lossy());
+            if !list.files.iter().any(|x| x.path == path) {
+                return Err(bad(format!(
+                    "it holds {path}, which no file list accounts for"
+                )));
+            }
+        }
+    }
+    Ok(list)
+}
+
+/// Copy every listed file into `to`, checking each one's size and checksum
+/// against the list, then check that the generation the manifest names
+/// replays: its log frame by frame with no torn tail (a backup is taken
+/// between group commits), and its snapshot's checksum.
+fn copy_and_verify(
+    from: &Path,
+    to: &Path,
+    generation: u32,
+    list: &BackupList,
+) -> Result<(), JournalError> {
+    let bad = |why: String| JournalError::BadBackup(why);
+    for f in &list.files {
+        let src = from.join(&f.path);
+        let m = fs::symlink_metadata(&src).map_err(|e| bad(format!("{}: {e}", f.path)))?;
+        if !m.file_type().is_file() {
+            return Err(bad(format!("{} is not a regular file", f.path)));
+        }
+        if let Some((g, _)) = f.path.split_once('/') {
+            if !to.join(g).exists() {
+                private_dir(&to.join(g))?;
+            }
+        }
+        let input = open_checked(&src, &m)?;
+        let (bytes, crc32) = copy_open_file_durably(input, &to.join(&f.path))?;
+        if bytes != f.bytes || f.crc32.is_some_and(|c| c != crc32) {
+            return Err(bad(format!(
+                "{} changed after the backup was taken ({bytes} bytes, listed {})",
+                f.path, f.bytes
+            )));
+        }
+    }
+    for g in list
+        .files
+        .iter()
+        .filter_map(|f| f.path.split_once('/').map(|(g, _)| g))
+    {
+        File::open(to.join(g))?.sync_data()?;
+    }
+    let gdir = gen_dir_path(to, generation);
+    let mut scan = Records::new(File::open(gdir.join("journal.log"))?)?;
+    let mut buf = Vec::new();
+    while scan.advance(&mut buf)?.is_some() {}
+    if let Some(t) = scan.torn_tail() {
+        return Err(bad(format!(
+            "gen-{generation:06}/journal.log ends inside a batch at offset {}",
+            t.offset
+        )));
+    }
+    match open_snapshot(&gdir)? {
+        Some(SnapshotSource::Binary(mut r)) => {
+            io::copy(&mut r, &mut io::sink())?;
+            r.finish()?;
+        }
+        Some(SnapshotSource::Legacy(_)) | None => {}
+    }
+    Ok(())
+}
+
 /// Copy a regular file into a new file (never through a symlink at the
-/// destination) and fsync it.
-fn copy_file_durably(src: &Path, dest: &Path) -> io::Result<()> {
-    let mut input = OpenOptions::new().read(true).open(src)?;
-    let mut out = new_file(dest)?;
+/// destination) and fsync it; the bytes copied and their CRC-32.
+fn copy_file_durably(src: &Path, dest: &Path) -> io::Result<(u64, u32)> {
+    copy_open_file_durably(OpenOptions::new().read(true).open(src)?, dest)
+}
+
+/// Open `path`, which `lstat` described as `seen` (a regular file), and
+/// check after opening that the handle is that very file: `open` follows
+/// a symlink swapped in after the check, and then `fstat` names another
+/// file (Unix: device and inode; elsewhere: the handle must still be a
+/// regular file).
+fn open_checked(path: &Path, seen: &fs::Metadata) -> io::Result<File> {
+    let file = OpenOptions::new().read(true).open(path)?;
+    let now = file.metadata()?;
+    #[cfg(unix)]
+    let same = {
+        use std::os::unix::fs::MetadataExt;
+        now.dev() == seen.dev() && now.ino() == seen.ino()
+    };
+    #[cfg(not(unix))]
+    let same = seen.is_file();
+    if !now.is_file() || !same {
+        return Err(io::Error::other(format!(
+            "{} changed while it was being restored",
+            path.display()
+        )));
+    }
+    Ok(file)
+}
+
+fn copy_open_file_durably(mut input: File, dest: &Path) -> io::Result<(u64, u32)> {
+    let mut out = Checked {
+        inner: new_file(dest)?,
+        crc: crc32fast::Hasher::new(),
+        len: 0,
+    };
     io::copy(&mut input, &mut out)?;
-    out.sync_data()
+    let Checked { inner, crc, len } = out;
+    inner.sync_data()?;
+    Ok((len, crc.finalize()))
 }
 
 /// Create a new file the journal owns: refuses an existing path (so never
@@ -2212,10 +2492,14 @@ mod tests {
         }
     }
 
-    /// A batch torn by process death keeps its complete frames: the kernel
-    /// keeps written bytes in order, so the file ends inside one frame.
+    /// A batch torn by a crash before its fsync returned was never
+    /// acknowledged, whatever part of it reached the disk. Replay drops the
+    /// whole batch, back to its first frame, not just its last partial
+    /// frame (review U1): keeping its complete frames let the next batch
+    /// start inside the old one's recorded extent, and the restart after
+    /// that refused the journal.
     #[test]
-    fn a_batch_torn_mid_write_keeps_its_complete_frames() {
+    fn a_batch_torn_mid_write_is_dropped_whole() {
         let dir = tempfile::tempdir().unwrap_or_else(|e| panic!("{e}"));
         let log = gen_dir_path(dir.path(), 1).join("journal.log");
         {
@@ -2227,13 +2511,313 @@ mod tests {
         }
         let whole = fs::read(&log).unwrap_or_else(|e| panic!("{e}"));
         let frame = |i: usize| (HEADER_LEN + record(i).len()) as u64;
+        let first_batch: u64 = (0..4).map(frame).sum();
         let seventh: u64 = (0..6).map(frame).sum(); // inside the second batch
         fs::write(&log, &whole[..seventh as usize + 5]).unwrap_or_else(|e| panic!("{e}"));
         let j = Journal::open(dir.path()).unwrap_or_else(|e| panic!("{e}"));
-        assert_eq!(j.records_written(), 6);
+        assert_eq!(j.records_written(), 4, "the torn batch is dropped whole");
+        assert_eq!(
+            j.discarded_tail(),
+            Some(TornTail {
+                offset: first_batch,
+                bytes: seventh + 5 - first_batch
+            })
+        );
         assert_eq!(
             fs::metadata(&log).unwrap_or_else(|e| panic!("{e}")).len(),
-            seventh
+            first_batch
+        );
+    }
+
+    /// Review U1, at every cut: a log torn anywhere inside its last two
+    /// batches opens, takes a new batch, and opens again with exactly the
+    /// complete batches plus the new one. (Before, a cut after a batch's
+    /// first frame survived the first restart and bricked the second.)
+    #[test]
+    fn every_torn_batch_reopens_after_more_appends() {
+        let dir = tempfile::tempdir().unwrap_or_else(|e| panic!("{e}"));
+        let log = gen_dir_path(dir.path(), 1).join("journal.log");
+        let batches: [std::ops::Range<usize>; 3] = [0..3, 3..7, 7..12];
+        {
+            let mut j = Journal::open(dir.path()).unwrap_or_else(|e| panic!("{e}"));
+            for b in batches.clone() {
+                j.append_batch(&b.map(record).collect::<Vec<_>>())
+                    .unwrap_or_else(|e| panic!("{e}"));
+            }
+        }
+        let whole = fs::read(&log).unwrap_or_else(|e| panic!("{e}"));
+        let frame = |i: usize| HEADER_LEN + record(i).len();
+        let ends: Vec<usize> = batches
+            .iter()
+            .map(|b| (0..b.end).map(frame).sum())
+            .collect();
+        let after = [record(100), record(101)];
+        for cut in ends[0]..whole.len() {
+            let complete = ends.iter().take_while(|e| **e <= cut).count();
+            let kept = batches[complete - 1].end;
+            fs::write(&log, &whole[..cut]).unwrap_or_else(|e| panic!("{e}"));
+            {
+                let mut j = Journal::open(dir.path())
+                    .unwrap_or_else(|e| panic!("cut {cut}: first restart: {e}"));
+                assert_eq!(j.records_written(), kept as u64, "cut {cut}");
+                j.append_batch(&after)
+                    .unwrap_or_else(|e| panic!("cut {cut}: {e}"));
+            }
+            let j = Journal::open(dir.path())
+                .unwrap_or_else(|e| panic!("cut {cut}: second restart: {e}"));
+            assert_eq!(j.records_written(), kept as u64 + 2, "cut {cut}");
+            drop(j);
+            let got: Vec<Vec<u8>> = replay_dir(&gen_dir_path(dir.path(), 1))
+                .unwrap_or_else(|e| panic!("cut {cut}: {e}"))
+                .into_iter()
+                .map(|r| r.payload)
+                .collect();
+            let mut want: Vec<Vec<u8>> = (0..kept).map(record).collect();
+            want.extend(after.iter().cloned());
+            assert_eq!(got, want, "cut {cut}");
+        }
+    }
+
+    /// A backup of a gen-1 journal holding three records.
+    fn backup_of_three(root: &Path) -> PathBuf {
+        let dest = root.join("backup");
+        let mut j = Journal::open(&root.join("src")).unwrap_or_else(|e| panic!("{e}"));
+        for i in 0..3 {
+            j.append(&record(i)).unwrap_or_else(|e| panic!("{e}"));
+        }
+        j.backup_to(&dest).unwrap_or_else(|e| panic!("{e}"));
+        dest
+    }
+
+    /// Review U3: a backup missing the generation its manifest names (a
+    /// partial copy, a deleted directory) restored with exit 0, and the
+    /// server then served an empty journal. Restore must verify the backup
+    /// first and leave nothing that opens.
+    #[test]
+    fn a_backup_missing_its_generation_is_refused() {
+        let d = tempfile::tempdir().unwrap_or_else(|e| panic!("{e}"));
+        let backup = backup_of_three(d.path());
+        fs::remove_dir_all(gen_dir_path(&backup, 1)).unwrap_or_else(|e| panic!("{e}"));
+        let to = d.path().join("to");
+        assert!(
+            restore_backup(&backup, &to).is_err(),
+            "restored a backup with no generation"
+        );
+        assert!(
+            !to.join("manifest.json").exists(),
+            "the target got a manifest"
+        );
+        assert!(Journal::open(&to).map(|j| j.records_written()).unwrap_or(0) == 0);
+    }
+
+    /// A backup whose files changed after it was taken (a flipped byte, a
+    /// truncated copy) is refused against its own file list.
+    #[test]
+    fn a_damaged_backup_is_refused_before_anything_is_published() {
+        let d = tempfile::tempdir().unwrap_or_else(|e| panic!("{e}"));
+        let backup = backup_of_three(d.path());
+        let log = gen_dir_path(&backup, 1).join("journal.log");
+        let mut bytes = fs::read(&log).unwrap_or_else(|e| panic!("{e}"));
+        let last = bytes.len() - 2;
+        bytes[last] ^= 0x01;
+        fs::write(&log, &bytes).unwrap_or_else(|e| panic!("{e}"));
+        let to = d.path().join("to");
+        assert!(
+            restore_backup(&backup, &to).is_err(),
+            "restored a damaged backup"
+        );
+        assert!(!to.join("manifest.json").exists());
+        bytes[last] ^= 0x01;
+        bytes.truncate(bytes.len() - 5);
+        fs::write(&log, &bytes).unwrap_or_else(|e| panic!("{e}"));
+        let to2 = d.path().join("to2");
+        assert!(
+            restore_backup(&backup, &to2).is_err(),
+            "restored a truncated backup"
+        );
+    }
+
+    /// The same for a live journal: a manifest naming a generation that is
+    /// not there is damage, never a fresh empty journal.
+    #[test]
+    fn a_journal_missing_the_generation_its_manifest_names_does_not_open() {
+        let d = tempfile::tempdir().unwrap_or_else(|e| panic!("{e}"));
+        let root = d.path().join("j");
+        {
+            let mut j = Journal::open(&root).unwrap_or_else(|e| panic!("{e}"));
+            j.append(&record(0)).unwrap_or_else(|e| panic!("{e}"));
+        }
+        fs::remove_dir_all(gen_dir_path(&root, 1)).unwrap_or_else(|e| panic!("{e}"));
+        assert!(matches!(
+            Journal::open(&root),
+            Err(JournalError::Manifest(_))
+        ));
+        assert!(
+            !gen_dir_path(&root, 1).exists(),
+            "open recreated the generation"
+        );
+    }
+
+    /// Review U4: the restore lock was unproven (with it removed, every
+    /// restore test still passed, because a live journal already has a
+    /// manifest). A server holding an *empty* target's lock refuses the
+    /// restore; and a server that tries to open the target while a restore
+    /// is copying into it is refused, so it never starts on half a journal.
+    #[test]
+    fn the_restore_lock_keeps_servers_out_and_restores_out_of_servers() {
+        let d = tempfile::tempdir().unwrap_or_else(|e| panic!("{e}"));
+        let backup = backup_of_three(d.path());
+        let held = d.path().join("held");
+        fs::create_dir(&held).unwrap_or_else(|e| panic!("{e}"));
+        let lock = File::create(held.join("LOCK")).unwrap_or_else(|e| panic!("{e}"));
+        fs2::FileExt::try_lock_exclusive(&lock).unwrap_or_else(|e| panic!("{e}"));
+        assert!(
+            matches!(
+                restore_backup(&backup, &held),
+                Err(JournalError::SecondWriter)
+            ),
+            "restored into a directory a server holds"
+        );
+        assert!(
+            !gen_dir_path(&held, 1).exists(),
+            "copied into a held directory"
+        );
+        drop(lock);
+
+        let to = d.path().join("to");
+        let opened = std::cell::Cell::new(None);
+        restore_with(&backup, &to, &|step| {
+            if step == RestoreStep::Copied {
+                opened.set(Some(matches!(
+                    Journal::open(&to),
+                    Err(JournalError::SecondWriter)
+                )));
+            }
+        })
+        .unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(
+            opened.get(),
+            Some(true),
+            "a server opened the target mid-restore"
+        );
+        let j = Journal::open(&to).unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(j.records_written(), 3);
+    }
+
+    const GOLDEN: [&[u8]; 3] = [
+        br#"{"run":1,"event":"golden-0"}"#,
+        br#"{"run":2,"event":"golden-1"}"#,
+        br#"{"run":3,"event":"golden-2"}"#,
+    ];
+
+    /// Review U5: every test wrote and read with the same build, so a change
+    /// to a frame, a checksum or the snapshot (a dependency bump: crc32fast
+    /// gained a new SIMD path) would pass the gate and then refuse every
+    /// existing journal. These fixtures were written from the formats'
+    /// specs by an independent implementation (`tests/fixtures/
+    /// make_fixtures.py`, Python's zlib); this build must read them exactly
+    /// and write them byte for byte.
+    #[test]
+    fn the_on_disk_formats_match_their_golden_files() {
+        assert_eq!(crc(b"123456789"), 0xCBF4_3926, "CRC-32 (IEEE) check value");
+        let v1: &[u8] = include_bytes!("../tests/fixtures/v1.log");
+        let v2: &[u8] = include_bytes!("../tests/fixtures/v2.log");
+        let snap: &[u8] = include_bytes!("../tests/fixtures/snapshot.bin");
+        // The first v2 header, spelled out: version 2, len 28, seq 1,
+        // batch 54, payload crc, header crc.
+        assert_eq!(
+            &v2[..26],
+            &[
+                0x00, 0x02, 0x00, 0x00, 0x00, 0x1c, 0, 0, 0, 0, 0, 0, 0, 0x01, 0x00, 0x00, 0x00,
+                0x36, 0x89, 0xdd, 0xfc, 0xc9, 0xb8, 0x0f, 0x93, 0xa3
+            ]
+        );
+        for (name, log) in [("v1", v1), ("v2", v2)] {
+            let (dir, _) = journal_with_log(log);
+            let got: Vec<Vec<u8>> = replay_dir(&gen_dir_path(dir.path(), 1))
+                .unwrap_or_else(|e| panic!("{name}: {e}"))
+                .into_iter()
+                .map(|r| r.payload)
+                .collect();
+            assert_eq!(got, GOLDEN.map(<[u8]>::to_vec), "{name} payloads");
+        }
+        // This build writes exactly the golden v2 log.
+        let d = tempfile::tempdir().unwrap_or_else(|e| panic!("{e}"));
+        {
+            let mut j = Journal::open(d.path()).unwrap_or_else(|e| panic!("{e}"));
+            j.append(GOLDEN[0]).unwrap_or_else(|e| panic!("{e}"));
+            j.append_batch(&[GOLDEN[1].to_vec(), GOLDEN[2].to_vec()])
+                .unwrap_or_else(|e| panic!("{e}"));
+        }
+        let written = fs::read(gen_dir_path(d.path(), 1).join("journal.log"))
+            .unwrap_or_else(|e| panic!("{e}"));
+        assert!(
+            written == v2,
+            "the v2 writer no longer matches its golden file"
+        );
+        // The snapshot frame, both ways.
+        let sd = tempfile::tempdir().unwrap_or_else(|e| panic!("{e}"));
+        fs::write(sd.path().join("snapshot.bin"), snap).unwrap_or_else(|e| panic!("{e}"));
+        let loaded = load_snapshot(sd.path())
+            .unwrap_or_else(|e| panic!("{e}"))
+            .unwrap_or_else(|| panic!("no snapshot"));
+        assert_eq!(
+            (loaded.covered_seq, loaded.payload.as_slice()),
+            (7, &b"golden snapshot payload"[..])
+        );
+        let wd = tempfile::tempdir().unwrap_or_else(|e| panic!("{e}"));
+        write_snapshot(&wd.path().join(""), &loaded).unwrap_or_else(|e| panic!("{e}"));
+        let rewritten = fs::read(wd.path().join("snapshot.bin")).unwrap_or_else(|e| panic!("{e}"));
+        assert!(
+            rewritten == snap,
+            "the snapshot writer no longer matches its golden file"
+        );
+    }
+
+    /// Review U9: restore checked a file's type with `lstat`, then opened
+    /// it, following a symlink swapped in between. The opened handle must
+    /// be the very file that was checked.
+    #[cfg(unix)]
+    #[test]
+    fn a_file_swapped_for_a_symlink_after_its_check_is_refused() {
+        let d = tempfile::tempdir().unwrap_or_else(|e| panic!("{e}"));
+        let file = d.path().join("journal.log");
+        let secret = d.path().join("secret");
+        fs::write(&file, b"backup data").unwrap_or_else(|e| panic!("{e}"));
+        fs::write(&secret, b"not backup data").unwrap_or_else(|e| panic!("{e}"));
+        let seen = fs::symlink_metadata(&file).unwrap_or_else(|e| panic!("{e}"));
+        open_checked(&file, &seen).unwrap_or_else(|e| panic!("the checked file itself: {e}"));
+        fs::remove_file(&file).unwrap_or_else(|e| panic!("{e}"));
+        std::os::unix::fs::symlink(&secret, &file).unwrap_or_else(|e| panic!("{e}"));
+        assert!(
+            open_checked(&file, &seen).is_err(),
+            "opened a symlink swapped in after the check"
+        );
+        // (A regular file replaced under the same name may reuse the inode
+        // on Linux, so it is not caught here; its size and checksum are
+        // checked against the backup's file list instead.)
+    }
+
+    /// Review U10: the generation directories' entries in the target were
+    /// not fsynced before the manifest's rename, so a power loss could keep
+    /// the manifest without its generation. The target directory must be
+    /// fsynced after the copies and before the publish.
+    #[test]
+    fn restore_makes_its_generations_durable_before_the_manifest() {
+        let d = tempfile::tempdir().unwrap_or_else(|e| panic!("{e}"));
+        let backup = backup_of_three(d.path());
+        let to = d.path().join("to");
+        let steps = std::cell::RefCell::new(Vec::new());
+        restore_with(&backup, &to, &|s| steps.borrow_mut().push(s))
+            .unwrap_or_else(|e| panic!("{e}"));
+        let steps = steps.into_inner();
+        let published = steps
+            .iter()
+            .position(|s| *s == RestoreStep::Published)
+            .unwrap_or_else(|| panic!("never published: {steps:?}"));
+        assert!(
+            steps[..published].contains(&RestoreStep::Synced(to.clone())),
+            "the target was not fsynced before the manifest's rename: {steps:?}"
         );
     }
 

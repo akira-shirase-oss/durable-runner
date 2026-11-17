@@ -7,7 +7,8 @@
 > `scripts/check.sh` (fmt, clippy, tests, architecture checks, cargo deny,
 > npm audit, the pilot) runs on hosted CI for every push. Reads and writes
 > need an API key (a read-only key exists); SIGTERM drains. The load plan
-> (`perf/LOAD_MATRIX.md`) is the remaining gate. See `docs/ROADMAP.md`.
+> (`perf/LOAD_MATRIX.md`) is the remaining gate. See `docs/ROADMAP.md`, and
+> the known limits at the end of `docs/OPERATING.md`.
 
 A background-task runner: submit versioned jobs, get durable acceptance,
 recover acknowledged state after process death. A framed append-only journal

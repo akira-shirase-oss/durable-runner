@@ -9,7 +9,9 @@ publish.workspace = true
 anyhow = "1"
 async-trait = "0.1"
 axum = "0.8"
-base64 = "0.23"
+# Only `std`: this workspace does not ask for base64's SIMD `unsafe` code
+# (hyper-util, through reqwest, still turns base64's defaults on; D-048).
+base64 = { version = "0.23", default-features = false, features = ["std"] }
 clap = { version = "4", features = ["derive"] }
 durable-domain = { path = "../durable-domain" }
 durable-engine = { path = "../durable-engine" }
@@ -20,7 +22,11 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 subtle = "2.6"
 tokio = { version = "1", features = ["macros", "net", "rt-multi-thread", "signal", "time"] }
-tower-http = { version = "0.7", features = ["fs"] }
+tower-http = { version = "0.7", features = ["fs", "timeout"] }
+# Served directly (not axum::serve) for a header timeout, a connection cap
+# and graceful shutdown (D-045). Both are already in the graph via axum.
+hyper = { version = "1", features = ["server", "http1"] }
+hyper-util = { version = "0.1", features = ["server", "http1", "tokio", "service", "server-graceful"] }
 
 [dev-dependencies]
 durable-journal = { path = "../durable-journal", features = ["fault-injection"] }

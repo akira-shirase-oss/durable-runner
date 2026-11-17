@@ -468,7 +468,8 @@ convention; these seed the contract's prescribed directions.
     bytes than a header, or a header that checks out whose payload runs
     past the end, with nothing after the header that checks out as a
     frame. That cut is less than one frame, so never more than the last
-    batch. Startup reports it (`durable-server: discarded a torn tail: N
+    batch. (Superseded by D-043: the cut is the whole incomplete last
+    batch, from its first frame.) Startup reports it (`durable-server: discarded a torn tail: N
     bytes at offset X`, and `discarded_tail_bytes` in diagnostics).
   - A full-length frame with a bad payload checksum is still refused, as
     D-014 chose.
@@ -548,7 +549,11 @@ convention; these seed the contract's prescribed directions.
      a compaction or backup already queued finish, and joins the writer,
      which releases the journal lock;
   3. exits 0 only if all of that happened within the drain timeout, and
-     non-zero otherwise (a restart then replays, as after a crash).
+     non-zero otherwise (a restart then replays, as after a crash). A
+     request still open when step 1's timeout ran out also exits
+     non-zero, after the engine has drained: nothing durable is at risk,
+     but a client lost its response (review U7; the first version exited
+     0 then).
 
   Handler calls in flight are abandoned, not awaited. Their runs are
   journaled running or reconciling, and after a restart they reconcile
@@ -666,3 +671,121 @@ convention; these seed the contract's prescribed directions.
   duplicated, 0 id mismatches, 0 cancels lost**, 69 compactions, 58
   backups, 31 of 31 checked backups restored complete, 0 visible partial
   backups, final generation 70, and the closing SIGTERM exited 0.
+- **D-043 — A torn batch is dropped whole, from its first frame.**
+  D-032 cut a torn tail back to the last complete frame. Inside a
+  multi-frame group commit that kept the batch's complete frames, so the
+  first restart succeeded. But the next append started a new batch inside
+  the old batch's recorded extent, and the restart after that refused
+  (`frame does not fit the batch it was written in … inside the log's
+  last batch`). A backup taken in between would not open, and the
+  OPERATING repair ("truncate to offset X") then deleted records
+  acknowledged after the first restart. Review reproduced it on the
+  release binary: 546 of 702 cut points broke the second restart. The
+  trigger is a crash that leaves the log ending after a batch's first
+  frame: a power loss (D-014), or SIGKILL during a write longer than a
+  page (a short write).
+  
+  Now a batch is read only once its whole recorded extent is on disk. If
+  the log ends before a batch does, the tail is cut at that batch's first
+  frame, and none of its frames is replayed or yielded. That is safe
+  because of the ack path: the writer reports a batch durable, and the
+  shell releases its acks, reads and handler calls, only after
+  `append_batch`'s fsync returns (D-014, D-015); under the crash model a
+  returned fsync makes the batch's bytes and the file's length durable.
+  So a batch whose extent is not on disk was never acknowledged. Inside a
+  complete batch a short remainder is damage (`Corrupt`), not a tear. The
+  "last batch" hint now names the batch's start, and OPERATING no longer
+  suggests truncating at a frame offset. Tested by tearing at every byte
+  of the last two batches, then opening, appending and opening again.
+- **D-044 — A backup carries a checksummed file list, and nothing opens
+  without the generation its manifest names.** A backup missing
+  `gen-000001` (a partial copy or sync, a deleted directory) restored
+  with exit 0, and the server then served an empty journal: `open`
+  created any missing generation, and D-029 covered only generations 2
+  and up. Now:
+  - `backup_to` writes `backup.json` before the manifest: the generation
+    and every file copied, with its size and CRC-32.
+  - `restore_backup` refuses, before publishing anything, a backup whose
+    list does not hold the named generation's `journal.log` (and a
+    snapshot if that generation came from a compaction), whose files
+    differ in size or checksum from the list, that holds a file the list
+    does not account for, or whose generation does not replay: its log
+    frame by frame with no torn tail (a backup is taken between group
+    commits), its snapshot by checksum. It copies only canonical
+    `gen-NNNNNN` names (`gen-+1` parsed as 1 before). On failure it
+    removes what it copied, so the target holds no generation. A backup
+    from before file lists is verified by structure and replay. Each
+    source file is opened and then checked by `fstat` to be the very file
+    `lstat` checked (device and inode), so a symlink swapped in between is
+    refused, not followed (review U9). The target directory is fsynced
+    after the copies and before the manifest's rename, so the manifest is
+    never durable without the generations it names (review U10).
+  - First open now creates generation 1 and its log, then writes the
+    manifest that names it, so a manifest naming a missing generation is
+    always damage: `open` refuses it (`restore from a backup`) instead of
+    starting empty. Without a manifest, an empty `gen-000001` (what a
+    crash during first open leaves) still opens as new; any other
+    generation without a manifest is refused, as in D-034.
+- **D-045 — Connections are capped and timed.** The server ran on
+  `axum::serve`, which sets no timer, so hyper's header timeout never
+  armed; nothing capped connections, and nothing bounded a request body.
+  Review held 300 sockets, each with a partial request head, against a
+  server with 256 descriptors: `/health` timed out, and the partial
+  requests were still held 35 s later. Unauthenticated, from anywhere
+  that can connect. The server now accepts on its own loop over hyper
+  (`hyper-util`, HTTP/1.1):
+  - at most `--max-connections` (512) at once, one semaphore permit each;
+    the rest wait in the kernel's accept queue, and a failed accept (out
+    of descriptors) backs off 100 ms instead of spinning;
+  - `--header-timeout-ms` (10 s): a request head, and the next one on an
+    idle keep-alive connection, must arrive in time or the connection
+    closes (hyper's `header_read_timeout` with a Tokio timer);
+  - `--body-deadline-ms` (30 s): a whole request body, by tower-http's
+    `RequestBodyDeadline`, not reset by a trickle;
+  - graceful shutdown through hyper-util's `GracefulShutdown`, and every
+    connection task in a `JoinSet`.
+
+  Drilled on the release binary (`perf/results/2026-11-17T03-20-00Z-
+  idle-connections.json`): 300 partial-head sockets against 256
+  descriptors and a 3 s header timeout. The first `/health` answered in
+  3.1 s, once the timeout freed descriptors, then at once, and all 300
+  sockets were closed. Not handled here, so a reverse proxy must do it for
+  any non-local exposure: TLS, per-client rate limits, a cap on
+  connections per client address, and slow-response (download) limits.
+- **D-046 — The on-disk formats are pinned by golden files.** Every
+  test wrote and read with the same build, so a change to a frame, a
+  checksum or the snapshot would pass the gate and then refuse every
+  existing journal at upgrade. The trigger could be a dependency bump
+  (crc32fast 1.5.5 added a SIMD path on this CPU) as easily as a code
+  change. `crates/durable-journal/tests/fixtures/` now holds a v1 log, a
+  v2 log (a single append, then a batch of two) and a `snapshot.bin`;
+  `crates/durable-engine/tests/fixtures/index.drix` holds a binary index
+  with a queued and a finished run. They were written by
+  `make_fixtures.py` from the formats' specs, with Python's zlib, an
+  implementation independent of the Rust code. The tests require the
+  readers to return exactly the expected records and the writers to
+  produce the same bytes, spell out the first v2 header, and check
+  CRC-32's standard check value (`0xCBF43926` for `"123456789"`).
+  Regenerate the files only for a deliberate, versioned format change.
+- **D-047 — Open reads answer only loopback Hosts.** D-037 limited
+  `--open-reads` to a loopback listener, but checked no `Host`. A page
+  in the operator's browser can rebind its own DNS name to 127.0.0.1
+  (DNS rebinding); its requests then reach the listener with that name as
+  `Host`, and could read every op_key and state. With `--open-reads`, a
+  request without a key is now answered only if its `Host` is
+  `localhost` or a loopback IP literal (127.0.0.0/8, `::1`), with or
+  without a port; any other Host, or none, needs a key (401). A request
+  with a valid key reads whatever its Host.
+- **D-048 — Input is canonical base64, refused with a stable message.**
+  The only base64 test was one valid `"aGk="`, and a refusal echoed the
+  decoder's own error text, which base64 0.23 changed. A test now
+  round-trips all 256 byte values through the submit route, and refuses
+  missing padding, non-zero trailing bits, stray characters and a
+  trailing newline with 400 `bad_input` and one fixed message. Our crates
+  now ask base64 for `std` only, without its SIMD `unsafe` code. That
+  does not remove the code from the binary: hyper-util (through reqwest)
+  depends on base64 with its default features, so Cargo's feature
+  unification still enables `simd-unsafe`. Base64's `STANDARD` engine
+  does not use it (a differential test in review found 0.22 and 0.23
+  identical over 304,026 decodes). Removing it needs that upstream
+  dependency to change.
