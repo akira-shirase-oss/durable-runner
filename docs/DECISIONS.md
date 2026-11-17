@@ -693,3 +693,27 @@ convention; these seed the contract's prescribed directions.
   "last batch" hint now names the batch's start, and OPERATING no longer
   suggests truncating at a frame offset. Tested by tearing at every byte
   of the last two batches, then opening, appending and opening again.
+- **D-044 — A backup carries a checksummed file list, and nothing opens
+  without the generation its manifest names.** A backup missing
+  `gen-000001` (a partial copy or sync, a deleted directory) restored
+  with exit 0, and the server then served an empty journal: `open`
+  created any missing generation, and D-029 covered only generations 2
+  and up. Now:
+  - `backup_to` writes `backup.json` before the manifest: the generation
+    and every file copied, with its size and CRC-32.
+  - `restore_backup` refuses, before publishing anything, a backup whose
+    list does not hold the named generation's `journal.log` (and a
+    snapshot if that generation came from a compaction), whose files
+    differ in size or checksum from the list, that holds a file the list
+    does not account for, or whose generation does not replay: its log
+    frame by frame with no torn tail (a backup is taken between group
+    commits), its snapshot by checksum. It copies only canonical
+    `gen-NNNNNN` names (`gen-+1` parsed as 1 before). On failure it
+    removes what it copied, so the target holds no generation. A backup
+    from before file lists is verified by structure and replay.
+  - First open now creates generation 1 and its log, then writes the
+    manifest that names it, so a manifest naming a missing generation is
+    always damage: `open` refuses it (`restore from a backup`) instead of
+    starting empty. Without a manifest, an empty `gen-000001` (what a
+    crash during first open leaves) still opens as new; any other
+    generation without a manifest is refused, as in D-034.

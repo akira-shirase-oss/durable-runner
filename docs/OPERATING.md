@@ -186,7 +186,11 @@ The restored server replays snapshot + journal and rebuilds identical
 state — same run ids, same `finished_at`. Verified live by
 `examples/pilot/run.sh`.
 
-`restore` takes the target's journal lock for the whole copy, so it
+`restore` first checks the backup against its own `backup.json` (every
+file's size and checksum, and the generation its manifest names), then
+checks that generation replays; a backup that fails any check is refused
+and nothing is left in the target (D-044). It takes the target's journal
+lock for the whole copy, so it
 fails while a server runs on that directory, and no server can start on
 it half restored. It refuses a target that already holds a journal
 (move a damaged one aside first; it never merges two histories), and it

@@ -737,20 +737,26 @@ impl Journal {
         tighten(&lock_path, FILE_MODE);
         tighten(&manifest_path_of(dir), FILE_MODE);
 
-        // Manifest: keep the last valid one; create generation 1 on first open.
+        // Manifest: keep the last valid one. First open creates generation
+        // 1 and its log, then the manifest that names it (D-044), so a
+        // manifest naming a generation that is not there is damage.
         let manifest_path = dir.join("manifest.json");
-        let generation = match fs::read_to_string(&manifest_path) {
-            Ok(text) => {
+        let (generation, fresh) = match fs::read_to_string(&manifest_path) {
+            Ok(text) => (
                 serde_json::from_str::<Manifest>(&text)
                     .map_err(|e| JournalError::Manifest(e.to_string()))?
-                    .generation
-            }
+                    .generation,
+                false,
+            ),
             Err(e) if e.kind() == io::ErrorKind::NotFound => {
-                // First open writes the manifest before any generation, so
-                // generations without one are damage or an interrupted
-                // restore — never a fresh journal to start over in.
+                // Without a manifest, the only generation a crash can leave
+                // is first open's own: an empty gen-000001. Anything else is
+                // damage or an interrupted restore, never a fresh journal.
                 for entry in fs::read_dir(dir)? {
-                    if parse_gen(&entry?.file_name()).is_some() {
+                    let entry = entry?;
+                    if parse_gen(&entry.file_name()).is_some()
+                        && !(entry.path() == gen_dir_path(dir, 1) && is_unused_gen(&entry.path()))
+                    {
                         return Err(JournalError::Manifest(
                             "generation directories but no manifest.json: a damaged journal \
                              or an interrupted restore (remove it and restore again)"
@@ -758,17 +764,18 @@ impl Journal {
                         ));
                     }
                 }
-                let m = Manifest { generation: 1 };
-                let tmp = dir.join("manifest.json.tmp");
-                write_private(&tmp, &serde_json::to_vec(&m).map_err(io::Error::other)?)?;
-                fs::rename(&tmp, &manifest_path)?;
-                sync_dir(&opts, dir)?;
-                1
+                (1, true)
             }
             Err(e) => return Err(e.into()),
         };
 
         let gdir = gen_dir_path(dir, generation);
+        if !fresh && !gdir.join("journal.log").is_file() {
+            return Err(JournalError::Manifest(format!(
+                "generation {generation}, which manifest.json names, has no journal.log: \
+                 restore from a backup (a journal that was never used can be deleted)"
+            )));
+        }
         let gen_existed = gdir.exists();
         private_dir_all(&gdir)?;
         tighten(&gdir, DIR_MODE);
@@ -785,6 +792,14 @@ impl Journal {
         }
         if !gen_existed {
             sync_dir(&opts, dir)?; // the generation directory's entry
+        }
+        if fresh {
+            // Only now, with generation 1 durable, may the manifest name it.
+            let m = Manifest { generation: 1 };
+            let tmp = dir.join("manifest.json.tmp");
+            write_private(&tmp, &serde_json::to_vec(&m).map_err(io::Error::other)?)?;
+            fs::rename(&tmp, &manifest_path)?;
+            sync_dir(&opts, dir)?;
         }
 
         // Verify committed history frame by frame (one payload buffer, never
@@ -1168,22 +1183,37 @@ impl Journal {
             Err(e) => return Err(e.into()),
         }
         private_dir(&partial)?;
+        let mut list = BackupList {
+            generation: self.generation,
+            files: Vec::new(),
+        };
         for entry in fs::read_dir(&self.root)? {
             let entry = entry?;
             let gname = entry.file_name();
             let Some(n) = gname.to_str() else { continue };
-            if n.starts_with("gen-") && entry.file_type()?.is_dir() {
+            if canonical_gen(n).is_some() && entry.file_type()?.is_dir() {
                 let gd = partial.join(n);
                 private_dir(&gd)?;
                 for f in SNAPSHOT_FILES {
                     let src = entry.path().join(f);
                     if src.exists() {
-                        copy_file_durably(&src, &gd.join(f))?;
+                        let (bytes, crc32) = copy_file_durably(&src, &gd.join(f))?;
+                        list.files.push(BackupFile {
+                            path: format!("{n}/{f}"),
+                            bytes,
+                            crc32: Some(crc32),
+                        });
                     }
                 }
                 File::open(&gd)?.sync_data()?;
             }
         }
+        // What restore verifies against (D-044): every file, its size and
+        // checksum, and the generation the manifest names.
+        write_private(
+            &partial.join(BACKUP_LIST),
+            &serde_json::to_vec_pretty(&list).map_err(io::Error::other)?,
+        )?;
         #[cfg(any(test, feature = "fault-injection"))]
         if self
             .opts
@@ -1287,6 +1317,10 @@ pub fn restore_backup(from: &Path, to: &Path) -> Result<(), JournalError> {
         }
         Err(e) => return Err(e.into()),
     }
+    let generation = read_manifest(from)?.ok_or_else(|| {
+        JournalError::BadBackup("manifest.json disappeared during the restore".into())
+    })?;
+    let list = backup_list(from, generation)?;
     private_dir_all(to)?;
     let lock = private(OpenOptions::new().read(true).write(true).create(true))
         .truncate(false)
@@ -1299,37 +1333,16 @@ pub fn restore_backup(from: &Path, to: &Path) -> Result<(), JournalError> {
             return Err(JournalError::RestoreTargetNotEmpty);
         }
     }
-    for entry in fs::read_dir(from)? {
-        let entry = entry?;
-        let name = entry.file_name();
-        if parse_gen(&name).is_none() {
-            continue;
-        }
-        if !entry.file_type()?.is_dir() {
-            return Err(JournalError::BadBackup(format!(
-                "{} is not a directory",
-                name.to_string_lossy()
-            )));
-        }
-        let gd = to.join(&name);
-        private_dir(&gd)?;
-        for f in fs::read_dir(entry.path())? {
-            let f = f?;
-            let fname = f.file_name();
-            let known = SNAPSHOT_FILES.iter().any(|k| fname == *k);
-            if !known {
-                continue; // a leftover `.tmp`: never part of a generation
+    let copied = copy_and_verify(from, to, generation, &list);
+    if let Err(e) = copied {
+        // Nothing was published: take back what was copied, so the target
+        // holds no generation a later restore or open would trip on.
+        for f in &list.files {
+            if let Some((g, _)) = f.path.split_once('/') {
+                let _ = fs::remove_dir_all(to.join(g));
             }
-            if !f.file_type()?.is_file() {
-                return Err(JournalError::BadBackup(format!(
-                    "{}/{} is not a regular file",
-                    name.to_string_lossy(),
-                    fname.to_string_lossy()
-                )));
-            }
-            copy_file_durably(&f.path(), &gd.join(&fname))?;
         }
-        File::open(&gd)?.sync_data()?;
+        return Err(e);
     }
     // Manifest last, by rename: until it lands, `to` opens as nothing.
     let tmp = to.join("manifest.json.tmp");
@@ -1340,13 +1353,199 @@ pub fn restore_backup(from: &Path, to: &Path) -> Result<(), JournalError> {
     Ok(())
 }
 
+/// A backup's file list (`backup.json`, D-044): each file with its size and
+/// CRC-32, and the generation its manifest names.
+#[derive(Debug, Serialize, Deserialize)]
+struct BackupList {
+    generation: u32,
+    files: Vec<BackupFile>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct BackupFile {
+    /// `gen-NNNNNN/<file>`.
+    path: String,
+    bytes: u64,
+    /// `None` only for a backup made before file lists existed.
+    crc32: Option<u32>,
+}
+
+const BACKUP_LIST: &str = "backup.json";
+
+/// The generation number of a canonical `gen-NNNNNN` name (`gen-+1`,
+/// `gen-1` and the like are not generations).
+fn canonical_gen(name: &str) -> Option<u32> {
+    let g = parse_gen(std::ffi::OsStr::new(name))?;
+    (format!("gen-{g:06}") == name).then_some(g)
+}
+
+/// A first open's leftover: `gen-000001` holding nothing, or only an empty
+/// `journal.log`.
+fn is_unused_gen(gdir: &Path) -> bool {
+    let Ok(entries) = fs::read_dir(gdir) else {
+        return false;
+    };
+    entries.flatten().all(|e| {
+        e.file_name() == "journal.log" && e.metadata().is_ok_and(|m| m.is_file() && m.len() == 0)
+    })
+}
+
+/// What a restore copies: the backup's `backup.json`, or, for a backup made
+/// before file lists, every generation file it holds (sizes only). Either
+/// way it must hold the generation the manifest names, with its log, and
+/// a snapshot if that generation was made by a compaction.
+fn backup_list(from: &Path, generation: u32) -> Result<BackupList, JournalError> {
+    let bad = |why: String| JournalError::BadBackup(why);
+    let list = match fs::read(from.join(BACKUP_LIST)) {
+        Ok(bytes) => {
+            let list: BackupList = serde_json::from_slice(&bytes)
+                .map_err(|e| bad(format!("{BACKUP_LIST} unreadable: {e}")))?;
+            if list.generation != generation {
+                return Err(bad(format!(
+                    "{BACKUP_LIST} lists generation {}, the manifest names {generation}",
+                    list.generation
+                )));
+            }
+            list
+        }
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {
+            let mut files = Vec::new();
+            for entry in fs::read_dir(from)? {
+                let entry = entry?;
+                let name = entry.file_name();
+                let Some(n) = name.to_str().filter(|n| canonical_gen(n).is_some()) else {
+                    continue;
+                };
+                for f in SNAPSHOT_FILES {
+                    match fs::symlink_metadata(entry.path().join(f)) {
+                        Ok(m) => files.push(BackupFile {
+                            path: format!("{n}/{f}"),
+                            bytes: m.len(),
+                            crc32: None,
+                        }),
+                        Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+                        Err(e) => return Err(e.into()),
+                    }
+                }
+            }
+            BackupList { generation, files }
+        }
+        Err(e) => return Err(e.into()),
+    };
+    let named = format!("gen-{generation:06}");
+    let has = |f: &str| list.files.iter().any(|x| x.path == format!("{named}/{f}"));
+    if !has("journal.log") {
+        return Err(bad(format!(
+            "it does not hold {named}/journal.log, the generation its manifest names"
+        )));
+    }
+    if generation > 1 && !has("snapshot.bin") && !has("snapshot.json") {
+        return Err(bad(format!(
+            "{named} was made by a compaction but has no snapshot"
+        )));
+    }
+    for f in &list.files {
+        let ok = f
+            .path
+            .split_once('/')
+            .is_some_and(|(g, file)| canonical_gen(g).is_some() && SNAPSHOT_FILES.contains(&file));
+        if !ok {
+            return Err(bad(format!("{BACKUP_LIST} lists {:?}", f.path)));
+        }
+    }
+    // Nothing may sit in a generation that the list does not account for
+    // (a planted file or symlink is tampering, not part of the backup).
+    for entry in fs::read_dir(from)? {
+        let entry = entry?;
+        let name = entry.file_name();
+        let Some(g) = name.to_str().filter(|n| n.starts_with("gen-")) else {
+            continue;
+        };
+        if !entry.file_type()?.is_dir() {
+            return Err(bad(format!("{g} is not a directory")));
+        }
+        for f in fs::read_dir(entry.path())? {
+            let path = format!("{g}/{}", f?.file_name().to_string_lossy());
+            if !list.files.iter().any(|x| x.path == path) {
+                return Err(bad(format!(
+                    "it holds {path}, which no file list accounts for"
+                )));
+            }
+        }
+    }
+    Ok(list)
+}
+
+/// Copy every listed file into `to`, checking each one's size and checksum
+/// against the list, then check that the generation the manifest names
+/// replays: its log frame by frame with no torn tail (a backup is taken
+/// between group commits), and its snapshot's checksum.
+fn copy_and_verify(
+    from: &Path,
+    to: &Path,
+    generation: u32,
+    list: &BackupList,
+) -> Result<(), JournalError> {
+    let bad = |why: String| JournalError::BadBackup(why);
+    for f in &list.files {
+        let src = from.join(&f.path);
+        let m = fs::symlink_metadata(&src).map_err(|e| bad(format!("{}: {e}", f.path)))?;
+        if !m.file_type().is_file() {
+            return Err(bad(format!("{} is not a regular file", f.path)));
+        }
+        if let Some((g, _)) = f.path.split_once('/') {
+            if !to.join(g).exists() {
+                private_dir(&to.join(g))?;
+            }
+        }
+        let (bytes, crc32) = copy_file_durably(&src, &to.join(&f.path))?;
+        if bytes != f.bytes || f.crc32.is_some_and(|c| c != crc32) {
+            return Err(bad(format!(
+                "{} changed after the backup was taken ({bytes} bytes, listed {})",
+                f.path, f.bytes
+            )));
+        }
+    }
+    for g in list
+        .files
+        .iter()
+        .filter_map(|f| f.path.split_once('/').map(|(g, _)| g))
+    {
+        File::open(to.join(g))?.sync_data()?;
+    }
+    let gdir = gen_dir_path(to, generation);
+    let mut scan = Records::new(File::open(gdir.join("journal.log"))?)?;
+    let mut buf = Vec::new();
+    while scan.advance(&mut buf)?.is_some() {}
+    if let Some(t) = scan.torn_tail() {
+        return Err(bad(format!(
+            "gen-{generation:06}/journal.log ends inside a batch at offset {}",
+            t.offset
+        )));
+    }
+    match open_snapshot(&gdir)? {
+        Some(SnapshotSource::Binary(mut r)) => {
+            io::copy(&mut r, &mut io::sink())?;
+            r.finish()?;
+        }
+        Some(SnapshotSource::Legacy(_)) | None => {}
+    }
+    Ok(())
+}
+
 /// Copy a regular file into a new file (never through a symlink at the
-/// destination) and fsync it.
-fn copy_file_durably(src: &Path, dest: &Path) -> io::Result<()> {
+/// destination) and fsync it; the bytes copied and their CRC-32.
+fn copy_file_durably(src: &Path, dest: &Path) -> io::Result<(u64, u32)> {
     let mut input = OpenOptions::new().read(true).open(src)?;
-    let mut out = new_file(dest)?;
+    let mut out = Checked {
+        inner: new_file(dest)?,
+        crc: crc32fast::Hasher::new(),
+        len: 0,
+    };
     io::copy(&mut input, &mut out)?;
-    out.sync_data()
+    let Checked { inner, crc, len } = out;
+    inner.sync_data()?;
+    Ok((len, crc.finalize()))
 }
 
 /// Create a new file the journal owns: refuses an existing path (so never
@@ -2324,6 +2523,86 @@ mod tests {
             want.extend(after.iter().cloned());
             assert_eq!(got, want, "cut {cut}");
         }
+    }
+
+    /// A backup of a gen-1 journal holding three records.
+    fn backup_of_three(root: &Path) -> PathBuf {
+        let dest = root.join("backup");
+        let mut j = Journal::open(&root.join("src")).unwrap_or_else(|e| panic!("{e}"));
+        for i in 0..3 {
+            j.append(&record(i)).unwrap_or_else(|e| panic!("{e}"));
+        }
+        j.backup_to(&dest).unwrap_or_else(|e| panic!("{e}"));
+        dest
+    }
+
+    /// Review U3: a backup missing the generation its manifest names (a
+    /// partial copy, a deleted directory) restored with exit 0, and the
+    /// server then served an empty journal. Restore must verify the backup
+    /// first and leave nothing that opens.
+    #[test]
+    fn a_backup_missing_its_generation_is_refused() {
+        let d = tempfile::tempdir().unwrap_or_else(|e| panic!("{e}"));
+        let backup = backup_of_three(d.path());
+        fs::remove_dir_all(gen_dir_path(&backup, 1)).unwrap_or_else(|e| panic!("{e}"));
+        let to = d.path().join("to");
+        assert!(
+            restore_backup(&backup, &to).is_err(),
+            "restored a backup with no generation"
+        );
+        assert!(
+            !to.join("manifest.json").exists(),
+            "the target got a manifest"
+        );
+        assert!(Journal::open(&to).map(|j| j.records_written()).unwrap_or(0) == 0);
+    }
+
+    /// A backup whose files changed after it was taken (a flipped byte, a
+    /// truncated copy) is refused against its own file list.
+    #[test]
+    fn a_damaged_backup_is_refused_before_anything_is_published() {
+        let d = tempfile::tempdir().unwrap_or_else(|e| panic!("{e}"));
+        let backup = backup_of_three(d.path());
+        let log = gen_dir_path(&backup, 1).join("journal.log");
+        let mut bytes = fs::read(&log).unwrap_or_else(|e| panic!("{e}"));
+        let last = bytes.len() - 2;
+        bytes[last] ^= 0x01;
+        fs::write(&log, &bytes).unwrap_or_else(|e| panic!("{e}"));
+        let to = d.path().join("to");
+        assert!(
+            restore_backup(&backup, &to).is_err(),
+            "restored a damaged backup"
+        );
+        assert!(!to.join("manifest.json").exists());
+        bytes[last] ^= 0x01;
+        bytes.truncate(bytes.len() - 5);
+        fs::write(&log, &bytes).unwrap_or_else(|e| panic!("{e}"));
+        let to2 = d.path().join("to2");
+        assert!(
+            restore_backup(&backup, &to2).is_err(),
+            "restored a truncated backup"
+        );
+    }
+
+    /// The same for a live journal: a manifest naming a generation that is
+    /// not there is damage, never a fresh empty journal.
+    #[test]
+    fn a_journal_missing_the_generation_its_manifest_names_does_not_open() {
+        let d = tempfile::tempdir().unwrap_or_else(|e| panic!("{e}"));
+        let root = d.path().join("j");
+        {
+            let mut j = Journal::open(&root).unwrap_or_else(|e| panic!("{e}"));
+            j.append(&record(0)).unwrap_or_else(|e| panic!("{e}"));
+        }
+        fs::remove_dir_all(gen_dir_path(&root, 1)).unwrap_or_else(|e| panic!("{e}"));
+        assert!(matches!(
+            Journal::open(&root),
+            Err(JournalError::Manifest(_))
+        ));
+        assert!(
+            !gen_dir_path(&root, 1).exists(),
+            "open recreated the generation"
+        );
     }
 
     /// A gen-1 journal whose log holds exactly `bytes` (hand-framed).
