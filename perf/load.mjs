@@ -17,7 +17,7 @@
 //
 // Evidence rules: machine spec + commit hash recorded in every result;
 // a missed threshold is a failing result, kept — never rerun to green.
-import { spawn, execFileSync } from 'node:child_process';
+import { spawn, spawnSync } from 'node:child_process';
 import fs from 'node:fs';
 import net from 'node:net';
 import os from 'node:os';
@@ -81,21 +81,81 @@ function verdictOf(checks) {
 }
 
 // --- spawned children ------------------------------------------------------
-// Every spawned child is tracked and SIGKILLed when the harness exits — a
-// crashed scenario must not leave a server holding the port (an orphan then
-// answers the next run's /health with the *old* run's API key: 401s and
-// resets that look like a product failure).
+// Every spawned child is recorded in a pidfile AND tracked in memory:
+//   - on ANY exit path the harness SIGKILLs its children and removes their
+//     pidfiles (SIGKILL on the harness itself skips this — the pidfiles stay);
+//   - on startup it reaps whatever its own leftover pidfiles name: the pid
+//     is killed only if its current command line still matches the recorded
+//     one (a reused pid is never touched). Then the port pre-flight runs.
+// A crashed run's orphan otherwise answers the next run's /health with the
+// old run's API key — 401s and resets that read as a product failure.
+const PIDDIR = `${os.tmpdir()}/durable-load.pids`;
+fs.mkdirSync(PIDDIR, { recursive: true });
 const kids = new Set();
-function track(p) {
+function pidfile(pid) { return `${PIDDIR}/${pid}.json`; }
+function track(p, match, command, port) {
+  fs.writeFileSync(pidfile(p.pid), JSON.stringify({
+    pid: p.pid, match, command, port, started_at: new Date().toISOString(),
+  }));
   kids.add(p);
-  p.on('exit', () => kids.delete(p));
+  p.on('exit', () => { kids.delete(p); fs.rmSync(pidfile(p.pid), { force: true }); });
   return p;
+}
+function alive(pid) {
+  try { process.kill(pid, 0); return true; }
+  catch (e) { return e.code !== 'ESRCH'; } // EPERM: exists, we may not signal it
+}
+function cmdline(pid) {
+  // spawnSync: ps exits 1 for a dead pid and is denied outright under a
+  // sandbox (EPERM) — either way we just get no match.
+  const r = spawnSync('ps', ['-p', String(pid), '-o', 'command=']);
+  return r.error ? '' : (r.stdout || '').toString();
+}
+function portHeldBy(port, pid) {
+  const r = spawnSync('lsof', ['-nP', `-iTCP:${port}`, '-sTCP:LISTEN']);
+  if (r.error) throw r.error; // lsof denied/missing: cannot verify
+  return (r.stdout || '').toString().split('\n')
+    .some((l) => l.trim().split(/\s+/)[1] === String(pid));
+}
+// True when the pidfile may be deleted: the pid is gone, or proven ours and
+// killed. False when it lives but cannot be verified — never kill a stranger,
+// never drop the only record of our own stray child.
+function verifyAndReap(rec) {
+  if (!alive(rec.pid)) return true;
+  let ours = cmdline(rec.pid).includes(rec.match);
+  if (!ours && rec.port != null) {
+    try { ours = portHeldBy(rec.port, rec.pid); } catch { /* cannot verify here */ }
+  }
+  if (!ours) return false;
+  try {
+    process.kill(rec.pid, 'SIGKILL');
+  } catch (e) {
+    // ESRCH: raced, already gone. EPERM (sandboxed signals): our orphan but
+    // unreachable — say so and keep the pidfile so every run keeps flagging it.
+    if (e.code !== 'ESRCH') {
+      console.error(`stale child ${rec.pid} (${rec.command}) is ours but could not be killed: ${e.code}`);
+      return false;
+    }
+  }
+  return true;
+}
+function reapStale() {
+  for (const f of fs.readdirSync(PIDDIR).filter((f) => f.endsWith('.json'))) {
+    let rec;
+    try { rec = JSON.parse(fs.readFileSync(`${PIDDIR}/${f}`, 'utf8')); }
+    catch { fs.rmSync(`${PIDDIR}/${f}`, { force: true }); continue; }
+    if (verifyAndReap(rec)) fs.rmSync(`${PIDDIR}/${f}`, { force: true });
+  }
 }
 process.on('exit', () => {
   for (const k of kids) {
     try { k.kill('SIGKILL'); } catch { /* already gone */ }
   }
 });
+for (const sig of ['SIGINT', 'SIGTERM']) {
+  process.on(sig, () => process.exit(sig === 'SIGINT' ? 130 : 143));
+}
+reapStale();
 
 // Something is already listening on a port the harness wants? Stop rather
 // than run against it — see above.
@@ -120,6 +180,7 @@ await assertFree(HPORT, 'handler');
 const seen = new Set();
 function startHandler(mode, stallMs = 0) {
   const src = `
+    const DRLOAD = 'drload-handler-${HPORT}'; // in the command line: stale-reap marker
     const seen = new Set();
     require('node:http').createServer((req, res) => {
       const url = new URL(req.url, 'http://x');
@@ -143,14 +204,24 @@ function startHandler(mode, stallMs = 0) {
       });
     }).listen(${HPORT}, '127.0.0.1');
   `;
-  const p = track(spawn('node', ['-e', src], { stdio: 'ignore' }));
+  const p = track(
+    spawn('node', ['-e', src], { stdio: 'ignore' }),
+    `drload-handler-${HPORT}`,
+    `node -e <handler fixture> on 127.0.0.1:${HPORT}`,
+    HPORT,
+  );
   return p;
 }
 
 async function startServer(journalDir, extra = []) {
-  const p = track(spawn(SRV, ['--journal', journalDir, '--listen', `127.0.0.1:${PORT}`,
-    '--handler', `step=http://127.0.0.1:${HPORT}/step`, ...extra],
-    { stdio: 'ignore', env: { ...process.env, DURABLE_API_KEY: API_KEY } }));
+  const argv = ['--journal', journalDir, '--listen', `127.0.0.1:${PORT}`,
+    '--handler', `step=http://127.0.0.1:${HPORT}/step`, ...extra];
+  const p = track(
+    spawn(SRV, argv, { stdio: 'ignore', env: { ...process.env, DURABLE_API_KEY: API_KEY } }),
+    journalDir, // unique per run (mkdtemp): matches only a child that serves this journal
+    [SRV, ...argv].join(' '),
+    PORT,
+  );
   for (let i = 0; i < 100; i++) {
     // If the child died (EADDRINUSE, a bad flag) while something still
     // answers /health, the listener is not ours — say so, don't run on it.
