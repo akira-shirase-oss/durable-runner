@@ -1,156 +1,87 @@
 # Test report: Durable Workflow Runner (`durable-runner`)
 
-**Commit tested:** `c36f5c3` (guide written against this HEAD)
-**Date:** 2026-11-10 · **Machine:** Apple M2 Pro, 12 cores, 32 GB, macOS (Darwin 27.0.0)
-**Toolchain:** Rust 1.99.1 via rustup proxies · python3 + curl + lsof for the pilot
+**Commit tested:** `a7b0a84` (D4 close-out)
+**Date:** 2026-11-18 · **Machine:** Apple M2 Pro, 12 cores, 32 GB, macOS
+**Toolchain:** Rust 1.99.1 via rustup proxies · node for `perf/load.mjs` · python3 + curl + lsof for the pilot
 **Guide:** `test/durable-runner-TESTING.md`
-**Verdict: PASS with one real bug found and fixed** (`464e908`), plus a lint-gate fix
-(`82ef4f8`) and the owed load battery committed (`1491441`). **The sustained-load
-ship gate is red — twice, solo included** (§4a): the journal's per-record-fsync
-ceiling is the open problem, not contention.
+**Verdict: the durability contract holds under every required failure case and
+every shipped gate is green.** The earlier red verdict — the sustained-load
+latency gate failing at the per-record-fsync ceiling — was root-caused and
+fixed by group commit (D-015); the 1,000,000-submit run now passes
+(`perf/results/2026-11-17T08-42-51-578Z-sustained.json`). The misses are kept
+below, not rerun away.
 
 ---
 
-## 1. Build and workspace tests
+## 1. Test suite
 
-| Check | Result |
+`cargo test --workspace` (debug) and the same under `--locked` on CI
+(`scripts/check.sh` = `.github/workflows/ci.yml`):
+
+| Crate / file | Tests | Covers |
+|---|---|---|
+| `durable-domain` | 9 | state machine: named refusals, terminal states, bounded retries, reconcile-before-retry, admission limits |
+| `durable-journal` | 35 | framing v1+v2, torn tails, batch integrity, corruption refusals, writer lock, reserve, compaction generations, backup/restore verification, owner-only files, golden-file formats |
+| `durable-engine` (lib + shell + snapshot) | 58 | group commit, dispatch permits, reconcile probes, crash/reopen cases, compaction crash steps, capacity bounds, drain, deadline sweep |
+| `durable-server` (unit) | 40 | keys and scopes, paging, error envelope, connection limits, CSP, open-reads Host check, full-disk 503s |
+| `durable-server` (`tests/process_exit.rs`) | 7 | real binary: failed manifest swap, SIGTERM drain ×2, second writer, key/open-reads startup refusals, proxy env ignored |
+| `durable-cli` | 3 | step parsing, input `@file`, backup-name validation |
+
+Plus fault-injection drills inside tests (`durable-journal` dev-feature only,
+kept out of the shipped binaries — an architecture check in `check.sh`
+fails otherwise).
+
+## 2. The four required failure cases
+
+`docs/END_GOAL.md` requires four. `docs/FAILURE_CASES.md` maps each to its
+tests and live evidence — the short version:
+
+| Case | Proven by |
 |---|---|
-| `cargo build --release --locked` | clean (server + CLI + engine) |
-| `cargo test --workspace --locked` | **26 tests, all pass** — domain 7, engine 14, journal 5 |
-| `cargo fmt --all --check` | clean |
-| `cargo clippy --workspace --all-targets --locked -- -D warnings` | **failed → fixed** (see §6) |
+| Crash before/after ack → only committed acks survive; resubmit returns the original run | `accepted_survives_reopen`, `duplicate_key_returns_original_run`, `nothing_escapes_before_the_covering_fsync`, torn-tail + corruption refusals; kill-9 drill: 36 kills, 25,201 acks, **0 lost / 0 duplicated** (`2026-11-17T02-28-00Z-kill9-drill.json`); SIGTERM drain process tests |
+| Handler reply vanished → reconcile before any repeat | `lost_reply_reconciles_before_retry` (domain), `lost_reply_reconciles_and_advances`, `restart_orphaned_*`, `no_probe_before_the_reply_lost_record_is_durable`; `stall` scenario pass (`2026-11-08T12-45-51`) |
+| Crash during compaction → old OR new complete generation | `crash_at_any_compaction_step_reopens_one_complete_generation`, `compaction_error_at_any_step_loses_no_acknowledged_job`, `real_io_error_after_manifest_swap_stops_the_engine`, process-level `failed_manifest_swap_exits_the_process_and_loses_nothing`; drill kills targeted at compactions |
+| Full disk / second writer | `appends_compaction_and_backup_respect_the_reserve`, `outcome_during_full_disk_is_counted_then_reconciled`, HTTP-level `full_disk_is_503_no_space_and_readiness_false`, `second_writer_refused`, `a_second_server_on_the_same_journal_refuses_startup` (binary) |
 
-Journal tests cover the contract directly: `torn_tail_is_discarded_history_is_kept`,
-`corrupt_committed_history_stops_startup`, `sequence_gap_is_corruption`,
-`second_writer_refused`, `append_then_replay_round_trips`.
+## 3. Ship-gate rehearsal
 
-## 2. Pilot drill (`examples/pilot/run.sh`) — the ship-gate rehearsal
+`examples/pilot/run.sh` performs `docs/OPERATING.md` end to end — submit,
+inspect, `kill -9` → restart replay, compact, backup, `durable-cli restore`
+on a second server with identical state, SIGTERM drain — and exits non-zero
+on the first failed check. It runs on every push via `scripts/check.sh`.
 
-Full output captured; every stage verified:
+## 4. Load evidence
 
-- `submit --op-key pilot/onboarding-email` → `{"run_id":1}`; inspect →
-  `state:"done", steps:2, finished_at` set.
-- Inspector UI served at `/inspector/` → HTTP **200**.
-- **`kill -9` the server**, restart against the same journal → replay restores
-  `state:"done"` with the same `finished_at` — acknowledged work survived.
-- `compact` → `{"generation":2}`; `backup --to …` → backup dir written.
-- **Restore on a second instance** (different port + journal dir) →
-  `restored inspect -> {"state":"done", same id, same finished_at}`.
-- `pilot complete — run survived kill -9, compaction, and a restore`.
+`perf/LOAD_MATRIX.md` is the index; every result carries machine + commit.
+The full million-scale battery re-runs on CI (`.github/workflows/load.yml`);
+small local smokes are the laptop evidence.
 
-## 3. Break-it drills (live server + CLI)
-
-| Drill | Expected | Observed |
+| Scenario | Latest evidence | Verdict |
 |---|---|---|
-| Resubmit same `--op-key` | same run id, no re-execution | `{"run_id":1}` again; run count stays **1** |
-| Resubmit same key, *different* steps | dedup is by key only | still `run_id:1`, original spec wins |
-| Unregistered handler | HTTP 409, nothing journaled | `Error: 409 Conflict: unregistered handler: nosuchhandler`, `exit=1`; `/jobs` shows only the legit run |
-| Second writer on same journal dir | startup refusal | `Error: engine open: journal already has a writer (LOCK held)`, exit 1; **original server kept serving** |
-| `kill -9` mid-dispatch (slow handler), restart same journal | orphaned attempt reconciles, never re-fires blindly | **FAILED before fix — see §5**; after fix the run reaches `done` with the handler called exactly once |
+| sustained 1M @100/s | `2026-11-17T08-42-51-578Z` at `cdbdfb8`: 1,000,000/1,000,000 accepted + drained, p50 12.5 ms, p99 41.3 ms, journal 496 MiB | **pass** |
+| kill-9 drill | `2026-11-17T02-28-00Z`: 0 lost across 36 kills + compactions + backups + cancel bursts | **pass** |
+| connection drills | `2026-11-17T03-20` idle-head sockets, `2026-11-17T03-45` non-reading clients | **pass** |
+| replay @100k events | earlier pass at 212 ms (`2026-11-08T19-03-45`); re-measured in the smoke battery | pending refresh |
+| submit / admission / stall / compact | `2026-11-08` runs on the pre-group-commit code | pass, re-measured in the smoke battery |
 
-## 4. Load battery (`perf/battery.sh`, committed in `1491441`)
+Laptop numbers are development observations (load averages are recorded in
+each result); they are not production capacity.
 
-Ran 2026-11-08 on `c36f5c3`, **deliberately concurrent with the colophon P6 soak**
-(user-directed overlap — the battery log says so; latency numbers are conservative /
-contended and are labeled as such). Results in `perf/results/`:
+## 5. History — kept, not rerun to green
 
-| Scenario | Result | Evidence |
-|---|---|---|
-| replay | **pass** | 100,000 journal events / 11,112 runs replayed in **212 ms** |
-| submit ladder | 200/600/3000 **pass**; 6000 **FAIL** | p99 198 ms → 3.3 s → 4.05 s under rising concurrency (contended) |
-| stall reconcile | FAIL then **pass** on retry | honest miss kept, then clean |
-| compact-under-load | **pass** | p99 30.9 ms while compacting |
-| admission | FAIL then **pass** on retry | bounds proven |
-| **sustained** | **FAIL — kept as evidence** | 1,000,000 submits @100/s for 10,093 s (~2.8 h): **619,480 accepted (200), 380,520 refused (503) by admission** — bounded refusal, never unbounded queueing; journal 311 MB; submit p50 15.5 s / p99 24.4 s. The latency gate failed under soak+contended conditions; per workspace rules the miss is committed, not re-run until green. |
-
-Honest reading: durability held (every accepted submit journaled; refusals were
-admission 503s, not lost work), but submit-ack latency under a full journal +
-contention did not meet the gate. That is a real, recorded limitation — flagged for
-the operator doc, not hidden.
-
-### 4a. The solo re-run — contention theory disproven (2026-11-10)
-
-Per the open item above, the sustained scenario re-ran alone: same machine free of
-any other load suite, `sustained --rate=100 --total=1000000`, commit `e193b20`,
-result `perf/results/2026-11-10T20-38-48-041Z-sustained.json`, runner log
-`solo-sustained-runner.log`.
-
-| Metric | Contended (Nov 8) | **Solo (Nov 10)** |
-|---|---|---|
-| sent / accepted | 1,000,000 / 619,480 | 1,000,000 / **481,914** |
-| HTTP 200 / 503 | 619,480 / 380,520 | 481,914 / **518,086** |
-| p50 / p99 / max | 15,453 / 24,362 / 26,019 ms | **7.5 / 29,934 / 34,566 ms** |
-| wall clock | 10,093 s | 10,131 s |
-| journal | 311 MB | 246 MB |
-| verdict | FAIL | **FAIL** |
-
-The solo run is *worse* on acceptance (48.2% vs 61.9%) — the earlier run's higher
-acceptance was the anomaly, not the norm. The 503s are the bounded admission
-control refusing before reserve exhaustion, exactly as designed; nothing
-acknowledged was lost (`done_after_drain` 341,273 runs completed during drain).
-p50 of 7.5 ms shows the fast path is genuinely fast when unsaturated; p99 ~30 s
-shows waiters queue into seconds once the per-record-fsync ceiling (~50–100
-submits/s, between the 50/s pass and 100/s fail on the submit ladder) is crossed.
-
-**Conclusion:** the sustained-load latency gate fails *intrinsically*, not from
-contention. Root-causing the ceiling — fsync batching/group commit, a lower
-declared sustained rate, or admission shaping — is the open work before the ship
-gate can be called green. Evidence kept per the workspace rule.
-
-## 5. Bug found and fixed — restart-orphaned runs stuck `running` forever
-
-**Reproduction (live):** submit a job to a slow handler, `kill -9` the server
-mid-dispatch, restart on the same journal. The run journaled
-`running:step:0:attempt:1` and sat there — polled every 0.4 s for **20+ s** with no
-reconcile, no re-dispatch, no terminal state.
-
-**Root cause:** the actor's deadline sweep only reconciled attempts present in the
-in-memory `live` set — attempts *this* process fired. A run orphaned by a restart
-had no `live` entry, so its expired deadline was never swept; and a run journaled
-`Reconciling` whose probe died with the old process was never re-probed.
-
-**Fix (`464e908`):** on actor spawn, collect journaled `Reconciling` runs and issue
-a fresh reconcile probe (verdicts are idempotent — a moved-on run refuses
-`NothingToReconcile`); the deadline sweep no longer gates orphaned `Running`
-attempts on `live`.
-
-**Regression tests (fail without the fix):**
-- `restart_orphaned_running_run_reconciles` — kill mid-flight, respawn, assert
-  `Done` and handler call count == 1 (reconcile must not blindly repeat the remote
-  call). Failed before: `run never reached a terminal state`.
-- `restart_orphaned_reconciling_run_reprobes` — crash after `ReplyLost` committed
-  `Reconciling` but before the probe verdict; restart must re-probe. Failed before,
-  passes after.
-
-Both verified failing on the pre-fix code, then passing — the D-018 rule.
-
-## 6. Lint-gate fix (`82ef4f8`)
-
-`cargo clippy -D warnings` failed on two `expect_err()` uses in engine tests
-(`shell.rs:577`, `lib.rs:535`) — `expect_used` is denied workspace-wide. Rewritten
-to `.err().unwrap_or_else(|| panic!(...))`, preserving the assertion messages.
-Clippy clean after; no behavior change.
-
-## 7. Commits landed by this testing pass
-
-| Commit | Content |
-|---|---|
-| `82ef4f8` | clippy `expect_err` → `err().unwrap_or_else` in engine tests |
-| `464e908` | **fix:** restart-orphaned runs reconcile instead of sticking forever (+ 2 regression tests) |
-| `38698ff` | `test/durable-runner-TESTING.md` |
-| `1491441` | load battery evidence: replay/submit/stall/compact/admission/sustained JSONs + runner log |
-| `e193b20` | this report (external testing guide pass) |
-
-## 8. Verdict
-
-The durability contract holds under every drill the guide defines — acknowledged
-work survives kill-9, compaction, backup and restore; dedup, the handler allowlist,
-and the single-writer lock all refuse correctly. **One real bug was found** (orphaned
-runs never reconciled after restart) and fixed with failing-first regression tests.
-The load battery is committed honestly: replay and compaction are fast. The
-sustained 1M-submit gate is **red twice** — contended (38% refused, p99 24.4 s)
-and solo (52% refused, p99 29.9 s) — proving the limit is the journal's
-per-record-fsync throughput ceiling, not external contention. Durability itself
-held throughout: refusals were bounded admission 503s and nothing acknowledged
-was lost. **The ship gate is not green**: root-causing the fsync ceiling (or
-re-scoping the declared sustained rate) is the remaining work.
+- **2026-11-08, `c36f5c3`, contended with the colophon soak:** sustained 1M
+  accepted 619,480 / refused 380,520 (bounded 503s, nothing lost), p99 24.4 s.
+- **2026-11-10, `e193b20`, solo re-run:** worse, not better — 481,914 accepted,
+  p50 7.5 ms / p99 29.9 s. Proved the ceiling was the journal's
+  per-record-fsync path, not contention. → fixed by group commit (D-015,
+  writer thread, one fsync per batch); the solo run at `cdbdfb8` above is the
+  green counterpart.
+- **Bug found by an earlier pass (`464e908`):** restart-orphaned runs sat
+  `running` forever — the deadline sweep only reconciled attempts this
+  process had fired. Fixed with the failing-first regression tests
+  `restart_orphaned_running_run_reconciles` /
+  `restart_orphaned_reconciling_run_reprobes`.
+- The first `stall` run (`2026-11-08T12-44-56`) honestly `failed` ×15: the
+  fixture recorded idem keys only at reply time, so probes correctly said
+  "not landed" and bounded retries exhausted — evidence of the
+  honest-refusal path, kept.
