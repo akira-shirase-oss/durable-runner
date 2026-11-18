@@ -861,23 +861,32 @@ convention; these seed the contract's prescribed directions.
   needs a plugin) and Cloudflare sits in front anyway, so the bounds
   live in `serve_http`: a token bucket per client address
   (`--rate-limit-per-addr`, 100/s with a one-second burst; past it, 429
-  `rate_limited` with a `Retry-After`), and a per-TCP-peer connection
-  count (`--max-conns-per-addr`, 64; past it the socket is dropped at
-  accept). The client address is the TCP peer, or `CF-Connecting-IP`
-  when the peer is inside a `--trusted-proxy` CIDR — the header from
-  any other peer is ignored, because anyone can set it and a believed
-  header would hand a flooder a fresh address per request. The bucket
-  table is bounded (`MAX_LIMITED_ADDRS`, ~4 MiB): entries idle a minute
-  are reclaimed when it fills, and addresses that still do not fit share
-  one overflow bucket, so a spray of distinct addresses limits itself
-  rather than buying memory with evictions. The connection count is
-  bounded by `max_connections` itself. Rate refusal happens before auth:
-  a flood without a key is still a flood, and the check is cheaper than
-  the work behind it. Behind a trusted proxy the conn cap applies to the
-  proxy's edges — raise it to what the proxy legitimately holds; the
-  request rate still bounds each real client. Proven against a real
-  listener: one flooding address is 429'd while another proceeds, a
-  spoofed header from an untrusted peer is ignored, a trusted peer's
-  header names the client, a million distinct addresses stay inside the
-  bound, and the third connection from one peer is closed while its
-  first two keep serving.
+  `rate_limited` with a `Retry-After`), and a per-peer connection cap
+  (`--max-conns-per-addr`, 64 for untrusted peers; peers inside the
+  trusted-proxy ranges get `--max-conns-per-proxy`, 4096, because a
+  proxy edge legitimately carries many real clients — the global
+  connection cap still bounds everything). The client address is the
+  TCP peer, or `CF-Connecting-IP` when the peer is inside a
+  `--trusted-proxy` CIDR — the header from any other peer is ignored,
+  because anyone can set it and a believed header would hand a flooder
+  a fresh address per request. What the limit counts as an address:
+  IPv4 as itself (a v4-mapped v6 is unwrapped to the same bucket), IPv6
+  masked to `--rate-limit-v6-prefix` bits (a /64 by default, so one
+  client's 2^64 addresses cannot each mint a bucket), and inside one
+  /48 the per-address buckets share an aggregate at 10x the rate, so a
+  /48 cannot mint a table of /64s either. The bucket table is bounded
+  (`MAX_LIMITED_ADDRS`, ~4 MiB): entries idle a minute are reclaimed
+  when it fills, and keys that still do not fit share one overflow
+  bucket, so a spray of distinct addresses limits itself rather than
+  buying memory with evictions — the residual, a spray of many distinct
+  /48s, can still push a new real client into that shared bucket.
+  Rate refusal happens before auth: a flood without a key is still a
+  flood, and the check is cheaper than the work behind it. Proven
+  against a real listener and in the table's own tests: one flooding
+  address is 429'd while another proceeds, a spoofed header from an
+  untrusted peer is ignored, a trusted peer's header names the client,
+  1,000 addresses in one /64 share one bucket, 1,000 /64s in one /48
+  hit the aggregate, `::ffff:1.2.3.4` and `1.2.3.4` share a bucket,
+  distinct v4s stay independent, a million distinct addresses stay
+  inside the bound, an untrusted peer's third connection is closed at
+  accept while a trusted peer holds its higher cap.

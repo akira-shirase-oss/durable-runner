@@ -4,7 +4,9 @@
 
 mod addr_limits;
 
-use addr_limits::{client_addr, ConnLimit, IpNet, RateLimit, TrustedProxies, MAX_LIMITED_ADDRS};
+use addr_limits::{
+    client_addr, ConnLimit, IpNet, RateLimit, TrustedProxies, DEFAULT_V6_PREFIX, MAX_LIMITED_ADDRS,
+};
 use anyhow::{Context, Result};
 use axum::{
     extract::{DefaultBodyLimit, FromRequestParts, Path as AxPath, Query, State},
@@ -112,12 +114,22 @@ struct Args {
     /// a one-second burst; the address table is bounded). 0 disables.
     #[arg(long, default_value_t = 100.0)]
     rate_limit_per_addr: f64,
-    /// Connections one peer address may hold at once; past the cap the
-    /// socket is closed at accept. Behind a trusted proxy the peer is the
-    /// proxy's edge — raise this there (the per-address request rate
-    /// still bounds each real client). 0 disables.
+    /// Prefix bits one IPv6 client address is keyed by for the rate
+    /// limit: a /64 holds 2^64 addresses, so keying the full address
+    /// would let one client mint unlimited buckets. Inside a /48 the
+    /// per-address buckets also share a /48 aggregate at 10x this rate.
+    #[arg(long, default_value_t = DEFAULT_V6_PREFIX, value_parser = parse_v6_prefix)]
+    rate_limit_v6_prefix: u8,
+    /// Connections one untrusted peer address may hold at once; past the
+    /// cap the socket is closed at accept. 0 disables.
     #[arg(long, default_value_t = 64)]
     max_conns_per_addr: usize,
+    /// Connections one peer inside the trusted-proxy ranges may hold: a
+    /// proxy's edge legitimately carries many real clients at once, so
+    /// it needs its own, higher cap (the global `--max-connections`
+    /// still bounds everything). 0 = unlimited.
+    #[arg(long, default_value_t = 4096)]
+    max_conns_per_proxy: usize,
     /// Proxy CIDR (repeatable) whose `CF-Connecting-IP` header names the
     /// client address for the per-address limits — Cloudflare's ranges
     /// when Cloudflare fronts this server. The header from any other
@@ -155,6 +167,15 @@ fn parse_handler(s: &str) -> Result<(String, String), String> {
         ));
     }
     Ok((name.to_string(), url.to_string()))
+}
+
+/// `--rate-limit-v6-prefix`: 0–128 bits.
+fn parse_v6_prefix(s: &str) -> std::result::Result<u8, String> {
+    let v: u8 = s.parse().map_err(|_| format!("bad prefix {s:?}"))?;
+    if v > 128 {
+        return Err(format!("an IPv6 prefix is at most /128, got /{v}"));
+    }
+    Ok(v)
 }
 
 /// The client every handler call goes through (D-039): it never follows a
@@ -1127,7 +1148,9 @@ async fn main() -> Result<()> {
         max_lifetime: Duration::from_secs(args.max_connection_secs.max(1)),
         max_requests: args.max_requests_per_connection.max(1),
         rate_per_addr: args.rate_limit_per_addr.max(0.0),
+        v6_prefix: args.rate_limit_v6_prefix,
         max_conns_per_addr: args.max_conns_per_addr,
+        max_conns_per_proxy: args.max_conns_per_proxy,
         trusted_proxies: TrustedProxies(args.trusted_proxies),
     };
     let serve = serve_http(listener, router, limits, http_stopped);
@@ -1194,8 +1217,12 @@ struct HttpLimits {
     max_requests: usize,
     /// Requests/second one client address may make (0 = unlimited).
     rate_per_addr: f64,
-    /// Open connections one peer address may hold (0 = unlimited).
+    /// Prefix bits one IPv6 client address is keyed by.
+    v6_prefix: u8,
+    /// Open connections one untrusted peer address may hold (0 = unlimited).
     max_conns_per_addr: usize,
+    /// Open connections one trusted-proxy peer may hold (0 = unlimited).
+    max_conns_per_proxy: usize,
     /// Who may name the client address in `CF-Connecting-IP`.
     trusted_proxies: TrustedProxies,
 }
@@ -1211,7 +1238,9 @@ impl Default for HttpLimits {
             max_lifetime: Duration::from_secs(600),
             max_requests: 100,
             rate_per_addr: 100.0,
+            v6_prefix: DEFAULT_V6_PREFIX,
             max_conns_per_addr: 64,
+            max_conns_per_proxy: 4096,
             trusted_proxies: TrustedProxies::default(),
         }
     }
@@ -1245,10 +1274,11 @@ async fn serve_http(
         Arc::new(std::sync::Mutex::new(RateLimit::new(
             limits.rate_per_addr,
             MAX_LIMITED_ADDRS,
+            limits.v6_prefix,
         )))
     });
-    let conn_limit =
-        (limits.max_conns_per_addr > 0).then(|| ConnLimit::new(limits.max_conns_per_addr));
+    let conn_limit = (limits.max_conns_per_addr > 0 || limits.max_conns_per_proxy > 0)
+        .then(|| ConnLimit::new(limits.max_conns_per_addr, limits.max_conns_per_proxy));
     let trusted = limits.trusted_proxies.clone();
     let mut conn_cap_refused = false;
     loop {
@@ -1289,7 +1319,7 @@ async fn serve_http(
         // accept — the client sees a refused connection, not a queue slot
         // held while one address spends them all.
         let conn_guard = match &conn_limit {
-            Some(l) => match l.acquire(peer.ip()) {
+            Some(l) => match l.acquire(peer.ip(), trusted.trusts(peer.ip())) {
                 Some(g) => {
                     conn_cap_refused = false;
                     Some(g)
@@ -2843,6 +2873,38 @@ mod tests {
             String::from_utf8_lossy(&reply)
         );
         drop(a);
+    }
+
+    /// D-052: a peer inside the trusted-proxy ranges gets the larger
+    /// proxy cap — a proxy's edge legitimately carries many clients, so
+    /// the untrusted-peer cap must not throttle it.
+    #[tokio::test]
+    async fn a_trusted_proxy_peer_gets_the_higher_connection_cap() {
+        let limits = HttpLimits {
+            max_conns_per_addr: 2,
+            max_conns_per_proxy: 4,
+            trusted_proxies: TrustedProxies(vec![
+                IpNet::parse("127.0.0.0/8").unwrap_or_else(|e| panic!("{e}"))
+            ]),
+            ..HttpLimits::default()
+        };
+        let (addr, _stop, _h) = serving(limits).await;
+        let mut held = Vec::new();
+        for _ in 0..4 {
+            held.push(
+                tokio::net::TcpStream::connect(addr)
+                    .await
+                    .unwrap_or_else(|e| panic!("{e}")),
+            );
+        }
+        let mut extra = tokio::net::TcpStream::connect(addr)
+            .await
+            .unwrap_or_else(|e| panic!("{e}"));
+        assert!(
+            closed_within(&mut extra, Duration::from_secs(5)).await,
+            "a fifth connection from a trusted peer was kept"
+        );
+        drop(held);
     }
 
     /// Review U11: base64 behaviour was checked by one valid input. Every

@@ -288,12 +288,14 @@ it):
 
 - **Exposure.** It caps connections and times heads and bodies (D-045),
   and limits each client address's request rate and each peer's
-  connection count (D-052). It still has no TLS: put Cloudflare (or a
-  reverse proxy that does TLS) in front, and pass its ranges as
+  connection count (D-052: IPv6 is keyed by /64 with a shared /48
+  aggregate, so a spray of distinct /48s can still push a new real
+  client into the overflow bucket). It still has no TLS: put Cloudflare
+  (or a reverse proxy that does TLS) in front, and pass its ranges as
   `--trusted-proxy` so the per-address limits count real clients — the
-  per-peer connection cap then applies to the proxy's edges, so raise
-  `--max-conns-per-addr` to what your proxy legitimately holds. Never
-  combine a proxy with `--open-reads`.
+  trusted edges then get `--max-conns-per-proxy` (4096) instead of the
+  untrusted `--max-conns-per-addr` (64). Never combine a proxy with
+  `--open-reads`.
 - **Handler calls are unsigned.** A handler cannot tell a call came from
   this runner except by network placement (D-039); keep handlers on a
   private network.
