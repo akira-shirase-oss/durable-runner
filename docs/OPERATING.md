@@ -287,9 +287,13 @@ What this server does not do, so the deployment must (or must not rely on
 it):
 
 - **Exposure.** It caps connections and times heads and bodies (D-045),
-  but has no TLS, per-client rate limit or per-address connection cap.
-  For any non-local exposure, put a reverse proxy in front that does.
-  Never combine a proxy with `--open-reads`.
+  and limits each client address's request rate and each peer's
+  connection count (D-052). It still has no TLS: put Cloudflare (or a
+  reverse proxy that does TLS) in front, and pass its ranges as
+  `--trusted-proxy` so the per-address limits count real clients — the
+  per-peer connection cap then applies to the proxy's edges, so raise
+  `--max-conns-per-addr` to what your proxy legitimately holds. Never
+  combine a proxy with `--open-reads`.
 - **Handler calls are unsigned.** A handler cannot tell a call came from
   this runner except by network placement (D-039); keep handlers on a
   private network.
@@ -297,8 +301,9 @@ it):
   even if the spec differs; there is no 409 for a changed spec.
 - **Keys.** One API key and one optional read-only key, read at startup:
   rotating either needs a restart, and there is no cancel-only scope.
-- **Reads have no rate limit.** A key holder can fill the read queue
-  (bounded: 503 `busy`), never the write queue.
+- **Reads are limited per address, not per key.** One key holder across
+  many addresses can still fill the read queue (bounded: 503 `busy`),
+  never the write queue.
 - **Power loss inside the last batch** with the file's length on disk
   stops startup (the batch cannot be told apart from damage); restore a
   backup (see "What honest looks like" above for the one lossy repair).

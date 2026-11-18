@@ -214,8 +214,13 @@ function startHandler(mode, stallMs = 0) {
 }
 
 async function startServer(journalDir, extra = []) {
+  // The battery measures the engine's bounds, not the per-address
+  // limiter's (that has its own tests): the request-rate path stays on at
+  // 100k/s so it is exercised, but never trips; the per-peer conn cap is
+  // off so the admission flood can queue sockets the kernel will allow.
   const argv = ['--journal', journalDir, '--listen', `127.0.0.1:${PORT}`,
-    '--handler', `step=http://127.0.0.1:${HPORT}/step`, ...extra];
+    '--handler', `step=http://127.0.0.1:${HPORT}/step`,
+    '--rate-limit-per-addr', '100000', '--max-conns-per-addr', '0', ...extra];
   const p = track(
     spawn(SRV, argv, { stdio: 'ignore', env: { ...process.env, DURABLE_API_KEY: API_KEY } }),
     journalDir, // unique per run (mkdtemp): matches only a child that serves this journal

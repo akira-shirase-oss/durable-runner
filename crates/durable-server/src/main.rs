@@ -2,6 +2,9 @@
 //! top — submit/inspect/cancel/compact/backup. Handlers are allowlisted
 //! HTTP endpoints configured at startup; the registry is the trust edge.
 
+mod addr_limits;
+
+use addr_limits::{client_addr, ConnLimit, IpNet, RateLimit, TrustedProxies, MAX_LIMITED_ADDRS};
 use anyhow::{Context, Result};
 use axum::{
     extract::{DefaultBodyLimit, FromRequestParts, Path as AxPath, Query, State},
@@ -104,6 +107,23 @@ struct Args {
     /// client pipelining requests gets at most this many per connection.
     #[arg(long, default_value_t = 100)]
     max_requests_per_connection: usize,
+    /// Requests per second one client address may make before it is
+    /// refused 429 `rate_limited` with a Retry-After (a token bucket with
+    /// a one-second burst; the address table is bounded). 0 disables.
+    #[arg(long, default_value_t = 100.0)]
+    rate_limit_per_addr: f64,
+    /// Connections one peer address may hold at once; past the cap the
+    /// socket is closed at accept. Behind a trusted proxy the peer is the
+    /// proxy's edge — raise this there (the per-address request rate
+    /// still bounds each real client). 0 disables.
+    #[arg(long, default_value_t = 64)]
+    max_conns_per_addr: usize,
+    /// Proxy CIDR (repeatable) whose `CF-Connecting-IP` header names the
+    /// client address for the per-address limits — Cloudflare's ranges
+    /// when Cloudflare fronts this server. The header from any other
+    /// peer is ignored: anyone can set it.
+    #[arg(long = "trusted-proxy", value_parser = IpNet::parse)]
+    trusted_proxies: Vec<IpNet>,
     /// On SIGTERM or SIGINT: how long to let requests in flight finish,
     /// and then how long the engine may take to make everything it
     /// decided durable, before exiting non-zero instead of 0.
@@ -1106,6 +1126,9 @@ async fn main() -> Result<()> {
         write_stall: Duration::from_millis(args.write_stall_ms.max(1)),
         max_lifetime: Duration::from_secs(args.max_connection_secs.max(1)),
         max_requests: args.max_requests_per_connection.max(1),
+        rate_per_addr: args.rate_limit_per_addr.max(0.0),
+        max_conns_per_addr: args.max_conns_per_addr,
+        trusted_proxies: TrustedProxies(args.trusted_proxies),
     };
     let serve = serve_http(listener, router, limits, http_stopped);
     tokio::pin!(serve);
@@ -1153,8 +1176,9 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-/// Bounds on what one client connection may hold.
-#[derive(Debug, Clone, Copy)]
+/// Bounds on what one client connection — or one client address — may
+/// hold.
+#[derive(Debug, Clone)]
 struct HttpLimits {
     max_connections: usize,
     header_timeout: Duration,
@@ -1168,6 +1192,12 @@ struct HttpLimits {
     /// The last request a connection serves carries `Connection: close`:
     /// a client pipelining thousands of requests gets this many answers.
     max_requests: usize,
+    /// Requests/second one client address may make (0 = unlimited).
+    rate_per_addr: f64,
+    /// Open connections one peer address may hold (0 = unlimited).
+    max_conns_per_addr: usize,
+    /// Who may name the client address in `CF-Connecting-IP`.
+    trusted_proxies: TrustedProxies,
 }
 
 impl Default for HttpLimits {
@@ -1180,6 +1210,9 @@ impl Default for HttpLimits {
             write_stall: Duration::from_secs(10),
             max_lifetime: Duration::from_secs(600),
             max_requests: 100,
+            rate_per_addr: 100.0,
+            max_conns_per_addr: 64,
+            trusted_proxies: TrustedProxies::default(),
         }
     }
 }
@@ -1204,6 +1237,20 @@ async fn serve_http(
     let service = tower_http::timeout::RequestBodyDeadline::new(router, limits.body_deadline);
     let mut conns = tokio::task::JoinSet::new();
     let mut accept_failing = false;
+    // Per-address bounds (D-052): the rate table is one token bucket per
+    // client address in a bounded map; the connection count is per TCP
+    // peer (at accept time no request — and so no trusted-proxy header —
+    // has been read yet).
+    let rate_limiter = (limits.rate_per_addr > 0.0).then(|| {
+        Arc::new(std::sync::Mutex::new(RateLimit::new(
+            limits.rate_per_addr,
+            MAX_LIMITED_ADDRS,
+        )))
+    });
+    let conn_limit =
+        (limits.max_conns_per_addr > 0).then(|| ConnLimit::new(limits.max_conns_per_addr));
+    let trusted = limits.trusted_proxies.clone();
+    let mut conn_cap_refused = false;
     loop {
         let permit = tokio::select! {
             p = permits.clone().acquire_owned() => match p {
@@ -1218,11 +1265,11 @@ async fn serve_http(
                 continue;
             }
         };
-        let stream = tokio::select! {
+        let (stream, peer) = tokio::select! {
             r = listener.accept() => match r {
-                Ok((stream, _)) => {
+                Ok(accepted) => {
                     accept_failing = false;
-                    stream
+                    accepted
                 }
                 Err(e) => {
                     // Out of descriptors or a reset handshake: back off
@@ -1238,6 +1285,28 @@ async fn serve_http(
             },
             _ = &mut stop => break,
         };
+        // The per-peer connection cap: past it the socket is dropped at
+        // accept — the client sees a refused connection, not a queue slot
+        // held while one address spends them all.
+        let conn_guard = match &conn_limit {
+            Some(l) => match l.acquire(peer.ip()) {
+                Some(g) => {
+                    conn_cap_refused = false;
+                    Some(g)
+                }
+                None => {
+                    if !conn_cap_refused {
+                        eprintln!(
+                            "durable-server: per-address connection cap reached; refusing {}",
+                            peer.ip()
+                        );
+                        conn_cap_refused = true;
+                    }
+                    continue; // the semaphore permit returns with the socket
+                }
+            },
+            None => None,
+        };
         let io = TokioIo::new(StallGuard::new(stream, limits.write_stall));
         // The connection's `max_requests`-th answer says `Connection:
         // close`, so pipelining cannot keep one connection busy for ever.
@@ -1245,10 +1314,48 @@ async fn serve_http(
         let served = std::sync::atomic::AtomicUsize::new(0);
         let max_requests = limits.max_requests.max(1);
         let per_conn = Arc::new((svc, served));
+        let peer_ip = peer.ip();
+        let rate_limiter = rate_limiter.clone();
+        let trusted = trusted.clone();
         let handler =
             hyper::service::service_fn(move |req: hyper::Request<hyper::body::Incoming>| {
                 let per_conn = per_conn.clone();
+                let rate_limiter = rate_limiter.clone();
+                let trusted = trusted.clone();
                 async move {
+                    // The per-address request rate. Refused before auth:
+                    // a flood without a key is still a flood, and the
+                    // check is cheaper than the work behind it.
+                    if let Some(lim) = rate_limiter.as_ref() {
+                        let client = client_addr(
+                            peer_ip,
+                            &trusted,
+                            req.headers()
+                                .get("cf-connecting-ip")
+                                .and_then(|v| v.to_str().ok()),
+                        );
+                        let refused = lim
+                            .lock()
+                            .unwrap_or_else(|p| p.into_inner())
+                            .check(client, std::time::Instant::now())
+                            .err();
+                        if let Some(retry) = refused {
+                            let mut res = Response::builder()
+                                .status(StatusCode::TOO_MANY_REQUESTS)
+                                .header(header::CONTENT_TYPE, "application/json")
+                                .body(axum::body::Body::from(
+                                    r#"{"error":"rate limited","code":"rate_limited"}"#,
+                                ))
+                                .unwrap_or_else(|_| Response::new(axum::body::Body::empty()));
+                            let secs = (retry.as_secs_f64().ceil() as u64).max(1);
+                            res.headers_mut().insert(
+                                header::RETRY_AFTER,
+                                header::HeaderValue::try_from(secs.to_string())
+                                    .unwrap_or_else(|_| header::HeaderValue::from_static("1")),
+                            );
+                            return Ok(res);
+                        }
+                    }
                     let (svc, served) = &*per_conn;
                     let n = served.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
                     let mut res = tower::ServiceExt::oneshot(svc.clone(), req).await?;
@@ -1269,6 +1376,7 @@ async fn serve_http(
         let lifetime = limits.max_lifetime;
         conns.spawn(async move {
             let _permit = permit;
+            let _conn_guard = conn_guard;
             let mut conn = std::pin::pin!(conn);
             // A connection error (a reset, a timed-out head, a stalled
             // write) ends only that connection.
@@ -2574,6 +2682,167 @@ mod tests {
             "{}",
             String::from_utf8_lossy(&reply)
         );
+    }
+
+    /// D-052: one flooding address is refused 429 `rate_limited` with a
+    /// Retry-After while another address proceeds. The test runs with
+    /// loopback "trusted" so `CF-Connecting-IP` stands in for distinct
+    /// client addresses behind a proxy.
+    #[tokio::test]
+    async fn a_flooding_address_is_limited_while_another_proceeds() {
+        let limits = HttpLimits {
+            rate_per_addr: 5.0,
+            trusted_proxies: TrustedProxies(vec![
+                IpNet::parse("127.0.0.0/8").unwrap_or_else(|e| panic!("{e}"))
+            ]),
+            ..HttpLimits::default()
+        };
+        let (addr, _stop, _h) = serving(limits).await;
+        let client = reqwest::Client::new();
+        let get = |from: &str| {
+            client
+                .get(format!("http://{addr}/health"))
+                .header("cf-connecting-ip", from)
+                .send()
+        };
+        for i in 0..5 {
+            let res = get("198.51.100.7").await.unwrap_or_else(|e| panic!("{e}"));
+            assert_eq!(res.status().as_u16(), 200, "request {i}");
+        }
+        let refused = get("198.51.100.7").await.unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(refused.status().as_u16(), 429);
+        let retry = refused
+            .headers()
+            .get("retry-after")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.parse::<u64>().ok());
+        assert_eq!(retry, Some(1), "Retry-After seconds");
+        let body: serde_json::Value = refused.json().await.unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(body["code"], json!("rate_limited"), "{body}");
+        let other = get("203.0.113.9").await.unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(
+            other.status().as_u16(),
+            200,
+            "a different address is not punished for the flood"
+        );
+    }
+
+    /// D-052: `CF-Connecting-IP` from a peer outside the trusted ranges is
+    /// ignored — the requests are counted against the peer's own address.
+    /// Once the peer's bucket is drained the spoofed-header requests are
+    /// refused; had the header been believed, each would have landed in a
+    /// fresh bucket and sailed through.
+    #[tokio::test]
+    async fn a_spoofed_client_header_from_an_untrusted_peer_is_ignored() {
+        let limits = HttpLimits {
+            rate_per_addr: 5.0,
+            trusted_proxies: TrustedProxies(vec![
+                IpNet::parse("10.0.0.0/8").unwrap_or_else(|e| panic!("{e}"))
+            ]),
+            ..HttpLimits::default()
+        };
+        let (addr, _stop, _h) = serving(limits).await;
+        let client = reqwest::Client::new();
+        let health = format!("http://{addr}/health");
+        for i in 0..5 {
+            let res = client
+                .get(&health)
+                .send()
+                .await
+                .unwrap_or_else(|e| panic!("{e}"));
+            assert_eq!(res.status().as_u16(), 200, "request {i}");
+        }
+        // The peer's bucket is now drained. A spoofed header does not move
+        // the count to a different address.
+        let res = client
+            .get(&health)
+            .header("cf-connecting-ip", "198.51.100.7")
+            .send()
+            .await
+            .unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(res.status().as_u16(), 429, "the header was believed");
+    }
+
+    /// D-052: from a trusted peer the header names the client address, so
+    /// two "clients" on one connection get separate buckets.
+    #[tokio::test]
+    async fn a_trusted_proxy_names_the_client() {
+        let limits = HttpLimits {
+            rate_per_addr: 5.0,
+            trusted_proxies: TrustedProxies(vec![
+                IpNet::parse("127.0.0.0/8").unwrap_or_else(|e| panic!("{e}"))
+            ]),
+            ..HttpLimits::default()
+        };
+        let (addr, _stop, _h) = serving(limits).await;
+        let client = reqwest::Client::new();
+        let health = format!("http://{addr}/health");
+        for _ in 0..6 {
+            client
+                .get(&health)
+                .header("cf-connecting-ip", "198.51.100.7")
+                .send()
+                .await
+                .unwrap_or_else(|e| panic!("{e}"));
+        }
+        // The flood drained 198.51.100.7's bucket, not the peer's: a
+        // headerless request (counted by peer address) still proceeds.
+        let res = client
+            .get(&health)
+            .send()
+            .await
+            .unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(
+            res.status().as_u16(),
+            200,
+            "the flood was counted against the peer, not the header"
+        );
+    }
+
+    /// D-052: past the per-peer connection cap the socket is closed at
+    /// accept — it never reaches a request — while the connections under
+    /// the cap keep serving.
+    #[tokio::test]
+    async fn the_per_peer_connection_cap_closes_the_excess() {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+        let limits = HttpLimits {
+            max_conns_per_addr: 2,
+            ..HttpLimits::default()
+        };
+        let (addr, _stop, _h) = serving(limits).await;
+        let a = tokio::net::TcpStream::connect(addr)
+            .await
+            .unwrap_or_else(|e| panic!("{e}"));
+        let _b = tokio::net::TcpStream::connect(addr)
+            .await
+            .unwrap_or_else(|e| panic!("{e}"));
+        let mut extra = tokio::net::TcpStream::connect(addr)
+            .await
+            .unwrap_or_else(|e| panic!("{e}"));
+        assert!(
+            closed_within(&mut extra, Duration::from_secs(5)).await,
+            "a third connection from one peer was kept"
+        );
+        // A slot frees when a held connection closes.
+        drop(_b);
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let mut c = tokio::net::TcpStream::connect(addr)
+            .await
+            .unwrap_or_else(|e| panic!("{e}"));
+        c.write_all(b"GET /health HTTP/1.1\r\nhost: x\r\nconnection: close\r\n\r\n")
+            .await
+            .unwrap_or_else(|e| panic!("{e}"));
+        let mut reply = Vec::new();
+        tokio::time::timeout(Duration::from_secs(5), c.read_to_end(&mut reply))
+            .await
+            .unwrap_or_else(|_| panic!("/health never answered"))
+            .unwrap_or_else(|e| panic!("{e}"));
+        assert!(
+            reply.starts_with(b"HTTP/1.1 200"),
+            "{}",
+            String::from_utf8_lossy(&reply)
+        );
+        drop(a);
     }
 
     /// Review U11: base64 behaviour was checked by one valid input. Every

@@ -854,3 +854,30 @@ convention; these seed the contract's prescribed directions.
   tested (the route is in both key tests, and the spec round-trips), and
   the engine is unchanged. Asked for by the same observability add-on's
   controlled recovery, through this public contract only.
+- **D-052 — Exposure is bounded per address in the server, not delegated
+  to the proxy.** OPERATING.md's known limits admitted two gaps a
+  reverse proxy was supposed to cover: no per-client request rate and no
+  per-address connection cap. Caddy has no built-in rate limiting (it
+  needs a plugin) and Cloudflare sits in front anyway, so the bounds
+  live in `serve_http`: a token bucket per client address
+  (`--rate-limit-per-addr`, 100/s with a one-second burst; past it, 429
+  `rate_limited` with a `Retry-After`), and a per-TCP-peer connection
+  count (`--max-conns-per-addr`, 64; past it the socket is dropped at
+  accept). The client address is the TCP peer, or `CF-Connecting-IP`
+  when the peer is inside a `--trusted-proxy` CIDR — the header from
+  any other peer is ignored, because anyone can set it and a believed
+  header would hand a flooder a fresh address per request. The bucket
+  table is bounded (`MAX_LIMITED_ADDRS`, ~4 MiB): entries idle a minute
+  are reclaimed when it fills, and addresses that still do not fit share
+  one overflow bucket, so a spray of distinct addresses limits itself
+  rather than buying memory with evictions. The connection count is
+  bounded by `max_connections` itself. Rate refusal happens before auth:
+  a flood without a key is still a flood, and the check is cheaper than
+  the work behind it. Behind a trusted proxy the conn cap applies to the
+  proxy's edges — raise it to what the proxy legitimately holds; the
+  request rate still bounds each real client. Proven against a real
+  listener: one flooding address is 429'd while another proceeds, a
+  spoofed header from an untrusted peer is ignored, a trusted peer's
+  header names the client, a million distinct addresses stay inside the
+  bound, and the third connection from one peer is closed while its
+  first two keep serving.
