@@ -1,0 +1,32 @@
+{
+  "machine": {
+    "host": "maintainer-laptop",
+    "platform": "darwin/arm64",
+    "cpu": "Apple M2 Pro",
+    "cores": 12,
+    "mem_gb": 32,
+    "date": "2026-11-18T23:24:03.720Z",
+    "commit": "b2c503a"
+  },
+  "scenario": "admission",
+  "params": {
+    "parallel_submits": 1500,
+    "cmd_capacity": 1024,
+    "smoke": true
+  },
+  "http_codes": {
+    "401": 639,
+    "tcp:ECONNRESET": 861
+  },
+  "tcp_refusals": 861,
+  "thresholds": {
+    "codes": "only 200/409/503 or a tcp refusal",
+    "refusals": "the bound is actually hit"
+  },
+  "verdict": "FAIL",
+  "failures": [
+    "every answer is an honest code or a tcp refusal",
+    "the flood hit the bound (some 503s)"
+  ],
+  "note": "over-capacity must refuse (503 reserve / 409), never queue silently"
+}

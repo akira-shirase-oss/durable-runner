@@ -10,10 +10,16 @@
 //   compact    steady submits while /admin/compact runs repeatedly
 //   sustained  the million-op run: fixed submit rate for a duration
 //
+// Flags: --smoke picks the small local sizes (perf/battery.sh runs these);
+// the full sizes are what .github/workflows/load.yml runs on CI. --p99=MS
+// moves the declared latency bound. A scenario exits non-zero when its
+// verdict is FAIL so a battery can gate on it.
+//
 // Evidence rules: machine spec + commit hash recorded in every result;
 // a missed threshold is a failing result, kept — never rerun to green.
 import { spawn, execFileSync } from 'node:child_process';
 import fs from 'node:fs';
+import net from 'node:net';
 import os from 'node:os';
 import path from 'node:path';
 
@@ -34,6 +40,12 @@ const INPUT_B64 = Buffer.from('load').toString('base64');
 // from DURABLE_API_KEY, so one random key per harness run serves both.
 const API_KEY = process.env.DURABLE_API_KEY ?? (await import('node:crypto')).randomBytes(32).toString('hex');
 const AUTH = { authorization: `Bearer ${API_KEY}` };
+const SMOKE = 'smoke' in args;
+// The declared p99 bound for every scenario that measures latency. The
+// pre-group-commit regime failed the gate at p99 24-30 s; the current code
+// measures ~40 ms at 100 submits/s, so 2 s is 50x headroom over the
+// measurement and still catches that regression.
+const P99_MS = Number(args.p99 ?? 2000);
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const now = () => Date.now();
@@ -55,7 +67,53 @@ function writeResult(name, data) {
   const file = `${ROOT}/perf/results/${stamp}-${name}.json`;
   fs.writeFileSync(file, JSON.stringify({ machine: machine(), scenario: name, ...data }, null, 2));
   console.log(`result -> ${file}`);
+  return data;
 }
+
+// A verdict is computed from named checks, so a result says exactly which
+// bound it missed. Misses are kept, never rerun to green.
+function verdictOf(checks) {
+  const failures = checks.filter(([, ok]) => !ok).map(([label]) => label);
+  return {
+    verdict: failures.length ? 'FAIL' : 'pass',
+    ...(failures.length ? { failures } : {}),
+  };
+}
+
+// --- spawned children ------------------------------------------------------
+// Every spawned child is tracked and SIGKILLed when the harness exits — a
+// crashed scenario must not leave a server holding the port (an orphan then
+// answers the next run's /health with the *old* run's API key: 401s and
+// resets that look like a product failure).
+const kids = new Set();
+function track(p) {
+  kids.add(p);
+  p.on('exit', () => kids.delete(p));
+  return p;
+}
+process.on('exit', () => {
+  for (const k of kids) {
+    try { k.kill('SIGKILL'); } catch { /* already gone */ }
+  }
+});
+
+// Something is already listening on a port the harness wants? Stop rather
+// than run against it — see above.
+function portFree(port) {
+  return new Promise((res) => {
+    const s = net.connect(port, '127.0.0.1');
+    s.once('connect', () => { s.end(); res(false); });
+    s.once('error', () => res(true));
+  });
+}
+async function assertFree(port, what) {
+  if (!(await portFree(port))) {
+    console.error(`${what} port ${port} already has a listener — a stale process from an earlier run? pick another --port/--hport`);
+    process.exit(3);
+  }
+}
+await assertFree(PORT, 'server');
+await assertFree(HPORT, 'handler');
 
 // --- handler fixture -------------------------------------------------------
 // modes: ok (200), stall (sleep ms), chaos (random 500s + hangs)
@@ -85,15 +143,18 @@ function startHandler(mode, stallMs = 0) {
       });
     }).listen(${HPORT}, '127.0.0.1');
   `;
-  const p = spawn('node', ['-e', src], { stdio: 'ignore' });
+  const p = track(spawn('node', ['-e', src], { stdio: 'ignore' }));
   return p;
 }
 
 async function startServer(journalDir, extra = []) {
-  const p = spawn(SRV, ['--journal', journalDir, '--listen', `127.0.0.1:${PORT}`,
+  const p = track(spawn(SRV, ['--journal', journalDir, '--listen', `127.0.0.1:${PORT}`,
     '--handler', `step=http://127.0.0.1:${HPORT}/step`, ...extra],
-    { stdio: 'ignore', env: { ...process.env, DURABLE_API_KEY: API_KEY } });
+    { stdio: 'ignore', env: { ...process.env, DURABLE_API_KEY: API_KEY } }));
   for (let i = 0; i < 100; i++) {
+    // If the child died (EADDRINUSE, a bad flag) while something still
+    // answers /health, the listener is not ours — say so, don't run on it.
+    if (p.exitCode !== null) throw new Error(`durable-server exited (code ${p.exitCode}) before becoming healthy`);
     try { await fetch(`${API}/health`); return p; } catch { await sleep(50); }
   }
   throw new Error('server never became healthy');
@@ -101,14 +162,23 @@ async function startServer(journalDir, extra = []) {
 
 async function submit(opKey, steps = 1) {
   const t0 = performance.now();
-  const r = await fetch(`${API}/jobs`, {
-    method: 'POST', headers: { 'content-type': 'application/json', ...AUTH },
-    body: JSON.stringify({
-      op_key: opKey,
-      spec: { version: 1, steps: Array.from({ length: steps }, (_, i) => ({ name: `s${i}`, handler: 'step' })), input_b64: INPUT_B64 },
-    }),
-  });
-  return { status: r.status, ms: performance.now() - t0, body: await r.text() };
+  try {
+    const r = await fetch(`${API}/jobs`, {
+      method: 'POST', headers: { 'content-type': 'application/json', ...AUTH },
+      body: JSON.stringify({
+        op_key: opKey,
+        spec: { version: 1, steps: Array.from({ length: steps }, (_, i) => ({ name: `s${i}`, handler: 'step' })), input_b64: INPUT_B64 },
+      }),
+    });
+    return { status: r.status, ms: performance.now() - t0, body: await r.text() };
+  } catch (e) {
+    // A refused or reset connection is backpressure at the TCP layer (the
+    // kernel's accept queue is full): record it under its own code so a
+    // flood shows kernel refusals next to the server's HTTP 503s instead of
+    // crashing the harness with no result at all.
+    const code = e.cause?.code ?? e.code ?? 'error';
+    return { status: `tcp:${code}`, ms: performance.now() - t0, body: '' };
+  }
 }
 
 // Run counts come from the bounded diagnostics (counts by state, never
@@ -122,7 +192,7 @@ const pct = (a, p) => a.length ? a.sort((x, y) => x - y)[Math.min(a.length - 1, 
 
 // --- scenarios -------------------------------------------------------------
 async function runSubmit() {
-  const rate = Number(args.rate ?? 50), secs = Number(args.seconds ?? 60);
+  const rate = Number(args.rate ?? (SMOKE ? 20 : 50)), secs = Number(args.seconds ?? (SMOKE ? 10 : 60));
   const dir = fs.mkdtempSync(`${os.tmpdir()}/dr-load-`);
   const h = startHandler('ok'); const s = await startServer(`${dir}/journal`);
   const lat = []; const codes = {}; let sent = 0, accepted = 0;
@@ -142,16 +212,23 @@ async function runSubmit() {
   await sleep(8000); // let the last submissions drain
   const done = (await diag()).states.done ?? 0;
   h.kill(); s.kill();
-  writeResult('submit', {
-    params: { rate_per_s: rate, seconds: secs, fsync: 'per-record (default)' },
+  const p99 = pct(lat, 0.99);
+  const r = writeResult('submit', {
+    params: { rate_per_s: rate, seconds: secs, fsync: 'per-record (default)', smoke: SMOKE },
     sent, accepted, done_of_last_drain: done, http_codes: codes,
-    latency_ms: { p50: pct(lat, 0.5), p99: pct(lat, 0.99), max: pct(lat, 1) },
-    verdict: accepted === sent && done >= accepted * 0.99 ? 'pass' : 'FAIL',
+    latency_ms: { p50: pct(lat, 0.5), p99, max: pct(lat, 1) },
+    thresholds: { accepted: 'every submit (in-capacity rate)', done: '>=99% of accepted', p99_ms: `<${P99_MS}` },
+    ...verdictOf([
+      ['every submit accepted', accepted === sent],
+      ['>=99% drained to done', done >= accepted * 0.99],
+      [`p99 < ${P99_MS}ms`, p99 !== null && p99 < P99_MS],
+    ]),
   });
+  return r.verdict === 'pass';
 }
 
 async function runReplay() {
-  const events = Number(args.events ?? 100_000);
+  const events = Number(args.events ?? (SMOKE ? 10_000 : 100_000));
   const dir = fs.mkdtempSync(`${os.tmpdir()}/dr-load-`);
   const h = startHandler('ok'); let s = await startServer(`${dir}/journal`);
   // Fill the journal: each submit = 1 event, each step lifecycle ~3 more.
@@ -166,15 +243,20 @@ async function runReplay() {
   const replayMs = now() - t0;
   const recovered = (await diag()).live_runs;
   h.kill(); s.kill();
-  writeResult('replay', {
-    params: { target_events: events, runs, steps_per_run: steps },
+  const r = writeResult('replay', {
+    params: { target_events: events, runs, steps_per_run: steps, smoke: SMOKE },
     replay_ms: replayMs, runs_recovered: recovered,
-    verdict: recovered === runs ? 'pass' : 'FAIL',
+    thresholds: { recovered: 'every filled run', replay_ms: '<30000' },
+    ...verdictOf([
+      ['every filled run recovered', recovered === runs],
+      ['replay under 30 s', replayMs < 30_000],
+    ]),
   });
+  return r.verdict === 'pass';
 }
 
 async function runStall() {
-  const stallMs = Number(args.stall_ms ?? 30000), n = Number(args.runs ?? 20);
+  const stallMs = Number(args.stall_ms ?? (SMOKE ? 6_000 : 30_000)), n = Number(args.runs ?? (SMOKE ? 5 : 20));
   const dir = fs.mkdtempSync(`${os.tmpdir()}/dr-load-`);
   const h = startHandler('stall', stallMs);
   const s = await startServer(`${dir}/journal`, ['--step-timeout-ms', '2000']);
@@ -187,34 +269,50 @@ async function runStall() {
   await sleep(stallMs + 15_000);
   const states = (await diag()).states;
   h.kill(); s.kill();
-  writeResult('stall', {
-    params: { runs: n, handler_stall_ms: stallMs, step_deadline_ms: 2000 },
+  const r = writeResult('stall', {
+    params: { runs: n, handler_stall_ms: stallMs, step_deadline_ms: 2000, smoke: SMOKE },
     states,
-    verdict: (states.done ?? 0) === n ? 'pass' : 'FAIL',
+    thresholds: { done: 'every run reconciled to done' },
+    ...verdictOf([['every run reconciled to done', (states.done ?? 0) === n]]),
     note: 'stall past deadline -> ReplyLost -> probe (handler saw the key) -> reconciled done, never repeated',
   });
+  return r.verdict === 'pass';
 }
 
 async function runAdmission() {
   const dir = fs.mkdtempSync(`${os.tmpdir()}/dr-load-`);
   const h = startHandler('stall', 60000); // keep in-flight slots occupied
   const s = await startServer(`${dir}/journal`);
-  const codes = {}; const N = Number(args.n ?? 3000);
+  const codes = {}; const N = Number(args.n ?? (SMOKE ? 1_500 : 3_000));
   await Promise.all(Array.from({ length: N }, async (_, i) => {
     const r = await submit(`flood-${i}`);
     codes[r.status] = (codes[r.status] ?? 0) + 1;
   }));
   h.kill(); s.kill();
-  writeResult('admission', {
-    params: { parallel_submits: N, cmd_capacity: 1024 },
-    http_codes: codes,
-    verdict: (codes[200] ?? 0) + (codes[503] ?? 0) + (codes[409] ?? 0) === N ? 'pass' : 'FAIL',
+  const honest = (codes[200] ?? 0) + (codes[503] ?? 0) + (codes[409] ?? 0);
+  // tcp:* codes are kernel-level refusals (accept queue full): bounded
+  // backpressure too, recorded separately from the server's chosen 503s.
+  const tcp = Object.keys(codes)
+    .filter((k) => k.startsWith('tcp:'))
+    .reduce((a, k) => a + codes[k], 0);
+  const r = writeResult('admission', {
+    params: { parallel_submits: N, cmd_capacity: 1024, smoke: SMOKE },
+    http_codes: codes, tcp_refusals: tcp,
+    thresholds: { codes: 'only 200/409/503 or a tcp refusal', refusals: 'a bound is actually hit' },
+    ...verdictOf([
+      ['every answer is an honest code or a tcp refusal', honest + tcp === N],
+      // Either layer may refuse first: the server's queue bound (503) or
+      // the kernel's accept queue (tcp reset) — macOS's is shallow enough
+      // that it usually wins locally; CI shows the split.
+      ['the flood hit a bound (503s or tcp refusals)', (codes[503] ?? 0) + tcp > 0],
+    ]),
     note: 'over-capacity must refuse (503 reserve / 409), never queue silently',
   });
+  return r.verdict === 'pass';
 }
 
 async function runCompact() {
-  const secs = Number(args.seconds ?? 30);
+  const secs = Number(args.seconds ?? (SMOKE ? 15 : 30));
   const dir = fs.mkdtempSync(`${os.tmpdir()}/dr-load-`);
   const h = startHandler('ok'); const s = await startServer(`${dir}/journal`);
   const lat = []; const codes = {}; let sent = 0;
@@ -236,17 +334,24 @@ async function runCompact() {
   await submits; await sleep(3000);
   const runsAfter = (await diag()).live_runs;
   h.kill(); s.kill();
-  writeResult('compact-under-load', {
-    params: { seconds: secs, submit_interval_ms: 20 },
+  const p99 = pct(lat, 0.99);
+  const r = writeResult('compact-under-load', {
+    params: { seconds: secs, submit_interval_ms: 20, smoke: SMOKE },
     submitted: sent, http_codes: codes, compactions,
     runs_after: runsAfter,
-    latency_ms: { p50: pct(lat, 0.5), p99: pct(lat, 0.99) },
-    verdict: Object.keys(codes).every((c) => c === '200') && compactions.every((c) => c.status === 200) ? 'pass' : 'FAIL',
+    latency_ms: { p50: pct(lat, 0.5), p99 },
+    thresholds: { submits: 'all 200', compactions: 'all 200', p99_ms: `<${P99_MS}` },
+    ...verdictOf([
+      ['every submit accepted', Object.keys(codes).every((c) => c === '200')],
+      ['every compaction succeeded', compactions.every((c) => c.status === 200)],
+      [`p99 < ${P99_MS}ms`, p99 !== null && p99 < P99_MS],
+    ]),
   });
+  return r.verdict === 'pass';
 }
 
 async function runSustained() {
-  const rate = Number(args.rate ?? 50), total = Number(args.total ?? 1_000_000);
+  const rate = Number(args.rate ?? (SMOKE ? 50 : 100)), total = Number(args.total ?? (SMOKE ? 5_000 : 1_000_000));
   const dir = fs.mkdtempSync(`${os.tmpdir()}/dr-load-`);
   const h = startHandler('ok'); const s = await startServer(`${dir}/journal`);
   const lat = []; const codes = {}; let sent = 0, accepted = 0;
@@ -269,14 +374,21 @@ async function runSustained() {
   const done = (await diag()).states.done ?? 0;
   const jsize = execFileSync('du', ['-sk', `${dir}/journal`]).toString().split('\t')[0];
   h.kill(); s.kill();
-  writeResult('sustained', {
-    params: { rate_per_s: rate, target_submits: total, fsync: 'per-record' },
+  const p99 = pct(lat, 0.99);
+  const r = writeResult('sustained', {
+    params: { rate_per_s: rate, target_submits: total, fsync: 'per-record', smoke: SMOKE },
     sent, accepted, done_after_drain: done, http_codes: codes,
     wall_clock_s: Math.round((now() - t0) / 1000),
     journal_kb: Number(jsize),
-    latency_ms: { p50: pct(lat, 0.5), p99: pct(lat, 0.99), max: pct(lat, 1) },
-    verdict: accepted === sent && done === sent ? 'pass' : 'FAIL',
+    latency_ms: { p50: pct(lat, 0.5), p99, max: pct(lat, 1) },
+    thresholds: { accepted: 'every submit', done: 'every accepted run', p99_ms: `<${P99_MS}` },
+    ...verdictOf([
+      ['every submit accepted', accepted === sent],
+      ['every accepted run finished', done === sent],
+      [`p99 < ${P99_MS}ms`, p99 !== null && p99 < P99_MS],
+    ]),
   });
+  return r.verdict === 'pass';
 }
 
 const runners = {
@@ -287,4 +399,5 @@ if (!runners[scenario]) {
   console.error(`unknown scenario ${scenario}; choices: ${Object.keys(runners).join(', ')}`);
   process.exit(2);
 }
-await runners[scenario]();
+const ok = await runners[scenario]();
+process.exit(ok === false ? 1 : 0);

@@ -1,0 +1,76 @@
+# The million-scale load battery on hosted runners — the ship gate's heavy
+# half (laptop smokes stay local: `perf/battery.sh`). Manual only: a full run
+# is ~3 h. Results land in perf/results/ with machine spec + commit, are
+# uploaded as an artifact, and are committed back to the branch — the
+# evidence rule requires them in the repo, and a FAIL is committed too
+# (misses are evidence, never rerun to green).
+name: load
+
+on:
+  workflow_dispatch:
+    inputs:
+      battery:
+        description: "full = the million-scale battery (~3 h); smoke = the quick local check"
+        required: true
+        default: "full"
+        type: choice
+        options: [full, smoke]
+
+# Commits the new perf/results JSONs back to the branch the dispatch ran on.
+permissions:
+  contents: write
+
+concurrency:
+  # Never cancel a battery halfway: a partial run is not evidence, and two
+  # batteries on one runner would contaminate each other's numbers.
+  group: load-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  battery:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    env:
+      BATTERY: ${{ inputs.battery }}
+      RUN_ID: ${{ github.run_id }}
+      PERF_HOST_LABEL: github-ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.ref_name }}
+
+      - name: Install the pinned Rust toolchain (rust-toolchain.toml)
+        run: |
+          rustup --version
+          rustup toolchain install || rustup show
+          cargo --version
+
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: "22"
+
+      - name: Build the release server the harness spawns
+        run: cargo build --release --locked -p durable-server
+
+      - name: Battery
+        run: perf/battery.sh "--$BATTERY"
+
+      # Upload and commit even on a failed battery: the miss is evidence.
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: always()
+        with:
+          name: perf-results-$RUN_ID
+          path: perf/results/*.json
+          if-no-files-found: warn
+
+      - name: Commit new results to the branch
+        if: always()
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add perf/results/
+          git diff --cached --quiet && { echo "no new results"; exit 0; }
+          git commit -m "perf: $BATTERY battery results (run $RUN_ID)"
+          git push
