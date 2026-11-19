@@ -48,4 +48,20 @@ run 0 nope reads-v2
 # A binary that cannot report its version: fail closed.
 run 1 jv1 broken
 
+# Fail-closed journal states — an unreadable or damaged journal is a
+# refusal, never a silent v1.
+install -d "$work/jperm/gen-000001"; printf '{"v":1}\n' >"$work/jperm/gen-000001/journal.log"
+chmod 000 "$work/jperm"; run 1 jperm reads-v2; chmod 755 "$work/jperm"
+
+install -d "$work/jnolog/gen-000001"; run 1 jnolog reads-v2          # gen dir, no journal.log
+
+install -d "$work/jnoperm/gen-000001"; printf '{"v":9}\n' >"$work/jnoperm/gen-000001/journal.log"
+chmod 000 "$work/jnoperm/gen-000001/journal.log"; run 1 jnoperm reads-v2
+chmod 644 "$work/jnoperm/gen-000001/journal.log"
+
+install -d "$work/jmani"; printf '{"generation":1}\n' >"$work/jmani/manifest.json"
+run 1 jmani reads-v2                                                  # manifest but no gen dir
+
+install -d "$work/jlogdir/gen-000001/journal.log"; run 1 jlogdir reads-v2  # journal.log is a dir
+
 (( fails == 0 )) && echo "format-guard tests: all pass" || exit 1
