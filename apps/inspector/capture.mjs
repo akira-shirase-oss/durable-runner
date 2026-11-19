@@ -15,12 +15,12 @@ import { fileURLToPath } from 'node:url';
 
 const ROOT = path.dirname(path.dirname(path.dirname(fileURLToPath(import.meta.url))));
 const SRV = `${ROOT}/target/release/durable-server`;
-const UI_DIR = `${ROOT}/apps/inspector/build`;
 const args = {};
 for (const a of process.argv.slice(2).filter((a) => a.startsWith('--'))) {
   const [k, v] = a.slice(2).split('=');
   args[k] = v;
 }
+const UI_DIR = path.resolve(args['ui-dir'] ?? `${ROOT}/apps/inspector/build`);
 const PORT = Number(args.port ?? 53344);
 const HPORT = Number(args.hport ?? 53345);
 const OUT = path.resolve(args.out ?? 'perf/ui/shots');
