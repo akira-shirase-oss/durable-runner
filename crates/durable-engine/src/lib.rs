@@ -245,7 +245,9 @@ impl EngineCore {
 
     /// `open` with explicit journal options.
     pub fn open_with(dir: &Path, opts: JournalOptions) -> Result<Self, EngineError> {
+        let t_open = std::time::Instant::now();
         let journal = Journal::open_with(dir, opts)?;
+        let t_journal_open = t_open.elapsed();
         let generation = journal.generation();
         let discarded_tail = journal.discarded_tail();
         let gdir = durable_journal::gen_dir_path(dir, generation);
@@ -309,6 +311,43 @@ impl EngineCore {
         }
         // One record at a time: restart memory is the index, not the log.
         let mut max_run = core.next_run.saturating_sub(1);
+        // DURABLE_PROFILE_OPEN breaks the replay into phases (restart
+        // cost is decode-bound; see perf/LOAD_MATRIX.md restart-ready).
+        let prof = std::env::var_os("DURABLE_PROFILE_OPEN").is_some();
+        if prof {
+            let t_journal = std::time::Instant::now();
+            let (mut t_read, mut t_decode, mut t_apply) = (
+                std::time::Duration::ZERO,
+                std::time::Duration::ZERO,
+                std::time::Duration::ZERO,
+            );
+            let mut n_records = 0u64;
+            if let Some(records) = durable_journal::records(&gdir)? {
+                for r in records {
+                    let t = std::time::Instant::now();
+                    let r = r?;
+                    t_read += t.elapsed();
+                    let t = std::time::Instant::now();
+                    let env: Envelope = serde_json::from_slice(&r.payload)?;
+                    t_decode += t.elapsed();
+                    max_run = max_run.max(env.run);
+                    let t = std::time::Instant::now();
+                    core.apply_committed(RunId(env.run), env.event, env.at)?;
+                    t_apply += t.elapsed();
+                    n_records += 1;
+                }
+            }
+            let t_replay = t_journal.elapsed();
+            let t = std::time::Instant::now();
+            core.next_run = max_run + 1;
+            core.recount();
+            eprintln!(
+                "PROFILE records={n_records} journal_open={t_journal_open:?} \
+                 replay_total={t_replay:?} [read={t_read:?} decode={t_decode:?} apply={t_apply:?}] recount={:?}",
+                t.elapsed()
+            );
+            return Ok(core);
+        }
         if let Some(records) = durable_journal::records(&gdir)? {
             for r in records {
                 let r = r?;
