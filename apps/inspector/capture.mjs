@@ -125,12 +125,19 @@ try {
           const doc = document.scrollingElement;
           const btn = [...document.querySelectorAll('table.runlist td button.danger')].at(-1);
           const r = btn ? btn.getBoundingClientRect() : null;
-          return { sw: doc.scrollWidth, iw: window.innerWidth, box: r ? { l: r.left, r: r.right } : null };
+          const keys = [...document.querySelectorAll('table.runlist td.key')].map((el) => ({
+            text: el.textContent, sw: el.scrollWidth, cw: el.clientWidth,
+          }));
+          return { sw: doc.scrollWidth, iw: window.innerWidth, box: r ? { l: r.left, r: r.right } : null, keys };
         });
         if (m.sw > m.iw) layoutFailures.push(`${theme}-390: scrollWidth ${m.sw} > innerWidth ${m.iw}`);
         if (!m.box) layoutFailures.push(`${theme}-390: no cancel button rendered on the runs table`);
         else if (m.box.l < 0 || m.box.r > m.iw)
           layoutFailures.push(`${theme}-390: cancel button at [${m.box.l.toFixed(0)},${m.box.r.toFixed(0)}] escapes ${m.iw}px`);
+        // Keys are the run's identity: short ones must never truncate.
+        const cut = m.keys.filter((k) => k.text.length < 20 && k.sw > k.cw);
+        if (cut.length)
+          layoutFailures.push(`${theme}-390: ${cut.length} key(s) under 20 chars truncated: ${cut.map((k) => JSON.stringify(k.text)).join(', ')}`);
       }
       const views = [
         ['detail', async () => {
