@@ -32,6 +32,43 @@ While the unit restarts the dial fails; Caddy's `lb_try_duration 15s`
 holds each request and retries — a client sees added latency, never an
 error, and nothing reaches the old process so **even a submit is safe**.
 
+## Capacity planning (measured, not assumed)
+
+A submit is acknowledged after the journal commit; the run then executes
+at machine speed. Accepted-but-unfinished runs are bounded at 100,000
+live — when the offered rate outruns the completion rate long enough for
+the backlog to reach that bound, admission refuses `503
+{"code":"at_capacity"}` rather than queueing silently (retrying after
+drain is safe; the submit's idempotency key dedupes). Plan the offered
+rate from the *completion* ceiling, not the accept ceiling.
+
+Measured ceilings (development observations, per-record fsync via group
+commit):
+
+| machine | result |
+|---|---|
+| 12-core Apple M2 Pro (this Mac) | **100 submits/s sustained** — 1,000,000/1,000,000 accepted and done, p99 41 ms (`cdbdfb8`) |
+| 4-core `ubuntu-24.04` GitHub runner | **~85 completions/s** — a 100/s offer accepted 835,397 then refused 161,535 honestly at the live bound; p99 hit the 10 s reply deadline (`c94edfd`, run 44440111562, kept in `perf/results/`) |
+
+The droplet's own ceiling is **measured at deploy, not assumed** — a
+2-vCPU host lands below the laptop. After install, run `deploy/smoke.sh`,
+then a short sustained probe. The harness needs `nodejs` on the droplet
+(`apt-get install -y nodejs`); it spawns its own server + handler on the
+ports given, against a scratch journal — it does not touch the running
+unit's state, though it does share the machine, so run it before real
+traffic:
+
+```sh
+cd $CHECKOUT   # the checkout's target/release/durable-server is what gets measured
+node perf/load.mjs sustained --rate=50 --total=30000 --port=58399 --hport=58398
+# watch done-rate + p99 in the result; repeat a rung above/below to bracket the ceiling
+```
+
+Record the droplet's sustained completions/s here before pointing real
+traffic at it; if the probe's refused share is nonzero, the offered rate
+is above the machine, not above the product's bounds. Ceilings move with
+disk latency (fsync) more than with cores.
+
 ## 1. Host + package
 
 ```sh
