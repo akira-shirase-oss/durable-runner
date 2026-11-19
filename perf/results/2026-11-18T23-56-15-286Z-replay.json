@@ -1,0 +1,25 @@
+{
+  "machine": {
+    "host": "maintainer-laptop",
+    "platform": "darwin/arm64",
+    "cpu": "Apple M2 Pro",
+    "cores": 12,
+    "mem_gb": 32,
+    "date": "2026-11-18T23:56:15.287Z",
+    "commit": "f267f35"
+  },
+  "scenario": "replay",
+  "params": {
+    "target_events": 10000,
+    "runs": 1112,
+    "steps_per_run": 4,
+    "smoke": true
+  },
+  "replay_ms": 55,
+  "runs_recovered": 1112,
+  "thresholds": {
+    "recovered": "every filled run",
+    "replay_ms": "<30000"
+  },
+  "verdict": "pass"
+}

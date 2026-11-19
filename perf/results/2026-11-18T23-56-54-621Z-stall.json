@@ -1,0 +1,26 @@
+{
+  "machine": {
+    "host": "maintainer-laptop",
+    "platform": "darwin/arm64",
+    "cpu": "Apple M2 Pro",
+    "cores": 12,
+    "mem_gb": 32,
+    "date": "2026-11-18T23:56:54.621Z",
+    "commit": "f267f35"
+  },
+  "scenario": "stall",
+  "params": {
+    "runs": 5,
+    "handler_stall_ms": 6000,
+    "step_deadline_ms": 2000,
+    "smoke": true
+  },
+  "states": {
+    "done": 5
+  },
+  "thresholds": {
+    "done": "every run reconciled to done"
+  },
+  "verdict": "pass",
+  "note": "stall past deadline -> ReplyLost -> probe (handler saw the key) -> reconciled done, never repeated"
+}

@@ -1,0 +1,34 @@
+# Caddy for the Durable Runner droplet (deploy/CREATE.md + docs/DEPLOY.md).
+# Cloudflare terminates visitor TLS and connects here with "Full (strict)"
+# and Authenticated Origin Pulls, so Caddy serves Cloudflare's Origin
+# Certificate AND requires a client certificate signed by Cloudflare's
+# origin-pull CA — a direct hit on the droplet's 443 fails the handshake
+# even before ufw's range check (which allows only Cloudflare anyway).
+{
+	auto_https off
+	servers {
+		# Written by deploy/cloudflare-ips.sh from Cloudflare's ranges.
+		import /etc/caddy/cloudflare-trusted.caddy
+	}
+}
+
+durable.404human.dev:443 {
+	tls /etc/caddy/origin.pem /etc/caddy/origin.key {
+		# Authenticated Origin Pulls: only connections presenting a cert
+		# signed by Cloudflare's origin-pull CA are let in.
+		client_auth {
+			mode require_and_verify
+			trusted_ca_cert_file /etc/caddy/cloudflare-origin-pull-ca.pem
+		}
+	}
+	encode zstd gzip
+	reverse_proxy 127.0.0.1:58300 {
+		# An upgrade is a restart plus a replay: while the unit is down
+		# the dial fails, and Caddy keeps the request and retries the
+		# upstream for up to 15s. Nothing reached the old process, so
+		# even a submit is safe to retry — the client sees added latency,
+		# not an error. (Measured: the restart table in docs/DEPLOY.md.)
+		lb_try_duration 15s
+		lb_try_interval 250ms
+	}
+}

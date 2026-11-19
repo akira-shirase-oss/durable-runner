@@ -854,3 +854,122 @@ convention; these seed the contract's prescribed directions.
   tested (the route is in both key tests, and the spec round-trips), and
   the engine is unchanged. Asked for by the same observability add-on's
   controlled recovery, through this public contract only.
+- **D-052 — Exposure is bounded per address in the server, not delegated
+  to the proxy.** OPERATING.md's known limits admitted two gaps a
+  reverse proxy was supposed to cover: no per-client request rate and no
+  per-address connection cap. Caddy has no built-in rate limiting (it
+  needs a plugin) and Cloudflare sits in front anyway, so the bounds
+  live in `serve_http`: a token bucket per client address
+  (`--rate-limit-per-addr`, 100/s with a one-second burst; past it, 429
+  `rate_limited` with a `Retry-After`), and a per-peer connection cap
+  (`--max-conns-per-addr`, 64 for untrusted peers; peers inside the
+  trusted-proxy ranges get `--max-conns-per-proxy`, 4096, because a
+  proxy edge legitimately carries many real clients — the global
+  connection cap still bounds everything). The client address is the
+  TCP peer, or `CF-Connecting-IP` when the peer is inside a
+  `--trusted-proxy` CIDR — the header from any other peer is ignored,
+  because anyone can set it and a believed header would hand a flooder
+  a fresh address per request. What the limit counts as an address:
+  IPv4 as itself (a v4-mapped v6 is unwrapped to the same bucket), IPv6
+  masked to `--rate-limit-v6-prefix` bits (a /64 by default, so one
+  client's 2^64 addresses cannot each mint a bucket), and inside one
+  /48 the per-address buckets share an aggregate at 10x the rate, so a
+  /48 cannot mint a table of /64s either. The bucket table is bounded
+  (`MAX_LIMITED_ADDRS`, ~4 MiB): entries idle a minute are reclaimed
+  when it fills, and keys that still do not fit share one overflow
+  bucket, so a spray of distinct addresses limits itself rather than
+  buying memory with evictions — the residual, a spray of many distinct
+  /48s, can still push a new real client into that shared bucket.
+  Rate refusal happens before auth: a flood without a key is still a
+  flood, and the check is cheaper than the work behind it. Proven
+  against a real listener and in the table's own tests: one flooding
+  address is 429'd while another proceeds, a spoofed header from an
+  untrusted peer is ignored, a trusted peer's header names the client,
+  1,000 addresses in one /64 share one bucket, 1,000 /64s in one /48
+  hit the aggregate, `::ffff:1.2.3.4` and `1.2.3.4` share a bucket,
+  distinct v4s stay independent, a million distinct addresses stay
+  inside the bound, an untrusted peer's third connection is closed at
+  accept while a trusted peer holds its higher cap.
+- **D-053 — The inspector covers every server operation, and holds two
+  keys.** The page is the audit surface for what the API offers, so it
+  does all of it: `GET /jobs` lists in both orders with cursor paging;
+  `GET /jobs/{id}` is the row's detail; `POST /jobs` submits (steps,
+  base64 input, `not_before`); `POST /jobs/{id}/cancel` cancels;
+  `GET /admin/diagnostics` renders the counters; `POST /admin/compact`
+  and `POST /admin/backup` sit behind an explicit confirm step;
+  `/health` + `/ready` drive the header pill. `GET /jobs/{id}/spec` is
+  a deliberate reveal: the input may be customer content (D-051), so
+  the page asks for the API key rather than fetching it on open. Two
+  keys are held — the read key for reads, the API key for everything
+  else — each in its own sessionStorage slot, never rendered back, and
+  a visible *Forget keys* clears both for the tab. CLI `restore` is
+  intentionally absent: it is a local operation on a stopped server's
+  journal, not an API the page can call. Styling is semantic CSS
+  tokens in light and dark (no raw colors in components) so a later
+  shared skin re-themes the token definitions alone.
+- **D-054 — Journal records are versioned; record v2 carries bytes as
+  base64.** Restart profiling showed 90.5% of replay was JSON decode,
+  because `spec.input` (and `StepCheckpointed.output`) serialized as a
+  JSON array of numbers — ~3.7 bytes of text per byte, parsed
+  digit-by-digit. v2 adds an explicit `v` field to the record envelope
+  (`ENVELOPE_VERSION`); every byte field serializes as a base64 string,
+  the compact carrier JSON allows (~4/3 vs ~3.7x; the API already
+  standardizes on it). The reader accepts both shapes forever — no
+  deployed v1 journal exists yet, but honest recovery is unchanged:
+  malformed base64, bad JSON, or a `v` this binary does not know all
+  refuse startup exactly like any corrupt committed record. The
+  binary snapshot encoding is unchanged (it was never JSON).
+  Measured on this laptop: journal 2.4x smaller (3.8→1.6 KiB/run);
+  decode 8.4x faster; restart-to-ready at 800k queued runs
+  8.68s→1.72s — the 5s upgrade target now holds at every probed size,
+  so parallel decode was not needed. Evidence: the
+  `restart-ready-*` result pairs in `perf/results/`, and the
+  replay-everything tests including a golden v1 journal written by
+  the pre-change binary.
+
+## D-055: The v1 deployment is one droplet behind Cloudflare
+
+The v1 production shape is a single 2 GB / 2-vCPU DigitalOcean droplet in
+Toronto running `durable-server` under systemd behind Caddy, which faces
+Cloudflare at Full (strict) with Authenticated Origin Pulls. Cloudflare
+terminates visitor TLS; its origin-pull client certificate plus ufw's
+range rules mean only Cloudflare can reach 443 (two independent layers).
+`cloudflare-ips.sh` feeds the same ranges to Caddy's `trusted_proxies`
+and to the server's `--trusted-proxy`, so D-052's per-address limit keys
+on the real client — smoke.sh fails when that file is missing.
+
+Restarts: Caddy `reverse_proxy` with `lb_try_duration 15s` /
+`lb_try_interval 250ms` retries only on dial failure, so requests held
+during a restart see latency, not errors; nothing reaches the old
+process, so retrying even a submit is safe. systemd uses
+`Restart=on-failure` with `TimeoutStopSec=70` (drain plus margin; a
+SIGKILL'd stop is still safe by journal design). Upgrades save the
+previous binary for a sub-minute rollback, and `format-guard.sh` refuses
+to swap in a binary that cannot read the journal's highest record
+version — the reader-ships-a-release-early rule in D-056 is what keeps
+one-step rollbacks honest.
+
+Backups: the timer calls `POST /admin/backup` daily, tars the named
+copy, encrypts it to an age recipient whose private half lives offline,
+and uploads to an R2 bucket with a 7-day object lock — a leaked rclone
+token cannot delete last week's backups. The restore drill decrypts the
+newest upload and replays it under a second server on a drill port.
+
+## D-056: record-format bumps ship the reader a release early
+
+Review found the one-way hole in "rollback replays the same journal": a
+newer reader accepts every older version, but an older binary refuses a
+journal holding records it does not understand — so a rollback across a
+format bump would make the service refuse to start. The rules:
+
+- **Reader first.** A new record version ships in a release that reads
+  it (`READER_VERSION`) at least one release before any writer emits it
+  (`ENVELOPE_VERSION`). Rolling back one release then always lands on a
+  binary that can read what the journal holds.
+- **The guard enforces it anyway.** `/admin/diagnostics` reports
+  `journal_record_version_max` (tracked from replay plus every commit);
+  `durable-server --journal-format` prints the binary's reader version.
+  `deploy/upgrade.sh` and `deploy/rollback.sh` run `format-guard.sh`,
+  which refuses — naming both versions — to swap in a binary whose
+  reader is below the journal's highest, and fails closed when it
+  cannot tell.

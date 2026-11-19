@@ -1,22 +1,51 @@
 #!/usr/bin/env bash
-# Durable-runner load battery — runs the latency-measured scenarios after
-# the colophon P6 soak (k6 PID given as $1) exits. One suite at a time.
+# Durable-runner load battery.
+#
+#   perf/battery.sh            # the smoke battery: every scenario, small sizes (~4 min)
+#   perf/battery.sh --full     # the full battery .github/workflows/load.yml runs (~3 h)
+#
+# Every scenario writes a result JSON to perf/results/ (machine spec + commit
+# recorded). A failing scenario exits non-zero here too; its result is kept —
+# never rerun to green. Ports: PORT (server, default 53340), HPORT (handler,
+# 53341); PERF_HOST_LABEL names the machine in results (never a hostname).
 set -u
 cd "$(dirname "$0")/.."
-K6_PID=${1:?usage: battery.sh <k6-pid-to-wait-for>}
-LOG=perf/results/battery-runner.log
+MODE=${1:-smoke}
+PORT=${PORT:-53340}
+HPORT=${HPORT:-53341}
+FAILED=()
 
-echo "battery armed: waiting for k6 pid $K6_PID" >> "$LOG"
-while kill -0 "$K6_PID" 2>/dev/null; do sleep 60; done
-echo "$(date -u +%FT%TZ) soak finished — machine free; battery starting" >> "$LOG"
+run() {
+  echo "== load.mjs $*"
+  node perf/load.mjs "$@" --port="$PORT" --hport="$HPORT" || FAILED+=("$1")
+}
 
-# Let the soak's own result-writing flush before we touch the machine.
-sleep 30
+case "$MODE" in
+  --full)
+    # The million-scale gate: what the ship evidence and CI run.
+    run replay --events=100000
+    run submit --rate=10 --seconds=60
+    run submit --rate=25 --seconds=60
+    run submit --rate=50 --seconds=60
+    run submit --rate=100 --seconds=60
+    run stall --runs=15 --stall_ms=20000
+    run admission --n=3000
+    run compact --seconds=60
+    run sustained --rate=100 --total=1000000
+    ;;
+  --smoke | smoke | *)
+    # Small sizes — laptop evidence only, marked smoke:true in each result.
+    run replay --smoke
+    run submit --smoke
+    run stall --smoke
+    run admission --smoke
+    run compact --smoke
+    run sustained --smoke
+    ;;
+esac
 
-node perf/load.mjs replay --events=100000      >> "$LOG" 2>&1
-node perf/load.mjs submit --rate=10 --seconds=60  >> "$LOG" 2>&1
-node perf/load.mjs submit --rate=50 --seconds=60  >> "$LOG" 2>&1
-node perf/load.mjs submit --rate=100 --seconds=60 >> "$LOG" 2>&1
-node perf/load.mjs sustained --rate=100 --total=1000000 >> "$LOG" 2>&1
-
-echo "$(date -u +%FT%TZ) battery complete" >> "$LOG"
+if ((${#FAILED[@]})); then
+  echo "FAILED scenarios (results kept in perf/results/): ${FAILED[*]}"
+  exit 1
+fi
+echo "battery complete"

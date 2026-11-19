@@ -92,7 +92,8 @@ full disk / second writer.
 crates/        durable-domain, durable-journal, durable-engine,
                durable-server, durable-cli
 apps/inspect/  SvelteKit inspection UI
-docs/          END_GOAL, ARCHITECTURE, ROADMAP, DECISIONS, modules/
+docs/          END_GOAL, ARCHITECTURE, ROADMAP, DECISIONS, OPERATING,
+               SAAS_PLAN, FAILURE_CASES
 fixtures/      torn-tail + crash-model fixtures, handler test server
 perf/          submit/replay/stall/compaction scenarios, drill.py (kill -9
                drills with compactions, backups and cancels) + results

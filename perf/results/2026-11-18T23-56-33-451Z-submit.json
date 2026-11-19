@@ -1,0 +1,35 @@
+{
+  "machine": {
+    "host": "maintainer-laptop",
+    "platform": "darwin/arm64",
+    "cpu": "Apple M2 Pro",
+    "cores": 12,
+    "mem_gb": 32,
+    "date": "2026-11-18T23:56:33.452Z",
+    "commit": "f267f35"
+  },
+  "scenario": "submit",
+  "params": {
+    "rate_per_s": 20,
+    "seconds": 10,
+    "fsync": "per-record (default)",
+    "smoke": true
+  },
+  "sent": 200,
+  "accepted": 200,
+  "done_of_last_drain": 200,
+  "http_codes": {
+    "200": 200
+  },
+  "latency_ms": {
+    "p50": 15.468832999999904,
+    "p99": 30.26024999999936,
+    "max": 30.372709000000214
+  },
+  "thresholds": {
+    "accepted": "every submit (in-capacity rate)",
+    "done": ">=99% of accepted",
+    "p99_ms": "<2000"
+  },
+  "verdict": "pass"
+}

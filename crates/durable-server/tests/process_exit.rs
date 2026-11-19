@@ -293,6 +293,58 @@ async fn refuses_to_start(env: &[(&str, &str)], args: &[&str], why: &str) {
     );
 }
 
+/// Contract case: a second local writer fails startup rather than share the
+/// journal. The first server holds LOCK for life; the second exits non-zero
+/// before listening, and the first keeps serving.
+#[tokio::test]
+async fn a_second_server_on_the_same_journal_refuses_startup() {
+    let d = tempfile::tempdir().unwrap_or_else(|e| panic!("{e}"));
+    let journal = d.path().join("journal");
+    let port = free_port();
+    let base = format!("http://127.0.0.1:{port}");
+    let c = reqwest::Client::new();
+    let mut first = start(&journal, port);
+    wait_healthy(&c, &base).await;
+
+    let mut second = Command::new(env!("CARGO_BIN_EXE_durable-server"))
+        .arg("--journal")
+        .arg(&journal)
+        .args(["--listen", &format!("127.0.0.1:{}", free_port())])
+        .args(["--handler", "step=http://127.0.0.1:9/unused"])
+        .env("DURABLE_API_KEY", KEY)
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap_or_else(|e| panic!("{e}"));
+    let status = match exit_within(&mut second, Duration::from_secs(10)).await {
+        Some(s) => s,
+        None => {
+            let _ = second.kill();
+            let _ = second.wait();
+            panic!("a second server on the same journal kept running");
+        }
+    };
+    let mut err = String::new();
+    if let Some(mut e) = second.stderr.take() {
+        let _ = std::io::Read::read_to_string(&mut e, &mut err);
+    }
+    assert!(!status.success(), "second writer exited {status}");
+    assert!(
+        err.contains("writer") || err.contains("LOCK"),
+        "stderr does not name the writer lock: {err}"
+    );
+
+    let healthy = c
+        .get(format!("{base}/health"))
+        .send()
+        .await
+        .map(|r| r.status().is_success())
+        .unwrap_or(false);
+    assert!(healthy, "the lock holder stopped serving");
+    let _ = first.kill();
+    let _ = first.wait();
+}
+
 /// Checklist: a missing or short API key refuses startup — the server
 /// never serves with no key or a guessable one; and a read-only key must
 /// be long and different from the admin key.
@@ -469,4 +521,21 @@ async fn sigterm_with_a_request_still_open_exits_non_zero() {
         !status.success(),
         "a drain that timed out with a request open must not exit 0: {status}"
     );
+}
+
+/// D-056: `--journal-format` prints the highest record version the
+/// binary reads and exits — no keys needed, since upgrade.sh and
+/// rollback.sh call it while making a decision, not while serving.
+#[test]
+fn journal_format_reports_the_reader_version() {
+    let out = Command::new(env!("CARGO_BIN_EXE_durable-server"))
+        .arg("--journal-format")
+        .output()
+        .unwrap_or_else(|e| panic!("{e}"));
+    assert!(out.status.success(), "status: {:?}", out.status);
+    let v: u8 = String::from_utf8_lossy(&out.stdout)
+        .trim()
+        .parse()
+        .unwrap_or_else(|_| panic!("stdout: {:?}", out.stdout));
+    assert_eq!(v, durable_engine::READER_VERSION);
 }

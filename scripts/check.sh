@@ -61,9 +61,13 @@ if [ "${SKIP_NPM:-0}" != 1 ]; then
     npm ci --no-audit --no-fund
     npm audit --omit=dev --audit-level=moderate
     npm run check
+    npm test
     npm run build
   )
 fi
+
+step "deploy format guard (D-056)"
+deploy/test-format-guard.sh
 
 if [ "${SKIP_PILOT:-0}" != 1 ]; then
   step "pilot (release build)"

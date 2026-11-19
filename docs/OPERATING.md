@@ -143,8 +143,13 @@ target/release/durable-server \
   files 0600; backups and restores too, D-038). Run the server as the
   user that owns them. A second server on the same
   directory **fails startup** — the exclusive writer lock is held.
-- The inspector is at `http://127.0.0.1:58300/inspector/`: newest runs
-  first, 50 per page, with newer/older controls.
+- The inspector is at `http://127.0.0.1:58300/inspector/` and covers
+  every API operation (list both orders, run detail, spec reveal,
+  submit, cancel, diagnostics, compact, backup, health/ready). It
+  holds the read key for reads and the API key for everything else,
+  each in its own sessionStorage slot; *Forget keys* clears both.
+  Dark and light themes share semantic tokens; the toggle is in the
+  header.
 
 ## Submit, inspect, cancel (the CLI)
 
@@ -287,9 +292,15 @@ What this server does not do, so the deployment must (or must not rely on
 it):
 
 - **Exposure.** It caps connections and times heads and bodies (D-045),
-  but has no TLS, per-client rate limit or per-address connection cap.
-  For any non-local exposure, put a reverse proxy in front that does.
-  Never combine a proxy with `--open-reads`.
+  and limits each client address's request rate and each peer's
+  connection count (D-052: IPv6 is keyed by /64 with a shared /48
+  aggregate, so a spray of distinct /48s can still push a new real
+  client into the overflow bucket). It still has no TLS: put Cloudflare
+  (or a reverse proxy that does TLS) in front, and pass its ranges as
+  `--trusted-proxy` so the per-address limits count real clients — the
+  trusted edges then get `--max-conns-per-proxy` (4096) instead of the
+  untrusted `--max-conns-per-addr` (64). Never combine a proxy with
+  `--open-reads`.
 - **Handler calls are unsigned.** A handler cannot tell a call came from
   this runner except by network placement (D-039); keep handlers on a
   private network.
@@ -297,8 +308,9 @@ it):
   even if the spec differs; there is no 409 for a changed spec.
 - **Keys.** One API key and one optional read-only key, read at startup:
   rotating either needs a restart, and there is no cancel-only scope.
-- **Reads have no rate limit.** A key holder can fill the read queue
-  (bounded: 503 `busy`), never the write queue.
+- **Reads are limited per address, not per key.** One key holder across
+  many addresses can still fill the read queue (bounded: 503 `busy`),
+  never the write queue.
 - **Power loss inside the last batch** with the file's length on disk
   stops startup (the batch cannot be told apart from damage); restore a
   backup (see "What honest looks like" above for the one lossy repair).

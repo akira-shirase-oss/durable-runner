@@ -1,0 +1,34 @@
+# durable-server under systemd (deploy/droplet/DEPLOY.md).
+# Restart=on-failure: the journal makes restarts safe. TimeoutStopSec=70
+# covers the drain timeout (--drain-timeout-secs 30) plus margin; a stop
+# that outlives it is SIGKILL'd, which the journal survives by design.
+[Unit]
+Description=Durable Workflow Runner
+After=network.target
+# A second writer on the same journal must never run — the lock also
+# lives on the filesystem, this just keeps the accident from retrying.
+ConditionPathExists=/var/lib/durable
+
+[Service]
+Type=simple
+User=durable
+Group=durable
+EnvironmentFile=/etc/durable/durable.env
+ExecStart=/usr/local/bin/durable-run
+Restart=on-failure
+RestartSec=2
+TimeoutStopSec=70
+LimitNOFILE=65536
+# Journal and backups are the only writable paths.
+ReadWritePaths=/var/lib/durable
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+NoNewPrivileges=yes
+# No secrets in the journal: keys arrive via the root-only env file.
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=durable-server
+
+[Install]
+WantedBy=multi-user.target

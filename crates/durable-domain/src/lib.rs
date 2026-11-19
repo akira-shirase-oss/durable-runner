@@ -31,7 +31,48 @@ pub struct StepSpec {
 pub struct JobSpec {
     pub version: u32,
     pub steps: Vec<StepSpec>,
+    #[serde(with = "input_bytes")]
     pub input: Vec<u8>,
+}
+
+/// `spec.input` inside a journal record (D-054): a base64 string under
+/// record v2, a JSON array of byte values under v1. The writer emits only
+/// base64 — the compact carrier JSON allows (~4/3 the bytes vs ~3.7x for
+/// the number array) — and the reader accepts both shapes forever, so a
+/// v1 journal replays under a new binary. Malformed base64 in a committed
+/// record is a decode error: startup stops, as it does for any corruption.
+pub mod input_bytes {
+    use base64::Engine as _;
+    use serde::de::{Error, SeqAccess, Visitor};
+    use serde::{Deserializer, Serializer};
+    use std::fmt;
+
+    pub fn serialize<S: Serializer>(bytes: &[u8], s: S) -> Result<S::Ok, S::Error> {
+        s.serialize_str(&base64::engine::general_purpose::STANDARD.encode(bytes))
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Vec<u8>, D::Error> {
+        struct V;
+        impl<'de> Visitor<'de> for V {
+            type Value = Vec<u8>;
+            fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+                f.write_str("a base64 string (record v2) or a byte array (record v1)")
+            }
+            fn visit_str<E: Error>(self, v: &str) -> Result<Vec<u8>, E> {
+                base64::engine::general_purpose::STANDARD
+                    .decode(v)
+                    .map_err(E::custom)
+            }
+            fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<Vec<u8>, A::Error> {
+                let mut out = Vec::with_capacity(seq.size_hint().unwrap_or(0));
+                while let Some(b) = seq.next_element()? {
+                    out.push(b);
+                }
+                Ok(out)
+            }
+        }
+        d.deserialize_any(V)
+    }
 }
 
 // --------------------------------------------------------------------- state
@@ -143,7 +184,11 @@ pub enum Event {
         deadline: Millis,
     },
     /// The handler answered in time; checkpoint its output.
-    StepCheckpointed { step: StepIndex, output: Vec<u8> },
+    StepCheckpointed {
+        step: StepIndex,
+        #[serde(with = "input_bytes")]
+        output: Vec<u8>,
+    },
     /// The attempt ended without a usable answer (fail, timeout, 5xx).
     StepFailed { step: StepIndex },
     /// The handler succeeded but the reply vanished — reconcile before repeat.
@@ -169,6 +214,7 @@ pub enum Effect {
     },
     CommitCheckpoint {
         step: StepIndex,
+        #[serde(with = "input_bytes")]
         output: Vec<u8>,
     },
     Reconcile {
