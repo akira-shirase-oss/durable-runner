@@ -268,7 +268,7 @@
 			<p class="empty">no runs yet</p>
 		{/if}
 		{#if runs.length > 0}
-			<table>
+			<table class="runlist">
 				<thead><tr><th>id</th><th>key</th><th>state</th><th>steps</th><th>finished</th><th></th></tr></thead>
 				<tbody>
 					{#each runs as r (r.id)}
@@ -543,8 +543,32 @@
 	form label input, form label textarea { display: block; margin-top: 0.3rem; width: 100%; box-sizing: border-box; }
 	.confirm { display: block; margin-top: 0.5rem; color: var(--warn); }
 	.notice-inline { color: var(--ok); margin-left: 0.6rem; }
-	@media (max-width: 560px) {
+	@media (max-width: 600px) {
 		dl { grid-template-columns: 8rem 1fr; }
-		table { display: block; overflow-x: auto; }
+		/* Stacked rows: id + key (ellipsized) + action on one line,
+		   state/steps/finished below — nothing escapes the viewport. */
+		.runlist thead { display: none; }
+		.runlist, .runlist tbody { display: block; }
+		.runlist tr {
+			display: grid;
+			grid-template-columns: auto minmax(0, 1fr) auto;
+			column-gap: 0.7rem;
+			padding: 0.45rem 0;
+			align-items: baseline;
+		}
+		.runlist td { display: block; padding: 0.15rem 0; }
+		.runlist td:nth-child(1) { grid-area: 1 / 1; }
+		.runlist td:nth-child(2) {
+			grid-area: 1 / 2;
+			min-width: 0;
+			overflow: hidden;
+			text-overflow: ellipsis;
+			white-space: nowrap;
+			word-break: normal;
+		}
+		.runlist td:nth-child(6) { grid-area: 1 / 3; }
+		.runlist td:nth-child(3) { grid-area: 2 / 1; }
+		.runlist td:nth-child(4) { grid-area: 2 / 2; }
+		.runlist td:nth-child(5) { grid-area: 2 / 3; }
 	}
 </style>

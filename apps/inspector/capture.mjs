@@ -16,9 +16,16 @@ import { fileURLToPath } from 'node:url';
 const ROOT = path.dirname(path.dirname(path.dirname(fileURLToPath(import.meta.url))));
 const SRV = `${ROOT}/target/release/durable-server`;
 const args = {};
-for (const a of process.argv.slice(2).filter((a) => a.startsWith('--'))) {
-  const [k, v] = a.slice(2).split('=');
-  args[k] = v;
+{
+  const argv = process.argv.slice(2);
+  for (let i = 0; i < argv.length; i++) {
+    const a = argv[i];
+    if (!a.startsWith('--')) continue;
+    const eq = a.indexOf('=');
+    if (eq > 0) args[a.slice(2, eq)] = a.slice(eq + 1);
+    else if (i + 1 < argv.length && !argv[i + 1].startsWith('--')) args[a.slice(2)] = argv[++i];
+    else args[a.slice(2)] = 'true';
+  }
 }
 const UI_DIR = path.resolve(args['ui-dir'] ?? `${ROOT}/apps/inspector/build`);
 const PORT = Number(args.port ?? 53344);
@@ -83,6 +90,7 @@ try {
   fs.mkdirSync(OUT, { recursive: true });
   const browser = await chromium.launch();
   const shots = [];
+  const layoutFailures = [];
   for (const theme of ['dark', 'light']) {
     for (const width of [1440, 390]) {
       const ctx = await browser.newContext({ viewport: { width, height: 900 } });
@@ -105,6 +113,21 @@ try {
         shots.push(file);
       };
       await snap('runs');
+      // The phone layout contract: no horizontal overflow, and the row
+      // action stays inside the viewport (the seeded scheduled run is
+      // queued, so its cancel button must be there).
+      if (width === 390) {
+        const m = await page.evaluate(() => {
+          const doc = document.scrollingElement;
+          const btn = [...document.querySelectorAll('table.runlist td button.danger')].at(-1);
+          const r = btn ? btn.getBoundingClientRect() : null;
+          return { sw: doc.scrollWidth, iw: window.innerWidth, box: r ? { l: r.left, r: r.right } : null };
+        });
+        if (m.sw > m.iw) layoutFailures.push(`${theme}-390: scrollWidth ${m.sw} > innerWidth ${m.iw}`);
+        if (!m.box) layoutFailures.push(`${theme}-390: no cancel button rendered on the runs table`);
+        else if (m.box.l < 0 || m.box.r > m.iw)
+          layoutFailures.push(`${theme}-390: cancel button at [${m.box.l.toFixed(0)},${m.box.r.toFixed(0)}] escapes ${m.iw}px`);
+      }
       await page.locator('table tbody tr td .link').first().click();
       await page.waitForSelector('.panel', { timeout: 5000 });
       await snap('detail');
@@ -118,6 +141,11 @@ try {
   }
   await browser.close();
   console.log(shots.map((s) => `shot: ${s}`).join('\n'));
+  if (layoutFailures.length) {
+    console.error(`layout failures:\n  ${layoutFailures.join('\n  ')}`);
+    process.exit(4);
+  }
+  console.log('390px layout checks: pass');
 } finally {
   for (const k of kids) { try { k.kill('SIGKILL'); } catch {} }
   fs.rmSync(dir, { recursive: true, force: true });
