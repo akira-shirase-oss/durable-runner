@@ -1,15 +1,17 @@
 # Durable Workflow Runner
 
-> **Status — D4 complete, ship gate rehearsed.** D0–D3 proven (model,
-> journal, execution, maintenance incl. a live kill-9 → restore drill).
-> D4: CLI, server, and an inspector at `/inspector` covering every API
-> operation (submit/list/cancel/detail/spec/diagnostics/compact/backup);
+> **Status — v1.0.0.** D0–D4 complete: model, journal, execution and
+> maintenance proven (incl. a live kill-9 → restore drill). The CLI,
+> server, and an inspector at `/inspector` cover every API operation
+> (submit/list/cancel/detail/spec/diagnostics/compact/backup);
 > `examples/pilot/run.sh` walks the second-developer path; per-address
-> rate limits and connection caps are on; the six-scenario smoke battery
-> is green; restarting with 800k queued runs takes 1.7 s after the v2
-> record format (D-054); a single-droplet deploy package with Caddy +
-> Cloudflare, R2+age backups and a restore drill lives in `deploy/` and
-> `docs/DEPLOY.md` (D-055). `scripts/check.sh` is the gate CI runs. See
+> rate limits and connection caps are on; restarting with 800k queued
+> runs takes 1.7 s (v2 records, D-054); a single-droplet deploy package
+> with Caddy + Cloudflare, R2+age backups and a restore drill lives in
+> `deploy/` and `docs/DEPLOY.md` (D-055). Load: 1M/1M submits at 100/s
+> on the dev machine; the CI 4-core sustained miss is kept in
+> `perf/results/` (machine-bound, honest `at_capacity` refusals).
+> `scripts/check.sh` is the gate CI runs. See `CHANGELOG.md`,
 > `docs/ROADMAP.md` and `docs/OPERATING.md`.
 
 A background-task runner: submit versioned jobs, get durable acceptance,

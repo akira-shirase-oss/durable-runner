@@ -12,7 +12,7 @@ use serde_json::json;
 use std::path::PathBuf;
 
 #[derive(Parser)]
-#[command(name = "durable", about = "Durable workflow runner CLI")]
+#[command(name = "durable", version, about = "Durable workflow runner CLI")]
 struct Args {
     /// durable-server base URL.
     #[arg(long, global = true, default_value = "http://127.0.0.1:58300")]

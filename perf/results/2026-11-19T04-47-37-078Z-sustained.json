@@ -1,0 +1,44 @@
+{
+  "machine": {
+    "host": "github-ubuntu-24.04",
+    "platform": "linux/x64",
+    "cpu": "AMD EPYC 9V74 80-Core Processor",
+    "cores": 4,
+    "mem_gb": 16,
+    "date": "2026-11-19T04:47:37.078Z",
+    "commit": "c94edfd"
+  },
+  "scenario": "sustained",
+  "params": {
+    "rate_per_s": 100,
+    "target_submits": 1000000,
+    "fsync": "per-record",
+    "smoke": false
+  },
+  "sent": 1000000,
+  "accepted": 835397,
+  "done_after_drain": 856364,
+  "http_codes": {
+    "200": 835397,
+    "503": 161535,
+    "tcp:UND_ERR_CONNECT_TIMEOUT": 3068
+  },
+  "wall_clock_s": 10046,
+  "journal_kb": 417312,
+  "latency_ms": {
+    "p50": 3.9182619992643595,
+    "p99": 10002.87672800012,
+    "max": 46213.59491300024
+  },
+  "thresholds": {
+    "accepted": "every submit",
+    "done": "every accepted run",
+    "p99_ms": "<2000"
+  },
+  "verdict": "FAIL",
+  "failures": [
+    "every submit accepted",
+    "every accepted run finished",
+    "p99 < 2000ms"
+  ]
+}

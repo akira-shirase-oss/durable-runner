@@ -27,7 +27,11 @@ use std::sync::Arc;
 use std::time::Duration;
 
 #[derive(Parser)]
-#[command(name = "durable-server", about = "Durable workflow runner coordinator")]
+#[command(
+    name = "durable-server",
+    version,
+    about = "Durable workflow runner coordinator"
+)]
 struct Args {
     /// Journal directory (created on first run).
     #[arg(long, default_value = "data/journal")]
@@ -2565,6 +2569,20 @@ mod tests {
         }
     }
 
+    /// The per-address bounds lifted the way the load battery lifts them
+    /// (`--rate-limit-per-addr 100000 --max-conns-per-addr 0`): the
+    /// limiter's code path still runs on every request, but a test that is
+    /// not about D-052 cannot be flunked by its own burst. The D-052
+    /// tests below name their own rate/conn caps explicitly.
+    fn lifted_limits() -> HttpLimits {
+        HttpLimits {
+            rate_per_addr: 100_000.0,
+            max_conns_per_addr: 0,
+            max_conns_per_proxy: 0,
+            ..HttpLimits::default()
+        }
+    }
+
     /// A served router with `limits` on 127.0.0.1; its address and a stop
     /// sender.
     async fn serving(
@@ -2607,7 +2625,7 @@ mod tests {
         use tokio::io::AsyncWriteExt as _;
         let limits = HttpLimits {
             header_timeout: Duration::from_millis(300),
-            ..HttpLimits::default()
+            ..lifted_limits()
         };
         let (addr, _stop, _h) = serving(limits).await;
         let mut partial = tokio::net::TcpStream::connect(addr)
@@ -2637,7 +2655,7 @@ mod tests {
         use tokio::io::AsyncWriteExt as _;
         let limits = HttpLimits {
             body_deadline: Duration::from_millis(300),
-            ..HttpLimits::default()
+            ..lifted_limits()
         };
         let (addr, _stop, _h) = serving(limits).await;
         let mut slow = tokio::net::TcpStream::connect(addr)
@@ -2663,7 +2681,7 @@ mod tests {
         use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
         let limits = HttpLimits {
             body_deadline: Duration::from_millis(300),
-            ..HttpLimits::default()
+            ..lifted_limits()
         };
         let (addr, _stop, _h) = serving(limits).await;
         let mut slow = tokio::net::TcpStream::connect(addr)
@@ -2691,7 +2709,7 @@ mod tests {
         let limits = HttpLimits {
             max_connections: 4,
             header_timeout: Duration::from_millis(500),
-            ..HttpLimits::default()
+            ..lifted_limits()
         };
         let (addr, _stop, _h) = serving(limits).await;
         let mut held = Vec::new();
@@ -2965,7 +2983,7 @@ mod tests {
             header_timeout: Duration::from_secs(60),
             write_stall: Duration::from_millis(300),
             max_requests: usize::MAX, // the stall alone must free the slot
-            ..HttpLimits::default()
+            ..lifted_limits()
         };
         let (addr, _stop, _h) = serving(limits).await;
         let sock = tokio::net::TcpSocket::new_v4().unwrap_or_else(|e| panic!("{e}"));
@@ -3013,7 +3031,7 @@ mod tests {
         use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
         let limits = HttpLimits {
             max_lifetime: Duration::from_millis(500),
-            ..HttpLimits::default()
+            ..lifted_limits()
         };
         let (addr, _stop, _h) = serving(limits).await;
         let mut s = tokio::net::TcpStream::connect(addr)
@@ -3048,7 +3066,7 @@ mod tests {
         use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
         let limits = HttpLimits {
             max_requests: 5,
-            ..HttpLimits::default()
+            ..lifted_limits()
         };
         let (addr, _stop, _h) = serving(limits).await;
         let mut s = tokio::net::TcpStream::connect(addr)
