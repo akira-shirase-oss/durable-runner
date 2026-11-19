@@ -71,11 +71,41 @@ pub enum EngineError {
 /// A journaled record: the run, the commit clock value, and the event.
 /// `at` makes replay faithful — deadlines and expiry reproduce the time
 /// the transition actually happened, not the time it was replayed.
+/// The record format a writer emits (D-054). v1 has no `v` and carries
+/// `spec.input` as a JSON number array; v2 adds `v` and carries it as
+/// base64. Readers accept both forever.
+pub const ENVELOPE_VERSION: u8 = 2;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Envelope {
+    /// Record format version. Records written before D-054 have no `v`
+    /// and read as 1. A larger value is a record from a newer binary:
+    /// refused at replay, never guessed.
+    #[serde(default = "envelope_v1")]
+    pub v: u8,
     pub run: u64,
     pub at: Millis,
     pub event: Event,
+}
+
+fn envelope_v1() -> u8 {
+    1
+}
+
+/// Decode a committed record and refuse one written by a newer binary.
+/// Anything malformed — bad JSON, bad base64 — is the same `Serde` error
+/// startup already stops on (D-054).
+fn decode_envelope(payload: &[u8]) -> Result<Envelope, EngineError> {
+    use serde::de::Error as _;
+    let env: Envelope = serde_json::from_slice(payload)?;
+    if env.v > ENVELOPE_VERSION {
+        return Err(serde_json::Error::custom(format_args!(
+            "record version {} is newer than this binary understands ({ENVELOPE_VERSION})",
+            env.v
+        ))
+        .into());
+    }
+    Ok(env)
 }
 
 /// Bounded diagnostics: aggregate counts only — safe to answer under load.
@@ -328,7 +358,7 @@ impl EngineCore {
                     let r = r?;
                     t_read += t.elapsed();
                     let t = std::time::Instant::now();
-                    let env: Envelope = serde_json::from_slice(&r.payload)?;
+                    let env = decode_envelope(&r.payload)?;
                     t_decode += t.elapsed();
                     max_run = max_run.max(env.run);
                     let t = std::time::Instant::now();
@@ -351,7 +381,7 @@ impl EngineCore {
         if let Some(records) = durable_journal::records(&gdir)? {
             for r in records {
                 let r = r?;
-                let env: Envelope = serde_json::from_slice(&r.payload)?;
+                let env = decode_envelope(&r.payload)?;
                 max_run = max_run.max(env.run);
                 core.apply_committed(RunId(env.run), env.event, env.at)?;
             }
@@ -630,6 +660,7 @@ impl EngineCore {
             reduce(run, &event, now, &self.limits, &self.retry)?;
         }
         let payload = serde_json::to_vec(&Envelope {
+            v: ENVELOPE_VERSION,
             run: run.0,
             at: now,
             event: event.clone(),
@@ -969,6 +1000,179 @@ mod tests {
             .submit(OperationKey("other".into()), spec(), 0)
             .unwrap_or_else(|e| panic!("{e}"));
         assert_ne!(a, c);
+    }
+
+    // --- D-054: record format v2 (base64 bytes) reads v1 forever ----------
+
+    /// Write one record in the shape a pre-D-054 binary committed — no
+    /// `v`, `input` as a JSON number array — straight into the journal.
+    fn commit_v1_accepted(dir: &std::path::Path, run: u64, key: &str, input: &[u8]) {
+        let mut j = Journal::open(dir).unwrap_or_else(|e| panic!("{e}"));
+        let nums: Vec<String> = input.iter().map(u8::to_string).collect();
+        let payload = format!(
+            "{{\"run\":{run},\"at\":1000,\"event\":{{\"Accepted\":{{\"key\":\"{key}\",\
+             \"spec\":{{\"version\":1,\"steps\":[{{\"name\":\"only\",\"handler\":\"echo\"}}],\
+             \"input\":[{}]}},\"not_before\":0}}}}}}",
+            nums.join(",")
+        );
+        j.append(payload.as_bytes())
+            .unwrap_or_else(|e| panic!("{e}"));
+    }
+
+    /// Copy a directory tree (the committed fixture journal) into a tempdir.
+    fn copy_tree(src: &std::path::Path, dst: &std::path::Path) {
+        for e in std::fs::read_dir(src).unwrap_or_else(|e| panic!("{e}")) {
+            let e = e.unwrap_or_else(|e| panic!("{e}"));
+            let to = dst.join(e.file_name());
+            if e.file_type().unwrap_or_else(|e| panic!("{e}")).is_dir() {
+                std::fs::create_dir(&to).unwrap_or_else(|e| panic!("{e}"));
+                copy_tree(&e.path(), &to);
+            } else {
+                std::fs::copy(e.path(), &to).unwrap_or_else(|e| panic!("{e}"));
+            }
+        }
+    }
+
+    /// The golden fixture: a journal the a7b0a84 binary wrote (v1
+    /// records, array inputs, checkpointed outputs — see
+    /// tests/fixtures/v1-journal). It replays to the identical index.
+    #[test]
+    fn a_journal_written_by_the_old_binary_replays() {
+        let src =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/v1-journal");
+        let d = tempfile::tempdir().unwrap_or_else(|e| panic!("{e}"));
+        copy_tree(&src, d.path());
+        let e = EngineCore::open(d.path()).unwrap_or_else(|e| panic!("{e}"));
+        for (id, key) in [
+            (1, "fx-empty"),
+            (2, "fx-text"),
+            (3, "fx-bin"),
+            (4, "fx-bytes"),
+        ] {
+            let r = e.run(RunId(id)).unwrap_or_else(|| panic!("run {id}"));
+            assert_eq!(r.key.0, key);
+            assert_eq!(r.state, RunState::Done);
+        }
+        assert_eq!(e.runs().count(), 4);
+    }
+
+    /// A hand-shaped v1 record: byte-exact input survives replay while
+    /// the run is still queued (terminal runs drop input by design).
+    #[test]
+    fn a_v1_record_replays_with_its_input_bytes() {
+        let d = tempfile::tempdir().unwrap_or_else(|e| panic!("{e}"));
+        commit_v1_accepted(d.path(), 1, "old", &[0, 127, 128, 255]);
+        let mut e = EngineCore::open(d.path()).unwrap_or_else(|e| panic!("{e}"));
+        let r = e.run(RunId(1)).unwrap_or_else(|| panic!("run"));
+        assert_eq!(r.spec.input, vec![0, 127, 128, 255]);
+        // And the dedup index picked the v1 key up: resubmitting returns run 1.
+        let again = e
+            .submit(OperationKey("old".into()), spec(), 0)
+            .unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(again, RunId(1));
+    }
+
+    /// One journal holding both record versions replays both.
+    #[test]
+    fn a_mixed_v1_and_v2_journal_replays() {
+        let d = tempfile::tempdir().unwrap_or_else(|e| panic!("{e}"));
+        commit_v1_accepted(d.path(), 1, "v1", &[1, 2, 3]);
+        {
+            let mut e = EngineCore::open(d.path()).unwrap_or_else(|e| panic!("{e}"));
+            e.submit(OperationKey("v2".into()), spec(), 0)
+                .unwrap_or_else(|e| panic!("{e}"));
+        }
+        let e = EngineCore::open(d.path()).unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(e.run(RunId(1)).unwrap_or_else(|| panic!("1")).key.0, "v1");
+        assert_eq!(e.run(RunId(2)).unwrap_or_else(|| panic!("2")).key.0, "v2");
+        assert_eq!(
+            e.run(RunId(1)).unwrap_or_else(|| panic!("1")).spec.input,
+            [1, 2, 3]
+        );
+    }
+
+    /// A committed record whose base64 is malformed is corruption and
+    /// stops startup — identical to any other corrupt committed record.
+    #[test]
+    fn a_corrupt_base64_input_stops_startup() {
+        let d = tempfile::tempdir().unwrap_or_else(|e| panic!("{e}"));
+        {
+            let mut j = Journal::open(d.path()).unwrap_or_else(|e| panic!("{e}"));
+            j.append(
+                br#"{"v":2,"run":1,"at":1,"event":{"Accepted":{"key":"k","spec":{"version":1,"steps":[],"input":"***"},"not_before":0}}}"#,
+            )
+            .unwrap_or_else(|e| panic!("{e}"));
+        }
+        let err = EngineCore::open(d.path())
+            .err()
+            .unwrap_or_else(|| panic!("opened"));
+        assert!(matches!(err, EngineError::Serde(_)), "{err}");
+    }
+
+    /// A record tagged with a version this binary does not know is from
+    /// the future: refuse it instead of guessing.
+    #[test]
+    fn a_record_newer_than_this_binary_is_refused() {
+        let d = tempfile::tempdir().unwrap_or_else(|e| panic!("{e}"));
+        {
+            let mut j = Journal::open(d.path()).unwrap_or_else(|e| panic!("{e}"));
+            j.append(
+                br#"{"v":9,"run":1,"at":1,"event":{"Accepted":{"key":"k","spec":{"version":1,"steps":[],"input":[]},"not_before":0}}}"#,
+            )
+            .unwrap_or_else(|e| panic!("{e}"));
+        }
+        let err = EngineCore::open(d.path())
+            .err()
+            .unwrap_or_else(|| panic!("opened"));
+        assert!(matches!(err, EngineError::Serde(_)), "{err}");
+    }
+
+    /// Compaction and its snapshot carry runs that arrived under either
+    /// record version, intact across the generation swap.
+    #[test]
+    fn compaction_round_trips_runs_from_both_record_versions() {
+        let d = tempfile::tempdir().unwrap_or_else(|e| panic!("{e}"));
+        commit_v1_accepted(d.path(), 1, "v1", &[7, 8, 9]);
+        {
+            let mut e = EngineCore::open(d.path()).unwrap_or_else(|e| panic!("{e}"));
+            e.submit(OperationKey("v2".into()), spec(), 0)
+                .unwrap_or_else(|e| panic!("{e}"));
+            e.compact(0).unwrap_or_else(|e| panic!("{e}"));
+        }
+        let e = EngineCore::open(d.path()).unwrap_or_else(|e| panic!("{e}"));
+        let r1 = e.run(RunId(1)).unwrap_or_else(|| panic!("1"));
+        assert_eq!(r1.key.0, "v1");
+        assert_eq!(r1.spec.input, [7, 8, 9]);
+        assert_eq!(e.run(RunId(2)).unwrap_or_else(|| panic!("2")).key.0, "v2");
+    }
+
+    proptest::proptest! {
+        /// Every byte shape — empty, odd, large — round-trips through the
+        /// record encoding unchanged.
+        #[test]
+        fn record_bytes_round_trip(input in proptest::collection::vec(proptest::prelude::any::<u8>(), 0..=8192)) {
+            let spec = JobSpec {
+                version: 1,
+                steps: vec![StepSpec { name: "s".into(), handler: "h".into() }],
+                input: input.clone(),
+            };
+            let env = Envelope {
+                v: ENVELOPE_VERSION,
+                run: 1,
+                at: 0,
+                event: Event::Accepted {
+                    key: OperationKey("k".into()),
+                    spec,
+                    not_before: 0,
+                },
+            };
+            let bytes = serde_json::to_vec(&env).unwrap_or_else(|e| panic!("{e}"));
+            let back = decode_envelope(&bytes).unwrap_or_else(|e| panic!("{e}"));
+            let Event::Accepted { spec: got, .. } = back.event else {
+                panic!("event changed kind")
+            };
+            assert_eq!(got.input, input);
+        }
     }
 
     #[test]

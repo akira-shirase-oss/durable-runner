@@ -2925,7 +2925,7 @@ mod tests {
         faults.hold_syncs();
         let first = submit_sized(&eng, "b0", 1, 1024);
         tokio::time::sleep(Duration::from_millis(30)).await;
-        let rest = submit_sized(&eng, "b", 40, 1024);
+        let rest = submit_sized(&eng, "b", 90, 1024);
         tokio::time::sleep(Duration::from_millis(100)).await;
         faults.release_syncs();
         for r in join_all(first)
@@ -2938,7 +2938,7 @@ mod tests {
         let syncs = faults.sync_calls();
         assert!(
             syncs >= 8,
-            "41 records of ~3 KB in {syncs} fsyncs under a 16 KiB bound"
+            "91 records of ~1.6 KB (D-054 base64) in {syncs} fsyncs under a 16 KiB bound"
         );
     }
 
@@ -2960,7 +2960,7 @@ mod tests {
         let first = submit_sized(&eng, "o-first", 1, 1024);
         tokio::time::sleep(Duration::from_millis(30)).await;
         let mut handles = Vec::new();
-        for i in 0..100 {
+        for i in 0..130 {
             handles.extend(submit_sized(&eng, &format!("o{i}"), 1, 1024));
             tokio::time::sleep(Duration::from_millis(2)).await;
         }
@@ -2980,7 +2980,7 @@ mod tests {
             .count();
         assert!(
             busy >= 80,
-            "only {busy} of 100 refused: the outbox kept buffering"
+            "only {busy} of 130 refused: the outbox kept buffering"
         );
         faults.release_syncs();
         for r in join_all(first)

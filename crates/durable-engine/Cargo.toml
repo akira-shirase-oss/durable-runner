@@ -16,6 +16,7 @@ tokio = { version = "1", features = ["macros", "rt", "sync", "time"] }
 
 [dev-dependencies]
 durable-journal = { path = "../durable-journal", features = ["fault-injection"] }
+proptest = "1"
 tempfile = "3"
 
 [lints]

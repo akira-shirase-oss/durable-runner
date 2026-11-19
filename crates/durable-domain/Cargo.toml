@@ -9,5 +9,8 @@ publish.workspace = true
 workspace = true
 
 [dependencies]
+# Only `std`: this workspace does not ask for base64's SIMD `unsafe` code
+# (D-048).
+base64 = { version = "0.23", default-features = false, features = ["std"] }
 serde.workspace = true
 thiserror.workspace = true

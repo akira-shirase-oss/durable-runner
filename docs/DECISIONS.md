@@ -907,3 +907,22 @@ convention; these seed the contract's prescribed directions.
   journal, not an API the page can call. Styling is semantic CSS
   tokens in light and dark (no raw colors in components) so a later
   shared skin re-themes the token definitions alone.
+- **D-054 — Journal records are versioned; record v2 carries bytes as
+  base64.** Restart profiling showed 90.5% of replay was JSON decode,
+  because `spec.input` (and `StepCheckpointed.output`) serialized as a
+  JSON array of numbers — ~3.7 bytes of text per byte, parsed
+  digit-by-digit. v2 adds an explicit `v` field to the record envelope
+  (`ENVELOPE_VERSION`); every byte field serializes as a base64 string,
+  the compact carrier JSON allows (~4/3 vs ~3.7x; the API already
+  standardizes on it). The reader accepts both shapes forever — no
+  deployed v1 journal exists yet, but honest recovery is unchanged:
+  malformed base64, bad JSON, or a `v` this binary does not know all
+  refuse startup exactly like any corrupt committed record. The
+  binary snapshot encoding is unchanged (it was never JSON).
+  Measured on this laptop: journal 2.4x smaller (3.8→1.6 KiB/run);
+  decode 8.4x faster; restart-to-ready at 800k queued runs
+  8.68s→1.72s — the 5s upgrade target now holds at every probed size,
+  so parallel decode was not needed. Evidence: the
+  `restart-ready-*` result pairs in `perf/results/`, and the
+  replay-everything tests including a golden v1 journal written by
+  the pre-change binary.
