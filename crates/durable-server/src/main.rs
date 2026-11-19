@@ -27,7 +27,11 @@ use std::sync::Arc;
 use std::time::Duration;
 
 #[derive(Parser)]
-#[command(name = "durable-server", about = "Durable workflow runner coordinator")]
+#[command(
+    name = "durable-server",
+    version,
+    about = "Durable workflow runner coordinator"
+)]
 struct Args {
     /// Journal directory (created on first run).
     #[arg(long, default_value = "data/journal")]
