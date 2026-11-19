@@ -926,3 +926,29 @@ convention; these seed the contract's prescribed directions.
   `restart-ready-*` result pairs in `perf/results/`, and the
   replay-everything tests including a golden v1 journal written by
   the pre-change binary.
+
+## D-055: The v1 deployment is one droplet behind Cloudflare
+
+The v1 production shape is a single 2 GB / 2-vCPU DigitalOcean droplet in
+Toronto running `durable-server` under systemd behind Caddy, which faces
+Cloudflare at Full (strict) with Authenticated Origin Pulls. Cloudflare
+terminates visitor TLS; its origin-pull client certificate plus ufw's
+range rules mean only Cloudflare can reach 443 (two independent layers).
+`cloudflare-ips.sh` feeds the same ranges to Caddy's `trusted_proxies`
+and to the server's `--trusted-proxy`, so D-052's per-address limit keys
+on the real client — smoke.sh fails when that file is missing.
+
+Restarts: Caddy `reverse_proxy` with `lb_try_duration 15s` /
+`lb_try_interval 250ms` retries only on dial failure, so requests held
+during a restart see latency, not errors; nothing reaches the old
+process, so retrying even a submit is safe. systemd uses
+`Restart=on-failure` with `TimeoutStopSec=70` (drain plus margin; a
+SIGKILL'd stop is still safe by journal design). Upgrades save the
+previous binary for a sub-minute rollback; the D-054 reader accepts
+every shipped record format, so the same journal replays under either.
+
+Backups: the timer calls `POST /admin/backup` daily, tars the named
+copy, encrypts it to an age recipient whose private half lives offline,
+and uploads to an R2 bucket with a 7-day object lock — a leaked rclone
+token cannot delete last week's backups. The restore drill decrypts the
+newest upload and replays it under a second server on a drill port.

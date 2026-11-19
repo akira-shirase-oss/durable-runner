@@ -1,0 +1,9 @@
+[Unit]
+Description=Durable Runner journal backup to R2 (age-encrypted)
+
+[Service]
+Type=oneshot
+User=root
+ExecStart=/usr/local/bin/durable-backup
+# Backups must never run at the same second as an upgrade restart.
+ConditionPathExists=/var/lib/durable/journal
