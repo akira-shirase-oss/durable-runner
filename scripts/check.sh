@@ -65,6 +65,9 @@ if [ "${SKIP_NPM:-0}" != 1 ]; then
   )
 fi
 
+step "deploy format guard (D-056)"
+deploy/test-format-guard.sh
+
 if [ "${SKIP_PILOT:-0}" != 1 ]; then
   step "pilot (release build)"
   examples/pilot/run.sh

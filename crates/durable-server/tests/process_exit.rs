@@ -522,3 +522,20 @@ async fn sigterm_with_a_request_still_open_exits_non_zero() {
         "a drain that timed out with a request open must not exit 0: {status}"
     );
 }
+
+/// D-056: `--journal-format` prints the highest record version the
+/// binary reads and exits — no keys needed, since upgrade.sh and
+/// rollback.sh call it while making a decision, not while serving.
+#[test]
+fn journal_format_reports_the_reader_version() {
+    let out = Command::new(env!("CARGO_BIN_EXE_durable-server"))
+        .arg("--journal-format")
+        .output()
+        .unwrap_or_else(|e| panic!("{e}"));
+    assert!(out.status.success(), "status: {:?}", out.status);
+    let v: u8 = String::from_utf8_lossy(&out.stdout)
+        .trim()
+        .parse()
+        .unwrap_or_else(|_| panic!("stdout: {:?}", out.stdout));
+    assert_eq!(v, durable_engine::READER_VERSION);
+}

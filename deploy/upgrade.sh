@@ -9,6 +9,10 @@ set -euo pipefail
 new=${1:?usage: upgrade.sh /path/to/new/durable-server}
 [[ -x $new ]] || { echo "$new not executable" >&2; exit 1; }
 
+# D-056: never swap in a binary that cannot read this journal — it would
+# refuse startup and turn the upgrade into an outage.
+deploy/format-guard.sh "$new"
+
 cp -a /usr/local/bin/durable-server /usr/local/bin/durable-server.prev
 install -m 0755 "$new" /usr/local/bin/durable-server
 systemctl restart durable-server

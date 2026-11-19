@@ -75,6 +75,10 @@ pub enum EngineError {
 /// `spec.input` as a JSON number array; v2 adds `v` and carries it as
 /// base64. Readers accept both forever.
 pub const ENVELOPE_VERSION: u8 = 2;
+/// The highest record version this binary can read. Today it equals
+/// `ENVELOPE_VERSION`; per D-056 a format bump ships a reader one
+/// release before any writer emits it, so this will run ahead.
+pub const READER_VERSION: u8 = ENVELOPE_VERSION;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Envelope {
@@ -98,9 +102,9 @@ fn envelope_v1() -> u8 {
 fn decode_envelope(payload: &[u8]) -> Result<Envelope, EngineError> {
     use serde::de::Error as _;
     let env: Envelope = serde_json::from_slice(payload)?;
-    if env.v > ENVELOPE_VERSION {
+    if env.v > READER_VERSION {
         return Err(serde_json::Error::custom(format_args!(
-            "record version {} is newer than this binary understands ({ENVELOPE_VERSION})",
+            "record version {} is newer than this binary understands ({READER_VERSION})",
             env.v
         ))
         .into());
@@ -138,6 +142,9 @@ pub struct Diagnostics {
     /// Bytes of an incomplete final frame the last startup discarded (a
     /// torn tail, never acknowledged); 0 if the log ended cleanly.
     pub discarded_tail_bytes: u64,
+    /// The highest record version present in the journal. Upgrade and
+    /// rollback refuse to run a binary whose reader is older (D-056).
+    pub journal_record_version_max: u8,
 }
 
 /// The index as snapshots before D-021 carried it (JSON, inputs as number
@@ -256,6 +263,9 @@ pub struct EngineCore {
     index_bytes: u64,
     /// The torn tail the journal discarded when this core opened it.
     discarded_tail: Option<durable_journal::TornTail>,
+    /// Highest record `v` present in the journal: bumped by replay and by
+    /// every commit this binary writes (D-056's rollback guard).
+    journal_record_version_max: u8,
     pub limits: Limits,
     pub retry: RetryPolicy,
 }
@@ -289,6 +299,7 @@ impl EngineCore {
             live: 0,
             index_bytes: 0,
             discarded_tail,
+            journal_record_version_max: 1,
             limits: Limits::default(),
             retry: RetryPolicy::default(),
         };
@@ -361,6 +372,7 @@ impl EngineCore {
                     let env = decode_envelope(&r.payload)?;
                     t_decode += t.elapsed();
                     max_run = max_run.max(env.run);
+                    core.journal_record_version_max = core.journal_record_version_max.max(env.v);
                     let t = std::time::Instant::now();
                     core.apply_committed(RunId(env.run), env.event, env.at)?;
                     t_apply += t.elapsed();
@@ -383,6 +395,7 @@ impl EngineCore {
                 let r = r?;
                 let env = decode_envelope(&r.payload)?;
                 max_run = max_run.max(env.run);
+                core.journal_record_version_max = core.journal_record_version_max.max(env.v);
                 core.apply_committed(RunId(env.run), env.event, env.at)?;
             }
         }
@@ -675,6 +688,7 @@ impl EngineCore {
             // durable.
             Log::Piped(p) => p.enqueue(payload)?,
         }
+        self.journal_record_version_max = self.journal_record_version_max.max(ENVELOPE_VERSION);
         self.apply_committed(run, event, now)
     }
 
@@ -866,6 +880,7 @@ impl EngineCore {
             largest_batch_bytes,
             stale_generations,
             discarded_tail_bytes: self.discarded_tail.map_or(0, |t| t.bytes),
+            journal_record_version_max: self.journal_record_version_max,
         }
     }
 
@@ -1089,6 +1104,27 @@ mod tests {
             e.run(RunId(1)).unwrap_or_else(|| panic!("1")).spec.input,
             [1, 2, 3]
         );
+        // D-056's rollback guard: the journal's highest version is what
+        // upgrade/rollback compare a binary's reader against.
+        assert_eq!(e.diagnostics().journal_record_version_max, 2);
+    }
+
+    /// D-056: the version guard reads the journal's highest `v` — a v1
+    /// journal reports 1, then the first v2 commit makes it 2, and a
+    /// reopen keeps it (the records stay in the journal).
+    #[test]
+    fn diagnostics_reports_the_journals_highest_record_version() {
+        let d = tempfile::tempdir().unwrap_or_else(|e| panic!("{e}"));
+        commit_v1_accepted(d.path(), 1, "old", &[9]);
+        {
+            let mut e = EngineCore::open(d.path()).unwrap_or_else(|e| panic!("{e}"));
+            assert_eq!(e.diagnostics().journal_record_version_max, 1);
+            e.submit(OperationKey("new".into()), spec(), 0)
+                .unwrap_or_else(|e| panic!("{e}"));
+            assert_eq!(e.diagnostics().journal_record_version_max, ENVELOPE_VERSION);
+        }
+        let e = EngineCore::open(d.path()).unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(e.diagnostics().journal_record_version_max, ENVELOPE_VERSION);
     }
 
     /// A committed record whose base64 is malformed is corruption and

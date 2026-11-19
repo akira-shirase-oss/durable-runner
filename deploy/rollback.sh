@@ -5,6 +5,9 @@
 set -euo pipefail
 [[ $EUID -eq 0 ]] || { echo "run as root" >&2; exit 1; }
 [[ -f /usr/local/bin/durable-server.prev ]] || { echo "no .prev binary — nothing to roll back to" >&2; exit 1; }
+# D-056: the saved binary must still read what the journal now holds;
+# a refused rollback leaves the new binary running, loudly.
+deploy/format-guard.sh /usr/local/bin/durable-server.prev
 mv /usr/local/bin/durable-server.prev /usr/local/bin/durable-server
 systemctl restart durable-server
 for _ in $(seq 240); do

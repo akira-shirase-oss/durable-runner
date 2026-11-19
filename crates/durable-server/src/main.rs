@@ -141,6 +141,11 @@ struct Args {
     /// decided durable, before exiting non-zero instead of 0.
     #[arg(long, default_value_t = 30)]
     drain_timeout_secs: u64,
+    /// Print the highest journal record version this binary can read and
+    /// exit. deploy/upgrade.sh and deploy/rollback.sh compare it against
+    /// the journal's highest version (D-056).
+    #[arg(long)]
+    journal_format: bool,
 }
 
 /// The environment variable holding the API key. Read from the
@@ -1078,6 +1083,10 @@ fn prepare_backup_root(dir: &Path) -> Result<Arc<Path>> {
 #[tokio::main]
 async fn main() -> Result<()> {
     let args = Args::parse();
+    if args.journal_format {
+        println!("{}", durable_engine::READER_VERSION);
+        return Ok(());
+    }
     let api_key = api_key_from_env()?;
     let read_key = read_key_from_env(&api_key)?;
     check_open_reads(&args.listen, args.open_reads)?;

@@ -944,11 +944,32 @@ during a restart see latency, not errors; nothing reaches the old
 process, so retrying even a submit is safe. systemd uses
 `Restart=on-failure` with `TimeoutStopSec=70` (drain plus margin; a
 SIGKILL'd stop is still safe by journal design). Upgrades save the
-previous binary for a sub-minute rollback; the D-054 reader accepts
-every shipped record format, so the same journal replays under either.
+previous binary for a sub-minute rollback, and `format-guard.sh` refuses
+to swap in a binary that cannot read the journal's highest record
+version — the reader-ships-a-release-early rule in D-056 is what keeps
+one-step rollbacks honest.
 
 Backups: the timer calls `POST /admin/backup` daily, tars the named
 copy, encrypts it to an age recipient whose private half lives offline,
 and uploads to an R2 bucket with a 7-day object lock — a leaked rclone
 token cannot delete last week's backups. The restore drill decrypts the
 newest upload and replays it under a second server on a drill port.
+
+## D-056: record-format bumps ship the reader a release early
+
+Review found the one-way hole in "rollback replays the same journal": a
+newer reader accepts every older version, but an older binary refuses a
+journal holding records it does not understand — so a rollback across a
+format bump would make the service refuse to start. The rules:
+
+- **Reader first.** A new record version ships in a release that reads
+  it (`READER_VERSION`) at least one release before any writer emits it
+  (`ENVELOPE_VERSION`). Rolling back one release then always lands on a
+  binary that can read what the journal holds.
+- **The guard enforces it anyway.** `/admin/diagnostics` reports
+  `journal_record_version_max` (tracked from replay plus every commit);
+  `durable-server --journal-format` prints the binary's reader version.
+  `deploy/upgrade.sh` and `deploy/rollback.sh` run `format-guard.sh`,
+  which refuses — naming both versions — to swap in a binary whose
+  reader is below the journal's highest, and fails closed when it
+  cannot tell.

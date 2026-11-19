@@ -178,3 +178,4 @@ version replays under the current binary.
 | Every visitor shares one rate limit | `/etc/durable/trusted-proxies` missing — rerun `cloudflare-ips.sh` |
 | `durable-backup` fails | `journalctl -u durable-backup`: `backups_disabled` → `--backup-root` unset; rclone remote `r2` misnamed |
 | Second writer refused | expected — the lock worked; find the stray process |
+| `format-guard: REFUSED` | the binary reads an older record version than the journal holds (D-056) — install a newer binary or replay under the old one from a backup |
