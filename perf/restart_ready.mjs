@@ -155,12 +155,13 @@ async function runSize(runs) {
   // The upgrade: a stopped server starts over the filled journal. Time
   // from spawn to the first /ready=200 — that is the unavailability a
   // deploy's restart costs at this size.
+  const errLog = `${dir}/server.err.log`;
   const s = track(
     spawn(SRV, ['--journal', journal, '--listen', `127.0.0.1:${PORT}`,
       '--handler', `step=http://127.0.0.1:${HPORT}/step`,
       '--rate-limit-per-addr', '100000', '--max-conns-per-addr', '0',
       '--max-live-runs', String(runs * 2), '--max-index-bytes', '8589934592'],
-      { stdio: 'ignore', env: { ...process.env, DURABLE_API_KEY: API_KEY } }),
+      { stdio: ['ignore', 'ignore', fs.openSync(errLog, 'w')], env: { ...process.env, DURABLE_API_KEY: API_KEY } }),
     journal, `durable-server --journal ${journal}`, PORT,
   );
   const t0 = performance.now();
@@ -174,6 +175,11 @@ async function runSize(runs) {
     await sleep(25);
   }
   if (ready_ms === null) throw new Error('server never became ready in 5 minutes');
+  let profile = null;
+  try {
+    profile = fs.readFileSync(errLog, 'utf8').split('\n').find((l) => l.includes('PROFILE')) ?? null;
+    if (profile) console.log(profile);
+  } catch { /* no log */ }
   const jmib = Math.round(
     Number(execFileSync('du', ['-sk', journal]).toString().split('\t')[0]) / 1024,
   );
@@ -185,6 +191,7 @@ async function runSize(runs) {
     fill_s: Math.round(fill_s * 10) / 10,
     ready_ms,
     journal_mib: jmib,
+    profile,
     thresholds: { ready_ms: `<${READY_TARGET_MS} (the upgrade-unavailability target)` },
     ...verdict(runs, ready_ms),
   });

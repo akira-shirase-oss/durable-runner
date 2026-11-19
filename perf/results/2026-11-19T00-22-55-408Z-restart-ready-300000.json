@@ -1,0 +1,32 @@
+{
+ "machine": {
+  "host": "maintainer-laptop",
+  "platform": "darwin/arm64",
+  "cpu": "Apple M2 Pro",
+  "cores": 12,
+  "mem_gb": 32,
+  "date": "2026-11-19T00:22:55.400Z",
+  "commit": "798a3a0"
+ },
+ "scenario": "restart-ready-300000",
+ "params": {
+  "runs": 300000,
+  "fill": "restart_probe_fill (queued runs)",
+  "smoke": false
+ },
+ "fill_s": 6.9,
+ "ready_ms": 599,
+ "journal_mib": 467,
+ "profile": "PROFILE records=300000 journal_open=59.686375ms replay_total=516.594708ms [read=5.828121ms decode=320.107453ms apply=76.766381ms] recount=15.624375ms",
+ "thresholds": {
+  "ready_ms": "<5000 (the upgrade-unavailability target)"
+ },
+ "verdict": "pass",
+ "checks": [
+  [
+   "ready < 5000ms at 300000 runs",
+   true,
+   "599ms"
+  ]
+ ]
+}
