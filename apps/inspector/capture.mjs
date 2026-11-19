@@ -28,6 +28,10 @@ const args = {};
   }
 }
 const UI_DIR = path.resolve(args['ui-dir'] ?? `${ROOT}/apps/inspector/build`);
+// An explicit --ui-dir means a before/other build: capture the views
+// that exist (the old UI lacks the detail/submit/admin panels) and skip
+// the layout assertions, which assert the NEW layout's contract.
+const BEFORE_MODE = args['ui-dir'] !== undefined;
 const PORT = Number(args.port ?? 53344);
 const HPORT = Number(args.hport ?? 53345);
 const OUT = path.resolve(args.out ?? 'perf/ui/shots');
@@ -106,7 +110,7 @@ try {
       const page = await ctx.newPage();
       const base = `${API}/inspector/`;
       await page.goto(base, { waitUntil: 'networkidle' });
-      await page.waitForSelector('table tbody tr', { timeout: 10000 });
+      try { await page.waitForSelector('table tbody tr', { timeout: 10000 }); } catch {}
       const snap = async (name) => {
         const file = `${OUT}/${theme}-${width}-${name}.png`;
         await page.screenshot({ path: file, fullPage: false });
@@ -116,7 +120,7 @@ try {
       // The phone layout contract: no horizontal overflow, and the row
       // action stays inside the viewport (the seeded scheduled run is
       // queued, so its cancel button must be there).
-      if (width === 390) {
+      if (width === 390 && !BEFORE_MODE) {
         const m = await page.evaluate(() => {
           const doc = document.scrollingElement;
           const btn = [...document.querySelectorAll('table.runlist td button.danger')].at(-1);
@@ -128,14 +132,28 @@ try {
         else if (m.box.l < 0 || m.box.r > m.iw)
           layoutFailures.push(`${theme}-390: cancel button at [${m.box.l.toFixed(0)},${m.box.r.toFixed(0)}] escapes ${m.iw}px`);
       }
-      await page.locator('table tbody tr td .link').first().click();
-      await page.waitForSelector('.panel', { timeout: 5000 });
-      await snap('detail');
-      await page.locator('nav.tabs button', { hasText: 'submit' }).click();
-      await snap('submit');
-      await page.locator('nav.tabs button', { hasText: 'admin' }).click();
-      await page.waitForSelector('.panel dl', { timeout: 5000 });
-      await snap('admin');
+      const views = [
+        ['detail', async () => {
+          await page.locator('table tbody tr td .link').first().click();
+          await page.waitForSelector('.panel', { timeout: 4000 });
+        }],
+        ['submit', async () => {
+          await page.locator('nav.tabs button', { hasText: 'submit' }).click();
+        }],
+        ['admin', async () => {
+          await page.locator('nav.tabs button', { hasText: 'admin' }).click();
+          await page.waitForSelector('.panel dl', { timeout: 4000 });
+        }],
+      ];
+      for (const [name, go] of views) {
+        try {
+          await go();
+          await snap(name);
+        } catch (e) {
+          if (!BEFORE_MODE) throw e;
+          console.log(`${theme}-${width}-${name}: view not present in this build — skipped`);
+        }
+      }
       await ctx.close();
     }
   }
@@ -145,7 +163,9 @@ try {
     console.error(`layout failures:\n  ${layoutFailures.join('\n  ')}`);
     process.exit(4);
   }
-  console.log('390px layout checks: pass');
+  console.log(BEFORE_MODE
+    ? `before build (--ui-dir=${args['ui-dir']}): captured the views that exist; layout checks skipped`
+    : '390px layout checks: pass');
 } finally {
   for (const k of kids) { try { k.kill('SIGKILL'); } catch {} }
   fs.rmSync(dir, { recursive: true, force: true });

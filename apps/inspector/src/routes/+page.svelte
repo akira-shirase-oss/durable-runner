@@ -276,7 +276,7 @@
 							<td><button class="link" onclick={() => openDetail(r.id)}>{r.id}</button></td>
 							<td class="key">{r.key}</td>
 							<td class="state" data-state={r.state.split(':')[0]}>{r.state}</td>
-							<td>{r.steps}</td>
+							<td>{r.steps}<span class="stepunit">{r.steps === 1 ? ' step' : ' steps'}</span></td>
 							<td>{r.finished_at ? new Date(r.finished_at).toLocaleTimeString() : '—'}</td>
 							<td>{#if cancellable(r.state)}<button class="danger" onclick={() => cancel(r.id)}>cancel</button>{/if}</td>
 						</tr>
@@ -543,32 +543,36 @@
 	form label input, form label textarea { display: block; margin-top: 0.3rem; width: 100%; box-sizing: border-box; }
 	.confirm { display: block; margin-top: 0.5rem; color: var(--warn); }
 	.notice-inline { color: var(--ok); margin-left: 0.6rem; }
+	.stepunit { display: none; }
 	@media (max-width: 600px) {
 		dl { grid-template-columns: 8rem 1fr; }
-		/* Stacked rows: id + key (ellipsized) + action on one line,
-		   state/steps/finished below — nothing escapes the viewport. */
+		/* Stacked rows: id (fixed column, so keys align) + key ellipsized
+		   + action on one line, then "state · N steps · finished" below —
+		   nothing escapes the viewport. */
 		.runlist thead { display: none; }
 		.runlist, .runlist tbody { display: block; }
 		.runlist tr {
-			display: grid;
-			grid-template-columns: auto minmax(0, 1fr) auto;
+			display: flex;
+			flex-wrap: wrap;
+			align-items: baseline;
 			column-gap: 0.7rem;
 			padding: 0.45rem 0;
-			align-items: baseline;
 		}
 		.runlist td { display: block; padding: 0.15rem 0; }
-		.runlist td:nth-child(1) { grid-area: 1 / 1; }
+		.runlist td:nth-child(1) { order: 1; flex: 0 0 4ch; overflow: hidden; }
 		.runlist td:nth-child(2) {
-			grid-area: 1 / 2;
+			order: 2;
+			flex: 1 1 0;
 			min-width: 0;
 			overflow: hidden;
 			text-overflow: ellipsis;
 			white-space: nowrap;
 			word-break: normal;
 		}
-		.runlist td:nth-child(6) { grid-area: 1 / 3; }
-		.runlist td:nth-child(3) { grid-area: 2 / 1; }
-		.runlist td:nth-child(4) { grid-area: 2 / 2; }
-		.runlist td:nth-child(5) { grid-area: 2 / 3; }
+		.runlist td:nth-child(6) { order: 3; }
+		.runlist td:nth-child(3), .runlist td:nth-child(4), .runlist td:nth-child(5) { order: 4; }
+		.runlist td:nth-child(4)::before,
+		.runlist td:nth-child(5)::before { content: '·  '; color: var(--fg-muted); }
+		.runlist .stepunit { display: inline; }
 	}
 </style>
