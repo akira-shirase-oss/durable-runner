@@ -9,7 +9,8 @@
     "build": "vite build",
     "preview": "vite preview",
     "prepare": "svelte-kit sync || echo ''",
-    "check": "svelte-kit sync && svelte-check --tsconfig ./tsconfig.json --fail-on-warnings"
+    "check": "svelte-kit sync && svelte-check --tsconfig ./tsconfig.json --fail-on-warnings",
+    "test": "node --test 'test/*.test.ts'"
   },
   "imports": {
     "#lib": "./src/lib/index.js",

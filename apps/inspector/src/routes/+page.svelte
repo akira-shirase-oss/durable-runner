@@ -6,6 +6,7 @@
 		loadKey, saveKey, forgetKeys,
 		type RunItem, type Spec, type Diag,
 	} from '../lib/api';
+	import { idChWidth } from '../lib/idch';
 
 	type Tab = 'runs' | 'submit' | 'admin';
 	type Order = 'asc' | 'desc';
@@ -28,6 +29,9 @@
 	let cursor = $state<number | null>(null);
 	let trail = $state<(number | null)[]>([]);
 	let nextCursor = $state<number | null>(null);
+	// The phone layout's id column: widest id on this page, so keys stay
+	// aligned and ids never clip (capture.mjs asserts it).
+	let idCh = $derived(idChWidth(runs.map((r) => r.id)));
 	let detail = $state<RunItem | null>(null);
 	let detailSpec = $state<Spec | null>(null);
 	let detailErr = $state<string | null>(null);
@@ -268,12 +272,12 @@
 			<p class="empty">no runs yet</p>
 		{/if}
 		{#if runs.length > 0}
-			<table class="runlist">
+			<table class="runlist" style:--id-ch="{idCh}ch">
 				<thead><tr><th>id</th><th>key</th><th>state</th><th>steps</th><th>finished</th><th></th></tr></thead>
 				<tbody>
 					{#each runs as r (r.id)}
 						<tr class:selected={detail?.id === r.id}>
-							<td><button class="link" onclick={() => openDetail(r.id)}>{r.id}</button></td>
+							<td class="id"><button class="link" onclick={() => openDetail(r.id)}>{r.id}</button></td>
 							<td class="key">{r.key}</td>
 							<td class="state" data-state={r.state.split(':')[0]}>{r.state}</td>
 							<td>{r.steps}</td>
@@ -557,7 +561,7 @@
 		.runlist, .runlist tbody { display: block; }
 		.runlist tr {
 			display: grid;
-			grid-template-columns: 4ch minmax(0, 1fr) auto;
+			grid-template-columns: var(--id-ch, 4ch) minmax(0, 1fr) auto;
 			column-gap: 0.7rem;
 			padding: 0.45rem 0;
 			align-items: baseline;

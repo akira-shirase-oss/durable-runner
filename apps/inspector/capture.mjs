@@ -128,7 +128,10 @@ try {
           const keys = [...document.querySelectorAll('table.runlist td.key')].map((el) => ({
             text: el.textContent, sw: el.scrollWidth, cw: el.clientWidth,
           }));
-          return { sw: doc.scrollWidth, iw: window.innerWidth, box: r ? { l: r.left, r: r.right } : null, keys };
+          const ids = [...document.querySelectorAll('table.runlist td.id')].map((el) => ({
+            text: el.textContent.trim(), sw: el.scrollWidth, cw: el.clientWidth,
+          }));
+          return { sw: doc.scrollWidth, iw: window.innerWidth, box: r ? { l: r.left, r: r.right } : null, keys, ids };
         });
         if (m.sw > m.iw) layoutFailures.push(`${theme}-390: scrollWidth ${m.sw} > innerWidth ${m.iw}`);
         if (!m.box) layoutFailures.push(`${theme}-390: no cancel button rendered on the runs table`);
@@ -138,6 +141,11 @@ try {
         const cut = m.keys.filter((k) => k.text.length < 20 && k.sw > k.cw);
         if (cut.length)
           layoutFailures.push(`${theme}-390: ${cut.length} key(s) under 20 chars truncated: ${cut.map((k) => JSON.stringify(k.text)).join(', ')}`);
+        // The id column sizes from the widest id on the page (idChWidth):
+        // nothing id-shaped may ever clip.
+        const cutIds = m.ids.filter((k) => k.sw > k.cw);
+        if (cutIds.length)
+          layoutFailures.push(`${theme}-390: ${cutIds.length} id(s) truncated: ${cutIds.map((k) => k.text).join(', ')}`);
       }
       const views = [
         ['detail', async () => {
