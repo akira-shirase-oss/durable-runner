@@ -26,15 +26,29 @@ fn free_port() -> u16 {
     }
 }
 
-fn start(journal: &Path, port: u16) -> Child {
-    Command::new(env!("CARGO_BIN_EXE_durable-server"))
-        .arg("--journal")
+/// The spawn every serving server in this file goes through: the
+/// per-address limits are lifted exactly as the load battery lifts them
+/// (`perf/load.mjs`), so a test's own burst can never be refused by D-052
+/// — the limiter's own tests exercise it in the crate's unit tests.
+/// `DURABLE_TEST_RATE_LIMIT` lowers the rate to reproduce a refusal on
+/// purpose.
+fn server_cmd(journal: &Path, port: u16) -> Command {
+    let rate = std::env::var("DURABLE_TEST_RATE_LIMIT").unwrap_or_else(|_| "100000".into());
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_durable-server"));
+    cmd.arg("--journal")
         .arg(journal)
         .args(["--listen", &format!("127.0.0.1:{port}")])
-        .args(["--handler", "step=http://127.0.0.1:9/unused"])
+        .args(["--rate-limit-per-addr", &rate])
+        .args(["--max-conns-per-addr", "0"])
         .env("DURABLE_API_KEY", KEY)
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
+        .stderr(Stdio::null());
+    cmd
+}
+
+fn start(journal: &Path, port: u16) -> Child {
+    server_cmd(journal, port)
+        .args(["--handler", "step=http://127.0.0.1:9/unused"])
         .spawn()
         .unwrap_or_else(|e| panic!("{e}"))
 }
@@ -68,6 +82,42 @@ async fn submit(c: &reqwest::Client, base: &str, key: &str) -> Option<u64> {
         return None;
     }
     r.json::<serde_json::Value>().await.ok()?["run_id"].as_u64()
+}
+
+/// Read an acknowledged run back and name what the answer means. Only a
+/// 404 (or a 200 naming a different run) is "lost". A 429 or 503 is the
+/// reader refused by a limit or by capacity — the run may be perfectly
+/// fine, and calling it lost costs a wrong diagnosis.
+async fn assert_run_survives(c: &reqwest::Client, base: &str, id: u64, across: &str) {
+    let Ok(r) = c
+        .get(format!("{base}/jobs/{id}"))
+        .bearer_auth(KEY)
+        .timeout(Duration::from_secs(5))
+        .send()
+        .await
+    else {
+        panic!("read-back of acknowledged run {id} got no answer {across}");
+    };
+    let s = r.status().as_u16();
+    match s {
+        200 => {
+            let body = r
+                .json::<serde_json::Value>()
+                .await
+                .unwrap_or_else(|e| panic!("{e}"));
+            assert_eq!(
+                body["id"].as_u64(),
+                Some(id),
+                "acknowledged run {id} lost {across}: /jobs/{id} names a different run: {body}"
+            );
+        }
+        404 => panic!("acknowledged run {id} lost {across}: /jobs/{id} is 404"),
+        429 | 503 => panic!(
+            "read-back of acknowledged run {id} refused {across} ({s}: rate or capacity), \
+             not lost — the burst tripped a bound, the run may be fine"
+        ),
+        other => panic!("read-back of acknowledged run {id} answered {other} {across}"),
+    }
 }
 
 struct Restore<'a>(&'a Path);
@@ -146,14 +196,7 @@ async fn failed_manifest_swap_exits_the_process_and_loses_nothing() {
     let mut server = start(&journal, port);
     wait_healthy(&c, &base).await;
     for id in &acked {
-        let s = c
-            .get(format!("{base}/jobs/{id}"))
-            .bearer_auth(KEY)
-            .send()
-            .await
-            .map(|r| r.status().as_u16())
-            .unwrap_or(0);
-        assert_eq!(s, 200, "acknowledged run {id} lost on restart");
+        assert_run_survives(&c, &base, *id, "on restart").await;
     }
     let _ = server.kill();
     let _ = server.wait();
@@ -236,14 +279,7 @@ async fn sigterm_drains_in_flight_work_and_exits_zero() {
     let mut server = start(&journal, port);
     wait_healthy(&c, &base).await;
     for id in &acked {
-        let s = c
-            .get(format!("{base}/jobs/{id}"))
-            .bearer_auth(KEY)
-            .send()
-            .await
-            .map(|r| r.status().as_u16())
-            .unwrap_or(0);
-        assert_eq!(s, 200, "acknowledged run {id} lost across SIGTERM");
+        assert_run_survives(&c, &base, *id, "across SIGTERM").await;
     }
     let _ = server.kill();
     let _ = server.wait();
@@ -306,13 +342,8 @@ async fn a_second_server_on_the_same_journal_refuses_startup() {
     let mut first = start(&journal, port);
     wait_healthy(&c, &base).await;
 
-    let mut second = Command::new(env!("CARGO_BIN_EXE_durable-server"))
-        .arg("--journal")
-        .arg(&journal)
-        .args(["--listen", &format!("127.0.0.1:{}", free_port())])
+    let mut second = server_cmd(&journal, free_port())
         .args(["--handler", "step=http://127.0.0.1:9/unused"])
-        .env("DURABLE_API_KEY", KEY)
-        .stdout(Stdio::null())
         .stderr(Stdio::piped())
         .spawn()
         .unwrap_or_else(|e| panic!("{e}"));
@@ -415,15 +446,11 @@ async fn handler_calls_ignore_proxy_environment_variables() {
     let port = free_port();
     let base = format!("http://127.0.0.1:{port}");
     let proxy_url = format!("http://127.0.0.1:{proxy}");
-    let mut server = Command::new(env!("CARGO_BIN_EXE_durable-server"))
-        .arg("--journal")
-        .arg(d.path().join("journal"))
-        .args(["--listen", &format!("127.0.0.1:{port}")])
+    let mut server = server_cmd(&d.path().join("journal"), port)
         .args([
             "--handler",
             &format!("step=http://127.0.0.1:{handler}/step"),
         ])
-        .env("DURABLE_API_KEY", KEY)
         .env("HTTP_PROXY", &proxy_url)
         .env("http_proxy", &proxy_url)
         .env("HTTPS_PROXY", &proxy_url)
@@ -431,8 +458,6 @@ async fn handler_calls_ignore_proxy_environment_variables() {
         .env("all_proxy", &proxy_url)
         .env_remove("NO_PROXY")
         .env_remove("no_proxy")
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
         .spawn()
         .unwrap_or_else(|e| panic!("{e}"));
     let c = reqwest::Client::builder()
@@ -477,10 +502,7 @@ async fn sigterm_with_a_request_still_open_exits_non_zero() {
     let port = free_port();
     let base = format!("http://127.0.0.1:{port}");
     let c = reqwest::Client::new();
-    let mut server = Command::new(env!("CARGO_BIN_EXE_durable-server"))
-        .arg("--journal")
-        .arg(d.path().join("journal"))
-        .args(["--listen", &format!("127.0.0.1:{port}")])
+    let mut server = server_cmd(&d.path().join("journal"), port)
         .args(["--handler", "step=http://127.0.0.1:9/unused"])
         .args(["--drain-timeout-secs", "1"])
         .args([
@@ -489,9 +511,6 @@ async fn sigterm_with_a_request_still_open_exits_non_zero() {
             "--header-timeout-ms",
             "60000",
         ])
-        .env("DURABLE_API_KEY", KEY)
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
         .spawn()
         .unwrap_or_else(|e| panic!("{e}"));
     wait_healthy(&c, &base).await;
