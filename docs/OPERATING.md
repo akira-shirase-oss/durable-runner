@@ -143,8 +143,13 @@ target/release/durable-server \
   files 0600; backups and restores too, D-038). Run the server as the
   user that owns them. A second server on the same
   directory **fails startup** — the exclusive writer lock is held.
-- The inspector is at `http://127.0.0.1:58300/inspector/`: newest runs
-  first, 50 per page, with newer/older controls.
+- The inspector is at `http://127.0.0.1:58300/inspector/` and covers
+  every API operation (list both orders, run detail, spec reveal,
+  submit, cancel, diagnostics, compact, backup, health/ready). It
+  holds the read key for reads and the API key for everything else,
+  each in its own sessionStorage slot; *Forget keys* clears both.
+  Dark and light themes share semantic tokens; the toggle is in the
+  header.
 
 ## Submit, inspect, cancel (the CLI)
 

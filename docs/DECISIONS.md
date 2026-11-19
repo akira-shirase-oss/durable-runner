@@ -890,3 +890,20 @@ convention; these seed the contract's prescribed directions.
   distinct v4s stay independent, a million distinct addresses stay
   inside the bound, an untrusted peer's third connection is closed at
   accept while a trusted peer holds its higher cap.
+- **D-053 — The inspector covers every server operation, and holds two
+  keys.** The page is the audit surface for what the API offers, so it
+  does all of it: `GET /jobs` lists in both orders with cursor paging;
+  `GET /jobs/{id}` is the row's detail; `POST /jobs` submits (steps,
+  base64 input, `not_before`); `POST /jobs/{id}/cancel` cancels;
+  `GET /admin/diagnostics` renders the counters; `POST /admin/compact`
+  and `POST /admin/backup` sit behind an explicit confirm step;
+  `/health` + `/ready` drive the header pill. `GET /jobs/{id}/spec` is
+  a deliberate reveal: the input may be customer content (D-051), so
+  the page asks for the API key rather than fetching it on open. Two
+  keys are held — the read key for reads, the API key for everything
+  else — each in its own sessionStorage slot, never rendered back, and
+  a visible *Forget keys* clears both for the tab. CLI `restore` is
+  intentionally absent: it is a local operation on a stopped server's
+  journal, not an API the page can call. Styling is semantic CSS
+  tokens in light and dark (no raw colors in components) so a later
+  shared skin re-themes the token definitions alone.
