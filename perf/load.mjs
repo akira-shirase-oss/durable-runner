@@ -17,7 +17,7 @@
 //
 // Evidence rules: machine spec + commit hash recorded in every result;
 // a missed threshold is a failing result, kept — never rerun to green.
-import { spawn, spawnSync } from 'node:child_process';
+import { spawn, spawnSync, execFileSync } from 'node:child_process';
 import fs from 'node:fs';
 import net from 'node:net';
 import os from 'node:os';
