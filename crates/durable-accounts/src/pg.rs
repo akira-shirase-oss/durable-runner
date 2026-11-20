@@ -1,6 +1,7 @@
+use std::str::FromStr;
 use std::time::Duration;
 
-use sqlx::postgres::PgPoolOptions;
+use sqlx::postgres::{PgConnectOptions, PgPoolOptions, PgSslMode};
 use sqlx::{PgPool, Row};
 
 use crate::{
@@ -27,12 +28,34 @@ impl Pg {
     /// `migrate` at startup to apply the schema (its failure should be
     /// logged and surfaced, not hidden). `Store` means the URL itself was
     /// unusable — a configuration error, distinct from an outage.
+    ///
+    /// TLS is part of the configuration contract (S2 review #5): a
+    /// non-loopback host must use `sslmode=verify-full` — `require`
+    /// encrypts but does not verify the server's certificate, leaving
+    /// `handler_secret` and `verify_key` grants open to a forged
+    /// endpoint. Loopback hosts (local development) are exempt.
     pub fn connect(url: &str) -> Result<Self, AccountError> {
+        let opts = PgConnectOptions::from_str(url)
+            .map_err(|e| AccountError::Store(format!("unusable DATABASE_URL: {e}")))?;
+        let host = opts.get_host();
+        let bare = host.trim_start_matches('[').trim_end_matches(']');
+        let loopback = host.eq_ignore_ascii_case("localhost")
+            || bare
+                .parse::<std::net::IpAddr>()
+                .map(|ip| ip.is_loopback())
+                .unwrap_or(false);
+        if !loopback && !matches!(opts.get_ssl_mode(), PgSslMode::VerifyFull) {
+            return Err(AccountError::Store(format!(
+                "DATABASE_URL for non-loopback host {host:?} must use \
+                 sslmode=verify-full (got {:?}): the store carries secrets \
+                 and grants — an unverified connection can be forged",
+                opts.get_ssl_mode()
+            )));
+        }
         let pool = PgPoolOptions::new()
             .max_connections(POOL_SIZE)
             .acquire_timeout(ACQUIRE_TIMEOUT)
-            .connect_lazy(url)
-            .map_err(|e| AccountError::Store(e.to_string()))?;
+            .connect_lazy_with(opts);
         Ok(Self { pool })
     }
 
@@ -354,6 +377,45 @@ mod tests {
 
     fn hash(seed: u8) -> [u8; 32] {
         [seed; 32]
+    }
+
+    /// S2 review #5: the store carries handler secrets and key grants —
+    /// a non-loopback connection must *verify* TLS, not merely encrypt.
+    /// The refusal happens at connect() (configuration), so a bad URL
+    /// fails startup loudly instead of downgrading quietly later.
+    #[tokio::test]
+    async fn non_loopback_requires_verify_full() {
+        let refused = |u: &str| {
+            let e = Pg::connect(u).err().unwrap_or_else(|| {
+                panic!("{u} must be refused");
+            });
+            assert!(
+                e.to_string().contains("verify-full"),
+                "{u}: refusal must name the fix: {e}"
+            );
+        };
+        // Encrypted-but-unverified is not enough: the certificate is
+        // never checked, so a forged endpoint reads everything.
+        refused("postgres://u:p@db.example.com/d?sslmode=require");
+        refused("postgres://u:p@db.example.com/d?sslmode=verify-ca");
+        refused("postgres://u:p@db.example.com/d?sslmode=prefer");
+        refused("postgres://u:p@db.example.com/d?sslmode=disable");
+        // No sslmode at all defaults to prefer — downgradeable.
+        refused("postgres://u:p@db.example.com/d");
+        refused("postgres://u:p@[2606:4700::1]/d?sslmode=require");
+
+        assert!(
+            Pg::connect("postgres://u:p@db.example.com/d?sslmode=verify-full").is_ok(),
+            "verify-full is the only accepted non-loopback mode"
+        );
+        // Loopback development targets are exempt — any mode allowed.
+        for u in [
+            "postgres://u:p@localhost/d",
+            "postgres://u:p@127.0.0.1/d",
+            "postgres://u:p@[::1]/d?sslmode=disable",
+        ] {
+            assert!(Pg::connect(u).is_ok(), "{u} must connect");
+        }
     }
 
     #[tokio::test]
