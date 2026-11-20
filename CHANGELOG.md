@@ -4,6 +4,33 @@ All notable changes to Durable Runner are recorded here. The format
 follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the
 versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.0.1] - 2026-11-20
+
+S2-0: the v3 journal-record reader, shipped one release before any writer
+emits v3 (D-056). No behavior change for existing users — every record is
+still written at v2.
+
+### Added
+
+- **Record format v3 reader**: every envelope may carry `ws` (the owning
+  workspace's internal id); v1/v2 records without it read as workspace 0,
+  the default. A committed event whose workspace disagrees with its run's
+  stops startup as corrupt history (`WorkspaceMismatch`).
+- **Snapshot format v2** (`DRIX` version 2): each run carries its
+  workspace; v1 snapshots still decode with `ws` 0. Independent golden
+  fixtures pin both versions
+  (`durable-engine/tests/fixtures/index{,-v2}.drix`).
+- The in-memory index is workspace-aware: runs carry `ws`, idempotency
+  dedup keys on `(workspace, op_key)`, and the legacy JSON snapshot's
+  keys map into workspace 0.
+
+### Load evidence
+
+- `cargo test --workspace`: all existing suites green plus five new v3
+  tests (replay with workspaces, v2→ws0, the v1.0.0 reader's refusal,
+  torn v3 tail, workspace-mismatch startup stop) and dual-version golden
+  snapshots.
+
 ## [1.0.0] - 2026-11-19
 
 The first stable release. A background-task runner whose framed

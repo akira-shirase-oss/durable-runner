@@ -322,7 +322,7 @@ dependencies = [
 
 [[package]]
 name = "durable-cli"
-version = "1.0.0"
+version = "1.0.1"
 dependencies = [
  "anyhow",
  "base64 0.23.1",
@@ -336,7 +336,7 @@ dependencies = [
 
 [[package]]
 name = "durable-domain"
-version = "1.0.0"
+version = "1.0.1"
 dependencies = [
  "base64 0.23.1",
  "serde",
@@ -345,7 +345,7 @@ dependencies = [
 
 [[package]]
 name = "durable-engine"
-version = "1.0.0"
+version = "1.0.1"
 dependencies = [
  "async-trait",
  "durable-domain",
@@ -360,7 +360,7 @@ dependencies = [
 
 [[package]]
 name = "durable-journal"
-version = "1.0.0"
+version = "1.0.1"
 dependencies = [
  "crc32fast",
  "fs2",
@@ -372,7 +372,7 @@ dependencies = [
 
 [[package]]
 name = "durable-server"
-version = "1.0.0"
+version = "1.0.1"
 dependencies = [
  "anyhow",
  "async-trait",
