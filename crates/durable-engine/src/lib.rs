@@ -166,6 +166,17 @@ pub struct Diagnostics {
     /// The highest record version present in the journal. Upgrade and
     /// rollback refuse to run a binary whose reader is older (D-056).
     pub journal_record_version_max: u8,
+    /// The highest snapshot (DRIX) format version the journal holds —
+    /// the same rollback gate needs it: a compacted journal can out-date
+    /// an older reader even when no new record version was ever written.
+    pub journal_snapshot_version_max: u16,
+    /// The highest workspace id the journal carries; nonzero means a
+    /// v3-writing binary's tenant work is present and a rollback must
+    /// know how to park it rather than run it on workspace-0 handlers.
+    pub journal_max_ws: u64,
+    /// Non-terminal runs parked because they belong to a workspace ≠ 0:
+    /// replayed faithfully, never dispatched or probed by this binary.
+    pub parked_runs: u64,
 }
 
 /// The index as snapshots before D-021 carried it (JSON, inputs as number
@@ -289,6 +300,14 @@ pub struct EngineCore {
     /// Highest record `v` present in the journal: bumped by replay and by
     /// every commit this binary writes (D-056's rollback guard).
     journal_record_version_max: u8,
+    /// Highest snapshot (DRIX) version the loaded journal holds — bumping
+    /// the record reader without the snapshot reader left rollback able
+    /// to strand itself on a compacted journal (S2 review).
+    snapshot_version_max: u16,
+    /// Highest workspace id any replayed record or snapshot run carried.
+    /// A binary that reads v3 must also know not to run those tenants'
+    /// work — `journal_max_ws > 0` is what format-guard keys on.
+    journal_max_ws: u64,
     pub limits: Limits,
     pub retry: RetryPolicy,
 }
@@ -323,6 +342,8 @@ impl EngineCore {
             index_bytes: 0,
             discarded_tail,
             journal_record_version_max: 1,
+            snapshot_version_max: 1,
+            journal_max_ws: 0,
             limits: Limits::default(),
             retry: RetryPolicy::default(),
         };
@@ -331,15 +352,17 @@ impl EngineCore {
             // and the checksum verified before the result is used (D-028).
             Some(durable_journal::SnapshotSource::Binary(mut r)) => {
                 let len = r.remaining();
-                let (next_run, runs) =
+                let (ver, next_run, runs) =
                     snapshot::decode_from(&mut r, len).map_err(JournalError::CorruptSnapshot)?;
                 r.finish()?;
+                core.snapshot_version_max = core.snapshot_version_max.max(ver);
                 core.install(next_run, runs);
             }
             Some(durable_journal::SnapshotSource::Legacy(snap)) => {
                 if snap.payload.starts_with(snapshot::MAGIC) {
-                    let (next_run, runs) =
+                    let (ver, next_run, runs) =
                         snapshot::decode(&snap.payload).map_err(JournalError::CorruptSnapshot)?;
+                    core.snapshot_version_max = core.snapshot_version_max.max(ver);
                     core.install(next_run, runs);
                 } else {
                     let idx: LegacyIndex = serde_json::from_slice(&snap.payload)?;
@@ -396,6 +419,7 @@ impl EngineCore {
                     t_decode += t.elapsed();
                     max_run = max_run.max(env.run);
                     core.journal_record_version_max = core.journal_record_version_max.max(env.v);
+                    core.journal_max_ws = core.journal_max_ws.max(env.ws);
                     let t = std::time::Instant::now();
                     core.apply_committed(env.ws, RunId(env.run), env.event, env.at)?;
                     t_apply += t.elapsed();
@@ -419,6 +443,7 @@ impl EngineCore {
                 let env = decode_envelope(&r.payload)?;
                 max_run = max_run.max(env.run);
                 core.journal_record_version_max = core.journal_record_version_max.max(env.v);
+                core.journal_max_ws = core.journal_max_ws.max(env.ws);
                 core.apply_committed(env.ws, RunId(env.run), env.event, env.at)?;
             }
         }
@@ -596,6 +621,9 @@ impl EngineCore {
             .values()
             .map(|r| ((r.ws, r.key.clone()), r.id))
             .collect();
+        self.journal_max_ws = self
+            .journal_max_ws
+            .max(runs.values().map(|r| r.ws).max().unwrap_or(0));
         self.runs = runs;
         self.next_run = next_run;
     }
@@ -806,7 +834,12 @@ impl EngineCore {
         let mut due: Vec<(Millis, RunId, StepIndex, u32)> = self
             .runs
             .iter()
+            // Runs of any workspace ≠ 0 are parked on this binary: it can
+            // replay their records but must never call a handler for them
+            // (the handler registry is name-keyed, workspace-blind — D-056
+            // floor safety, S2 review).
             .filter_map(|(id, r)| match &r.state {
+                _ if r.ws != 0 => None,
                 RunState::Queued { next_run_at } if *next_run_at <= now => {
                     Some((*next_run_at, *id, StepIndex(0), 1))
                 }
@@ -940,6 +973,13 @@ impl EngineCore {
             stale_generations,
             discarded_tail_bytes: self.discarded_tail.map_or(0, |t| t.bytes),
             journal_record_version_max: self.journal_record_version_max,
+            journal_snapshot_version_max: self.snapshot_version_max,
+            journal_max_ws: self.journal_max_ws,
+            parked_runs: self
+                .runs
+                .values()
+                .filter(|r| r.ws != 0 && !r.state.is_terminal())
+                .count() as u64,
         }
     }
 
@@ -972,11 +1012,14 @@ impl EngineCore {
     }
 
     /// Attempts whose deadline passed at `now` — each is a lost reply until
-    /// a reconciler proves otherwise.
+    /// a reconciler proves otherwise. Parked (ws ≠ 0) runs never expire
+    /// into a reconcile either: probing would call a workspace-blind
+    /// handler for a tenant's step.
     pub fn expired_attempts(&self, now: Millis) -> Vec<(RunId, StepIndex)> {
         self.runs
             .iter()
             .filter_map(|(id, r)| match &r.state {
+                _ if r.ws != 0 => None,
                 RunState::Running { step, deadline, .. } if *deadline < now => Some((*id, *step)),
                 _ => None,
             })
@@ -1333,6 +1376,76 @@ mod tests {
             .err()
             .unwrap_or_else(|| panic!("opened"));
         assert!(matches!(err, EngineError::Serde(_)), "{err}");
+    }
+
+    // --- v1.0.2: ws ≠ 0 runs are parked, never dispatched -----------------
+    //
+    // This binary's registry is name-keyed and workspace-blind. Running a
+    // replayed tenant run would POST the tenant's input and idempotency
+    // key to workspace 0's same-named handler — the S2-review rollback
+    // finding. Parked means: replayed faithfully, surfaced in
+    // diagnostics, and never scheduled, expired, or probed.
+
+    /// A queued tenant run never leaves `due` — only workspace-0 work is
+    /// scheduled — and diagnostics expose it as parked, not lost.
+    #[test]
+    fn tenant_runs_are_parked_not_dispatched() {
+        let d = tempfile::tempdir().unwrap_or_else(|e| panic!("{e}"));
+        commit_v3(d.path(), 1, 7, &v3_accepted("tenant"));
+        commit_v3(d.path(), 2, 0, &v3_accepted("ops"));
+        let e = EngineCore::open(d.path()).unwrap_or_else(|e| panic!("{e}"));
+        let due: Vec<RunId> = e.due(u64::MAX).into_iter().map(|(r, ..)| r).collect();
+        assert_eq!(due, vec![RunId(2)], "the tenant run must never be due");
+        let diag = e.diagnostics();
+        assert_eq!(diag.journal_max_ws, 7);
+        assert_eq!(diag.parked_runs, 1);
+    }
+
+    /// A tenant attempt journaled Running past its deadline stays parked:
+    /// expiring it would start a probe — a handler call with the same
+    /// exposure the park exists to prevent.
+    #[test]
+    fn a_parked_attempt_never_expires_into_a_probe() {
+        let d = tempfile::tempdir().unwrap_or_else(|e| panic!("{e}"));
+        commit_v3(d.path(), 1, 7, &v3_accepted("tenant"));
+        commit_v3(
+            d.path(),
+            1,
+            7,
+            "{\"StepDispatched\":{\"step\":0,\"attempt\":1,\"deadline\":1000}}",
+        );
+        commit_v3(d.path(), 2, 0, &v3_accepted("ops"));
+        commit_v3(
+            d.path(),
+            2,
+            0,
+            "{\"StepDispatched\":{\"step\":0,\"attempt\":1,\"deadline\":1000}}",
+        );
+        let e = EngineCore::open(d.path()).unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(
+            e.expired_attempts(2000),
+            vec![(RunId(2), StepIndex(0))],
+            "only the workspace-0 attempt may expire into a reconcile"
+        );
+    }
+
+    /// A snapshot that already carries tenant runs parks them too — the
+    /// park is not a journal-tail property only.
+    #[test]
+    fn tenant_runs_stay_parked_through_a_snapshot() {
+        let d = tempfile::tempdir().unwrap_or_else(|e| panic!("{e}"));
+        commit_v3(d.path(), 1, 7, &v3_accepted("tenant"));
+        {
+            let mut e = EngineCore::open(d.path()).unwrap_or_else(|e| panic!("{e}"));
+            e.compact(0).unwrap_or_else(|e| panic!("{e}"));
+        }
+        let e = EngineCore::open(d.path()).unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(e.run(RunId(1)).unwrap_or_else(|| panic!("run")).ws, 7);
+        assert!(e.due(u64::MAX).is_empty());
+        let diag = e.diagnostics();
+        assert_eq!(diag.parked_runs, 1);
+        assert_eq!(diag.journal_snapshot_version_max, snapshot::VERSION);
+        assert_eq!(diag.journal_max_ws, 7);
     }
 
     /// Compaction and its snapshot carry runs that arrived under either
@@ -1796,7 +1909,7 @@ mod tests {
         let mut bytes = Vec::new();
         snapshot::encode(&plan.view, &mut bytes).unwrap_or_else(|e| panic!("{e}"));
         assert_eq!(bytes.len() as u64, plan.bytes);
-        let (_, runs) = snapshot::decode(&bytes).unwrap_or_else(|e| panic!("{e}"));
+        let (_, _, runs) = snapshot::decode(&bytes).unwrap_or_else(|e| panic!("{e}"));
         assert!(matches!(
             runs.get(&run).map(|r| &r.state),
             Some(RunState::Queued { .. })

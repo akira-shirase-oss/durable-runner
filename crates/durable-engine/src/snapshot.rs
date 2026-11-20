@@ -208,8 +208,10 @@ impl<R: Read> Src<'_, R> {
     }
 }
 
-/// The decoded index: `next_run` and every retained run by id.
-pub type Decoded = (u64, BTreeMap<RunId, Arc<Run>>);
+/// The decoded index: the format version it was written at, `next_run`
+/// and every retained run by id. The version rides along so the caller
+/// can report the highest DRIX version the journal holds (D-056).
+pub type Decoded = (u16, u64, BTreeMap<RunId, Arc<Run>>);
 
 /// Decode a binary index held in memory; any malformation is an error.
 pub fn decode(bytes: &[u8]) -> Result<Decoded, String> {
@@ -318,7 +320,7 @@ pub fn decode_from(r: &mut impl Read, len: u64) -> Result<Decoded, String> {
     if c.left != 0 {
         return Err(format!("{} trailing bytes", c.left));
     }
-    Ok((next_run, runs))
+    Ok((version, next_run, runs))
 }
 
 #[cfg(test)]
@@ -394,7 +396,7 @@ mod tests {
         let mut out = Vec::new();
         encode(&v, &mut out).unwrap_or_else(|e| panic!("{e}"));
         assert_eq!(out.len() as u64, encoded_len(&v));
-        let (next_run, runs) = decode(&out).unwrap_or_else(|e| panic!("{e}"));
+        let (_, next_run, runs) = decode(&out).unwrap_or_else(|e| panic!("{e}"));
         assert_eq!(next_run, 99);
         let back: Vec<Run> = runs.values().map(|r| (**r).clone()).collect();
         let want: Vec<Run> = v.runs.iter().map(|r| (**r).clone()).collect();
@@ -426,8 +428,9 @@ mod tests {
         let streamed =
             decode_from(&mut Trickle(&out), out.len() as u64).unwrap_or_else(|e| panic!("{e}"));
         assert_eq!(whole.0, streamed.0);
-        let a: Vec<Run> = whole.1.values().map(|r| (**r).clone()).collect();
-        let b: Vec<Run> = streamed.1.values().map(|r| (**r).clone()).collect();
+        assert_eq!(whole.1, streamed.1);
+        let a: Vec<Run> = whole.2.values().map(|r| (**r).clone()).collect();
+        let b: Vec<Run> = streamed.2.values().map(|r| (**r).clone()).collect();
         assert_eq!(a, b);
     }
 
@@ -533,8 +536,8 @@ mod tests {
         };
         // v1 golden: same runs, ws defaulted to 0.
         let v1: &[u8] = include_bytes!("../tests/fixtures/index.drix");
-        let (next_run, runs) = decode(v1).unwrap_or_else(|e| panic!("v1: {e}"));
-        assert_eq!(next_run, 3);
+        let (ver, next_run, runs) = decode(v1).unwrap_or_else(|e| panic!("v1: {e}"));
+        assert_eq!((ver, next_run), (1, 3));
         let got: Vec<Run> = runs.values().map(|r| (**r).clone()).collect();
         let expect_v1: Vec<Run> = want
             .runs
@@ -547,8 +550,8 @@ mod tests {
         assert_eq!(got, expect_v1, "a v1 index must decode into workspace 0");
         // v2 golden: decode exactly, and encode to the same bytes.
         let v2: &[u8] = include_bytes!("../tests/fixtures/index-v2.drix");
-        let (next_run, runs) = decode(v2).unwrap_or_else(|e| panic!("v2: {e}"));
-        assert_eq!(next_run, 3);
+        let (ver, next_run, runs) = decode(v2).unwrap_or_else(|e| panic!("v2: {e}"));
+        assert_eq!((ver, next_run), (2, 3));
         let got: Vec<Run> = runs.values().map(|r| (**r).clone()).collect();
         let expect: Vec<Run> = want.runs.iter().map(|r| (**r).clone()).collect();
         assert_eq!(got, expect);

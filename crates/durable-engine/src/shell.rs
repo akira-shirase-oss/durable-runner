@@ -1001,10 +1001,14 @@ async fn actor(
 
     // Crash-window orphans: a run journaled Reconciling whose probe died
     // with the last process gets a fresh probe. Reconcile verdicts are
-    // idempotent — a run that moved on refuses NothingToReconcile.
+    // idempotent — a run that moved on refuses NothingToReconcile. Parked
+    // (ws ≠ 0) runs are never probed here either: the registry is
+    // workspace-blind, so the probe would be a tenant's call made on the
+    // operator's handler.
     let orphaned: Vec<(RunId, StepIndex)> = core
         .runs()
         .filter_map(|r| match r.state {
+            _ if r.ws != 0 => None,
             RunState::Reconciling { step, .. } => Some((r.id, step)),
             _ => None,
         })
@@ -1862,6 +1866,98 @@ mod tests {
         // every attempt is Lost, but the probe says the effect landed —
         // the run advances without ever repeating the remote call.
         assert!(matches!(until_done(&eng, run).await, RunState::Done));
+    }
+
+    /// Counts handler invocations — the evidence a parked run made none.
+    struct Counting {
+        calls: Arc<std::sync::atomic::AtomicUsize>,
+        probes: Arc<std::sync::atomic::AtomicUsize>,
+    }
+    #[async_trait::async_trait]
+    impl StepHandler for Counting {
+        async fn execute(&self, _s: &StepSpec, input: &[u8], _k: &str) -> Outcome {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Outcome::Checkpoint(input.to_vec())
+        }
+        async fn probe(&self, _s: &StepSpec, _k: &str) -> bool {
+            self.probes
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            true
+        }
+    }
+
+    /// Append a v3 record as the S2 writer shapes it — the fixture for
+    /// a journal written under workspace scoping.
+    fn commit_v3(dir: &std::path::Path, run: u64, ws: u64, event: &str) {
+        let mut j = durable_journal::Journal::open(dir).unwrap_or_else(|e| panic!("{e}"));
+        j.append(
+            format!("{{\"v\":3,\"ws\":{ws},\"run\":{run},\"at\":1000,\"event\":{event}}}")
+                .as_bytes(),
+        )
+        .unwrap_or_else(|e| panic!("{e}"));
+    }
+
+    fn v3_accepted(key: &str) -> String {
+        format!(
+            "{{\"Accepted\":{{\"key\":\"{key}\",\"spec\":{{\"version\":1,\
+             \"steps\":[{{\"name\":\"only\",\"handler\":\"echo\"}}],\"input\":[]}},\
+             \"not_before\":0}}}}"
+        )
+    }
+
+    /// The S2-review scenario end to end: replay a journal carrying
+    /// tenant runs on this workspace-blind binary — a queued one and a
+    /// crash-orphaned Reconciling one — and neither may ever produce a
+    /// handler call or a probe, while workspace-0 work proceeds.
+    #[tokio::test(flavor = "current_thread")]
+    async fn replayed_tenant_runs_never_reach_a_handler() {
+        let d = tempfile::tempdir().unwrap_or_else(|e| panic!("{e}"));
+        commit_v3(d.path(), 1, 7, &v3_accepted("tenant"));
+        commit_v3(d.path(), 2, 8, &v3_accepted("other-tenant"));
+        commit_v3(
+            d.path(),
+            2,
+            8,
+            "{\"StepDispatched\":{\"step\":0,\"attempt\":1,\"deadline\":1000}}",
+        );
+        commit_v3(d.path(), 2, 8, "{\"ReplyLost\":{\"step\":0}}");
+        commit_v3(d.path(), 3, 0, &v3_accepted("ops"));
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let probes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut reg = Registry::default();
+        reg.register(
+            "echo",
+            Arc::new(Counting {
+                calls: calls.clone(),
+                probes: probes.clone(),
+            }),
+        );
+        let eng = spawn(
+            d.path(),
+            reg,
+            ShellConfig {
+                tick_ms: 5,
+                ..Default::default()
+            },
+        )
+        .unwrap_or_else(|e| panic!("{e}"));
+        // Workspace 0 runs to done — the engine itself is healthy.
+        assert!(matches!(until_done(&eng, RunId(3)).await, RunState::Done));
+        // Parked runs would have every chance to misbehave by now.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::SeqCst),
+            1, // ws-0's single step — and only that one
+            "a parked run reached the handler"
+        );
+        assert_eq!(
+            probes.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "a parked run was probed"
+        );
+        let diag = eng.diag().await.unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(diag.journal_max_ws, 8);
+        assert_eq!(diag.parked_runs, 2);
     }
 
     #[tokio::test(flavor = "current_thread")]
