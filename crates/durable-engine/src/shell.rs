@@ -535,9 +535,16 @@ impl Engine {
 pub struct ShellConfig {
     /// Maximum handler calls (attempts and reconcile probes) in flight.
     /// A dispatch is journaled only while holding one of these permits.
+    /// Under a submit burst the permits saturate instantly and the rest
+    /// defer to the tick scheduler — measured the drain bound (S2-7):
+    /// 32 permits held ~640 runs/s against a fast fixture while 256 gave
+    /// ~5k/s; the journal/fsync path itself sustains ~33k/s (Echo bench).
     pub max_in_flight: usize,
     /// Upper bound on dispatches (and on deadline expiries) per tick, so a
-    /// backlog of due runs cannot monopolise the actor.
+    /// backlog of due runs cannot monopolise the actor. This is the drain
+    /// ceiling once permits stop throttling: 64 per 50 ms tick caps a
+    /// deferred backlog at ~1,280 dispatches/s (measured ~1,356/s), which
+    /// is what bounded the 50k-run workspaces load to ~1.3k/s (S2-7).
     pub max_dispatch_per_tick: usize,
     /// Scheduler/deadline-sweep cadence.
     pub tick_ms: u64,
@@ -578,8 +585,8 @@ pub struct ShellConfig {
 impl Default for ShellConfig {
     fn default() -> Self {
         Self {
-            max_in_flight: 32,
-            max_dispatch_per_tick: 64,
+            max_in_flight: 256,
+            max_dispatch_per_tick: 512,
             tick_ms: 50,
             cmd_capacity: 1024,
             read_capacity: 256,
@@ -1975,6 +1982,76 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
         panic!("run never reached a terminal state");
+    }
+
+    /// Drain-rate measurement for the S2-7 investigation: N one-step Echo
+    /// runs, time from last submit to all-Done. Run with
+    /// `cargo test -p durable-engine drain_rate -- --ignored --nocapture`.
+    /// Echo removes the network — whatever bounds this bounds the engine.
+    #[tokio::test]
+    #[ignore = "measurement, not a regression test"]
+    async fn drain_rate_under_default_caps() {
+        async fn measure(per_tick: usize, in_flight: usize, tick_ms: u64, n: usize) -> f64 {
+            let d = tempfile::tempdir().unwrap_or_else(|e| panic!("{e}"));
+            let mut reg = Registry::default();
+            reg.register("e", Arc::new(Echo));
+            let cfg = ShellConfig {
+                tick_ms,
+                max_dispatch_per_tick: per_tick,
+                max_in_flight: in_flight,
+                limits: Limits {
+                    max_step_deadline_ms: 30_000,
+                    ..Limits::default()
+                },
+                ..Default::default()
+            };
+            let eng = spawn(d.path(), reg, cfg).unwrap_or_else(|e| panic!("{e}"));
+            for i in 0..n {
+                eng.submit(
+                    OperationKey(format!("drain-{i}")),
+                    JobSpec {
+                        version: 1,
+                        input: b"x".to_vec(),
+                        steps: vec![StepSpec {
+                            name: "s".into(),
+                            handler: "e".into(),
+                        }],
+                    },
+                )
+                .await
+                .unwrap_or_else(|e| panic!("submit {i}: {e}"));
+            }
+            let start = std::time::Instant::now();
+            let deadline = start + Duration::from_secs(120);
+            loop {
+                let d = eng.diag().await.unwrap_or_else(|e| panic!("{e}"));
+                let done = d
+                    .states
+                    .iter()
+                    .filter(|(k, _)| matches!(**k, "done" | "failed" | "cancelled"))
+                    .map(|(_, c)| *c as usize)
+                    .sum::<usize>();
+                if done >= n {
+                    break;
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "drain stalled at {done}/{n}"
+                );
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+            let secs = start.elapsed().as_secs_f64();
+            eprintln!(
+                "per_tick={per_tick} in_flight={in_flight} tick_ms={tick_ms}: \
+                 {n} done in {secs:.1}s = {:.0} runs/s",
+                n as f64 / secs
+            );
+            n as f64 / secs
+        }
+        let base = measure(64, 32, 50, 2000).await;
+        let raised = measure(512, 256, 50, 2000).await;
+        let tight = measure(64, 128, 10, 2000).await;
+        eprintln!("summary: default={base:.0}/s per_tick512={raised:.0}/s tick10={tight:.0}/s");
     }
 
     /// The per-workspace bound: `put` accepts 256 distinct names for one

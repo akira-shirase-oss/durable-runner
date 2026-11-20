@@ -1,0 +1,59 @@
+{
+  "machine": {
+    "host": "maintainer-laptop",
+    "platform": "darwin/arm64",
+    "cpu": "Apple M2 Pro",
+    "cores": 12,
+    "mem_gb": 32,
+    "date": "2026-11-20T13:47:53.401Z",
+    "commit": "01d2490"
+  },
+  "scenario": "workspaces",
+  "params": {
+    "workspaces": 2,
+    "submits_per_workspace": 200,
+    "account_backend": "memory",
+    "drain_budget_ms": 120000,
+    "smoke": true
+  },
+  "sent": 400,
+  "accepted": 400,
+  "http_codes": {
+    "200": 400
+  },
+  "per_workspace": {
+    "01a1f936-a823-75ef-a66f-d64de17dfa73": {
+      "runs": 200,
+      "pages": 1
+    },
+    "01a1f936-a82a-7260-9d12-cd17dfebb403": {
+      "runs": 200,
+      "pages": 1
+    }
+  },
+  "churn_registrations": 191,
+  "done_after_drain": 400,
+  "drain_seconds": 2,
+  "drain_runs_per_s": 199,
+  "handler_calls": {
+    "signed": 397,
+    "unsigned": 0,
+    "signedProbes": 8,
+    "unsignedProbes": 0
+  },
+  "latency_ms": {
+    "p50": 30.733791999999994,
+    "p99": 37.894957999999974,
+    "max": 40.05062499999997
+  },
+  "thresholds": {
+    "accepted": "every submit",
+    "sized": "200 runs per workspace",
+    "disjoint": "no run id shared across workspaces",
+    "oracle": "foreign run id → 404",
+    "done": "every accepted run within 120s drain",
+    "signed": "every handler call signed",
+    "p99_ms": "<2000"
+  },
+  "verdict": "pass"
+}

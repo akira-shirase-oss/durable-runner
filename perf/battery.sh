@@ -32,8 +32,12 @@ case "$MODE" in
     run admission --n=3000
     run compact --seconds=60
     run sustained --rate=100 --total=1000000
-    # S2: workspaces share one server — needs DATABASE_URL, else a visible skip.
-    run workspaces --workspaces=4 --per=25000
+    # S2: workspaces share one server at million scale (4 × 275k submits
+    # plus churn, paging and signed handler calls) — once per account
+    # backend. memory always runs; postgres runs when CI provides
+    # PG_DATABASE_URL (load.yml's service), else a visible skip.
+    run workspaces --workspaces=4 --per=275000 --backend=memory
+    DATABASE_URL="${PG_DATABASE_URL:-}" run workspaces --workspaces=4 --per=275000 --backend=postgres
     ;;
   --smoke | smoke | *)
     # Small sizes — laptop evidence only, marked smoke:true in each result.
@@ -43,8 +47,9 @@ case "$MODE" in
     run admission --smoke
     run compact --smoke
     run sustained --smoke
-    # S2: skips visibly without DATABASE_URL (no account graph to load).
-    run workspaces --smoke
+    # S2: memory backend is always available, so the smoke always
+    # exercises the workspace path instead of skipping.
+    run workspaces --smoke --backend=memory
     ;;
 esac
 

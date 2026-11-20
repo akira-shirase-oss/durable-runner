@@ -83,12 +83,15 @@ struct Args {
     /// `at_capacity`. Default 512 MiB, sized for a 2 GB host (D-031).
     #[arg(long, default_value_t = durable_domain::Limits::default().max_index_bytes)]
     max_index_bytes: u64,
-    /// Handler calls (attempts and probes) in flight at once.
-    #[arg(long, default_value_t = 32)]
+    /// Handler calls (attempts and probes) in flight at once. A submit
+    /// burst saturates the permits and defers the rest to the tick — 32
+    /// held the workspaces drain to ~640 runs/s measured (S2-7).
+    #[arg(long, default_value_t = 256)]
     max_in_flight: usize,
-    /// Dispatches per scheduler tick (ticks every 50 ms, so the first-step
-    /// dispatch rate is at most 20 × this per second).
-    #[arg(long, default_value_t = 64)]
+    /// Dispatches per scheduler tick (ticks every 50 ms, so the deferred
+    /// dispatch rate is at most 20 × this per second — 64 capped a backlog
+    /// at ~1,280/s, the measured ~1.3k/s workspaces bound; S2-7).
+    #[arg(long, default_value_t = 512)]
     max_dispatch_per_tick: usize,
     /// How long a submit, cancel or read waits for the engine before it is
     /// answered 503 `timeout` (a stuck disk must not hang every request).
@@ -1425,7 +1428,8 @@ fn unhex(s: &str) -> Option<[u8; 32]> {
     if b.len() != 64 {
         return None;
     }
-    for (i, pair) in b.chunks_exact(2).enumerate() {
+    let (pairs, _) = b.as_chunks::<2>();
+    for (i, pair) in pairs.iter().enumerate() {
         out[i] = (nib(pair[0])? << 4) | nib(pair[1])?;
     }
     Some(out)
@@ -5934,6 +5938,154 @@ mod tests {
             matches!(outcome, Outcome::Checkpoint(_)),
             "the rotated secret must verify: {outcome:?}"
         );
+    }
+
+    /// S2-7's drain investigation, at the level the load run observed it:
+    /// the same engine, same caps, same submit burst — once against a
+    /// fast axum fixture and once against the single-threaded node
+    /// fixture `perf/load.mjs` spawns. Whatever differs is the bound.
+    /// `cargo test -p durable-server drain_rate -- --ignored --nocapture`.
+    #[tokio::test]
+    #[ignore = "measurement, not a regression test"]
+    async fn drain_rate_against_http_fixtures() {
+        async fn axum_echo() -> String {
+            async fn ok() -> &'static str {
+                "{}"
+            }
+            let app = Router::new().route("/step", axum::routing::post(ok).get(ok));
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+                .await
+                .unwrap_or_else(|e| panic!("{e}"));
+            let addr = listener.local_addr().unwrap_or_else(|e| panic!("{e}"));
+            tokio::spawn(async move {
+                axum::serve(listener, app).await.ok();
+            });
+            format!("http://{addr}")
+        }
+        // The exact fixture load.mjs spawns — one node process, one
+        // thread, JSON parse + reply per request. The URL comes from
+        // `DRAIN_NODE_URL` (spawn it outside: nothing in src/ may start a
+        // process, arch gate) — unset, the node comparisons are skipped.
+        //   node -e "require('node:http').createServer((q,r)=>{let b='';\
+        //     q.on('data',c=>b+=c);q.on('end',()=>{r.writeHead(200,\
+        //     {'content-type':'application/json'});r.end('{}')})})\
+        //     .listen(63999,'127.0.0.1')" &
+        let node_url = std::env::var("DRAIN_NODE_URL").ok();
+        async fn measure(url: &str, n: usize, in_flight: usize, per_tick: usize) -> f64 {
+            let journal = tempfile::tempdir().unwrap_or_else(|e| panic!("{e}"));
+            let engine = spawn(
+                journal.path(),
+                Registry::default(),
+                ShellConfig {
+                    tick_ms: 50,
+                    max_in_flight: in_flight,
+                    max_dispatch_per_tick: per_tick,
+                    ..Default::default()
+                },
+            )
+            .unwrap_or_else(|e| panic!("{e}"));
+            let h = http_handler(url.to_string());
+            engine
+                .put_handler(0, "step", Arc::new(h))
+                .await
+                .unwrap_or_else(|e| panic!("{e}"));
+            // Concurrent submits — submit latency must not hide drain.
+            // Bounded well under cmd_capacity (1024): more in flight is
+            // refused ReserveExhausted, not queued.
+            let gate = Arc::new(tokio::sync::Semaphore::new(256));
+            let mut pending = Vec::with_capacity(n);
+            for i in 0..n {
+                let eng = engine.clone();
+                let g = gate.clone();
+                pending.push(tokio::spawn(async move {
+                    let _permit = g.acquire().await;
+                    eng.submit(
+                        OperationKey(format!("dr-{i}")),
+                        JobSpec {
+                            version: 1,
+                            input: b"x".to_vec(),
+                            steps: vec![StepSpec {
+                                name: "s".into(),
+                                handler: "step".into(),
+                            }],
+                        },
+                    )
+                    .await
+                }));
+            }
+            for p in pending {
+                p.await
+                    .unwrap_or_else(|e| panic!("{e}"))
+                    .unwrap_or_else(|e| panic!("submit: {e}"));
+            }
+            let start = std::time::Instant::now();
+            let deadline = start + Duration::from_secs(240);
+            loop {
+                let d = engine.diag().await.unwrap_or_else(|e| panic!("{e}"));
+                let done = d
+                    .states
+                    .iter()
+                    .filter(|(k, _)| matches!(**k, "done" | "failed" | "cancelled"))
+                    .map(|(_, c)| *c as usize)
+                    .sum::<usize>();
+                if done >= n {
+                    break;
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "stalled at {done}/{n}"
+                );
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+            let secs = start.elapsed().as_secs_f64();
+            eprintln!(
+                "{url} in_flight={in_flight} per_tick={per_tick}: \
+                 {n} done in {secs:.1}s = {:.0} runs/s",
+                n as f64 / secs
+            );
+            n as f64 / secs
+        }
+        // Sequential calls — no concurrency, so this is the fixture's
+        // own round-trip latency (what one permit-slot actually pays).
+        async fn latency(url: &str, n: usize) -> f64 {
+            let h = http_handler(url.to_string());
+            let spec = StepSpec {
+                name: "s".into(),
+                handler: "step".into(),
+            };
+            h.execute(&spec, b"w", "warm").await;
+            let start = std::time::Instant::now();
+            for i in 0..n {
+                h.execute(&spec, b"x", &format!("seq-{i}")).await;
+            }
+            let us = start.elapsed().as_micros() as f64 / n as f64 / 1000.0;
+            eprintln!("{url}: {us:.2} ms/call sequential (n={n})");
+            us
+        }
+        let url_fast = axum_echo().await;
+        latency(&url_fast, 200).await;
+        let fast = measure(&url_fast, 2000, 32, 64).await;
+        // axum at the raised caps — an in-process fixture shares this
+        // single-threaded test runtime with engine+client, so it
+        // understates; the node fixture (own process) is the fair one.
+        let axum_fast = measure(&url_fast, 2000, 256, 512).await;
+        eprintln!("summary: axum32={fast:.0}/s axum256={axum_fast:.0}/s");
+        if let Some(url_node) = node_url {
+            latency(&url_node, 200).await;
+            let slow = measure(&url_node, 2000, 32, 64).await;
+            // If the bound is in-flight call latency × permits, raising
+            // the permit count scales the rate; the writer/tick, it won't.
+            let more = measure(&url_node, 2000, 256, 512).await;
+            // in_flight alone, per_tick at its default — is the permit
+            // the whole story?
+            let alone = measure(&url_node, 2000, 256, 64).await;
+            eprintln!(
+                "node: 32/64={slow:.0}/s 256/512={more:.0}/s \
+                 in_flight256-only={alone:.0}/s"
+            );
+        } else {
+            eprintln!("node comparisons skipped: DRAIN_NODE_URL unset");
+        }
     }
 
     /// Signing is per-call overhead the dispatch path pays: measure the

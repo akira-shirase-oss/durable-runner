@@ -62,7 +62,7 @@ convention; these seed the contract's prescribed directions.
   cancels the local call it declares lost, so a stalled handler cannot hold
   a permit forever (cancelling never undoes a remote effect; the probe
   decides). Dispatches and expiries are capped per tick
-  (`max_dispatch_per_tick`, default 64), longest-waiting first.
+  (`max_dispatch_per_tick`, default 512), longest-waiting first.
 - **D-011 — An API key on every mutating and admin route; backups only
   under a configured root.** No route was authenticated, and
   `/admin/backup` wrote to whatever path the client sent. Now the server

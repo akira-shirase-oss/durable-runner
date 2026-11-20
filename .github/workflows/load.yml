@@ -30,10 +30,29 @@ jobs:
     # Pinned image, not -latest: machine spec must stay comparable between runs.
     runs-on: ubuntu-24.04
     timeout-minutes: 360
+    services:
+      # The workspaces scenario runs twice at million scale — memory
+      # backend always, postgres against this service. Named
+      # PG_DATABASE_URL (not DATABASE_URL) so no other scenario's spawned
+      # server silently picks up the account store and changes what it
+      # measures; battery.sh activates it only for the pg run.
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: durable_load
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres -d durable_load"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
     env:
       BATTERY: ${{ inputs.battery }}
       RUN_ID: ${{ github.run_id }}
       PERF_HOST_LABEL: github-ubuntu-24.04
+      PG_DATABASE_URL: postgres://postgres:postgres@localhost:5432/durable_load
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:

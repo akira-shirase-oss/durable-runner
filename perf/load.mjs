@@ -273,8 +273,21 @@ async function submit(opKey, steps = 1, auth = AUTH) {
 // Run counts come from the bounded diagnostics (counts by state, never
 // rows): GET /jobs is paged, and paging 1M runs to count them would be the
 // unbounded read the paging exists to prevent.
+// Kernel-level refusals (accept-queue overflow under load) hit machinery
+// calls the same way they hit submits; retry a few times rather than let
+// one reset kill a million-scale run. `submit` keeps its own tcp: codes.
+async function req(url, opts = {}, tries = 6) {
+  for (let i = 0;; i++) {
+    try { return await fetch(url, opts); }
+    catch (e) {
+      if (i + 1 >= tries) throw e;
+      await sleep(250);
+    }
+  }
+}
+
 async function diag() {
-  return (await fetch(`${API}/admin/diagnostics`, { headers: AUTH })).json();
+  return (await req(`${API}/admin/diagnostics`, { headers: AUTH })).json();
 }
 
 const pct = (a, p) => a.length ? a.sort((x, y) => x - y)[Math.min(a.length - 1, Math.floor(p * a.length))] : null;
@@ -486,22 +499,36 @@ async function runSustained() {
 // without one the server has no account graph and the scenario skips
 // visibly rather than running compat mode and calling it workspace load.
 async function runWorkspaces() {
-  const backend = process.env.DATABASE_URL ? 'postgres' : process.env.DURABLE_ACCOUNTS_BACKEND;
+  // --backend=memory|postgres forces the account backend for this run;
+  // unset, the ambient env decides (DATABASE_URL, else BACKEND=memory).
+  const backend = args.backend ?? (process.env.DATABASE_URL ? 'postgres' : process.env.DURABLE_ACCOUNTS_BACKEND);
   if (!backend) {
-    console.error('workspaces scenario needs DATABASE_URL or DURABLE_ACCOUNTS_BACKEND=memory; skipping — this is a skip, not a pass');
+    console.error('workspaces scenario needs --backend, DATABASE_URL, or DURABLE_ACCOUNTS_BACKEND=memory; skipping — this is a skip, not a pass');
     return true;
   }
+  const dbUrl = args.database_url ?? process.env.DATABASE_URL;
+  if (backend === 'postgres' && !dbUrl) {
+    console.error('workspaces --backend=postgres needs DATABASE_URL or --database_url=; skipping — this is a skip, not a pass');
+    return true;
+  }
+  // The spawned server inherits process.env — pin exactly the backend this
+  // run asked for so an ambient DATABASE_URL can't silently turn a memory
+  // run into a pg one (the server refuses the pair anyway).
+  delete process.env.DATABASE_URL;
+  delete process.env.DURABLE_ACCOUNTS_BACKEND;
+  if (backend === 'postgres') process.env.DATABASE_URL = dbUrl;
+  else process.env.DURABLE_ACCOUNTS_BACKEND = backend;
   const n = Number(args.workspaces ?? 2), per = Number(args.per ?? (SMOKE ? 200 : 25_000));
   const dir = fs.mkdtempSync(`${os.tmpdir()}/dr-load-`);
   const h = startHandler('ok'); const s = await startServer(`${dir}/journal`);
   // Mint one admin key per workspace through the ops routes.
   const keys = [];
   for (let i = 0; i < n; i++) {
-    const w = await (await fetch(`${API}/admin/workspaces`, {
+    const w = await (await req(`${API}/admin/workspaces`, {
       method: 'POST', headers: { 'content-type': 'application/json', ...AUTH },
       body: JSON.stringify({ name: `load-ws-${i}` }),
     })).json();
-    const k = await (await fetch(`${API}/admin/workspaces/${w.public_id}/keys`, {
+    const k = await (await req(`${API}/admin/workspaces/${w.public_id}/keys`, {
       method: 'POST', headers: { 'content-type': 'application/json', ...AUTH },
       body: JSON.stringify({ name: 'load', permission: 'admin' }),
     })).json();
@@ -511,7 +538,7 @@ async function runWorkspaces() {
   // ws-0 flag registration, so every workspace registers it through the
   // route before its submits can admit.
   for (const ws of keys) {
-    const r = await fetch(`${API}/handlers/step`, {
+    const r = await req(`${API}/handlers/step`, {
       method: 'PUT', headers: { 'content-type': 'application/json', ...ws.auth },
       body: JSON.stringify({ url: `http://127.0.0.1:${HPORT}/step` }),
     });
@@ -523,35 +550,61 @@ async function runWorkspaces() {
   // Registration churn concurrent with dispatch lookups: a second name
   // flaps register→delete under the first workspace's key while the
   // submit burst runs — the registry is rebuilt per workspace, never
-  // blocked.
-  let churnDone = false; let churnOps = 0;
+  // blocked. Kernel refusals count as churn_errors, not a harness crash;
+  // a persistent outage stops churning rather than spin on a dead port.
+  let churnDone = false; let churnOps = 0, churnErrors = 0;
   const churn = (async () => {
     while (!churnDone) {
-      const put = await fetch(`${API}/handlers/churn`, {
-        method: 'PUT', headers: { 'content-type': 'application/json', ...keys[0].auth },
-        body: JSON.stringify({ url: `http://127.0.0.1:${HPORT}/step` }),
-      });
-      const del = await fetch(`${API}/handlers/churn`, { method: 'DELETE', headers: keys[0].auth });
-      if (put.status !== 200 || del.status !== 200) {
-        console.error(`churn broke: put=${put.status} del=${del.status}`); return;
+      try {
+        const put = await fetch(`${API}/handlers/churn`, {
+          method: 'PUT', headers: { 'content-type': 'application/json', ...keys[0].auth },
+          body: JSON.stringify({ url: `http://127.0.0.1:${HPORT}/step` }),
+        });
+        const del = await fetch(`${API}/handlers/churn`, { method: 'DELETE', headers: keys[0].auth });
+        if (put.status !== 200 || del.status !== 200) {
+          console.error(`churn broke: put=${put.status} del=${del.status}`); return;
+        }
+        churnOps++;
+      } catch {
+        if (++churnErrors > 200) { console.error('churn abandoned: server unreachable'); return; }
       }
-      churnOps++; await sleep(5);
+      await sleep(5);
     }
   })();
   // Submit `per` runs per workspace, same op_key prefix in each — dedup is
   // per (workspace, key), so identical keys in two workspaces are two runs.
-  const lat = []; const codes = {}; let sent = 0;
+  // Outstanding fetches stay bounded: at million scale an unawaited
+  // promise per submit is its own heap bound violation.
+  const lat = []; const codes = {}; let sent = 0, accepted = 0;
+  const MAX_PENDING = 4096;
+  const pending = new Set();
   const t0 = now();
   for (let i = 0; i < per; i++) {
     for (const ws of keys) {
       sent++;
-      submit(`shared-${i}`, 1, ws.auth).then((r) => {
+      const p = submit(`shared-${i}`, 1, ws.auth).then((r) => {
+        pending.delete(p);
         lat.push(r.ms); codes[r.status] = (codes[r.status] ?? 0) + 1;
+        if (r.status === 200) accepted++;
       });
+      pending.add(p);
     }
+    if (pending.size >= MAX_PENDING) await Promise.race(pending);
     if (i % 100 === 0) await sleep(50);
   }
-  await sleep(15_000); // drain
+  await Promise.all(pending); // every submit answered before drain timing
+  // Drain: poll diagnostics until every run is terminal or the budget is
+  // gone. A fixed sleep under-drains a million-scale run and a partial
+  // drain masquerading as a pass is worse than an honest miss.
+  const drainBudgetMs = Number(args.drain_budget_ms ?? (SMOKE ? 120_000 : 1_800_000));
+  const drainStart = now();
+  let done = 0;
+  for (;;) {
+    done = (await diag()).states.done ?? 0;
+    if (done >= accepted || now() - drainStart >= drainBudgetMs) break;
+    await sleep(2_000);
+  }
+  const drainSecs = (now() - drainStart) / 1000;
   churnDone = true; await churn;
   // Page each workspace's list: it must contain exactly its `per` runs and
   // no id another workspace owns.
@@ -561,7 +614,7 @@ async function runWorkspaces() {
     const ids = new Set(); let after = null; let pages = 0;
     for (;;) {
       const q = after == null ? '' : `&after=${after}`;
-      const page = await (await fetch(`${API}/jobs?limit=1000${q}`, { headers: ws.auth })).json();
+      const page = await (await req(`${API}/jobs?limit=1000${q}`, { headers: ws.auth })).json();
       for (const r of page.runs ?? []) ids.add(r.id);
       pages++;
       if (page.next_after == null) break;
@@ -573,8 +626,7 @@ async function runWorkspaces() {
     [...owned.values()].every((o, j) => i === j || [...ids].every((id) => !o.has(id))));
   // No-oracle spot check: workspace 0's first run read under workspace 1's key.
   const foreign = [...owned.get(0)][0];
-  const probe = await fetch(`${API}/jobs/${foreign}`, { headers: keys[1].auth });
-  const done = (await diag()).states.done ?? 0;
+  const probe = await req(`${API}/jobs/${foreign}`, { headers: keys[1].auth });
   // S2-6: every call this scenario dispatches went through a
   // store-registered handler, so each must carry the signature headers.
   const sigs = await fetch(`http://127.0.0.1:${HPORT}/stats`).then((r) => r.json())
@@ -582,14 +634,17 @@ async function runWorkspaces() {
   h.kill(); s.kill();
   const p99 = pct(lat, 0.99);
   const r = writeResult('workspaces', {
-    params: { workspaces: n, submits_per_workspace: per, account_backend: backend, smoke: SMOKE },
-    sent, http_codes: codes, per_workspace: pageCounts, churn_registrations: churnOps,
-    done_after_drain: done, handler_calls: sigs,
+    params: { workspaces: n, submits_per_workspace: per, account_backend: backend, drain_budget_ms: drainBudgetMs, smoke: SMOKE },
+    sent, accepted, http_codes: codes, per_workspace: pageCounts, churn_registrations: churnOps, churn_errors: churnErrors,
+    done_after_drain: done, drain_seconds: Math.round(drainSecs),
+    drain_runs_per_s: drainSecs > 0 ? Math.round(done / drainSecs) : done,
+    handler_calls: sigs,
     latency_ms: { p50: pct(lat, 0.5), p99, max: pct(lat, 1) },
     thresholds: {
       accepted: 'every submit', sized: `${per} runs per workspace`,
       disjoint: 'no run id shared across workspaces', oracle: 'foreign run id → 404',
-      done: 'every accepted run', signed: 'every handler call signed', p99_ms: `<${P99_MS}`,
+      done: `every accepted run within ${Math.round(drainBudgetMs / 1000)}s drain`,
+      signed: 'every handler call signed', p99_ms: `<${P99_MS}`,
     },
     ...verdictOf([
       ['every submit accepted', Object.keys(codes).every((c) => c === '200')],

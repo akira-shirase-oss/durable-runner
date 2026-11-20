@@ -34,10 +34,11 @@ target/release/durable-server \
 - **Capacity.** `--max-live-runs` (100,000 non-terminal runs) and
   `--max-index-bytes` (512 MiB of retained runs) bound the index; past them
   a submit is `503 at_capacity` (nothing journaled; retry with the same
-  `op_key`). `--max-in-flight` (32 handler calls) and
-  `--max-dispatch-per-tick` (64 per 50 ms tick) bound execution; raise
-  them if dispatch is the bottleneck. `GET /admin/diagnostics` shows
-  `active_runs` and `index_bytes`.
+  `op_key`). `--max-in-flight` (256 handler calls) and
+  `--max-dispatch-per-tick` (512 per 50 ms tick) bound execution — sized
+  after the S2-7 drain measurement (32/64 held ~640–1,300 runs/s against a
+  fast handler; 256/512 reached ~5k/s; the journal itself sustains ~33k/s).
+  `GET /admin/diagnostics` shows `active_runs` and `index_bytes`.
 
   *Memory sizing (D-031).* Plan for a peak RSS of about
   `2.6 × max_index_bytes + 100 MiB`. Measured, restart and steady state
