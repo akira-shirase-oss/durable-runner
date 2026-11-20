@@ -4,6 +4,55 @@ All notable changes to Durable Runner are recorded here. The format
 follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the
 versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.0.2] - 2026-11-21
+
+Rollback-safety release: the independent review of the workspace work
+found two ways v1.0.1 was an unsafe rollback floor, both fixed here.
+
+### Fixed
+
+- **Runs of any workspace ≠ 0 are parked, never executed.** This binary
+  replays v3 records faithfully but its handler registry is name-keyed
+  and workspace-blind — dispatching a tenant run would POST the tenant's
+  input and idempotency key to workspace 0's same-named handler. Parked
+  runs (queued, running past deadline, or crash-orphaned in Reconciling)
+  are now excluded from dispatch, the deadline sweep, and startup's
+  orphan re-probe; they surface as `parked_runs` in diagnostics.
+- **format-guard checks the snapshot (DRIX) version.** v1.0.1 wrote
+  DRIX 2 on every compaction, but D-056's guard compared record versions
+  only — so a rollback to v1.0.0 (which reads DRIX 1) passed the guard
+  and then refused startup. The guard now refuses any binary whose
+  snapshot reader is older than the journal's highest DRIX version.
+- **format-guard refuses non-parking binaries once ws ≠ 0 records
+  exist.** A v3 journal carrying tenant runs refuses any binary that
+  cannot park them — regardless of record-version compatibility.
+
+### Changed
+
+- `--journal-format` now prints three numbers —
+  `<max record version> <max DRIX version> <parks ws ≠ 0>` —
+  `3 2 1` for this release. Older binaries print one number; the guard
+  maps that to the release table (record-reader 3 ⇒ DRIX 2, older ⇒
+  DRIX 1, no parking).
+- Diagnostics grew `journal_snapshot_version_max`, `journal_max_ws`,
+  and `parked_runs` so the guard sees the journal's shape while the
+  server is up; server-down it scans the same facts off the files.
+
+### Rollback note (read before downgrading)
+
+**v1.0.1 is not a safe rollback floor** for any journal that has ever
+been compacted or that carries tenant records:
+
+- After one compaction under v1.0.1 the journal holds DRIX 2 snapshots,
+  which v1.0.0 cannot read (it fails safe — startup refused, no
+  corruption — but the rollback is still the outage).
+- Once any `ws ≠ 0` record exists, both v1.0.0 and v1.0.1 would run
+  tenant work on workspace 0's handlers: v1.0.1 replays the records and
+  its workspace-blind registry dispatches them by name.
+- With this release's guard, v1.0.2 is the floor for such journals; a
+  v1.0.1-era journal (v2 records, no ws ≠ 0, DRIX ≤ 2) still rolls back
+  to v1.0.1 cleanly.
+
 ## [1.0.1] - 2026-11-20
 
 S2-0: the v3 journal-record reader, shipped one release before any writer

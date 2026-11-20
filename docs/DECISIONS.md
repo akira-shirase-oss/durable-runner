@@ -966,10 +966,20 @@ format bump would make the service refuse to start. The rules:
   it (`READER_VERSION`) at least one release before any writer emits it
   (`ENVELOPE_VERSION`). Rolling back one release then always lands on a
   binary that can read what the journal holds.
-- **The guard enforces it anyway.** `/admin/diagnostics` reports
-  `journal_record_version_max` (tracked from replay plus every commit);
-  `durable-server --journal-format` prints the binary's reader version.
-  `deploy/upgrade.sh` and `deploy/rollback.sh` run `format-guard.sh`,
-  which refuses — naming both versions — to swap in a binary whose
-  reader is below the journal's highest, and fails closed when it
-  cannot tell.
+- **The guard enforces it anyway — on all three format dimensions.**
+  `/admin/diagnostics` reports `journal_record_version_max`,
+  `journal_snapshot_version_max`, and `journal_max_ws` (tracked from
+  replay plus every commit and snapshot); server-down, the same facts
+  are scanned off the files. `durable-server --journal-format` prints
+  them from the binary's side:
+  `<max record version> <max DRIX version> <parks ws ≠ 0>` since
+  v1.0.2 (a lone integer before it means records only, snapshot
+  capability from the release table, no parking). `deploy/upgrade.sh`
+  and `deploy/rollback.sh` run `format-guard.sh`, which refuses —
+  naming both versions — to swap in a binary below the journal's
+  highest on any of the three, and fails closed when it cannot tell.
+  Snapshots are part of the check because a compaction can out-date an
+  older reader without any new record version (the e6951b5 gap: v1.0.1
+  wrote DRIX 2 while the guard compared records only); workspace scope
+  is part of it because a binary that cannot park ws ≠ 0 runs would
+  execute tenant work on workspace 0's name-keyed handlers.
