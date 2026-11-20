@@ -1,17 +1,28 @@
 #!/usr/bin/env bash
 # format-guard — D-056's upgrade/rollback guard. Refuses (exit 1) to run
-# a binary whose reader is older than the journal's highest record
-# version: such a binary refuses startup, which turns a bad upgrade into
-# an outage — or makes an automatic rollback the outage.
+# a binary that cannot safely read this journal:
+#   * record version  — an older reader refuses startup, which turns a
+#     bad upgrade (or an automatic rollback) into the outage;
+#   * snapshot format — a compacted journal can out-date an older reader
+#     even when no new record version was ever written (v1.0.0 reads
+#     DRIX 1 only; v1.0.1 wrote DRIX 2 — the e6951b5 gap);
+#   * workspace scope — a v3 journal may carry ws ≠ 0 runs; any binary
+#     that cannot park them would execute tenant work on workspace 0's
+#     name-keyed handlers (S2 review).
 #
 #   deploy/format-guard.sh /path/to/durable-server
 #
-# The journal's highest version comes from the running server's
-# /admin/diagnostics when reachable; otherwise it is read straight off
-# the journal files ("v" fields — a v1-only journal legitimately has
-# none, so no match means 1). The fallback fails CLOSED: an unreadable
-# journal, a gen-* dir without a readable journal.log, or a grep error
-# is a refusal, never a silent "1".
+# The journal's shape comes from the running server's /admin/diagnostics
+# when reachable, joined with what is read straight off the journal
+# files ("v"/"ws" fields — a v1-only journal legitimately has neither —
+# and gen-*/snapshot.bin DRIX headers). The file scan fails CLOSED: an
+# unreadable journal, a gen-* dir without a readable journal.log, or a
+# malformed snapshot is a refusal, never a silent "1".
+#
+# `$bin --journal-format` prints three numbers since v1.0.2 —
+# "<records> <snapshots> <parks-ws≠0>"; older binaries print only the
+# record version, and their snapshot capability is the release table
+# (record-reader 3 = DRIX 2; older = DRIX 1). None of them parks.
 # Env overrides exist only for the test (deploy/test-format-guard.sh).
 set -euo pipefail
 bin=${1:?usage: format-guard.sh /path/to/durable-server}
@@ -22,17 +33,25 @@ JOURNAL_ROOT=${FORMAT_GUARD_JOURNAL_ROOT:-/var/lib/durable/journal}
 refuse() { echo "format-guard: REFUSED — $*" >&2; exit 1; }
 
 jmax=""
+jsnap=""
+jws=""
 if [[ -r $KEY_FILE ]]; then
-  jmax=$(curl -fsS --max-time 5 \
+  diag=$(curl -fsS --max-time 5 \
     -H "authorization: Bearer $(tr -d '\n' <"$KEY_FILE")" \
-    "http://$LISTEN/admin/diagnostics" 2>/dev/null \
-    | jq -r '.journal_record_version_max // empty' 2>/dev/null || true)
+    "http://$LISTEN/admin/diagnostics" 2>/dev/null || true)
+  jmax=$(printf '%s' "$diag" | jq -r '.journal_record_version_max // empty' 2>/dev/null || true)
+  jsnap=$(printf '%s' "$diag" | jq -r '.journal_snapshot_version_max // empty' 2>/dev/null || true)
+  jws=$(printf '%s' "$diag" | jq -r '.journal_max_ws // empty' 2>/dev/null || true)
 fi
-if [[ -z $jmax ]]; then
-  # Server-down fallback: read the highest "v" off the journal files.
-  # Fail CLOSED here — a scan that cannot complete is not a v1 journal.
+if [[ -z $jmax || -z $jsnap || -z $jws ]]; then
+  # File scan — needed whenever diagnostics could not supply a field:
+  # server down entirely, or an older binary that reports record
+  # versions only. Fail CLOSED: an unreadable journal, a gen-* dir
+  # without a readable journal.log, or a malformed snapshot is a
+  # refusal, never a silent "1".
+  smax=1; ssnap=1; sws=0
   if [[ ! -d $JOURNAL_ROOT ]]; then
-    jmax=1                                   # no journal at all: nothing written
+    :                                        # no journal at all
   elif [[ ! -r $JOURNAL_ROOT || ! -x $JOURNAL_ROOT ]]; then
     refuse "journal dir $JOURNAL_ROOT is not readable"
   else
@@ -48,25 +67,73 @@ if [[ -z $jmax ]]; then
     if (( ${#gens[@]} == 0 )) && [[ -f $JOURNAL_ROOT/manifest.json ]]; then
       refuse "$JOURNAL_ROOT has a manifest but no gen-*/journal.log"
     fi
-    jmax=1
     for f in ${logs[@]+"${logs[@]}"}; do
       # grep 0 = matches, 1 = no match (v1 records only — fine), >=2 = error.
       if out=$(LC_ALL=C grep -ao '"v":[0-9]*' "$f" 2>/dev/null); then rc=0; else rc=$?; fi
       (( rc < 2 )) || refuse "cannot scan $f (grep exit $rc)"
-      [[ -n $out ]] || continue
-      m=$(printf '%s\n' "$out" | sed 's/.*://' | sort -n | tail -1)
-      (( m > jmax )) && jmax=$m
+      if [[ -n $out ]]; then
+        m=$(printf '%s\n' "$out" | sed 's/.*://' | sort -n | tail -1)
+        (( m > smax )) && smax=$m
+      fi
+      # Workspace-scoped history: a v3 record with ws ≠ 0 is what a
+      # pre-v1.0.2 binary cannot park — it would run tenant work on
+      # workspace-0's name-keyed handlers (S2 review). "ws":0 is the
+      # writer's own default, not tenant data.
+      if LC_ALL=C grep -aq '"ws":[1-9]' "$f" 2>/dev/null; then sws=1; fi
+    done
+    # Snapshot formats: gen-*/snapshot.bin is a framed record whose
+    # payload is "DRIX" + u16 version — so the magic sits at bytes 28-31
+    # and the version at 32-33. DRIX ≥ 2 means a workspace-aware writer
+    # compacted this journal; the ws fields inside are binary, not
+    # greppable, so the journal.log ws scan above is the only tenant
+    # check — keep it that way by refusing anything unparseable.
+    for g in "${gens[@]}"; do
+      sbin=$g/snapshot.bin
+      [[ -e $sbin ]] || continue
+      [[ -f $sbin && -r $sbin ]] || refuse "cannot read $sbin"
+      magic=$(dd bs=1 skip=28 count=4 <"$sbin" 2>/dev/null || true)
+      [[ $magic == DRIX ]] || refuse "$sbin is not a DRIX snapshot"
+      vb=$(od -An -j32 -N2 -tu1 <"$sbin" 2>/dev/null) || refuse "cannot scan $sbin"
+      [[ -n $vb ]] || refuse "$sbin is too short to carry a DRIX header"
+      read -r b0 b1 _ <<<"$vb"
+      sv=$(( b0 * 256 + b1 ))
+      (( sv > ssnap )) && ssnap=$sv
     done
   fi
+  # Whatever the files hold outranks whatever a still-running older
+  # server reports — the journal is the authority, not the process.
+  [[ $smax =~ ^[0-9]+$ ]] && (( smax > ${jmax:-0} )) && jmax=$smax
+  [[ $ssnap =~ ^[0-9]+$ ]] && (( ssnap > ${jsnap:-0} )) && jsnap=$ssnap
+  [[ $sws =~ ^[0-9]+$ ]] && (( sws > ${jws:-0} )) && jws=$sws
 fi
 [[ $jmax =~ ^[0-9]+$ ]] || refuse "cannot determine the journal's record version"
-bmax=$("$bin" --journal-format 2>/dev/null) || {
+[[ $jsnap =~ ^[0-9]+$ ]] || refuse "cannot determine the journal's snapshot version"
+[[ $jws =~ ^[0-9]+$ ]] || jws=0
+bmax=""
+bout=$("$bin" --journal-format 2>/dev/null) || {
   echo "format-guard: $bin --journal-format failed — refusing" >&2
   exit 1
 }
+# "3 2 1" since v1.0.2: records, snapshots, parks-ws≠0. A lone integer
+# predates the extra fields: its snapshot capability is the release
+# table (record-reader 3 = DRIX 2; older = DRIX 1) and it parks nothing.
+read -r bmax bsnap bpark <<<"$bout"
+[[ $bmax =~ ^[0-9]+$ ]] || refuse "cannot parse $bin --journal-format: '$bout'"
+if [[ -z $bsnap ]]; then bsnap=$(( bmax >= 3 ? 2 : 1 )); fi
+bpark=${bpark:-0}
 if (( bmax < jmax )); then
   echo "format-guard: REFUSED — the journal holds record version $jmax" \
     "but $bin reads only up to $bmax" >&2
   exit 1
 fi
-echo "format-guard: journal v$jmax, $bin reads to v$bmax — ok"
+if (( bsnap < jsnap )); then
+  echo "format-guard: REFUSED — the journal holds snapshot format $jsnap" \
+    "but $bin reads only up to $bsnap" >&2
+  exit 1
+fi
+if (( jws > 0 && bpark < 1 )); then
+  echo "format-guard: REFUSED — the journal holds workspace-scoped records" \
+    "and $bin cannot park them: it would run tenant work on workspace-0 handlers" >&2
+  exit 1
+fi
+echo "format-guard: journal v$jmax/snap v$jsnap/ws $jws, $bin reads to v$bmax/snap $bsnap — ok"
