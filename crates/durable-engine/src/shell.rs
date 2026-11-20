@@ -1145,8 +1145,8 @@ async fn actor(
     let mut probes: JoinSet<ProbeJoin> = JoinSet::new();
     let mut live: HashMap<(RunId, StepIndex), AbortHandle> = HashMap::new();
     let mut waiting_probes = ProbeQueue::default();
-    let mut ws_load: HashMap<u64, u32> = HashMap::new();
-    let mut call_ws: HashMap<(RunId, StepIndex), u64> = HashMap::new();
+    let inflight = WsInflight::default();
+    let mut spawned: HashMap<tokio::task::Id, (RunId, StepIndex)> = HashMap::new();
     let sem = Arc::new(Semaphore::new(cfg.max_in_flight));
     let mut status = writer.status;
     let mut pipe = Pipeline::new(
@@ -1172,8 +1172,8 @@ async fn actor(
                 attempts: &mut attempts,
                 probes: &mut probes,
                 live: &mut live,
-                ws_load: &mut ws_load,
-                call_ws: &mut call_ws,
+                inflight: &inflight,
+                spawned: &mut spawned,
                 ws_cap: cfg.max_in_flight_per_ws as u32,
                 waiting_probes: &mut waiting_probes,
                 per_tick: cfg.max_dispatch_per_tick,
@@ -1309,34 +1309,61 @@ async fn actor(
                     return StopReason::Dropped;
                 }
             },
-            Some(Ok((run, step, outcome, permit))) = attempts.join_next() => {
-                live.remove(&(run, step));
-                if let Some(ws) = call_ws.remove(&(run, step)) {
-                    if let Some(n) = ws_load.get_mut(&ws) {
-                        *n = n.saturating_sub(1);
+            Some(res) = attempts.join_next() => match res {
+                Ok((run, step, outcome, permit)) => {
+                    live.remove(&(run, step));
+                    spawned.retain(|_, k| *k != (run, step));
+                    let (out, fail) = match outcome {
+                        Outcome::Checkpoint(o) => (Some(o), None),
+                        Outcome::Failed => (None, Some("failed".to_string())),
+                        Outcome::Lost => (None, None),
+                    };
+                    let mut ex = exec!();
+                    // Not journaled (e.g. NoSpace): counted; the run stays
+                    // Running and its deadline sweep reconciles the effect.
+                    let effects = ex.mon.effects(core.step_finished(run, step, out, fail, wall_ms()));
+                    run_effects(&mut core, &mut ex, effects, run, Some(permit));
+                }
+                // A panicked or aborted attempt: the WsSlot already
+                // returned the workspace's share on drop. The call's
+                // outcome is unknown → journaled as Lost so
+                // at-least-once retry reconciles it.
+                Err(e) => {
+                    eprintln!("durable: handler task died: {e}");
+                    if let Some((run, step)) = spawned.remove(&e.id()) {
+                        live.remove(&(run, step));
+                        let mut ex = exec!();
+                        let effects = ex.mon.effects(core.step_finished(
+                            run,
+                            step,
+                            None,
+                            None,
+                            wall_ms(),
+                        ));
+                        run_effects(&mut core, &mut ex, effects, run, None);
                     }
                 }
-                let (out, fail) = match outcome {
-                    Outcome::Checkpoint(o) => (Some(o), None),
-                    Outcome::Failed => (None, Some("failed".to_string())),
-                    Outcome::Lost => (None, None),
-                };
-                let mut ex = exec!();
-                // Not journaled (e.g. NoSpace): counted; the run stays
-                // Running and its deadline sweep reconciles the effect.
-                let effects = ex.mon.effects(core.step_finished(run, step, out, fail, wall_ms()));
-                run_effects(&mut core, &mut ex, effects, run, Some(permit));
-            }
-            Some(Ok((run, step, found, permit))) = probes.join_next() => {
-                if let Some(ws) = call_ws.remove(&(run, step)) {
-                    if let Some(n) = ws_load.get_mut(&ws) {
-                        *n = n.saturating_sub(1);
+            },
+            Some(res) = probes.join_next() => match res {
+                Ok((run, step, found, permit)) => {
+                    spawned.retain(|_, k| *k != (run, step));
+                    let mut ex = exec!();
+                    let effects = ex.mon.effects(core.reconciled(run, step, found, wall_ms()));
+                    run_effects(&mut core, &mut ex, effects, run, Some(permit));
+                }
+                // Same release rule for a dead probe; its verdict is
+                // unknown, so it reconciles as not-found — at-least-once
+                // retries the call under the same idempotency key.
+                Err(e) => {
+                    eprintln!("durable: probe task died: {e}");
+                    if let Some((run, step)) = spawned.remove(&e.id()) {
+                        let mut ex = exec!();
+                        let effects =
+                            ex.mon.effects(core.reconciled(run, step, false, wall_ms()));
+                        run_effects(&mut core, &mut ex, effects, run, None);
                     }
                 }
-                let mut ex = exec!();
-                let effects = ex.mon.effects(core.reconciled(run, step, found, wall_ms()));
-                run_effects(&mut core, &mut ex, effects, run, Some(permit));
-            }
+            },
             r = compaction_done(&mut pending_compaction) => {
                 if let Some(c) = pending_compaction.take() {
                     let answer = match r {
@@ -1455,6 +1482,61 @@ impl ProbeQueue {
     }
 }
 
+/// In-flight handler work per workspace (attempts + probes), shared
+/// with the tasks it counts: a `WsSlot` owns one slot and releases it
+/// on drop — a completed call, a panicking handler, or an aborted task
+/// all give it back. The join arms only retire bookkeeping; the count
+/// itself can never be stranded by a dead task (S2 re-review).
+#[derive(Clone, Default)]
+struct WsInflight(Arc<std::sync::Mutex<HashMap<u64, u32>>>);
+
+impl WsInflight {
+    fn count(&self, ws: u64) -> u32 {
+        self.0
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&ws)
+            .copied()
+            .unwrap_or(0)
+    }
+}
+
+/// One workspace's in-flight slot: taken under the counter's lock (the
+/// check and the claim are one step) and returned on drop.
+struct WsSlot {
+    shared: WsInflight,
+    ws: u64,
+}
+
+impl WsSlot {
+    fn take(shared: &WsInflight, ws: u64) -> Self {
+        *shared
+            .0
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .entry(ws)
+            .or_default() += 1;
+        Self {
+            shared: shared.clone(),
+            ws,
+        }
+    }
+}
+
+impl Drop for WsSlot {
+    fn drop(&mut self) {
+        if let Some(n) = self
+            .shared
+            .0
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get_mut(&self.ws)
+        {
+            *n = n.saturating_sub(1);
+        }
+    }
+}
+
 /// The executor's plumbing, bundled so helpers stay under the arg limit.
 struct Exec<'a> {
     registry: &'a Registry,
@@ -1465,12 +1547,13 @@ struct Exec<'a> {
     /// local call and free its permit (cancelling cannot undo a remote
     /// effect; the reconcile probe decides that).
     live: &'a mut HashMap<(RunId, StepIndex), AbortHandle>,
-    /// In-flight handler calls per workspace (attempts + probes): the
-    /// fairness counter for `max_in_flight_per_ws`. `call_ws` remembers
-    /// which workspace owns each spawned call so the join decrements the
-    /// right tenant. Bounded by `max_in_flight` entries each.
-    ws_load: &'a mut HashMap<u64, u32>,
-    call_ws: &'a mut HashMap<(RunId, StepIndex), u64>,
+    /// The fairness counter for `max_in_flight_per_ws` — each spawned
+    /// task carries a `WsSlot` off it.
+    inflight: &'a WsInflight,
+    /// Task id → (run, step) for every spawned call and probe: the
+    /// join-ERROR arm gets no tuple, so this is how it learns which
+    /// step's task died.
+    spawned: &'a mut HashMap<tokio::task::Id, (RunId, StepIndex)>,
     ws_cap: u32,
     waiting_probes: &'a mut ProbeQueue,
     per_tick: usize,
@@ -1525,13 +1608,14 @@ impl Exec<'_> {
         let idem = idem_key(&r.key, step);
         let input = r.spec.input.clone();
         let call = Call { run, step, attempt };
+        let slot = WsSlot::take(self.inflight, r.ws);
         let handle = self.attempts.spawn(async move {
             let outcome = handler.execute_call(call, &sspec, &input, &idem).await;
+            drop(slot); // the slot returns at task end — panic and abort included
             (run, step, outcome, permit)
         });
+        self.spawned.insert(handle.id(), (run, step));
         self.live.insert((run, step), handle);
-        *self.ws_load.entry(r.ws).or_default() += 1;
-        self.call_ws.insert((run, step), r.ws);
     }
 
     /// Fail a step's attempt (journaled; retry/terminal decided by domain).
@@ -1563,7 +1647,7 @@ impl Exec<'_> {
     /// at most its own cap, never the whole pool.
     fn ws_full(&self, core: &EngineCore, run: RunId) -> bool {
         core.run(run)
-            .map(|r| self.ws_load.get(&r.ws).copied().unwrap_or(0) >= self.ws_cap)
+            .map(|r| self.inflight.count(r.ws) >= self.ws_cap)
             .unwrap_or(false)
     }
 
@@ -1612,12 +1696,13 @@ impl Exec<'_> {
         };
         let idem = idem_key(&r.key, step);
         let call = Call { run, step, attempt };
-        self.probes.spawn(async move {
+        let slot = WsSlot::take(self.inflight, r.ws);
+        let handle = self.probes.spawn(async move {
             let found = handler.probe_call(call, &sspec, &idem).await;
+            drop(slot); // the slot returns at task end — panic and abort included
             (run, step, found, permit)
         });
-        *self.ws_load.entry(r.ws).or_default() += 1;
-        self.call_ws.insert((run, step), r.ws);
+        self.spawned.insert(handle.id(), (run, step));
     }
 }
 
@@ -1682,7 +1767,7 @@ fn tick(core: &mut EngineCore, exec: &mut Exec<'_>) {
         }
         // Fairness (S2 review #6): a workspace at its in-flight share is
         // skipped — its runs stay queued while others dispatch.
-        if exec.ws_load.get(&ws).copied().unwrap_or(0) >= exec.ws_cap {
+        if exec.inflight.count(ws) >= exec.ws_cap {
             continue;
         }
         let Ok(permit) = exec.sem.clone().try_acquire_owned() else {
@@ -1806,6 +1891,21 @@ mod tests {
         }
         async fn probe(&self, _s: &StepSpec, _k: &str) -> bool {
             self.calls.load(std::sync::atomic::Ordering::SeqCst) > 0
+        }
+    }
+
+    /// Its first call panics inside the task; later calls answer. The
+    /// probe keeps the default "not found", so a journaled Lost re-fires.
+    struct PanicOnce {
+        calls: Arc<std::sync::atomic::AtomicUsize>,
+    }
+    #[async_trait::async_trait]
+    impl StepHandler for PanicOnce {
+        async fn execute(&self, _s: &StepSpec, _i: &[u8], _k: &str) -> Outcome {
+            if self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+                panic!("handler blew up inside the task");
+            }
+            Outcome::Checkpoint(b"ok".to_vec())
         }
     }
 
@@ -2261,6 +2361,46 @@ mod tests {
         assert!(matches!(until_done(&eng, run).await, RunState::Done));
     }
 
+    /// S2 re-review: a panicking handler task must not strand the
+    /// workspace's in-flight share — the WsSlot returns on drop, so the
+    /// journaled Lost can reconcile and retry. With
+    /// `max_in_flight_per_ws = 1` a leaked slot would stall the probe
+    /// and every later call forever: reaching `Done` proves the count
+    /// came back to zero.
+    #[tokio::test(flavor = "current_thread")]
+    async fn panicking_handler_releases_the_workspace_slot() {
+        let d = tempfile::tempdir().unwrap_or_else(|e| panic!("{e}"));
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut reg = Registry::default();
+        reg.register(
+            "panic-once",
+            Arc::new(PanicOnce {
+                calls: calls.clone(),
+            }),
+        );
+        let eng = spawn(
+            d.path(),
+            reg,
+            ShellConfig {
+                tick_ms: 5,
+                max_in_flight_per_ws: 1,
+                limits: fast_limits(),
+                ..Default::default()
+            },
+        )
+        .unwrap_or_else(|e| panic!("{e}"));
+        let run = eng
+            .submit(OperationKey("panic-slot".into()), spec1("panic-once"))
+            .await
+            .unwrap_or_else(|e| panic!("{e}"));
+        assert!(matches!(until_done(&eng, run).await, RunState::Done));
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "the panicked call was retried, not stranded"
+        );
+    }
+
     /// Counts handler invocations — the evidence a parked run made none.
     struct Counting {
         calls: Arc<std::sync::atomic::AtomicUsize>,
@@ -2450,7 +2590,8 @@ mod tests {
         let sem = Arc::new(Semaphore::new(10));
         let (mut attempts, mut probes) = (JoinSet::new(), JoinSet::new());
         let (mut live, mut waiting) = (HashMap::new(), ProbeQueue::default());
-        let (mut ws_load, mut call_ws) = (HashMap::new(), HashMap::new());
+        let inflight = WsInflight::default();
+        let mut spawned = HashMap::new();
         let mut mon = Monitor {
             health: Arc::default(),
             errors: BTreeMap::new(),
@@ -2463,8 +2604,8 @@ mod tests {
             attempts: &mut attempts,
             probes: &mut probes,
             live: &mut live,
-            ws_load: &mut ws_load,
-            call_ws: &mut call_ws,
+            inflight: &inflight,
+            spawned: &mut spawned,
             ws_cap: 64,
             waiting_probes: &mut waiting,
             per_tick: 3,

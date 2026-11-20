@@ -314,8 +314,19 @@ impl AccountStore for Pg {
     async fn put_handler(&self, workspace: u64, name: &str, url: &str) -> Result<(), AccountError> {
         // The bound enforced where it cannot be raced (S2 review #6):
         // a row is written iff the name already exists (an update) or
-        // the workspace is under MAX_HANDLERS_PER_WS, inside the same
-        // statement — concurrent PUTs serialize on it honestly.
+        // the workspace is under MAX_HANDLERS_PER_WS. Under READ
+        // COMMITTED each statement's count(*) sees its own snapshot —
+        // a PUT burst at the boundary would all observe "under" and all
+        // insert — so the check and the insert run inside a
+        // transaction serialized per workspace by an advisory lock
+        // (released automatically at commit/rollback).
+        let mut tx = bounded(self.pool.begin()).await?;
+        bounded(
+            sqlx::query("SELECT pg_advisory_xact_lock($1)")
+                .bind(to_i64(workspace, "workspace")?)
+                .execute(&mut *tx),
+        )
+        .await?;
         let done = bounded(
             sqlx::query(
                 "INSERT INTO handler_registrations (workspace_id, name, url) \
@@ -334,12 +345,13 @@ impl AccountStore for Pg {
             .bind(name)
             .bind(url)
             .bind(crate::MAX_HANDLERS_PER_WS as i64)
-            .execute(&self.pool),
+            .execute(&mut *tx),
         )
         .await?;
         if done.rows_affected() == 0 {
             return Err(AccountError::RegistryFull);
         }
+        bounded(tx.commit()).await?;
         Ok(())
     }
 
@@ -379,6 +391,7 @@ impl AccountStore for Pg {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
 
     fn url() -> Option<String> {
         match std::env::var("DURABLE_TEST_DATABASE_URL") {
@@ -535,5 +548,53 @@ mod tests {
             .delete_handler(a.id, "h")
             .await
             .unwrap_or_else(|e| panic!("del: {e}")));
+    }
+
+    /// The re-review's race: under READ COMMITTED each PUT's count(*)
+    /// saw its own snapshot, so a concurrent burst at the boundary all
+    /// observed "under" and all inserted — overshooting the bound. The
+    /// advisory-lock transaction makes count-and-insert one critical
+    /// section: at the boundary exactly ONE concurrent put may land.
+    #[tokio::test]
+    async fn pg_a_put_burst_at_the_bound_admits_exactly_one() {
+        let Some(store) = store().await else { return };
+        let store = Arc::new(store);
+        let ws = store
+            .create_workspace("pg-burst")
+            .await
+            .unwrap_or_else(|e| panic!("ws: {e}"));
+        for i in 0..crate::MAX_HANDLERS_PER_WS - 1 {
+            store
+                .put_handler(ws.id, &format!("h{i}"), "https://h.example/x")
+                .await
+                .unwrap_or_else(|e| panic!("fill {i}: {e}"));
+        }
+        let mut set = tokio::task::JoinSet::new();
+        for i in 0..8 {
+            let store = Arc::clone(&store);
+            set.spawn(async move {
+                store
+                    .put_handler(ws.id, &format!("burst{i}"), "https://h.example/y")
+                    .await
+            });
+        }
+        let mut ok = 0;
+        while let Some(r) = set.join_next().await {
+            match r.unwrap_or_else(|e| panic!("join: {e}")) {
+                Ok(()) => ok += 1,
+                Err(AccountError::RegistryFull) => {}
+                Err(e) => panic!("unexpected put failure: {e}"),
+            }
+        }
+        assert_eq!(ok, 1, "exactly one of the burst may land at the bound");
+        assert_eq!(
+            store
+                .list_handlers(ws.id)
+                .await
+                .unwrap_or_else(|e| panic!("list: {e}"))
+                .len(),
+            crate::MAX_HANDLERS_PER_WS,
+            "the bound admits exactly MAX_HANDLERS_PER_WS, never more"
+        );
     }
 }
