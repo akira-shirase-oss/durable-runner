@@ -140,6 +140,11 @@ impl RunState {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Run {
     pub id: RunId,
+    /// The owning workspace's internal id (S2; 0 = the default workspace,
+    /// which pre-S2 journals map to). Internal only: the opaque public id
+    /// is what external surfaces carry, so this field never serializes.
+    #[serde(default, skip_serializing)]
+    pub ws: u64,
     pub key: OperationKey,
     pub spec: JobSpec,
     pub state: RunState,
@@ -151,9 +156,16 @@ impl Run {
     /// The run as its `Accepted` record creates it: queued for `not_before`.
     /// The reducer never builds a Run — acceptance is construction, not a
     /// transition; a second `Accepted` for an existing run is `DuplicateKey`.
-    pub fn accepted(id: RunId, key: OperationKey, spec: JobSpec, not_before: Millis) -> Self {
+    pub fn accepted(
+        id: RunId,
+        ws: u64,
+        key: OperationKey,
+        spec: JobSpec,
+        not_before: Millis,
+    ) -> Self {
         Self {
             id,
+            ws,
             key,
             spec,
             state: RunState::Queued {
@@ -651,6 +663,7 @@ mod tests {
     fn run(state: RunState) -> Run {
         Run {
             id: RunId(7),
+            ws: 0,
             key: OperationKey("k".into()),
             spec: spec(),
             state,

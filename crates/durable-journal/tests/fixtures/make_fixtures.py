@@ -49,6 +49,18 @@ def drix():
     return out
 
 
+def drix2():
+    # v2 (S2): each run gains a u64 workspace id after its run id.
+    out = b"DRIX" + struct.pack(">HQQ", 2, 3, 2)
+    # run 1: queued, a 3-byte input, workspace 7
+    out += struct.pack(">QQ", 1, 7) + s("golden-1") + struct.pack(">II", 1, 1) + s("a") + s("h")
+    out += struct.pack(">I", 3) + b"\x00\x01\xff" + b"\x00" + struct.pack(">Q", 5) + b"\x00"
+    # run 2: done (its input already dropped), finished at a fixed time
+    out += struct.pack(">QQ", 2, 7) + s("golden-2") + struct.pack(">II", 2, 1) + s("b") + s("h2")
+    out += struct.pack(">I", 0) + b"\x04" + b"\x01" + struct.pack(">Q", 1_700_000_000_000)
+    return out
+
+
 def snapshot(covered_seq, payload):
     return b"DRSNAP\x00\x02" + struct.pack(">QQI", covered_seq, len(payload), zlib.crc32(payload)) + payload
 
@@ -62,5 +74,7 @@ with open(os.path.join(HERE, "snapshot.bin"), "wb") as f:
     f.write(snapshot(7, b"golden snapshot payload"))
 with open(os.path.join(ENGINE, "index.drix"), "wb") as f:
     f.write(drix())
+with open(os.path.join(ENGINE, "index-v2.drix"), "wb") as f:
+    f.write(drix2())
 assert zlib.crc32(b"123456789") == 0xCBF43926
 print("fixtures written")

@@ -7,12 +7,14 @@
 //!
 //! ```text
 //! "DRIX" u16 version | next_run u64 | count u64 | count × run
-//! run = id u64 | key str | spec.version u32 | steps u32 × (name str, handler str)
+//! run = id u64 | ws u64 (v2+) | key str | spec.version u32
+//!     | steps u32 × (name str, handler str)
 //!     | input bytes | state | finished_at (u8 0/1 [+ u64])
 //! str/bytes = u32 length + bytes (big-endian throughout)
 //! state = u8 tag: 0 Queued{at} 1 Running{step,attempt,deadline}
 //!         2 RetryWaiting{step,attempt,at} 3 Reconciling{step,attempt}
 //!         4 Done 5 Failed{step} 6 Cancelled
+//! version 1 has no ws (reads as 0); version 2 adds it (S2).
 //! ```
 
 use durable_domain::{JobSpec, OperationKey, Run, RunId, RunState, StepIndex, StepSpec};
@@ -21,7 +23,9 @@ use std::io::{self, Read, Write};
 use std::sync::Arc;
 
 pub const MAGIC: &[u8; 4] = b"DRIX";
-pub const VERSION: u16 = 1;
+/// v2 adds the workspace id (S2); v1 snapshots still decode, their runs
+/// reading as workspace 0.
+pub const VERSION: u16 = 2;
 
 /// A consistent view of the index for one compaction: shared pointers to
 /// the runs as they were when it was planned. The core copies a run before
@@ -47,7 +51,8 @@ fn state_len(s: &RunState) -> u64 {
 }
 
 fn run_len(r: &Run) -> u64 {
-    8 + str_len(&r.key.0)
+    8 + 8
+        + str_len(&r.key.0)
         + 4
         + 4
         + r.spec
@@ -86,6 +91,7 @@ pub fn encode(v: &View, w: &mut dyn Write) -> io::Result<()> {
     w.write_all(&(v.runs.len() as u64).to_be_bytes())?;
     for r in &v.runs {
         w.write_all(&r.id.0.to_be_bytes())?;
+        w.write_all(&r.ws.to_be_bytes())?;
         put_str(w, &r.key.0)?;
         w.write_all(&r.spec.version.to_be_bytes())?;
         put_len(w, r.spec.steps.len())?;
@@ -222,14 +228,15 @@ pub fn decode_from(r: &mut impl Read, len: u64) -> Result<Decoded, String> {
         return Err("not a binary index".into());
     }
     let version = c.u16()?;
-    if version != VERSION {
-        return Err(format!("index version {version} is not {VERSION}"));
+    if version == 0 || version > VERSION {
+        return Err(format!("index version {version} is not 1..={VERSION}"));
     }
     let next_run = c.u64()?;
     let count = c.u64()?;
-    // Every run takes at least 26 bytes: refuse an impossible count before
-    // reserving anything for it.
-    if count > c.left / 26 {
+    // Every run takes at least 26 bytes (34 at v2, which adds ws): refuse
+    // an impossible count before reserving anything for it.
+    let min_run = if version == VERSION { 34 } else { 26 };
+    if count > c.left / min_run {
         return Err(format!("{count} runs cannot fit in {} bytes", c.left));
     }
     // Every count and length is held to the stored bounds as well as to
@@ -240,6 +247,9 @@ pub fn decode_from(r: &mut impl Read, len: u64) -> Result<Decoded, String> {
     let mut runs = BTreeMap::new();
     for _ in 0..count {
         let id = RunId(c.u64()?);
+        // v1 snapshots predate workspaces: their runs belong to the
+        // default workspace 0 (S2).
+        let ws = if version == VERSION { c.u64()? } else { 0 };
         let key = OperationKey(c.string(b.max_key_bytes, "key")?);
         let version = c.u32()?;
         let n_steps = c.u32()?;
@@ -291,6 +301,7 @@ pub fn decode_from(r: &mut impl Read, len: u64) -> Result<Decoded, String> {
         };
         let run = Run {
             id,
+            ws,
             key,
             spec: JobSpec {
                 version,
@@ -317,6 +328,7 @@ mod tests {
     fn run(id: u64, state: RunState, finished_at: Option<u64>) -> Arc<Run> {
         Arc::new(Run {
             id: RunId(id),
+            ws: id,
             key: OperationKey(format!("key-{id}")),
             spec: JobSpec {
                 version: 3,
@@ -422,6 +434,7 @@ mod tests {
     fn wide(steps: usize, key: usize, name: usize, input: usize) -> Arc<Run> {
         Arc::new(Run {
             id: RunId(1),
+            ws: 0,
             key: OperationKey("k".repeat(key)),
             spec: JobSpec {
                 version: 1,
@@ -476,18 +489,19 @@ mod tests {
         decode(&out).unwrap_or_else(|e| panic!("at the bounds: {e}"));
     }
 
-    /// Review U5: the binary index is pinned to a golden file written from
+    /// Review U5: the binary index is pinned to golden files written from
     /// its spec by an independent implementation (`durable-journal/tests/
-    /// fixtures/make_fixtures.py`): this build decodes it exactly and
-    /// encodes the same view to the same bytes.
+    /// fixtures/make_fixtures.py`): the v1 file (no ws — S2 predates it)
+    /// must decode with every run in workspace 0; the v2 file must decode
+    /// exactly and the encoder must reproduce it byte for byte.
     #[test]
-    fn the_index_format_matches_its_golden_file() {
-        let golden: &[u8] = include_bytes!("../tests/fixtures/index.drix");
+    fn the_index_format_matches_its_golden_files() {
         let want = View {
             next_run: 3,
             runs: vec![
                 Arc::new(Run {
                     id: RunId(1),
+                    ws: 7,
                     key: OperationKey("golden-1".into()),
                     spec: JobSpec {
                         version: 1,
@@ -502,6 +516,7 @@ mod tests {
                 }),
                 Arc::new(Run {
                     id: RunId(2),
+                    ws: 7,
                     key: OperationKey("golden-2".into()),
                     spec: JobSpec {
                         version: 2,
@@ -516,7 +531,23 @@ mod tests {
                 }),
             ],
         };
-        let (next_run, runs) = decode(golden).unwrap_or_else(|e| panic!("{e}"));
+        // v1 golden: same runs, ws defaulted to 0.
+        let v1: &[u8] = include_bytes!("../tests/fixtures/index.drix");
+        let (next_run, runs) = decode(v1).unwrap_or_else(|e| panic!("v1: {e}"));
+        assert_eq!(next_run, 3);
+        let got: Vec<Run> = runs.values().map(|r| (**r).clone()).collect();
+        let expect_v1: Vec<Run> = want
+            .runs
+            .iter()
+            .map(|r| Run {
+                ws: 0,
+                ..(**r).clone()
+            })
+            .collect();
+        assert_eq!(got, expect_v1, "a v1 index must decode into workspace 0");
+        // v2 golden: decode exactly, and encode to the same bytes.
+        let v2: &[u8] = include_bytes!("../tests/fixtures/index-v2.drix");
+        let (next_run, runs) = decode(v2).unwrap_or_else(|e| panic!("v2: {e}"));
         assert_eq!(next_run, 3);
         let got: Vec<Run> = runs.values().map(|r| (**r).clone()).collect();
         let expect: Vec<Run> = want.runs.iter().map(|r| (**r).clone()).collect();
@@ -524,10 +555,10 @@ mod tests {
         let mut out = Vec::new();
         encode(&want, &mut out).unwrap_or_else(|e| panic!("{e}"));
         assert!(
-            out == golden,
-            "the index encoder no longer matches its golden file"
+            out == v2,
+            "the index encoder no longer matches its v2 golden file"
         );
-        assert_eq!(encoded_len(&want), golden.len() as u64);
+        assert_eq!(encoded_len(&want), v2.len() as u64);
     }
 
     /// Every truncation and every flipped tag is refused, never misread.

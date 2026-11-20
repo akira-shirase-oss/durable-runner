@@ -603,9 +603,10 @@ impl From<EngineError> for ApiError {
                 "the engine did not answer in time; a submit may still commit, so retry with the \
                  same op_key",
             ),
-            EngineError::Serde(_) | EngineError::Piped | EngineError::Config(_) => {
-                Self::internal(&e)
-            }
+            EngineError::Serde(_)
+            | EngineError::Piped
+            | EngineError::Config(_)
+            | EngineError::WorkspaceMismatch { .. } => Self::internal(&e),
         }
     }
 }

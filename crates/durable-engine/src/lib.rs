@@ -66,6 +66,15 @@ pub enum EngineError {
     /// may still complete (a submit may commit): retry with the same key.
     #[error("the engine did not answer in time")]
     Timeout,
+    /// A committed record attributes an event to a workspace other than
+    /// the run's — corrupt committed history; startup stops rather than
+    /// guessing (S2).
+    #[error("record for run {run} carries workspace {record_ws} but the run belongs to {run_ws}")]
+    WorkspaceMismatch {
+        run: u64,
+        record_ws: u64,
+        run_ws: u64,
+    },
 }
 
 /// A journaled record: the run, the commit clock value, and the event.
@@ -75,10 +84,10 @@ pub enum EngineError {
 /// `spec.input` as a JSON number array; v2 adds `v` and carries it as
 /// base64. Readers accept both forever.
 pub const ENVELOPE_VERSION: u8 = 2;
-/// The highest record version this binary can read. Today it equals
-/// `ENVELOPE_VERSION`; per D-056 a format bump ships a reader one
-/// release before any writer emits it, so this will run ahead.
-pub const READER_VERSION: u8 = ENVELOPE_VERSION;
+/// The highest record version this binary can read. Per D-056 a format
+/// bump ships a reader one release before any writer emits it: S2-0 reads
+/// v3 (every record carries `ws`) while still writing v2.
+pub const READER_VERSION: u8 = 3;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Envelope {
@@ -87,6 +96,11 @@ pub struct Envelope {
     /// refused at replay, never guessed.
     #[serde(default = "envelope_v1")]
     pub v: u8,
+    /// The owning workspace's internal id (v3; v1/v2 records carry none
+    /// and read as workspace 0, the default). Internal only — never an
+    /// external surface (S2 opaque `public_id`).
+    #[serde(default)]
+    pub ws: u64,
     pub run: u64,
     pub at: Millis,
     pub event: Event,
@@ -96,15 +110,22 @@ fn envelope_v1() -> u8 {
     1
 }
 
-/// Decode a committed record and refuse one written by a newer binary.
-/// Anything malformed — bad JSON, bad base64 — is the same `Serde` error
-/// startup already stops on (D-054).
+/// Decode a committed record with this binary's reader version.
 fn decode_envelope(payload: &[u8]) -> Result<Envelope, EngineError> {
+    decode_envelope_as(payload, READER_VERSION)
+}
+
+/// Decode with an explicit reader version and refuse one written by a
+/// newer binary. Anything malformed — bad JSON, bad base64 — is the same
+/// `Serde` error startup already stops on (D-054). The explicit-reader
+/// form exists so tests can pin an older reader's refusal (S2-0 proves
+/// the v1.0.0 reader refuses v3 without shipping the old binary).
+fn decode_envelope_as(payload: &[u8], reader: u8) -> Result<Envelope, EngineError> {
     use serde::de::Error as _;
     let env: Envelope = serde_json::from_slice(payload)?;
-    if env.v > READER_VERSION {
+    if env.v > reader {
         return Err(serde_json::Error::custom(format_args!(
-            "record version {} is newer than this binary understands ({READER_VERSION})",
+            "record version {} is newer than this binary understands ({reader})",
             env.v
         ))
         .into());
@@ -255,7 +276,9 @@ pub struct EngineCore {
     /// Copy-on-write per run: a compaction's view shares these, and a run
     /// is copied only if it changes while that view is alive.
     runs: BTreeMap<RunId, Arc<Run>>,
-    by_op: HashMap<OperationKey, RunId>,
+    /// Idempotency dedup, scoped by workspace (S2): the same key in two
+    /// workspaces is two runs, never a collision.
+    by_op: HashMap<(u64, OperationKey), RunId>,
     next_run: u64,
     /// Non-terminal runs and the index's approximate bytes, kept current
     /// so admission is O(1).
@@ -334,7 +357,7 @@ impl EngineCore {
                         .into_iter()
                         .map(|(id, r)| (id, Arc::new(r)))
                         .collect();
-                    core.by_op = idx.by_op;
+                    core.by_op = idx.by_op.into_iter().map(|(k, v)| ((0, k), v)).collect();
                     core.next_run = idx.next_run;
                 }
             }
@@ -374,7 +397,7 @@ impl EngineCore {
                     max_run = max_run.max(env.run);
                     core.journal_record_version_max = core.journal_record_version_max.max(env.v);
                     let t = std::time::Instant::now();
-                    core.apply_committed(RunId(env.run), env.event, env.at)?;
+                    core.apply_committed(env.ws, RunId(env.run), env.event, env.at)?;
                     t_apply += t.elapsed();
                     n_records += 1;
                 }
@@ -396,7 +419,7 @@ impl EngineCore {
                 let env = decode_envelope(&r.payload)?;
                 max_run = max_run.max(env.run);
                 core.journal_record_version_max = core.journal_record_version_max.max(env.v);
-                core.apply_committed(RunId(env.run), env.event, env.at)?;
+                core.apply_committed(env.ws, RunId(env.run), env.event, env.at)?;
             }
         }
         core.next_run = max_run + 1;
@@ -558,8 +581,9 @@ impl EngineCore {
                 self.index_bytes = self
                     .index_bytes
                     .saturating_sub(Limits::run_bytes(&run.key, &run.spec));
-                if self.by_op.get(&run.key) == Some(id) {
-                    self.by_op.remove(&run.key);
+                let dk = (run.ws, run.key.clone());
+                if self.by_op.get(&dk) == Some(id) {
+                    self.by_op.remove(&dk);
                 }
             }
         }
@@ -568,7 +592,10 @@ impl EngineCore {
     /// Take a decoded snapshot as the index; dedup keys are exactly the
     /// retained runs' keys.
     fn install(&mut self, next_run: u64, runs: BTreeMap<RunId, Arc<Run>>) {
-        self.by_op = runs.values().map(|r| (r.key.clone(), r.id)).collect();
+        self.by_op = runs
+            .values()
+            .map(|r| ((r.ws, r.key.clone()), r.id))
+            .collect();
         self.runs = runs;
         self.next_run = next_run;
     }
@@ -617,6 +644,7 @@ impl EngineCore {
 
     fn apply_committed(
         &mut self,
+        ws: u64,
         run_id: RunId,
         event: Event,
         now: Millis,
@@ -631,16 +659,25 @@ impl EngineCore {
             if self.runs.contains_key(&run_id) {
                 return Err(Refusal::DuplicateKey.into());
             }
-            self.by_op.insert(key.clone(), run_id);
+            self.by_op.insert((ws, key.clone()), run_id);
             self.live += 1;
             self.index_bytes += Limits::run_bytes(&key, &spec);
             self.runs.insert(
                 run_id,
-                Arc::new(Run::accepted(run_id, key, spec, not_before)),
+                Arc::new(Run::accepted(run_id, ws, key, spec, not_before)),
             );
             return Ok(vec![]);
         }
         let run = self.runs.get(&run_id).ok_or(Refusal::StaleReply)?;
+        // A record that attributes an event to a workspace other than the
+        // run's is corrupt committed history — never reduce onto it.
+        if run.ws != ws {
+            return Err(EngineError::WorkspaceMismatch {
+                run: run_id.0,
+                record_ws: ws,
+                run_ws: run.ws,
+            });
+        }
         let (state, effects) = reduce(run, &event, now, &self.limits, &self.retry)?;
         // Copies the run only if a compaction's view still shares it.
         let run = Arc::make_mut(self.runs.get_mut(&run_id).ok_or(Refusal::StaleReply)?);
@@ -662,8 +699,11 @@ impl EngineCore {
     /// Journal first, then fold — the only path by which state may change.
     /// Trial-reduce before appending: a refused event must never reach the
     /// journal, because every committed record has to apply on replay.
-    fn commit(
+    /// `ws` is the record's workspace (S2): the run's own for every event
+    /// after acceptance.
+    fn commit_record(
         &mut self,
+        ws: u64,
         run: RunId,
         event: Event,
         now: Millis,
@@ -674,6 +714,7 @@ impl EngineCore {
         }
         let payload = serde_json::to_vec(&Envelope {
             v: ENVELOPE_VERSION,
+            ws,
             run: run.0,
             at: now,
             event: event.clone(),
@@ -689,24 +730,41 @@ impl EngineCore {
             Log::Piped(p) => p.enqueue(payload)?,
         }
         self.journal_record_version_max = self.journal_record_version_max.max(ENVELOPE_VERSION);
-        self.apply_committed(run, event, now)
+        self.apply_committed(ws, run, event, now)
     }
 
-    /// Submit a job under an operation key. A repeated key returns the
-    /// original run id without touching the journal — the dedup contract.
+    /// Commit a run-scoped event: the record carries the run's own
+    /// workspace (an `Accepted` for an id not yet in the index reaches
+    /// here only by programming error and fails `StaleReply`, never writes).
+    fn commit(
+        &mut self,
+        run: RunId,
+        event: Event,
+        now: Millis,
+    ) -> Result<Vec<Effect>, EngineError> {
+        let ws = self.runs.get(&run).ok_or(Refusal::StaleReply)?.ws;
+        self.commit_record(ws, run, event, now)
+    }
+
+    /// Submit a job under an operation key in the default workspace. A
+    /// repeated key returns the original run id without touching the
+    /// journal — the dedup contract.
     pub fn submit(
         &mut self,
         key: OperationKey,
         spec: JobSpec,
         now: Millis,
     ) -> Result<RunId, EngineError> {
-        self.submit_at(key, spec, now, now)
+        self.submit_at(0, key, spec, now, now)
     }
 
     /// Submit with a delayed start: the run queues until `not_before`.
-    /// Same durability and dedup contract as `submit`.
+    /// Same durability and dedup contract as `submit`. `ws` is the owning
+    /// workspace: dedup is per `(ws, key)` — the same key in another
+    /// workspace is a different job (S2).
     pub fn submit_at(
         &mut self,
+        ws: u64,
         key: OperationKey,
         spec: JobSpec,
         not_before: Millis,
@@ -714,7 +772,7 @@ impl EngineCore {
     ) -> Result<RunId, EngineError> {
         // Dedup first: a run accepted under an older (larger) key bound
         // must still return itself. The bound refuses new keys only.
-        if let Some(existing) = self.by_op.get(&key) {
+        if let Some(existing) = self.by_op.get(&(ws, key.clone())) {
             return Ok(*existing); // duplicate: hand back the original run
         }
         self.limits.admits_key(&key)?;
@@ -727,7 +785,8 @@ impl EngineCore {
             return Err(Refusal::AtCapacity.into());
         }
         let run = RunId(self.next_run);
-        self.commit(
+        self.commit_record(
+            ws,
             run,
             Event::Accepted {
                 key,
@@ -1145,6 +1204,119 @@ mod tests {
         assert!(matches!(err, EngineError::Serde(_)), "{err}");
     }
 
+    // --- S2-0: record format v3 reader (ws), still writes v2 -------------
+
+    /// Write one record in the shape the S2 writer will emit — `v:3` with
+    /// a workspace — straight into the journal.
+    fn commit_v3(dir: &std::path::Path, run: u64, ws: u64, event: &str) {
+        let mut j = Journal::open(dir).unwrap_or_else(|e| panic!("{e}"));
+        let payload =
+            format!("{{\"v\":3,\"ws\":{ws},\"run\":{run},\"at\":1000,\"event\":{event}}}");
+        j.append(payload.as_bytes())
+            .unwrap_or_else(|e| panic!("{e}"));
+    }
+
+    fn v3_accepted(key: &str) -> String {
+        format!(
+            "{{\"Accepted\":{{\"key\":\"{key}\",\"spec\":{{\"version\":1,\
+             \"steps\":[{{\"name\":\"only\",\"handler\":\"echo\"}}],\"input\":[]}},\
+             \"not_before\":0}}}}"
+        )
+    }
+
+    /// The v3 reader: a journal written by the future S2 writer replays
+    /// with each run in its own workspace, and dedup is per workspace —
+    /// the same key under two workspaces is two runs.
+    #[test]
+    fn a_v3_journal_replays_with_workspaces() {
+        let d = tempfile::tempdir().unwrap_or_else(|e| panic!("{e}"));
+        commit_v3(d.path(), 1, 7, &v3_accepted("same-key"));
+        {
+            let mut e = EngineCore::open(d.path()).unwrap_or_else(|e| panic!("{e}"));
+            assert_eq!(e.run(RunId(1)).unwrap_or_else(|| panic!("run")).ws, 7);
+            // Same key, same workspace → dedup returns run 1.
+            let again = e
+                .submit_at(7, OperationKey("same-key".into()), spec(), 0, 0)
+                .unwrap_or_else(|e| panic!("{e}"));
+            assert_eq!(again, RunId(1));
+            // Same key, another workspace → an independent run.
+            let other = e
+                .submit_at(9, OperationKey("same-key".into()), spec(), 0, 0)
+                .unwrap_or_else(|e| panic!("{e}"));
+            assert_ne!(other, RunId(1));
+            assert_eq!(e.run(other).unwrap_or_else(|| panic!("run")).ws, 9);
+        }
+        let e = EngineCore::open(d.path()).unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(e.diagnostics().journal_record_version_max, 3);
+    }
+
+    /// Every record a v2 writer emits decodes under the v3 reader as
+    /// workspace 0 — the back-compat direction of the bump.
+    #[test]
+    fn a_v2_journal_reads_as_workspace_zero() {
+        let (d, mut e) = open();
+        let run = e
+            .submit(OperationKey("k".into()), spec(), 0)
+            .unwrap_or_else(|e| panic!("{e}"));
+        drop(e);
+        let e = EngineCore::open(d.path()).unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(e.run(run).unwrap_or_else(|| panic!("run")).ws, 0);
+    }
+
+    /// The released v1.0.0 binary reads up to v2 only: a v3 record must
+    /// stop it cleanly at startup, never be guessed or skipped. Pinned
+    /// through the same version check the release shipped.
+    #[test]
+    fn the_v1_0_reader_refuses_v3_cleanly() {
+        let payload = format!(
+            "{{\"v\":3,\"ws\":7,\"run\":1,\"at\":1,\"event\":{}}}",
+            v3_accepted("k")
+        );
+        assert!(decode_envelope_as(payload.as_bytes(), 2).is_err());
+        // …and this binary reads it.
+        decode_envelope_as(payload.as_bytes(), READER_VERSION).unwrap_or_else(|e| panic!("{e}"));
+    }
+
+    /// Crash-mid-write on a v3 journal: the committed head survives, the
+    /// torn tail is discarded, and the journal keeps appending.
+    #[test]
+    fn a_torn_v3_tail_is_discarded_and_the_journal_continues() {
+        use std::io::Write as _;
+        let d = tempfile::tempdir().unwrap_or_else(|e| panic!("{e}"));
+        commit_v3(d.path(), 1, 7, &v3_accepted("first"));
+        // Crash mid-append: garbage bytes glued after the good frame.
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(durable_journal::gen_dir_path(d.path(), 1).join("journal.log"))
+            .unwrap_or_else(|e| panic!("{e}"))
+            .write_all(&[0xde, 0xad, 0xbe])
+            .unwrap_or_else(|e| panic!("{e}"));
+        {
+            let mut e = EngineCore::open(d.path()).unwrap_or_else(|e| panic!("{e}"));
+            assert_eq!(e.run(RunId(1)).unwrap_or_else(|| panic!("run")).ws, 7);
+            e.submit_at(9, OperationKey("after".into()), spec(), 0, 0)
+                .unwrap_or_else(|e| panic!("{e}"));
+        }
+        let e = EngineCore::open(d.path()).unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(e.runs().count(), 2);
+    }
+
+    /// A v3 event stamped with a workspace other than its run's is
+    /// corrupt committed history: startup stops on it.
+    #[test]
+    fn a_mismatched_workspace_record_stops_startup() {
+        let d = tempfile::tempdir().unwrap_or_else(|e| panic!("{e}"));
+        commit_v3(d.path(), 1, 7, &v3_accepted("k"));
+        commit_v3(d.path(), 1, 9, "\"CancelRequested\"");
+        let err = EngineCore::open(d.path())
+            .err()
+            .unwrap_or_else(|| panic!("opened"));
+        assert!(
+            matches!(err, EngineError::WorkspaceMismatch { .. }),
+            "{err}"
+        );
+    }
+
     /// A record tagged with a version this binary does not know is from
     /// the future: refuse it instead of guessing.
     #[test]
@@ -1194,6 +1366,7 @@ mod tests {
             };
             let env = Envelope {
                 v: ENVELOPE_VERSION,
+                ws: 0,
                 run: 1,
                 at: 0,
                 event: Event::Accepted {
@@ -1525,7 +1698,7 @@ mod tests {
             next_run: u64,
         }
         let d = tempfile::tempdir().unwrap_or_else(|e| panic!("{e}"));
-        let run = Run::accepted(RunId(7), OperationKey("legacy".into()), spec(), 0);
+        let run = Run::accepted(RunId(7), 0, OperationKey("legacy".into()), spec(), 0);
         let payload = serde_json::to_vec(&OldIndex {
             runs: BTreeMap::from([(RunId(7), run)]),
             by_op: HashMap::from([(OperationKey("legacy".into()), RunId(7))]),
@@ -1578,7 +1751,7 @@ mod tests {
                 handler: "noop".into(),
             })
             .collect();
-        let run = Run::accepted(RunId(7), OperationKey("legacy".into()), wide, 0);
+        let run = Run::accepted(RunId(7), 0, OperationKey("legacy".into()), wide, 0);
         let payload = serde_json::to_vec(&OldIndex {
             runs: BTreeMap::from([(RunId(7), run)]),
             by_op: HashMap::from([(OperationKey("legacy".into()), RunId(7))]),
