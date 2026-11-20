@@ -878,8 +878,9 @@ impl Journal {
         tighten(&lock_path, FILE_MODE);
         tighten(&manifest_path_of(dir), FILE_MODE);
         tighten(&shape_path(dir), FILE_MODE);
-        // A crash can orphan the sidecar's temp file; it is not journal
-        // content and the next write_shape recreates it anyway.
+        tighten(&dir.join("public_id.key"), FILE_MODE); // the server's id key
+                                                        // A crash can orphan the sidecar's temp file; it is not journal
+                                                        // content and the next write_shape recreates it anyway.
         let _ = fs::remove_file(dir.join("journal.shape.tmp"));
 
         // Manifest: keep the last valid one. First open creates generation
@@ -1365,14 +1366,21 @@ impl Journal {
                 File::open(&gd)?.sync_data()?;
             }
         }
-        // The format sidecar travels too — a restored journal must keep
+        // The flat sidecars travel too — a restored journal must keep
         // the same claims about versions and workspace scope for the
-        // format-guard (D-056); its absence would read as ambiguity.
-        if shape_path(&self.root).exists() {
-            let (bytes, crc32) =
-                copy_file_durably(&shape_path(&self.root), &partial.join("journal.shape"))?;
+        // format-guard (D-056), and the server's public-id key so ids a
+        // client holds still decode on the restored instance (the
+        // permutation key lives beside the journal; without it every
+        // public id orphans to a 404). Neither is a journal file, but
+        // both are journal-dir state a faithful backup must carry.
+        for flat in ["journal.shape", "public_id.key"] {
+            let src = self.root.join(flat);
+            if !src.exists() {
+                continue;
+            }
+            let (bytes, crc32) = copy_file_durably(&src, &partial.join(flat))?;
             list.files.push(BackupFile {
-                path: "journal.shape".into(),
+                path: flat.into(),
                 bytes,
                 crc32: Some(crc32),
             });
@@ -1412,8 +1420,10 @@ impl Journal {
     /// manifest.
     fn backup_bytes(&self) -> Result<u64, JournalError> {
         let mut total = fs::metadata(self.root.join("manifest.json"))?.len();
-        if let Ok(m) = fs::metadata(shape_path(&self.root)) {
-            total += m.len();
+        for flat in ["journal.shape", "public_id.key"] {
+            if let Ok(m) = fs::metadata(self.root.join(flat)) {
+                total += m.len();
+            }
         }
         for entry in fs::read_dir(&self.root)? {
             let entry = entry?;
@@ -1518,7 +1528,11 @@ fn restore_with(from: &Path, to: &Path, step: &dyn Fn(RestoreStep)) -> Result<()
     for entry in fs::read_dir(to)? {
         let name = entry?.file_name();
         let n = name.to_string_lossy();
-        if n == "manifest.json" || n.starts_with("gen-") || n.starts_with("journal.shape") {
+        if n == "manifest.json"
+            || n.starts_with("gen-")
+            || n.starts_with("journal.shape")
+            || n.starts_with("public_id.key")
+        {
             return Err(JournalError::RestoreTargetNotEmpty);
         }
     }
@@ -1679,6 +1693,7 @@ fn backup_list(from: &Path, generation: u32) -> Result<BackupList, JournalError>
             return Err(bad(format!("{BACKUP_LIST} lists {} twice", f.path)));
         }
         let ok = f.path == "journal.shape"
+            || f.path == "public_id.key"
             || f.path.split_once('/').is_some_and(|(g, file)| {
                 canonical_gen(g).is_some() && SNAPSHOT_FILES.contains(&file)
             });
@@ -2852,6 +2867,66 @@ mod tests {
         assert!(
             restore_backup(&backup, &to2).is_err(),
             "restored a truncated backup"
+        );
+    }
+
+    /// The pilot caught this: a backup without the server's
+    /// `public_id.key` restored fine, but the fresh instance generated a
+    /// different permutation key — every public id a client held decoded
+    /// to nothing (404). The journal-dir sidecars travel with the
+    /// backup, checksummed and owner-only, so a restore keeps the ids.
+    #[test]
+    fn the_flat_sidecars_ride_the_backup() {
+        let d = tempfile::tempdir().unwrap_or_else(|e| panic!("{e}"));
+        let src = d.path().join("src");
+        let mut j = Journal::open(&src).unwrap_or_else(|e| panic!("{e}"));
+        j.append(&record(0)).unwrap_or_else(|e| panic!("{e}"));
+        let key = [7u8; 32];
+        fs::write(src.join("public_id.key"), key).unwrap_or_else(|e| panic!("{e}"));
+        write_shape(
+            &src,
+            Shape {
+                records: 2,
+                snapshots: 1,
+                max_ws: 0,
+            },
+        )
+        .unwrap_or_else(|e| panic!("{e}"));
+        drop(j);
+        let backup = d.path().join("backup");
+        Journal::open(&src)
+            .unwrap_or_else(|e| panic!("{e}"))
+            .backup_to(&backup)
+            .unwrap_or_else(|e| panic!("{e}"));
+        let to = d.path().join("to");
+        restore_backup(&backup, &to).unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(
+            fs::read(to.join("public_id.key")).unwrap_or_else(|e| panic!("{e}")),
+            key,
+            "the restored key differs — every public id would rename"
+        );
+        assert!(to.join("journal.shape").exists());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                fs::metadata(to.join("public_id.key"))
+                    .unwrap_or_else(|e| panic!("{e}"))
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o600,
+                "the restored key must stay owner-only"
+            );
+        }
+        // And a target already holding a stale key is refused — the old
+        // key must never silently survive a restore that lacks one.
+        let stale = d.path().join("stale");
+        fs::create_dir(&stale).unwrap_or_else(|e| panic!("{e}"));
+        fs::write(stale.join("public_id.key"), [9u8; 32]).unwrap_or_else(|e| panic!("{e}"));
+        assert!(
+            restore_backup(&backup, &stale).is_err(),
+            "restored onto a stale public_id.key"
         );
     }
 
