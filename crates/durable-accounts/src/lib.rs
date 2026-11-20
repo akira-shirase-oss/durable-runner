@@ -146,9 +146,14 @@ pub trait AccountStore: Send + Sync {
 
     async fn create_workspace(&self, name: &str) -> Result<Workspace, AccountError>;
 
-    /// Workspaces, bounded to `limit` — the caller pages if the graph
-    /// ever grows beyond an ops dashboard's view.
-    async fn list_workspaces(&self, limit: u32) -> Result<Vec<Workspace>, AccountError>;
+    /// Workspaces bounded to `limit`, ordered by internal id; `after`
+    /// pages forward so callers that walk the whole graph (the registry
+    /// reconciler) are not silently capped at a first page (S3).
+    async fn list_workspaces(
+        &self,
+        limit: u32,
+        after: Option<u64>,
+    ) -> Result<Vec<Workspace>, AccountError>;
 
     /// Record a newly issued key. `key_hash` is sha256 of the secret the
     /// caller shows once; the store never sees the plaintext.

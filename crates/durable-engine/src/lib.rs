@@ -128,15 +128,36 @@ fn decode_envelope(payload: &[u8]) -> Result<Envelope, EngineError> {
 /// the v1.0.0 reader refuses v3 without shipping the old binary).
 fn decode_envelope_as(payload: &[u8], reader: u8) -> Result<Envelope, EngineError> {
     use serde::de::Error as _;
-    let env: Envelope = serde_json::from_slice(payload)?;
-    if env.v > reader {
+    // A shadow with `ws` optional: a v3 record that carries no ws is
+    // ambiguous — ws 0 only means "a pre-v3 record", so a v3 missing the
+    // field is corrupt, not workspace 0 (S3).
+    #[derive(Deserialize)]
+    struct Raw {
+        #[serde(default = "envelope_v1")]
+        v: u8,
+        ws: Option<u64>,
+        run: u64,
+        at: Millis,
+        event: Event,
+    }
+    let raw: Raw = serde_json::from_slice(payload)?;
+    if raw.v > reader {
         return Err(serde_json::Error::custom(format_args!(
             "record version {} is newer than this binary understands ({reader})",
-            env.v
+            raw.v
         ))
         .into());
     }
-    Ok(env)
+    if raw.v >= 3 && raw.ws.is_none() {
+        return Err(serde_json::Error::custom("v3 record without ws").into());
+    }
+    Ok(Envelope {
+        v: raw.v,
+        ws: raw.ws.unwrap_or(0),
+        run: raw.run,
+        at: raw.at,
+        event: raw.event,
+    })
 }
 
 /// Bounded diagnostics: aggregate counts only — safe to answer under load.
@@ -1385,6 +1406,34 @@ mod tests {
         }
         let e = EngineCore::open(d.path()).unwrap_or_else(|e| panic!("{e}"));
         assert_eq!(e.diagnostics().journal_record_version_max, 3);
+    }
+
+    /// S3: a v3 record with no `ws` is ambiguous — ws 0 is a pre-v3
+    /// record's meaning, not a guess for a v3 that lost the field.
+    /// Startup must refuse it like any other corruption, not quietly
+    /// replay the run into the operator's workspace.
+    #[test]
+    fn a_v3_record_without_ws_is_refused() {
+        let d = tempfile::tempdir().unwrap_or_else(|e| panic!("{e}"));
+        let mut j = Journal::open(d.path()).unwrap_or_else(|e| panic!("{e}"));
+        // A syntactically valid v3 envelope — except `ws` is absent.
+        j.append(
+            format!(
+                "{{\"v\":3,\"run\":1,\"at\":1000,\"event\":{}}}",
+                v3_accepted("k")
+            )
+            .as_bytes(),
+        )
+        .unwrap_or_else(|e| panic!("{e}"));
+        drop(j); // release the writer lock before startup replays
+        match EngineCore::open(d.path()) {
+            Err(EngineError::Serde(m)) => {
+                let m = m.to_string();
+                assert!(m.contains("ws"), "{m}")
+            }
+            Err(e) => panic!("wrong error: {e}"),
+            Ok(_) => panic!("a v3 record without ws must not replay as ws 0"),
+        }
     }
 
     /// Every record a v2 writer emits decodes under the v3 reader as

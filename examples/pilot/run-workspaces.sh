@@ -64,7 +64,9 @@ WS_B=$(curl -sf -X POST "$API/admin/workspaces" -H "$AUTH" -H 'content-type: app
   -d '{"name":"bravo"}') || fail "create workspace B"
 PA=$(echo "$WS_A" | JQ 'd["public_id"]')
 PB=$(echo "$WS_B" | JQ 'd["public_id"]')
-[ "$(echo "$WS_A" | JQ 'len(d.get("handler_secret",""))')" = 64 ] || fail "workspace A secret not returned once: $WS_A"
+# Never print the response: it carries the secret itself (S3). Shape only.
+[ "$(echo "$WS_A" | JQ 'len(d.get("handler_secret",""))')" = 64 ] \
+  || fail "workspace A did not return handler_secret once (keys: $(echo "$WS_A" | JQ 'sorted(d.keys())'))"
 echo "A=$PA B=$PB (secrets returned once, 64 hex chars)"
 
 KA=$(curl -sf -X POST "$API/admin/workspaces/$PA/keys" -H "$AUTH" -H 'content-type: application/json' \
@@ -83,7 +85,8 @@ for K in "$AUTH_A" "$AUTH_B"; do
 done
 # Rotate A's secret once — must return the new one and keep working.
 ROT=$(curl -sf -X POST "$API/handler-secret" -H "$AUTH_A") || fail "rotate A secret"
-[ "$(echo "$ROT" | JQ 'len(d.get("secret",""))')" = 64 ] || fail "rotation did not return a secret: $ROT"
+[ "$(echo "$ROT" | JQ 'len(d.get("secret",""))')" = 64 ] \
+  || fail "rotation did not return a secret (keys: $(echo "$ROT" | JQ 'sorted(d.keys())'))"
 for i in 1 2 3; do
   curl -sf -X POST "$API/jobs" -H "$AUTH_A" -H 'content-type: application/json' \
     -d "{\"op_key\":\"drill-a-$i\",\"spec\":{\"version\":1,\"steps\":[{\"name\":\"s\",\"handler\":\"step\"}],\"input_b64\":\"aGk=\"}}" >/dev/null \

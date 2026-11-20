@@ -562,11 +562,16 @@ fn load_registry_file(path: &Path) -> Vec<RegistryEntry> {
     }
 }
 
-/// Whole-file replace, tmp + rename: a crash mid-write leaves either the
-/// old snapshot or the new one, never a torn file.
+/// Whole-file replace, tmp + fsync + rename: a crash mid-write leaves
+/// either the old snapshot or the new one, never a torn file — and the
+/// fsync makes "the new one" durable, not merely renamed (S3: the file
+/// carried secrets but the write was never forced to disk).
 fn save_registry_file(path: &Path, entries: &[RegistryEntry]) -> Result<()> {
+    use std::io::Write as _;
     let tmp = path.with_extension("json.tmp");
-    std::fs::write(&tmp, serde_json::to_vec(entries)?)?;
+    let mut f = std::fs::File::create(&tmp)?;
+    f.write_all(&serde_json::to_vec(entries)?)?;
+    f.sync_all()?;
     // The file carries signing secrets — owner-only like the journal.
     #[cfg(unix)]
     {
@@ -574,6 +579,11 @@ fn save_registry_file(path: &Path, entries: &[RegistryEntry]) -> Result<()> {
         std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600))?;
     }
     std::fs::rename(&tmp, path)?;
+    // The rename itself must reach disk or a crash can resurrect the old
+    // registry under the same path.
+    if let Some(dir) = path.parent() {
+        std::fs::File::open(dir)?.sync_all()?;
+    }
     Ok(())
 }
 
@@ -594,8 +604,31 @@ async fn registry_sync(
     flags: &[(String, Arc<dyn StepHandler>)],
     file: &Path,
     lock: &Mutex<()>,
+    epoch: &std::sync::atomic::AtomicU64,
 ) -> Result<(), AccountError> {
-    let workspaces = store.list_workspaces(REGISTRY_SYNC_WS_LIMIT).await?;
+    // A mutation anywhere in the pass's read window makes its applies
+    // stale — bail out; the mutation applied itself and the next pass
+    // converges (S3: the race was up to a whole 30 s pass).
+    let e0 = epoch.load(std::sync::atomic::Ordering::Acquire);
+    let stale = || epoch.load(std::sync::atomic::Ordering::Acquire) != e0;
+    // The whole graph, paged: more than REGISTRY_SYNC_WS_LIMIT
+    // workspaces must still reconcile — a capped first page silently
+    // dropped every later tenant's handlers (S3).
+    let mut workspaces = Vec::new();
+    let mut after = None;
+    loop {
+        let page = store.list_workspaces(REGISTRY_SYNC_WS_LIMIT, after).await?;
+        match page.last() {
+            Some(last) if page.len() == REGISTRY_SYNC_WS_LIMIT as usize => {
+                after = Some(last.id);
+            }
+            _ => {
+                workspaces.extend(page);
+                break;
+            }
+        }
+        workspaces.extend(page);
+    }
     let mut all = Vec::new();
     let mut refused = 0u64;
     for ws in &workspaces {
@@ -635,6 +668,12 @@ async fn registry_sync(
                 secret: Some(hex(&ws.handler_secret)),
             });
         }
+        if stale() {
+            eprintln!(
+                "durable-server: registry reconcile discarded a pass overtaken by a mutation"
+            );
+            return Ok(());
+        }
         if let Err(e) = engine.set_workspace_handlers(ws.id, set).await {
             eprintln!("durable-server: registry reconcile skipped a workspace: {e}");
             continue;
@@ -645,6 +684,10 @@ async fn registry_sync(
             "durable-server: registry reconcile dropped {refused} stored \
              handler row(s) whose URL fails the SSRF policy"
         );
+    }
+    if stale() {
+        eprintln!("durable-server: registry reconcile discarded a pass overtaken by a mutation");
+        return Ok(());
     }
     // The file write is the only thing a route mutation can race with.
     let _g = lock.lock().unwrap_or_else(|e| e.into_inner());
@@ -666,9 +709,10 @@ fn spawn_registry_reconcile(
     let flags = Arc::clone(&app.flag_handlers);
     let file = app.registry_file.clone();
     let lock = Arc::clone(&app.registry_lock);
+    let epoch = Arc::clone(&app.registry_epoch);
     tokio::spawn(async move {
         loop {
-            match registry_sync(&store, &engine, &factory, &flags, &file, &lock).await {
+            match registry_sync(&store, &engine, &factory, &flags, &file, &lock, &epoch).await {
                 Ok(()) => stale.store(false, std::sync::atomic::Ordering::Relaxed),
                 Err(e) => {
                     stale.store(true, std::sync::atomic::Ordering::Relaxed);
@@ -917,6 +961,11 @@ struct App {
     registry_file: Arc<Path>,
     /// Serializes snapshot writes between routes and the reconciler.
     registry_lock: Arc<Mutex<()>>,
+    /// Bumped by every route mutation (PUT/DELETE/rotate). A reconcile
+    /// pass that sees it move mid-flight discards its stale apply — the
+    /// mutation already wrote the engine and the file itself, so re-
+    /// applying a pass read *before* it would resurrect it (S3).
+    registry_epoch: Arc<std::sync::atomic::AtomicU64>,
     /// Opaque public run ids (S2 #7): every run id crosses the API
     /// through this keyed permutation, so no response reveals the
     /// global sequence or another workspace's volume.
@@ -949,6 +998,7 @@ fn test_app(
         registry_stale: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         registry_file: Arc::from(journal_dir.join("handlers.json").as_path()),
         registry_lock: Arc::new(Mutex::new(())),
+        registry_epoch: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         pubid: pubid::PubId::load_or_generate(journal_dir).unwrap_or_else(|e| panic!("{e}")),
     }
 }
@@ -1649,7 +1699,7 @@ async fn list_workspaces(
 ) -> Result<Json<serde_json::Value>, ApiError> {
     ops_admin(&auth)?;
     let store = accounts(&app)?;
-    let list = store.list_workspaces(1000).await.map_err(store_err)?;
+    let list = store.list_workspaces(1000, None).await.map_err(store_err)?;
     let items: Vec<serde_json::Value> = list
         .iter()
         .map(|ws| {
@@ -1906,11 +1956,23 @@ async fn put_handler(
         .put_handler(auth.ws, name, &url)
         .await
         .map_err(store_err)?;
+    app.registry_epoch
+        .fetch_add(1, std::sync::atomic::Ordering::Release);
     let secret = store
         .workspace_by_id(auth.ws)
         .await
         .map_err(store_err)?
         .map(|w| Arc::new(w.handler_secret));
+    // S3: a missing workspace row must not arm the handler *unsigned* —
+    // the row stays in the store (the reconcile re-arms it if the
+    // workspace heals), but this process refuses to dispatch unsigned.
+    if auth.ws != 0 && secret.is_none() {
+        return Err(ApiError::new(
+            StatusCode::CONFLICT,
+            "registry_unavailable",
+            "the workspace's signing secret is unavailable; the handler is stored but not armed",
+        ));
+    }
     app.engine
         .put_handler(
             auth.ws,
@@ -1951,6 +2013,8 @@ async fn rotate_handler_secret(
             "no such workspace",
         ));
     };
+    app.registry_epoch
+        .fetch_add(1, std::sync::atomic::Ordering::Release);
     // Rebuild this workspace's engine set signed with the new secret —
     // the same shape as a reconcile pass for one workspace.
     let regs = store.list_handlers(auth.ws).await.map_err(store_err)?;
@@ -2001,6 +2065,8 @@ async fn delete_handler(
             "no such handler registration",
         ));
     }
+    app.registry_epoch
+        .fetch_add(1, std::sync::atomic::Ordering::Release);
     app.engine.delete_handler(auth.ws, &name)?;
     registry_file_remove(&app, auth.ws, &name);
     Ok(Json(serde_json::json!({ "deleted": name })))
@@ -2414,6 +2480,18 @@ async fn main() -> Result<()> {
                 continue;
             }
             let secret = entry.secret.as_deref().and_then(unhex).map(Arc::new);
+            // A tenant handler with no usable secret must not arm
+            // *unsigned* — that is the S3 hole (a corrupt entry would
+            // silently downgrade to trust-anyone). ws 0 stays honest:
+            // its flag handlers are unsigned by design.
+            if entry.ws != 0 && secret.is_none() {
+                eprintln!(
+                    "durable-server: snapshot handler {:?} (ws {}) has no usable \
+                     secret; refusing it rather than arming unsigned",
+                    entry.name, entry.ws
+                );
+                continue;
+            }
             let h = factory.make_signed(&entry.url, secret);
             if let Err(e) = engine.put_handler(entry.ws, &entry.name, h).await {
                 eprintln!(
@@ -2435,6 +2513,7 @@ async fn main() -> Result<()> {
         registry_stale: Arc::clone(&registry_stale),
         registry_file,
         registry_lock: Arc::new(Mutex::new(())),
+        registry_epoch: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         pubid: pubid::PubId::load_or_generate(&args.journal)
             .with_context(|| "load public-id key")?,
     };
@@ -3634,6 +3713,16 @@ mod tests {
                                 "{path}: field {k:?} carries the internal workspace id {internal}"
                             );
                         }
+                        // S3: run ids are strings now — a *numeric*
+                        // run_id (or any ws-named value) is an internal
+                        // sequence leaking. Key `id`s stay numeric:
+                        // they are the management API's own handle.
+                        if matches!(k.as_str(), "run_id" | "ws") && val.is_number() {
+                            panic!(
+                                "{path}: field {k:?} is numeric ({val}) — \
+                                 an internal id, not the opaque public form"
+                            );
+                        }
                         scan_json(val, internal, path);
                     }
                 }
@@ -3737,7 +3826,7 @@ mod tests {
         // The workspace's internal id never left the process — the test
         // finds it through the store to give the ws a `step` handler.
         let ws_id = store
-            .list_workspaces(100)
+            .list_workspaces(100, None)
             .await
             .unwrap_or_else(|e| panic!("{e}"))
             .into_iter()
@@ -4114,6 +4203,51 @@ mod tests {
         assert_eq!(status, StatusCode::OK, "{v}");
     }
 
+    /// S3: every registry mutation bumps `registry_epoch` — the marker a
+    /// running reconcile pass checks before each apply, so a pass read
+    /// before the mutation discards itself instead of resurrecting a
+    /// rotated secret or a deleted handler for up to 30 s.
+    #[tokio::test]
+    async fn registry_mutations_bump_the_epoch() {
+        use durable_accounts::Memory;
+        let store = Arc::new(Memory::new());
+        let a = store
+            .create_workspace("a")
+            .await
+            .unwrap_or_else(|e| panic!("{e}"));
+        let key_a = "dr_cccccccccccccccccccccccccccccccccccccccccccccccc";
+        store
+            .create_key(
+                a.id,
+                "k",
+                Permission::Admin,
+                &sha256(key_a.as_bytes()),
+                "dr_c",
+            )
+            .await
+            .unwrap_or_else(|e| panic!("{e}"));
+        let h = harness_store(true, None, Some(store));
+        let epoch = || {
+            h.app
+                .registry_epoch
+                .load(std::sync::atomic::Ordering::Acquire)
+        };
+        let e0 = epoch();
+        for (method, uri, body) in [
+            (
+                "PUT",
+                "/handlers/h",
+                Some(json!({ "url": "http://127.0.0.1:9/x" })),
+            ),
+            ("DELETE", "/handlers/h", None),
+            ("POST", "/handler-secret", None),
+        ] {
+            let (status, v) = call(&h.router, method, uri, Some(key_a), body).await;
+            assert_eq!(status, StatusCode::OK, "{method} {uri}: {v}");
+        }
+        assert_eq!(epoch() - e0, 3, "PUT + DELETE + rotate each bump once");
+    }
+
     /// The reconciler's outage path: with the store down the engine keeps
     /// the last-known-good set — submits still admit and diagnostics says
     /// `registry_stale` (the loop sets the flag on the same error).
@@ -4154,6 +4288,7 @@ mod tests {
             &h.app.flag_handlers,
             &h.app.registry_file,
             &h.app.registry_lock,
+            &h.app.registry_epoch,
         )
         .await
         .unwrap_or_else(|e| panic!("{e}"));
@@ -4179,6 +4314,7 @@ mod tests {
                 &h.app.flag_handlers,
                 &h.app.registry_file,
                 &h.app.registry_lock,
+                &h.app.registry_epoch,
             )
             .await
             .is_err(),

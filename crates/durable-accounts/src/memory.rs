@@ -134,10 +134,19 @@ impl AccountStore for Memory {
         Ok(workspace)
     }
 
-    async fn list_workspaces(&self, limit: u32) -> Result<Vec<Workspace>, AccountError> {
+    async fn list_workspaces(
+        &self,
+        limit: u32,
+        after: Option<u64>,
+    ) -> Result<Vec<Workspace>, AccountError> {
         self.check_up()?;
         let inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-        let mut out: Vec<Workspace> = inner.workspaces.values().cloned().collect();
+        let mut out: Vec<Workspace> = inner
+            .workspaces
+            .values()
+            .filter(|ws| after.is_none_or(|a| ws.id > a))
+            .cloned()
+            .collect();
         out.sort_by_key(|ws| ws.id);
         out.truncate(limit as usize);
         Ok(out)

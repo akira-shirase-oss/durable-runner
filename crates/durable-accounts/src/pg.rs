@@ -181,13 +181,20 @@ impl AccountStore for Pg {
         })
     }
 
-    async fn list_workspaces(&self, limit: u32) -> Result<Vec<Workspace>, AccountError> {
+    async fn list_workspaces(
+        &self,
+        limit: u32,
+        after: Option<u64>,
+    ) -> Result<Vec<Workspace>, AccountError> {
+        let after = after.map(|a| to_i64(a, "workspace")).transpose()?;
         let rows = bounded(
             sqlx::query(
                 "SELECT id, public_id, name, handler_secret FROM workspaces \
+                 WHERE ($2::bigint IS NULL OR id > $2) \
                  ORDER BY id LIMIT $1",
             )
             .bind(i64::from(limit))
+            .bind(after)
             .fetch_all(&self.pool),
         )
         .await?;

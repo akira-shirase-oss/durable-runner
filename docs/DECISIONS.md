@@ -983,3 +983,31 @@ format bump would make the service refuse to start. The rules:
   wrote DRIX 2 while the guard compared records only); workspace scope
   is part of it because a binary that cannot park ws ≠ 0 runs would
   execute tenant work on workspace 0's name-keyed handlers.
+
+## D-057: account records live in Neon Postgres; the journal stays sole job authority
+
+*(adopted from S2-PLAN, implemented in S2)*
+
+The account graph — workspaces (internal `u64` plus an opaque `public_id`),
+accounts, members, hashed API keys, handler registrations, signing secrets —
+lives in Neon Postgres (sqlx, `sslmode=verify-full`, a bounded pool, a
+deadline on every query). It is consulted at ingress only: dispatch reads
+the in-memory registry and the journal, so a store outage degrades sign-in
+and uncached-key submits (`503 accounts_unavailable`, fail closed) while
+accepted runs keep executing.
+
+SQLite was the honest alternative — zero dependency, no new failure mode —
+and was declined: the graph must survive a droplet loss independently of
+the journal backup so a restored journal can reattach by workspace id, and
+the family standardizes account records on Neon.
+
+Two consequences pinned by the white-hat review and now enforced:
+
+- **Bounded like everything else**: a `dr_`-format pre-check before any
+  store query, a 10k key cache that evicts denials before grants, URL caps,
+  per-workspace in-flight/live/handler quotas, a per-workspace run index,
+  and a store-enforced (not route-enforced) handler bound.
+- **Opaque ids at the boundary**: workspaces expose only `public_id`
+  (UUIDv7); run ids cross the API as a keyed 64-bit permutation
+  (`<journal>/public_id.key`), so no response reveals a sequence or
+  another tenant's volume. Neither id is a journal change.
