@@ -117,4 +117,93 @@ run 1 jbadmagic reads-v3-2-1
 mkjournal short 2; printf 'xxDRIX' >"$work/jshort/gen-000001/snapshot.bin"
 run 1 jshort reads-v3-2-1
 
+# A 33-byte snapshot: magic fits, the u16 version does not.
+mkjournal b33 2
+python3 -c "import sys; sys.stdout.buffer.write(b'x'*28 + b'DRIX' + b'\x00')" \
+  >"$work/jb33/gen-000001/snapshot.bin"
+run 1 jb33 reads-v3-2-1
+
+# --- v1.0.2 (fix review): journal.shape — the server-down sidecar -----
+# After compaction, ws ≠ 0 runs can live ONLY inside snapshot.bin; the
+# sidecar is what the guard reads when the records are pruned.
+mkjournal scws 2; mksnap "$work/jscws" 2
+printf 'records=2\nsnapshots=2\nws=9\n' >"$work/jscws/journal.shape"
+run 1 jscws reads-v3           # tenant runs hidden in the snapshot: refused
+run 0 jscws reads-v3-2-1       # a parking binary: admitted
+
+mkjournal sc0 2; mksnap "$work/jsc0" 2
+printf 'records=2\nsnapshots=2\nws=0\n' >"$work/jsc0/journal.shape"
+run 0 jsc0 reads-v3            # precise: a clean sidecar admits
+
+# A malformed or partial sidecar is damage, not a zero.
+mkjournal scbad 2; printf 'records=zzz\n' >"$work/jscbad/journal.shape"
+run 1 jscbad reads-v3-2-1
+mkjournal scmiss 2; printf 'records=2\nsnapshots=2\n' >"$work/jscmiss/journal.shape"
+run 1 jscmiss reads-v3-2-1
+
+# Ambiguity without a sidecar refuses: DRIX ≥ 2 + any ws-bearing record
+# (a ws-capable writer ran) could mean parked tenant runs pruned into
+# the snapshot before sidecars existed.
+mkjournal ambws 2; mksnap "$work/jambws" 2
+printf '{"v":2,"ws":0,"run":1}\n' >"$work/jambws/gen-000001/journal.log"
+run 1 jambws reads-v3
+run 0 jambws reads-v3-2-1
+
+# Same for a v3 record with no ws field, and for a crash right after
+# compaction that left the newest journal.log empty.
+mkjournal amb3 3; mksnap "$work/jamb3" 2
+printf '{"v":3,"run":1}\n' >"$work/jamb3/gen-000001/journal.log"
+run 1 jamb3 reads-v3
+mkjournal ambmt 2; mksnap "$work/jambmt" 2
+: >"$work/jambmt/gen-000001/journal.log"
+run 1 jambmt reads-v3
+
+# Multi-generation: the scan walks every gen dir.
+mkjournal multi 3; install -d "$work/jmulti/gen-000002"
+printf '{"v":3,"ws":4,"run":1}\n' >"$work/jmulti/gen-000002/journal.log"
+python3 -c "import sys; sys.stdout.buffer.write(b'x'*28 + b'DRIX' + b'\x00\x02')" \
+  >"$work/jmulti/gen-000002/snapshot.bin"
+printf 'records=3\nsnapshots=2\nws=4\n' >"$work/jmulti/journal.shape"
+run 1 jmulti reads-v3
+run 0 jmulti reads-v3-2-1
+
+# --- v1.0.2 (fix review): the server-UP path --------------------------
+# A running server under-reports (open-time maxima, pre-live-commit):
+# the files must outrank it. Stub diagnostics over loopback.
+mkjournal upws 3; printf '{"v":3,"ws":7,"run":1}\n' >"$work/jupws/gen-000001/journal.log"
+printf 'records=3\nsnapshots=1\nws=7\n' >"$work/jupws/journal.shape"
+printf 'x' >"$work/keyfile"
+# A canned /admin/diagnostics claiming a clean journal (2/1/0) must NOT
+# admit a non-parking binary: the files win.
+python3 - "$work" <<'PY' &
+import http.server, json, sys, threading
+work = sys.argv[1]
+class H(http.server.BaseHTTPRequestHandler):
+    def do_GET(self):
+        b = json.dumps({"journal_record_version_max": 2,
+                        "journal_snapshot_version_max": 1,
+                        "journal_max_ws": 0}).encode()
+        self.send_response(200)
+        self.send_header("content-type", "application/json")
+        self.send_header("content-length", str(len(b)))
+        self.end_headers(); self.wfile.write(b)
+    def log_message(self, *a): pass
+s = http.server.HTTPServer(("127.0.0.1", 58401), H)
+threading.Thread(target=s.serve_forever, daemon=True).start()
+import os, subprocess, time
+time.sleep(0.4)
+env = dict(os.environ, FORMAT_GUARD_LISTEN="127.0.0.1:58401",
+           FORMAT_GUARD_KEY_FILE=f"{work}/keyfile",
+           FORMAT_GUARD_JOURNAL_ROOT=f"{work}/jupws")
+for stub, want in [("reads-v3", 1), ("reads-v3-2-1", 0)]:
+    r = subprocess.run(["deploy/format-guard.sh", f"{work}/{stub}"],
+                       env=env, capture_output=True)
+    print(f"server-up {stub}: exit {r.returncode} (want {want})",
+          file=sys.stderr)
+    if r.returncode != want:
+        print(r.stderr.decode(), file=sys.stderr); sys.exit(1)
+PY
+pypid=$!
+wait $pypid || { echo "FAIL: server-up merge wrong"; fails=1; }
+
 (( fails == 0 )) && echo "format-guard tests: all pass" || exit 1

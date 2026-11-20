@@ -1149,6 +1149,16 @@ async fn main() -> Result<()> {
             t.bytes, t.offset
         );
     }
+    if let Ok(d) = engine.diag().await {
+        if d.parked_runs > 0 {
+            eprintln!(
+                "durable-server: {} run(s) parked — ws ≠ 0 work is held, not executed \
+                 (a rollback floor does not dispatch tenant work); parked runs still \
+                 occupy live-run and index capacity",
+                d.parked_runs
+            );
+        }
+    }
     let stopped = engine.clone();
     let app = App {
         engine,

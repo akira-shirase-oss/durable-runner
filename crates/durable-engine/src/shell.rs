@@ -780,6 +780,7 @@ impl Pipeline {
 struct PendingCompaction {
     done: oneshot::Receiver<Result<u32, JournalError>>,
     expired: Vec<RunId>,
+    shape: durable_journal::Shape,
     reply: Option<CompactReply>,
 }
 
@@ -804,16 +805,21 @@ fn start_compaction(
         };
         return Err((e, reply));
     }
+    // The shape the writer persists inside the manifest swap — after
+    // pruning, the records that carried it are gone.
+    let shape = core.planned_compaction_shape(&plan.view);
     pipe.collect(core);
     let (done_tx, done) = oneshot::channel();
     pipe.outbound.push_back(WriterMsg::Compact {
         view: plan.view,
         bytes: plan.bytes,
+        shape,
         reply: done_tx,
     });
     Ok(PendingCompaction {
         done,
         expired: plan.expired,
+        shape,
         reply,
     })
 }
@@ -931,6 +937,7 @@ async fn drain(
                     let answer = match r {
                         Ok(Ok(generation)) => {
                             core.finish_compaction(&c.expired);
+                            core.note_shape_persisted(c.shape);
                             Ok(generation)
                         }
                         Ok(Err(e)) => Err(EngineError::Journal(e)),
@@ -1142,6 +1149,7 @@ async fn actor(
                             // The new generation is durable: only now does
                             // expiry reach the live index (all or nothing).
                             core.finish_compaction(&c.expired);
+                            core.note_shape_persisted(c.shape);
                             Ok(generation)
                         }
                         Ok(Err(e)) => Err(EngineError::Journal(e)),
