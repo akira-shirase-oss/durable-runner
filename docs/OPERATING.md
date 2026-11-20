@@ -112,6 +112,10 @@ target/release/durable-server \
   cached keys keep authenticating inside the TTL, uncached bearers fail
   closed as `503 accounts_unavailable`, and already-accepted runs keep
   executing — the store is never on the commit or dispatch path.
+  `DURABLE_ACCOUNTS_BACKEND=memory` (dev/test only — announced loudly at
+  startup) serves the same graph from an in-memory store: workspaces and
+  keys die with the process. It conflicts with `DATABASE_URL` — set one
+  or the other, never both.
 - **Backup root.** `--backup-root DIR` is the only place backups are
   written; without it `/admin/backup` answers `403 backups_disabled`.
 

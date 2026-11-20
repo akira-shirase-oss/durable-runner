@@ -41,6 +41,11 @@ through a store outage.
   permission.
 - **`Diagnostics.workspaces_active`**: distinct workspaces holding live
   runs, as a count only — diagnostics never carries a workspace id.
+- **Record format v3 writer** (S2-3): every committed record now carries
+  `ws`. Journals written by this build refuse the v1.0.0 binary (reader
+  to v2) and remain readable by v1.0.1 — the rollback floor D-056 kept.
+  Mixed v2/v3 journals replay each run into its own workspace; a torn
+  v3 tail is discarded exactly as a torn v2 tail was.
 - **Neon CI workflow** (`.github/workflows/neon.yml`): the Postgres
   store's contract tests run against real Neon behind a secret; absent,
   the job skips with a visible notice rather than silently passing.

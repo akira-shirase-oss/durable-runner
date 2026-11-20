@@ -1510,21 +1510,40 @@ fn read_key_from_env(api_key: &ApiKey) -> Result<Option<ApiKey>> {
 /// affected paths rather than a silent fallthrough to deny-all.
 async fn account_store_from_env() -> Result<Option<Arc<dyn AccountStore>>> {
     const DATABASE_URL_ENV: &str = "DATABASE_URL";
-    let Ok(url) = std::env::var(DATABASE_URL_ENV) else {
-        return Ok(None);
-    };
-    if url.trim().is_empty() {
-        anyhow::bail!("{DATABASE_URL_ENV} is set but empty");
+    const BACKEND_ENV: &str = "DURABLE_ACCOUNTS_BACKEND";
+    let backend = std::env::var(BACKEND_ENV).unwrap_or_default();
+    let url = std::env::var(DATABASE_URL_ENV).ok();
+    match (backend.trim(), url) {
+        ("memory", None) => {
+            eprintln!(
+                "durable-server: DURABLE_ACCOUNTS_BACKEND=memory — the account \
+                 graph is in-memory only (dev/test): keys and workspaces die \
+                 with the process"
+            );
+            Ok(Some(Arc::new(durable_accounts::Memory::new())))
+        }
+        ("memory", Some(_)) => {
+            anyhow::bail!("{BACKEND_ENV}=memory conflicts with {DATABASE_URL_ENV}: pick one")
+        }
+        ("", None) => Ok(None),
+        ("", Some(url)) if !url.trim().is_empty() => {
+            let store =
+                Pg::connect(url.trim()).map_err(|e| anyhow::anyhow!("{DATABASE_URL_ENV}: {e}"))?;
+            match store.migrate().await {
+                Ok(()) => {
+                    eprintln!("durable-server: account store connected, migrations applied")
+                }
+                Err(e) => eprintln!(
+                    "durable-server: WARNING account store unreachable at startup ({e}); \
+                     serving anyway — store-verified keys answer accounts_unavailable \
+                     until it returns"
+                ),
+            }
+            Ok(Some(Arc::new(store)))
+        }
+        ("", Some(_)) => anyhow::bail!("{DATABASE_URL_ENV} is set but empty"),
+        (other, _) => anyhow::bail!("{BACKEND_ENV}={other:?} is unknown (want: memory)"),
     }
-    let store = Pg::connect(url.trim()).map_err(|e| anyhow::anyhow!("{DATABASE_URL_ENV}: {e}"))?;
-    match store.migrate().await {
-        Ok(()) => eprintln!("durable-server: account store connected, migrations applied"),
-        Err(e) => eprintln!(
-            "durable-server: WARNING account store unreachable at startup ({e}); \
-             serving anyway — store-verified keys answer accounts_unavailable until it returns"
-        ),
-    }
-    Ok(Some(Arc::new(store)))
 }
 
 /// Whether the request's `Host` is a loopback name: `localhost`, or an IP

@@ -82,11 +82,13 @@ pub enum EngineError {
 /// the transition actually happened, not the time it was replayed.
 /// The record format a writer emits (D-054). v1 has no `v` and carries
 /// `spec.input` as a JSON number array; v2 adds `v` and carries it as
-/// base64. Readers accept both forever.
-pub const ENVELOPE_VERSION: u8 = 2;
+/// base64; v3 adds `ws` (the owning workspace's internal id — S2). Readers
+/// accept all three forever.
+pub const ENVELOPE_VERSION: u8 = 3;
 /// The highest record version this binary can read. Per D-056 a format
-/// bump ships a reader one release before any writer emits it: S2-0 reads
-/// v3 (every record carries `ws`) while still writing v2.
+/// bump ships a reader one release before any writer emits it: v1.0.1
+/// (S2-0) shipped the v3 reader; this binary writes v3, so a rollback to
+/// v1.0.0 is refused but v1.0.1 remains a valid rollback floor.
 pub const READER_VERSION: u8 = 3;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1185,7 +1187,7 @@ mod tests {
         );
         // D-056's rollback guard: the journal's highest version is what
         // upgrade/rollback compare a binary's reader against.
-        assert_eq!(e.diagnostics().journal_record_version_max, 2);
+        assert_eq!(e.diagnostics().journal_record_version_max, ENVELOPE_VERSION);
     }
 
     /// D-056: the version guard reads the journal's highest `v` — a v1
@@ -1224,16 +1226,33 @@ mod tests {
         assert!(matches!(err, EngineError::Serde(_)), "{err}");
     }
 
-    // --- S2-0: record format v3 reader (ws), still writes v2 -------------
+    // --- S2: record format v3 (ws); S2-0 read early, S2-3 writes it ------
 
-    /// Write one record in the shape the S2 writer will emit — `v:3` with
-    /// a workspace — straight into the journal.
+    /// Write one record in the shape the S2 writer emits — `v:3` with a
+    /// workspace — straight into the journal.
     fn commit_v3(dir: &std::path::Path, run: u64, ws: u64, event: &str) {
         let mut j = Journal::open(dir).unwrap_or_else(|e| panic!("{e}"));
         let payload =
             format!("{{\"v\":3,\"ws\":{ws},\"run\":{run},\"at\":1000,\"event\":{event}}}");
         j.append(payload.as_bytes())
             .unwrap_or_else(|e| panic!("{e}"));
+    }
+
+    /// Write one record in the v1.0.x writer's shape — `v:2`, no `ws`,
+    /// base64 input — straight into the journal.
+    fn commit_v2(dir: &std::path::Path, run: u64, event: &str) {
+        let mut j = Journal::open(dir).unwrap_or_else(|e| panic!("{e}"));
+        let payload = format!("{{\"v\":2,\"run\":{run},\"at\":1000,\"event\":{event}}}");
+        j.append(payload.as_bytes())
+            .unwrap_or_else(|e| panic!("{e}"));
+    }
+
+    fn v2_accepted(key: &str) -> String {
+        format!(
+            "{{\"Accepted\":{{\"key\":\"{key}\",\"spec\":{{\"version\":1,\
+             \"steps\":[{{\"name\":\"only\",\"handler\":\"echo\"}}],\"input\":\"aGk=\"}},\
+             \"not_before\":0}}}}"
+        )
     }
 
     fn v3_accepted(key: &str) -> String {
@@ -1306,6 +1325,91 @@ mod tests {
         assert_eq!(seven.iter().map(|s| s.id).collect::<Vec<_>>(), vec![b]);
         let (none, _) = e.page(9, None, 100);
         assert!(none.is_empty());
+    }
+
+    /// S2-3: the writer emits v3 — every committed record carries `v:3`
+    /// and its run's workspace, including compat-mode ws 0.
+    #[test]
+    fn the_writer_emits_v3_records_with_their_workspace() {
+        let (d, mut e) = open();
+        e.submit_at(7, OperationKey("seven".into()), spec(), 0, 0)
+            .unwrap_or_else(|e| panic!("{e}"));
+        e.submit(OperationKey("zero".into()), spec(), 0)
+            .unwrap_or_else(|e| panic!("{e}"));
+        drop(e);
+        let recs = durable_journal::replay_dir(&durable_journal::gen_dir_path(d.path(), 1))
+            .unwrap_or_else(|e| panic!("{e}"));
+        assert!(!recs.is_empty());
+        let mut saw_seven = false;
+        let mut saw_zero = false;
+        for r in &recs {
+            let v: serde_json::Value =
+                serde_json::from_slice(&r.payload).unwrap_or_else(|e| panic!("seq {}: {e}", r.seq));
+            assert_eq!(v["v"], 3, "record must be v3: {line:?}", line = v);
+            assert!(v.get("ws").is_some(), "record must carry ws: {v}");
+            saw_seven |= v["ws"] == 7;
+            saw_zero |= v["ws"] == 0;
+        }
+        assert!(saw_seven && saw_zero, "workspaces 7 and 0 both journaled");
+    }
+
+    /// A journal with v2 and v3 records interleaved — the state an in-place
+    /// upgrade leaves behind — replays each run into its own workspace and
+    /// the writer keeps appending v3.
+    #[test]
+    fn a_mixed_v2_v3_journal_replays_each_workspace() {
+        let d = tempfile::tempdir().unwrap_or_else(|e| panic!("{e}"));
+        commit_v2(d.path(), 1, &v2_accepted("old"));
+        commit_v3(d.path(), 2, 7, &v3_accepted("new"));
+        {
+            let mut e = EngineCore::open(d.path()).unwrap_or_else(|e| panic!("{e}"));
+            assert_eq!(e.run(RunId(1)).unwrap_or_else(|| panic!("1")).ws, 0);
+            assert_eq!(e.run(RunId(2)).unwrap_or_else(|| panic!("2")).ws, 7);
+            e.submit_at(7, OperationKey("after".into()), spec(), 0, 0)
+                .unwrap_or_else(|e| panic!("{e}"));
+            assert_eq!(e.diagnostics().journal_record_version_max, 3);
+        }
+        // …and the journal stays coherent across a second reopen.
+        let e = EngineCore::open(d.path()).unwrap_or_else(|e| panic!("{e}"));
+        let (seven, _) = e.page(7, None, 100);
+        assert_eq!(seven.len(), 2);
+        let (zero, _) = e.page(0, None, 100);
+        assert_eq!(zero.len(), 1);
+    }
+
+    /// Crash mid-write on a mixed-version journal: the committed v2+v3
+    /// head survives with its workspaces, the torn tail is discarded and
+    /// the journal keeps appending v3.
+    #[test]
+    fn a_torn_tail_on_a_mixed_journal_is_discarded() {
+        let d = tempfile::tempdir().unwrap_or_else(|e| panic!("{e}"));
+        commit_v2(d.path(), 1, &v2_accepted("old"));
+        commit_v3(d.path(), 2, 7, &v3_accepted("new"));
+        // Crash mid-append: a third v3 record's frame starts but the file
+        // ends inside it — the torn tail.
+        let log = durable_journal::gen_dir_path(d.path(), 1).join("journal.log");
+        let committed_len = std::fs::metadata(&log)
+            .unwrap_or_else(|e| panic!("{e}"))
+            .len();
+        commit_v3(d.path(), 3, 7, &v3_accepted("torn"));
+        let f = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&log)
+            .unwrap_or_else(|e| panic!("{e}"));
+        f.set_len(committed_len + 20)
+            .unwrap_or_else(|e| panic!("{e}"));
+        drop(f);
+        {
+            let mut e = EngineCore::open(d.path()).unwrap_or_else(|e| panic!("{e}"));
+            assert_eq!(e.run(RunId(1)).unwrap_or_else(|| panic!("1")).ws, 0);
+            assert_eq!(e.run(RunId(2)).unwrap_or_else(|| panic!("2")).ws, 7);
+            e.submit_at(7, OperationKey("after".into()), spec(), 0, 0)
+                .unwrap_or_else(|e| panic!("{e}"));
+        }
+        let e = EngineCore::open(d.path()).unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(e.diagnostics().journal_record_version_max, 3);
+        let (seven, _) = e.page(7, None, 100);
+        assert_eq!(seven.len(), 2, "torn run 3 is gone; the new submit kept");
     }
 
     /// The released v1.0.0 binary reads up to v2 only: a v3 record must

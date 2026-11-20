@@ -32,6 +32,8 @@ case "$MODE" in
     run admission --n=3000
     run compact --seconds=60
     run sustained --rate=100 --total=1000000
+    # S2: workspaces share one server — needs DATABASE_URL, else a visible skip.
+    run workspaces --workspaces=4 --per=25000
     ;;
   --smoke | smoke | *)
     # Small sizes — laptop evidence only, marked smoke:true in each result.
@@ -41,6 +43,8 @@ case "$MODE" in
     run admission --smoke
     run compact --smoke
     run sustained --smoke
+    # S2: skips visibly without DATABASE_URL (no account graph to load).
+    run workspaces --smoke
     ;;
 esac
 

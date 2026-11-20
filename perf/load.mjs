@@ -9,6 +9,8 @@
 //   admission  flood submits past channel capacity -> 503 reserve refusals
 //   compact    steady submits while /admin/compact runs repeatedly
 //   sustained  the million-op run: fixed submit rate for a duration
+//   workspaces S2: N workspaces, own keys, split submits + isolation
+//              (needs DATABASE_URL; skips visibly without one)
 //
 // Flags: --smoke picks the small local sizes (perf/battery.sh runs these);
 // the full sizes are what .github/workflows/load.yml runs on CI. --p99=MS
@@ -236,11 +238,11 @@ async function startServer(journalDir, extra = []) {
   throw new Error('server never became healthy');
 }
 
-async function submit(opKey, steps = 1) {
+async function submit(opKey, steps = 1, auth = AUTH) {
   const t0 = performance.now();
   try {
     const r = await fetch(`${API}/jobs`, {
-      method: 'POST', headers: { 'content-type': 'application/json', ...AUTH },
+      method: 'POST', headers: { 'content-type': 'application/json', ...auth },
       body: JSON.stringify({
         op_key: opKey,
         spec: { version: 1, steps: Array.from({ length: steps }, (_, i) => ({ name: `s${i}`, handler: 'step' })), input_b64: INPUT_B64 },
@@ -467,9 +469,97 @@ async function runSustained() {
   return r.verdict === 'pass';
 }
 
+// The S2 battery: N workspaces share one server, each authenticated by its
+// own minted key; submits split across workspaces and every workspace's
+// listing is re-paged to count exactly its own runs. Needs DATABASE_URL —
+// without one the server has no account graph and the scenario skips
+// visibly rather than running compat mode and calling it workspace load.
+async function runWorkspaces() {
+  const backend = process.env.DATABASE_URL ? 'postgres' : process.env.DURABLE_ACCOUNTS_BACKEND;
+  if (!backend) {
+    console.error('workspaces scenario needs DATABASE_URL or DURABLE_ACCOUNTS_BACKEND=memory; skipping — this is a skip, not a pass');
+    return true;
+  }
+  const n = Number(args.workspaces ?? 2), per = Number(args.per ?? (SMOKE ? 200 : 25_000));
+  const dir = fs.mkdtempSync(`${os.tmpdir()}/dr-load-`);
+  const h = startHandler('ok'); const s = await startServer(`${dir}/journal`);
+  // Mint one admin key per workspace through the ops routes.
+  const keys = [];
+  for (let i = 0; i < n; i++) {
+    const w = await (await fetch(`${API}/admin/workspaces`, {
+      method: 'POST', headers: { 'content-type': 'application/json', ...AUTH },
+      body: JSON.stringify({ name: `load-ws-${i}` }),
+    })).json();
+    const k = await (await fetch(`${API}/admin/workspaces/${w.public_id}/keys`, {
+      method: 'POST', headers: { 'content-type': 'application/json', ...AUTH },
+      body: JSON.stringify({ name: 'load', permission: 'admin' }),
+    })).json();
+    keys.push({ public_id: w.public_id, auth: { authorization: `Bearer ${k.key}` } });
+  }
+  // Submit `per` runs per workspace, same op_key prefix in each — dedup is
+  // per (workspace, key), so identical keys in two workspaces are two runs.
+  const lat = []; const codes = {}; let sent = 0;
+  const t0 = now();
+  for (let i = 0; i < per; i++) {
+    for (const ws of keys) {
+      sent++;
+      submit(`shared-${i}`, 1, ws.auth).then((r) => {
+        lat.push(r.ms); codes[r.status] = (codes[r.status] ?? 0) + 1;
+      });
+    }
+    if (i % 100 === 0) await sleep(50);
+  }
+  await sleep(15_000); // drain
+  // Page each workspace's list: it must contain exactly its `per` runs and
+  // no id another workspace owns.
+  const owned = new Map(); // ws -> Set(run ids)
+  const pageCounts = {};
+  for (const [w, ws] of keys.entries()) {
+    const ids = new Set(); let after = null; let pages = 0;
+    for (;;) {
+      const q = after == null ? '' : `&after=${after}`;
+      const page = await (await fetch(`${API}/jobs?limit=1000${q}`, { headers: ws.auth })).json();
+      for (const r of page.runs ?? []) ids.add(r.id);
+      pages++;
+      if (page.next_after == null) break;
+      after = page.next_after;
+    }
+    owned.set(w, ids); pageCounts[ws.public_id] = { runs: ids.size, pages };
+  }
+  const disjoint = [...owned.values()].every((ids, i) =>
+    [...owned.values()].every((o, j) => i === j || [...ids].every((id) => !o.has(id))));
+  // No-oracle spot check: workspace 0's first run read under workspace 1's key.
+  const foreign = [...owned.get(0)][0];
+  const probe = await fetch(`${API}/jobs/${foreign}`, { headers: keys[1].auth });
+  const done = (await diag()).states.done ?? 0;
+  h.kill(); s.kill();
+  const p99 = pct(lat, 0.99);
+  const r = writeResult('workspaces', {
+    params: { workspaces: n, submits_per_workspace: per, account_backend: backend, smoke: SMOKE },
+    sent, http_codes: codes, per_workspace: pageCounts,
+    done_after_drain: done,
+    latency_ms: { p50: pct(lat, 0.5), p99, max: pct(lat, 1) },
+    thresholds: {
+      accepted: 'every submit', sized: `${per} runs per workspace`,
+      disjoint: 'no run id shared across workspaces', oracle: 'foreign run id → 404',
+      done: 'every accepted run', p99_ms: `<${P99_MS}`,
+    },
+    ...verdictOf([
+      ['every submit accepted', Object.keys(codes).every((c) => c === '200')],
+      ['every workspace lists exactly its own runs', [...owned.values()].every((ids) => ids.size === per)],
+      ['run ids disjoint across workspaces', disjoint],
+      ['a foreign run id answers 404', probe.status === 404],
+      ['every accepted run finished', done >= sent * 0.99],
+      [`p99 < ${P99_MS}ms`, p99 !== null && p99 < P99_MS],
+    ]),
+  });
+  return r.verdict === 'pass';
+}
+
 const runners = {
   submit: runSubmit, replay: runReplay, stall: runStall,
   admission: runAdmission, compact: runCompact, sustained: runSustained,
+  workspaces: runWorkspaces,
 };
 if (!runners[scenario]) {
   console.error(`unknown scenario ${scenario}; choices: ${Object.keys(runners).join(', ')}`);
