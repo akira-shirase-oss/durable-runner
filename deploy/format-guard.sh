@@ -66,7 +66,6 @@ else
   if (( ${#gens[@]} == 0 )) && [[ -f $JOURNAL_ROOT/manifest.json ]]; then
     refuse "$JOURNAL_ROOT has a manifest but no gen-*/journal.log"
   fi
-  ws_field_seen=0
   for f in ${logs[@]+"${logs[@]}"}; do
     # grep 0 = matches, 1 = no match (v1 records only — fine), >=2 = error.
     if out=$(LC_ALL=C grep -ao '"v":[0-9]*' "$f" 2>/dev/null); then rc=0; else rc=$?; fi
@@ -78,10 +77,8 @@ else
     # Workspace-scoped history: a record with ws ≠ 0 is what a
     # pre-v1.0.2 binary cannot park — it would run tenant work on
     # workspace-0's name-keyed handlers (S2 review). "ws":0 is the
-    # writer's own default, not tenant data — but its presence still
-    # marks a sidecar-era writer, needed for the ambiguity check below.
+    # writer's own default, not tenant data.
     if LC_ALL=C grep -aq '"ws":[1-9]' "$f" 2>/dev/null; then sws=1; fi
-    if LC_ALL=C grep -aq '"ws":' "$f" 2>/dev/null; then ws_field_seen=1; fi
   done
   # Snapshot formats: gen-*/snapshot.bin is a framed record whose
   # payload is "DRIX" + u16 version — so the magic sits at bytes 28-31
@@ -121,19 +118,12 @@ else
     sidecar=1
   fi
   # Ambiguity is a refusal, not an assumption: a snapshot CAN hide ws ≠ 0
-  # runs once compaction deleted their records. Without a sidecar the
-  # journal is provably clean only when its DRIX ≥ 2 snapshot predates
-  # ws-capable writers — i.e. records exist, none carries a ws field,
-  # and none is v3. Anything else could be a ws-aware writer that
-  # compacted and stopped before the sidecar existed.
+  # runs once compaction deleted their records, and every ws-aware writer
+  # has stamped a "ws" field on every record since v1.0.1 — so a
+  # sidecar-less DRIX ≥ 2 journal can never prove a pre-workspace writer
+  # made it. No sidecar and DRIX ≥ 2 refuses every non-parking binary.
   if (( sidecar == 0 && ssnap >= 2 )); then
-    newest=""
-    if (( ${#logs[@]} > 0 )); then
-      newest=${logs[$((${#logs[@]} - 1))]}
-    fi
-    if (( ws_field_seen == 1 || smax >= 3 )) || [[ -z $newest || ! -s $newest ]]; then
-      sws=1
-    fi
+    sws=1
   fi
 fi
 # Whatever the files hold outranks whatever a still-running older

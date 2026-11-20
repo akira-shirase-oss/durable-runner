@@ -79,8 +79,10 @@ install -d "$work/jlogdir/gen-000001/journal.log"; run 1 jlogdir reads-v2  # jou
 # passed the guard and then refused startup.
 mkjournal snap2 2; mksnap "$work/jsnap2" 2
 run 1 jsnap2 reads-v2          # v1.0.0-class reader on a DRIX-2 journal
-run 0 jsnap2 reads-v3          # v1.0.1 floor: reader 3 implies DRIX 2
-run 0 jsnap2 reads-v3-2-1      # the explicit three-number answer
+# A sidecar-less DRIX-2 journal can never prove a pre-workspace writer
+# (v1.0.1+ stamps "ws" on every record) — refused even for reads-v3.
+run 1 jsnap2 reads-v3          # ambiguous: cannot park, refused
+run 0 jsnap2 reads-v3-2-1      # the parking three-number answer
 
 # A snapshot from the future refuses even a three-number binary.
 mkjournal snap9 2; mksnap "$work/jsnap9" 9
@@ -158,6 +160,15 @@ mkjournal ambmt 2; mksnap "$work/jambmt" 2
 : >"$work/jambmt/gen-000001/journal.log"
 run 1 jambmt reads-v3
 
+# Hardest case: v2 records WITHOUT ws fields + a DRIX ≥ 2 snapshot and
+# no sidecar — the only combination the old guard admitted. But every
+# ws-aware writer (v1.0.1+) stamps "ws" on each record, so ws-free
+# records can't prove the compactor was pre-workspace: refuse.
+mkjournal ambold 2; mksnap "$work/jambold" 2
+printf '{"v":2,"run":1}\n' >"$work/jambold/gen-000001/journal.log"
+run 1 jambold reads-v3
+run 0 jambold reads-v3-2-1
+
 # Multi-generation: the scan walks every gen dir.
 mkjournal multi 3; install -d "$work/jmulti/gen-000002"
 printf '{"v":3,"ws":4,"run":1}\n' >"$work/jmulti/gen-000002/journal.log"
@@ -204,6 +215,36 @@ for stub, want in [("reads-v3", 1), ("reads-v3-2-1", 0)]:
         print(r.stderr.decode(), file=sys.stderr); sys.exit(1)
 PY
 pypid=$!
+# A diagnostics answer that carries a non-numeric ws field refuses —
+# the workspace scope can never be guessed at (line: `jws =~ ^[0-9]+$`).
+python3 - "$work" <<'PY' &
+import http.server, json, sys, threading
+work = sys.argv[1]
+class H(http.server.BaseHTTPRequestHandler):
+    def do_GET(self):
+        b = json.dumps({"journal_record_version_max": 2,
+                        "journal_snapshot_version_max": 1,
+                        "journal_max_ws": "nine"}).encode()
+        self.send_response(200)
+        self.send_header("content-type", "application/json")
+        self.send_header("content-length", str(len(b)))
+        self.end_headers(); self.wfile.write(b)
+    def log_message(self, *a): pass
+s = http.server.HTTPServer(("127.0.0.1", 58402), H)
+threading.Thread(target=s.serve_forever, daemon=True).start()
+import os, subprocess, time
+time.sleep(0.4)
+env = dict(os.environ, FORMAT_GUARD_LISTEN="127.0.0.1:58402",
+           FORMAT_GUARD_KEY_FILE=f"{work}/keyfile",
+           FORMAT_GUARD_JOURNAL_ROOT=f"{work}/jsc0")
+r = subprocess.run(["deploy/format-guard.sh", f"{work}/reads-v3-2-1"],
+                   env=env, capture_output=True)
+print(f"server-up nonnumeric-ws: exit {r.returncode} (want 1)", file=sys.stderr)
+if r.returncode != 1:
+    print(r.stderr.decode(), file=sys.stderr); sys.exit(1)
+PY
+pypid2=$!
 wait $pypid || { echo "FAIL: server-up merge wrong"; fails=1; }
+wait $pypid2 || { echo "FAIL: nonnumeric-ws refusal wrong"; fails=1; }
 
 (( fails == 0 )) && echo "format-guard tests: all pass" || exit 1

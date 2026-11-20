@@ -43,14 +43,17 @@ found two ways v1.0.1 was an unsafe rollback floor, both fixed here.
   to `<journal>/journal.shape`, written BEFORE the record or manifest
   swap it describes and only ever upward — so after `prune_superseded`
   deletes the generations that held ws ≠ 0 records, the down-server
-  guard can still see tenant runs living inside `snapshot.bin`.
+  guard can still see tenant runs living inside `snapshot.bin`. The
+  sidecar stays OUT of backups: open rebuilds it from the replayed
+  maxima, and a backup listing it would refuse under the v1.0.1
+  restore tool (its file list admits generation paths only).
 - **format-guard always scans the files** and takes the max of files
   and `/admin/diagnostics` — a running server's numbers were open-time
   facts that live commits could leave behind. A DRIX ≥ 2 snapshot with
-  no sidecar is ambiguous (a ws-capable writer may have compacted
-  before sidecars existed): the guard treats it as possibly-tenant
-  unless the records prove a pre-workspace writer (records exist, none
-  carries a `ws` field, none is v3).
+  no sidecar is ambiguous: every ws-aware writer stamps a `ws` field on
+  every record since v1.0.1, so a sidecar-less journal can never prove
+  a pre-workspace writer made it — the guard refuses it for every
+  non-parking binary.
 
 ### Rollback note (read before downgrading)
 
@@ -62,9 +65,11 @@ found two ways v1.0.1 was an unsafe rollback floor, both fixed here.
   workspace-blind registry would dispatch tenant work on workspace 0's
   handlers. `journal.shape` is the proof; an ambiguous journal
   (DRIX ≥ 2, no sidecar, ws-capable records) is refused too.
-- A pure v1.0.1-era journal — v2 records without `ws` fields, DRIX ≤ 2,
-  no sidecar and no need of one — still rolls back to v1.0.1 cleanly;
-  compaction under v1.0.1 breaks **v1.0.0 only**, not v1.0.1.
+- A v1.0.1-era journal is **indistinguishable** from a ws-aware one —
+  v1.0.1 already stamps `"ws":0` on every record, so no sidecar-less
+  DRIX ≥ 2 journal can prove it never saw tenant data: the guard
+  refuses v1.0.1 on any of them. Compaction under v1.0.1 breaks
+  **v1.0.0 only**, not v1.0.1.
 - Parked runs hold live-run and index capacity like any open run;
   after a rollback, enough parked tenants can admit-refuse workspace 0
   submits (`at_capacity`). The count is logged at startup and reported

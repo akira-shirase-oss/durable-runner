@@ -976,9 +976,10 @@ format bump would make the service refuse to start. The rules:
   three maxima — including ws ≠ 0 runs that survive only inside
   `snapshot.bin` after `prune_superseded` deleted their records, which
   no grep can find. Server-down the guard reads the sidecar plus a
-  full scan; a DRIX ≥ 2 journal with no sidecar is ambiguous (a
-  ws-capable writer may have compacted before sidecars existed) and
-  refuses unless the records prove a pre-workspace writer.
+  full scan; a DRIX ≥ 2 journal with no sidecar is ambiguous — every
+  workspace-aware writer (v1.0.1+) stamps `"ws"` on each record, so no
+  record set can prove such a journal is pre-workspace — and refuses
+  every non-parking binary.
   `durable-server --journal-format` prints them from the binary's side:
   `<max record version> <max DRIX version> <parks ws ≠ 0>` since
   v1.0.2 (a lone integer before it means records only, snapshot

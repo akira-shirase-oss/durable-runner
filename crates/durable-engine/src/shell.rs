@@ -2804,11 +2804,12 @@ mod tests {
     }
 
     /// The same with a real OS error: a journal root the process can write
-    /// into but not open for reading makes the post-rename directory fsync
-    /// fail (EACCES), as the reviewer reproduced on the release binary.
+    /// into but not open for reading fails the sidecar's directory fsync
+    /// (EACCES) BEFORE the manifest swap — an ordinary compaction error,
+    /// so the engine carries on and loses nothing (review 2d).
     #[cfg(unix)]
     #[tokio::test(flavor = "current_thread")]
-    async fn real_io_error_after_manifest_swap_stops_the_engine() {
+    async fn real_io_error_before_manifest_swap_is_not_fatal() {
         use std::os::unix::fs::PermissionsExt;
         struct Restore<'a>(&'a Path);
         impl Drop for Restore<'_> {
@@ -2844,13 +2845,16 @@ mod tests {
         assert!(bounded(eng.compact()).await.is_err());
         let after = submit_acked(&eng, "post", 30).await;
         drop(guard);
-        assert!(
-            after.is_empty(),
-            "{} submits acked after the failed swap",
-            after.len()
+        assert_eq!(
+            after.len(),
+            30,
+            "a pre-swap compaction error must not stop the engine"
         );
         acked.extend(after);
-        bounded(eng.closed()).await;
+        assert!(
+            bounded(eng.shutdown(Duration::from_secs(5))).await.is_ok(),
+            "a live engine drains cleanly"
+        );
         drop(eng);
         let core = reopen(d.path()).await;
         for id in &acked {

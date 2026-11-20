@@ -834,12 +834,18 @@ impl EngineCore {
             at: now,
             event: event.clone(),
         })?;
-        // Shape BEFORE the append it describes: a crash between the
-        // sidecar and the record leaves the file claiming more than the
-        // journal holds — the guard refuses more, never less.
-        self.journal_record_version_max = self.journal_record_version_max.max(ENVELOPE_VERSION);
-        self.journal_max_ws = self.journal_max_ws.max(ws);
-        self.persist_shape()?;
+        // Shape BEFORE the append it describes — but only when a
+        // maximum actually moved. Persisting unconditionally would add a
+        // create-in-root to every commit: an already-open log can append
+        // under a root that no longer grants create (the dir-mode fault
+        // test), so the steady state must cost nothing here.
+        let r = self.journal_record_version_max.max(ENVELOPE_VERSION);
+        let w = self.journal_max_ws.max(ws);
+        if r != self.journal_record_version_max || w != self.journal_max_ws {
+            self.journal_record_version_max = r;
+            self.journal_max_ws = w;
+            self.persist_shape()?;
+        }
         match &mut self.log {
             // durable BEFORE applied below
             Log::Direct(j) => {
