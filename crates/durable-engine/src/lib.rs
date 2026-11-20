@@ -175,6 +175,17 @@ pub struct Diagnostics {
     /// The highest record version present in the journal. Upgrade and
     /// rollback refuse to run a binary whose reader is older (D-056).
     pub journal_record_version_max: u8,
+    /// The highest snapshot (DRIX) format version the journal holds —
+    /// the same rollback gate needs it: a compacted journal can out-date
+    /// an older reader even when no new record version was ever written.
+    pub journal_snapshot_version_max: u16,
+    /// The highest workspace id the journal carries; nonzero means a
+    /// v3-writing binary's tenant work is present and a rollback must
+    /// know how to park it rather than run it on workspace-0 handlers.
+    pub journal_max_ws: u64,
+    /// Non-terminal runs belonging to a workspace ≠ 0 — the count a
+    /// rollback guard's target must be able to handle (park or execute).
+    pub workspace_scoped_live_runs: u64,
 }
 
 /// The index as snapshots before D-021 carried it (JSON, inputs as number
@@ -298,6 +309,14 @@ pub struct EngineCore {
     /// Highest record `v` present in the journal: bumped by replay and by
     /// every commit this binary writes (D-056's rollback guard).
     journal_record_version_max: u8,
+    /// Highest snapshot (DRIX) version the loaded journal holds — bumping
+    /// the record reader without the snapshot reader left rollback able
+    /// to strand itself on a compacted journal (S2 review).
+    snapshot_version_max: u16,
+    /// Highest workspace id any replayed record or snapshot run carried.
+    /// A binary that reads v3 must also know not to run those tenants'
+    /// work — `journal_max_ws > 0` is what format-guard keys on.
+    journal_max_ws: u64,
     pub limits: Limits,
     pub retry: RetryPolicy,
 }
@@ -332,6 +351,8 @@ impl EngineCore {
             index_bytes: 0,
             discarded_tail,
             journal_record_version_max: 1,
+            snapshot_version_max: 1,
+            journal_max_ws: 0,
             limits: Limits::default(),
             retry: RetryPolicy::default(),
         };
@@ -340,15 +361,17 @@ impl EngineCore {
             // and the checksum verified before the result is used (D-028).
             Some(durable_journal::SnapshotSource::Binary(mut r)) => {
                 let len = r.remaining();
-                let (next_run, runs) =
+                let (ver, next_run, runs) =
                     snapshot::decode_from(&mut r, len).map_err(JournalError::CorruptSnapshot)?;
                 r.finish()?;
+                core.snapshot_version_max = core.snapshot_version_max.max(ver);
                 core.install(next_run, runs);
             }
             Some(durable_journal::SnapshotSource::Legacy(snap)) => {
                 if snap.payload.starts_with(snapshot::MAGIC) {
-                    let (next_run, runs) =
+                    let (ver, next_run, runs) =
                         snapshot::decode(&snap.payload).map_err(JournalError::CorruptSnapshot)?;
+                    core.snapshot_version_max = core.snapshot_version_max.max(ver);
                     core.install(next_run, runs);
                 } else {
                     let idx: LegacyIndex = serde_json::from_slice(&snap.payload)?;
@@ -405,6 +428,7 @@ impl EngineCore {
                     t_decode += t.elapsed();
                     max_run = max_run.max(env.run);
                     core.journal_record_version_max = core.journal_record_version_max.max(env.v);
+                    core.journal_max_ws = core.journal_max_ws.max(env.ws);
                     let t = std::time::Instant::now();
                     core.apply_committed(env.ws, RunId(env.run), env.event, env.at)?;
                     t_apply += t.elapsed();
@@ -428,6 +452,7 @@ impl EngineCore {
                 let env = decode_envelope(&r.payload)?;
                 max_run = max_run.max(env.run);
                 core.journal_record_version_max = core.journal_record_version_max.max(env.v);
+                core.journal_max_ws = core.journal_max_ws.max(env.ws);
                 core.apply_committed(env.ws, RunId(env.run), env.event, env.at)?;
             }
         }
@@ -605,6 +630,9 @@ impl EngineCore {
             .values()
             .map(|r| ((r.ws, r.key.clone()), r.id))
             .collect();
+        self.journal_max_ws = self
+            .journal_max_ws
+            .max(runs.values().map(|r| r.ws).max().unwrap_or(0));
         self.runs = runs;
         self.next_run = next_run;
     }
@@ -955,6 +983,13 @@ impl EngineCore {
             stale_generations,
             discarded_tail_bytes: self.discarded_tail.map_or(0, |t| t.bytes),
             journal_record_version_max: self.journal_record_version_max,
+            journal_snapshot_version_max: self.snapshot_version_max,
+            journal_max_ws: self.journal_max_ws,
+            workspace_scoped_live_runs: self
+                .runs
+                .values()
+                .filter(|r| r.ws != 0 && !r.state.is_terminal())
+                .count() as u64,
         }
     }
 
@@ -1488,6 +1523,73 @@ mod tests {
         assert!(matches!(err, EngineError::Serde(_)), "{err}");
     }
 
+    // --- v1.0.2 telemetry on the workspace-aware binary -------------------
+    //
+    // This branch's registry is (ws, name)-keyed: tenant runs dispatch to
+    // their own workspace's handlers — nothing is parked here. What the
+    // merge keeps is the journal-shape telemetry the rollback guard keys
+    // on (D-056): a downgrade to a pre-v1.0.2 binary is refused once the
+    // journal shows workspace data, because that binary cannot park it.
+
+    /// Tenant runs are due like any other — the workspace-aware registry
+    /// resolves their handlers — and diagnostics still expose the shape.
+    #[test]
+    fn tenant_runs_dispatch_with_journal_shape_reported() {
+        let d = tempfile::tempdir().unwrap_or_else(|e| panic!("{e}"));
+        commit_v3(d.path(), 1, 7, &v3_accepted("tenant"));
+        commit_v3(d.path(), 2, 0, &v3_accepted("ops"));
+        let e = EngineCore::open(d.path()).unwrap_or_else(|e| panic!("{e}"));
+        let due: Vec<RunId> = e.due(u64::MAX).into_iter().map(|(r, ..)| r).collect();
+        assert_eq!(due, vec![RunId(1), RunId(2)]);
+        let diag = e.diagnostics();
+        assert_eq!(diag.journal_max_ws, 7);
+        assert_eq!(diag.workspace_scoped_live_runs, 1);
+    }
+
+    /// Tenant attempts expire into reconciles on the same terms as
+    /// workspace 0's — the probe resolves through their own registry.
+    #[test]
+    fn tenant_attempts_expire_like_everyone_elses() {
+        let d = tempfile::tempdir().unwrap_or_else(|e| panic!("{e}"));
+        commit_v3(d.path(), 1, 7, &v3_accepted("tenant"));
+        commit_v3(
+            d.path(),
+            1,
+            7,
+            "{\"StepDispatched\":{\"step\":0,\"attempt\":1,\"deadline\":1000}}",
+        );
+        commit_v3(d.path(), 2, 0, &v3_accepted("ops"));
+        commit_v3(
+            d.path(),
+            2,
+            0,
+            "{\"StepDispatched\":{\"step\":0,\"attempt\":1,\"deadline\":1000}}",
+        );
+        let e = EngineCore::open(d.path()).unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(
+            e.expired_attempts(2000),
+            vec![(RunId(1), StepIndex(0)), (RunId(2), StepIndex(0))]
+        );
+    }
+
+    /// A compacted journal reports its DRIX version and keeps tenant
+    /// scope — the guard's snapshot check keys on the same telemetry.
+    #[test]
+    fn a_snapshot_reports_its_drix_version_and_scope() {
+        let d = tempfile::tempdir().unwrap_or_else(|e| panic!("{e}"));
+        commit_v3(d.path(), 1, 7, &v3_accepted("tenant"));
+        {
+            let mut e = EngineCore::open(d.path()).unwrap_or_else(|e| panic!("{e}"));
+            e.compact(0).unwrap_or_else(|e| panic!("{e}"));
+        }
+        let e = EngineCore::open(d.path()).unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(e.run(RunId(1)).unwrap_or_else(|| panic!("run")).ws, 7);
+        let diag = e.diagnostics();
+        assert_eq!(diag.workspace_scoped_live_runs, 1);
+        assert_eq!(diag.journal_snapshot_version_max, snapshot::VERSION);
+        assert_eq!(diag.journal_max_ws, 7);
+    }
+
     /// Compaction and its snapshot carry runs that arrived under either
     /// record version, intact across the generation swap.
     #[test]
@@ -1949,7 +2051,7 @@ mod tests {
         let mut bytes = Vec::new();
         snapshot::encode(&plan.view, &mut bytes).unwrap_or_else(|e| panic!("{e}"));
         assert_eq!(bytes.len() as u64, plan.bytes);
-        let (_, runs) = snapshot::decode(&bytes).unwrap_or_else(|e| panic!("{e}"));
+        let (_, _, runs) = snapshot::decode(&bytes).unwrap_or_else(|e| panic!("{e}"));
         assert!(matches!(
             runs.get(&run).map(|r| &r.state),
             Some(RunState::Queued { .. })

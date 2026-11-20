@@ -2133,6 +2133,101 @@ mod tests {
         assert!(matches!(until_done(&eng, run).await, RunState::Done));
     }
 
+    /// Counts handler invocations — the evidence a parked run made none.
+    struct Counting {
+        calls: Arc<std::sync::atomic::AtomicUsize>,
+        probes: Arc<std::sync::atomic::AtomicUsize>,
+    }
+    #[async_trait::async_trait]
+    impl StepHandler for Counting {
+        async fn execute(&self, _s: &StepSpec, input: &[u8], _k: &str) -> Outcome {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Outcome::Checkpoint(input.to_vec())
+        }
+        async fn probe(&self, _s: &StepSpec, _k: &str) -> bool {
+            self.probes
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            true
+        }
+    }
+
+    /// Append a v3 record as the S2 writer shapes it — the fixture for
+    /// a journal written under workspace scoping.
+    fn commit_v3(dir: &std::path::Path, run: u64, ws: u64, event: &str) {
+        let mut j = durable_journal::Journal::open(dir).unwrap_or_else(|e| panic!("{e}"));
+        j.append(
+            format!("{{\"v\":3,\"ws\":{ws},\"run\":{run},\"at\":1000,\"event\":{event}}}")
+                .as_bytes(),
+        )
+        .unwrap_or_else(|e| panic!("{e}"));
+    }
+
+    fn v3_accepted(key: &str) -> String {
+        format!(
+            "{{\"Accepted\":{{\"key\":\"{key}\",\"spec\":{{\"version\":1,\
+             \"steps\":[{{\"name\":\"only\",\"handler\":\"echo\"}}],\"input\":[]}},\
+             \"not_before\":0}}}}"
+        )
+    }
+
+    /// The S2-review scenario end to end on the workspace-aware binary:
+    /// replay a journal carrying tenant runs — a queued one and a
+    /// crash-orphaned Reconciling one — and each resolves its handler in
+    /// its OWN workspace's registry, never borrowing workspace 0's.
+    /// Diagnostics expose the journal shape the rollback guard reads.
+    #[tokio::test(flavor = "current_thread")]
+    async fn replayed_tenant_runs_dispatch_in_their_workspace() {
+        let d = tempfile::tempdir().unwrap_or_else(|e| panic!("{e}"));
+        commit_v3(d.path(), 1, 7, &v3_accepted("tenant"));
+        commit_v3(d.path(), 2, 8, &v3_accepted("other-tenant"));
+        commit_v3(
+            d.path(),
+            2,
+            8,
+            "{\"StepDispatched\":{\"step\":0,\"attempt\":1,\"deadline\":1000}}",
+        );
+        commit_v3(d.path(), 2, 8, "{\"ReplyLost\":{\"step\":0}}");
+        commit_v3(d.path(), 3, 0, &v3_accepted("ops"));
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let probes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut reg = Registry::default();
+        let h = Arc::new(Counting {
+            calls: calls.clone(),
+            probes: probes.clone(),
+        });
+        reg.register("echo", h.clone()); // workspace 0 (compat path)
+        reg.put(7, "echo", h.clone())
+            .unwrap_or_else(|e| panic!("{e}"));
+        reg.put(8, "echo", h).unwrap_or_else(|e| panic!("{e}"));
+        let eng = spawn(
+            d.path(),
+            reg,
+            ShellConfig {
+                tick_ms: 5,
+                ..Default::default()
+            },
+        )
+        .unwrap_or_else(|e| panic!("{e}"));
+        for run in [RunId(1), RunId(2), RunId(3)] {
+            assert!(
+                matches!(until_done(&eng, run).await, RunState::Done),
+                "run {run:?} must finish in its own workspace"
+            );
+        }
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::SeqCst),
+            2, // the two queued runs — ws-7's and ws-0's
+            "each workspace's run called its own registration"
+        );
+        assert_eq!(
+            probes.load(std::sync::atomic::Ordering::SeqCst),
+            1, // ws-8's orphaned Reconciling run was re-probed
+            "the tenant orphan reconciled through its own workspace"
+        );
+        let diag = eng.diag().await.unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(diag.journal_max_ws, 8);
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn unregistered_handler_refused_at_admission() {
         let d = tempfile::tempdir().unwrap_or_else(|e| panic!("{e}"));

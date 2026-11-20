@@ -544,9 +544,10 @@ async fn sigterm_with_a_request_still_open_exits_non_zero() {
     );
 }
 
-/// D-056: `--journal-format` prints the highest record version the
-/// binary reads and exits — no keys needed, since upgrade.sh and
-/// rollback.sh call it while making a decision, not while serving.
+/// D-056: `--journal-format` prints the binary's journal-format
+/// capabilities — `<max record version> <max DRIX version> <parks ws≠0>`
+/// since v1.0.2 — and exits. No keys needed: upgrade.sh and rollback.sh
+/// call it while making a decision, not while serving.
 #[test]
 fn journal_format_reports_the_reader_version() {
     let out = Command::new(env!("CARGO_BIN_EXE_durable-server"))
@@ -554,9 +555,20 @@ fn journal_format_reports_the_reader_version() {
         .output()
         .unwrap_or_else(|e| panic!("{e}"));
     assert!(out.status.success(), "status: {:?}", out.status);
-    let v: u8 = String::from_utf8_lossy(&out.stdout)
-        .trim()
-        .parse()
-        .unwrap_or_else(|_| panic!("stdout: {:?}", out.stdout));
-    assert_eq!(v, durable_engine::READER_VERSION);
+    let nums: Vec<u64> = String::from_utf8_lossy(&out.stdout)
+        .split_whitespace()
+        .map(|n| {
+            n.parse()
+                .unwrap_or_else(|_| panic!("stdout: {:?}", out.stdout))
+        })
+        .collect();
+    assert_eq!(
+        nums,
+        vec![
+            durable_engine::READER_VERSION as u64,
+            durable_engine::snapshot::VERSION as u64,
+            1
+        ],
+        "records, snapshots, parks-ws≠0"
+    );
 }
