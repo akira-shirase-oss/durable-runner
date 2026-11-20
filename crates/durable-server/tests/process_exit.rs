@@ -66,7 +66,7 @@ async fn wait_healthy(c: &reqwest::Client, base: &str) {
 }
 
 /// Submit a delayed job; its run id if acknowledged.
-async fn submit(c: &reqwest::Client, base: &str, key: &str) -> Option<u64> {
+async fn submit(c: &reqwest::Client, base: &str, key: &str) -> Option<String> {
     let body = serde_json::json!({
         "op_key": key,
         "not_before": 9_999_999_999_999u64,
@@ -83,14 +83,18 @@ async fn submit(c: &reqwest::Client, base: &str, key: &str) -> Option<u64> {
     if !r.status().is_success() {
         return None;
     }
-    r.json::<serde_json::Value>().await.ok()?["run_id"].as_u64()
+    Some(
+        r.json::<serde_json::Value>().await.ok()?["run_id"]
+            .as_str()?
+            .to_string(),
+    )
 }
 
 /// Read an acknowledged run back and name what the answer means. Only a
 /// 404 (or a 200 naming a different run) is "lost". A 429 or 503 is the
 /// reader refused by a limit or by capacity — the run may be perfectly
 /// fine, and calling it lost costs a wrong diagnosis.
-async fn assert_run_survives(c: &reqwest::Client, base: &str, id: u64, across: &str) {
+async fn assert_run_survives(c: &reqwest::Client, base: &str, id: &str, across: &str) {
     let Ok(r) = c
         .get(format!("{base}/jobs/{id}"))
         .bearer_auth(KEY)
@@ -108,7 +112,7 @@ async fn assert_run_survives(c: &reqwest::Client, base: &str, id: u64, across: &
                 .await
                 .unwrap_or_else(|e| panic!("{e}"));
             assert_eq!(
-                body["id"].as_u64(),
+                body["id"].as_str(),
                 Some(id),
                 "acknowledged run {id} lost {across}: /jobs/{id} names a different run: {body}"
             );
@@ -198,7 +202,7 @@ async fn failed_manifest_swap_exits_the_process_and_loses_nothing() {
     let mut server = start(&journal, port);
     wait_healthy(&c, &base).await;
     for id in &acked {
-        assert_run_survives(&c, &base, *id, "on restart").await;
+        assert_run_survives(&c, &base, id, "on restart").await;
     }
     let _ = server.kill();
     let _ = server.wait();
@@ -281,7 +285,7 @@ async fn sigterm_drains_in_flight_work_and_exits_zero() {
     let mut server = start(&journal, port);
     wait_healthy(&c, &base).await;
     for id in &acked {
-        assert_run_survives(&c, &base, *id, "across SIGTERM").await;
+        assert_run_survives(&c, &base, id, "across SIGTERM").await;
     }
     let _ = server.kill();
     let _ = server.wait();

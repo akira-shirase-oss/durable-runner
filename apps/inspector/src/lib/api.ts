@@ -1,7 +1,7 @@
 // The API base is the server origin minus the /inspector mount — the UI is
 // served same-origin by durable-server, so plain relative calls work.
 export interface RunItem {
-	id: number;
+	id: string;
 	key: string;
 	state: string;
 	steps: number;
@@ -11,8 +11,8 @@ export interface RunItem {
 export interface RunPage {
 	runs: RunItem[];
 	/** Cursor for the next page; which key exists depends on `order`. */
-	next_before?: number | null;
-	next_after?: number | null;
+	next_before?: string | null;
+	next_after?: string | null;
 }
 
 export interface Diag {
@@ -95,7 +95,7 @@ export async function ready(): Promise<{ ready: boolean; code: string | null }> 
 export async function listRuns(
 	key: string,
 	order: 'asc' | 'desc',
-	cursor: number | null = null,
+	cursor: string | null = null,
 	limit = 50,
 ): Promise<RunPage> {
 	const q = new URLSearchParams({ order, limit: String(limit) });
@@ -103,12 +103,12 @@ export async function listRuns(
 	return req(`/jobs?${q}`, key);
 }
 
-export async function inspect(key: string, id: number): Promise<RunItem> {
+export async function inspect(key: string, id: string): Promise<RunItem> {
 	return req(`/jobs/${id}`, key);
 }
 
 // The spec is API-key only (D-051): the input may be customer content.
-export async function spec(apiKey: string, id: number): Promise<{ spec: Spec }> {
+export async function spec(apiKey: string, id: string): Promise<{ spec: Spec }> {
 	return req(`/jobs/${id}/spec`, apiKey);
 }
 
@@ -116,11 +116,11 @@ export async function spec(apiKey: string, id: number): Promise<{ spec: Spec }> 
 export async function submitJob(
 	apiKey: string,
 	body: { op_key: string; spec: { version: number; steps: { name: string; handler: string }[]; input_b64: string }; not_before?: number },
-): Promise<{ run_id: number }> {
+): Promise<{ run_id: string }> {
 	return req('/jobs', apiKey, { method: 'POST', headers: { 'content-type': 'application/json', authorization: `Bearer ${apiKey}` }, body: JSON.stringify(body) });
 }
 
-export async function cancelRun(id: number, apiKey: string): Promise<void> {
+export async function cancelRun(id: string, apiKey: string): Promise<void> {
 	await req(`/jobs/${id}/cancel`, apiKey, { method: 'POST' });
 }
 

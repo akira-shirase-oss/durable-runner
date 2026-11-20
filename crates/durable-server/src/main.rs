@@ -3,6 +3,7 @@
 //! HTTP endpoints configured at startup; the registry is the trust edge.
 
 mod addr_limits;
+mod pubid;
 mod ssrf;
 
 use addr_limits::{
@@ -79,6 +80,10 @@ struct Args {
     /// `at_capacity`.
     #[arg(long, default_value_t = 100_000)]
     max_live_runs: usize,
+    /// One workspace's share of the live-run bound — a tenant at its
+    /// share is refused while everyone else keeps submitting (S2 #6).
+    #[arg(long, default_value_t = 25_000)]
+    max_live_runs_per_ws: usize,
     /// Approximate bytes of all retained runs; beyond it submits are 503
     /// `at_capacity`. Default 512 MiB, sized for a 2 GB host (D-031).
     #[arg(long, default_value_t = durable_domain::Limits::default().max_index_bytes)]
@@ -912,6 +917,10 @@ struct App {
     registry_file: Arc<Path>,
     /// Serializes snapshot writes between routes and the reconciler.
     registry_lock: Arc<Mutex<()>>,
+    /// Opaque public run ids (S2 #7): every run id crosses the API
+    /// through this keyed permutation, so no response reveals the
+    /// global sequence or another workspace's volume.
+    pubid: pubid::PubId,
 }
 
 /// Test constructor: the registry plumbing (`handlers.json`, factory,
@@ -940,6 +949,7 @@ fn test_app(
         registry_stale: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         registry_file: Arc::from(journal_dir.join("handlers.json").as_path()),
         registry_lock: Arc::new(Mutex::new(())),
+        pubid: pubid::PubId::load_or_generate(journal_dir).unwrap_or_else(|e| panic!("{e}")),
     }
 }
 
@@ -1283,7 +1293,8 @@ async fn submit(
         Some(at) => app.engine.submit_at_scoped(auth.ws, key, spec, at).await,
         None => app.engine.submit_scoped(auth.ws, key, spec).await,
     }?;
-    Ok(Json(serde_json::json!({ "run_id": run.0 })))
+    // The id leaves only in its opaque form (S2 #7).
+    Ok(Json(serde_json::json!({ "run_id": app.pubid.encode(run) })))
 }
 
 fn state_name(s: &RunState) -> String {
@@ -1302,28 +1313,35 @@ fn state_name(s: &RunState) -> String {
     }
 }
 
+/// The public id → the internal one. A malformed or forged string is
+/// `None`, which answers exactly like an id that was never issued —
+/// the permutation adds no new oracle (S2 #7).
+fn not_found() -> ApiError {
+    ApiError::new(StatusCode::NOT_FOUND, "not_found", "no such run")
+}
+
+fn decode_id(app: &App, s: &str) -> Result<u64, ApiError> {
+    app.pubid.decode(s).ok_or_else(not_found)
+}
+
 /// The run if it exists AND belongs to the caller's workspace — a
 /// cross-workspace id is 404, never 403: a foreign run id leaks nothing
 /// (S2-2's no-oracle rule).
 async fn scoped_run(app: &App, auth: &Auth, id: u64) -> Result<durable_domain::Run, ApiError> {
     match app.engine.inspect(RunId(id)).await? {
         Some(run) if run.ws == auth.ws => Ok(run),
-        _ => Err(ApiError::new(
-            StatusCode::NOT_FOUND,
-            "not_found",
-            "no such run",
-        )),
+        _ => Err(not_found()),
     }
 }
 
 async fn inspect(
     ReadAuthorized(auth): ReadAuthorized,
     State(app): State<App>,
-    P(id): P<u64>,
+    P(id): P<String>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let run = scoped_run(&app, &auth, id).await?;
+    let run = scoped_run(&app, &auth, decode_id(&app, &id)?).await?;
     Ok(Json(serde_json::json!({
-        "id": run.id.0,
+        "id": app.pubid.encode(run.id),
         "key": run.key.0,
         "state": state_name(&run.state),
         "steps": run.spec.steps.len(),
@@ -1337,12 +1355,12 @@ async fn inspect(
 async fn spec(
     Authorized(auth): Authorized,
     State(app): State<App>,
-    P(id): P<u64>,
+    P(id): P<String>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     use base64::Engine as _;
-    let run = scoped_run(&app, &auth, id).await?;
+    let run = scoped_run(&app, &auth, decode_id(&app, &id)?).await?;
     Ok(Json(serde_json::json!({
-        "id": run.id.0,
+        "id": app.pubid.encode(run.id),
         "key": run.key.0,
         "spec": {
             "version": run.spec.version,
@@ -1355,12 +1373,13 @@ async fn spec(
 async fn cancel(
     Authorized(auth): Authorized,
     State(app): State<App>,
-    P(id): P<u64>,
+    P(id): P<String>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     // The scope check happens before the cancel: a run's workspace is
     // fixed at acceptance, so inspecting first cannot race.
-    scoped_run(&app, &auth, id).await?;
-    app.engine.cancel(RunId(id)).await?;
+    let internal = decode_id(&app, &id)?;
+    scoped_run(&app, &auth, internal).await?;
+    app.engine.cancel(RunId(internal)).await?;
     Ok(Json(serde_json::json!({ "cancelled": id })))
 }
 
@@ -1369,10 +1388,10 @@ struct ListQuery {
     /// `asc` (default): oldest first, continue with `after`.
     /// `desc`: newest first, continue with `before`.
     order: Option<String>,
-    /// Return runs with id greater than this (the previous `next_after`).
-    after: Option<u64>,
-    /// Newest first: runs with id less than this (the previous `next_before`).
-    before: Option<u64>,
+    /// Return runs after this public cursor (the previous `next_after`).
+    after: Option<String>,
+    /// Newest first: runs before this public cursor (`next_before`).
+    before: Option<String>,
     /// Page size: default 100, clamped to 1..=1000.
     limit: Option<usize>,
 }
@@ -1393,13 +1412,20 @@ async fn list(
             ))
         }
     };
+    // Cursors are public ids like every other boundary value (S2 #7):
+    // a malformed one is a client bug — 400, never a lookup.
+    let decode_cursor = |s: Option<String>| -> Result<Option<u64>, ApiError> {
+        s.map(|c| decode_id(&app, &c))
+            .transpose()
+            .map_err(|_| ApiError::new(StatusCode::BAD_REQUEST, "bad_query", "malformed cursor"))
+    };
     let order = if newest {
         Order::Newest {
-            before: q.before.map(RunId),
+            before: decode_cursor(q.before)?.map(RunId),
         }
     } else {
         Order::Oldest {
-            after: q.after.map(RunId),
+            after: decode_cursor(q.after)?.map(RunId),
         }
     };
     let page = app
@@ -1411,7 +1437,7 @@ async fn list(
         .iter()
         .map(|r| {
             serde_json::json!({
-                "id": r.id.0,
+                "id": app.pubid.encode(r.id),
                 "key": r.key.0,
                 "state": state_name(&r.state),
                 "steps": r.steps,
@@ -1421,7 +1447,7 @@ async fn list(
         .collect();
     let cursor = if newest { "next_before" } else { "next_after" };
     let mut body = serde_json::json!({ "runs": items });
-    body[cursor] = serde_json::json!(page.next.map(|id| id.0));
+    body[cursor] = serde_json::json!(page.next.map(|id| app.pubid.encode(id)));
     Ok(Json(body))
 }
 
@@ -1512,6 +1538,13 @@ fn store_err(e: durable_accounts::AccountError) -> ApiError {
     use durable_accounts::AccountError as E;
     match e {
         E::Unavailable(_) => accounts_unavailable(),
+        // The store's atomic refusal — same shape the route's pre-check
+        // and the engine's bound produce.
+        E::RegistryFull => ApiError::new(
+            StatusCode::CONFLICT,
+            "registry_full",
+            "the workspace's handler registry is at its bound",
+        ),
         E::Store(m) => {
             eprintln!("durable-server: account store error: {m}");
             ApiError::new(
@@ -2325,6 +2358,7 @@ async fn main() -> Result<()> {
         reply_timeout: Duration::from_millis(args.reply_timeout_ms.max(1)),
         limits: durable_domain::Limits {
             max_live_runs: args.max_live_runs,
+            max_live_runs_per_ws: args.max_live_runs_per_ws,
             max_index_bytes: args.max_index_bytes,
             ..durable_domain::Limits::default()
         },
@@ -2401,6 +2435,8 @@ async fn main() -> Result<()> {
         registry_stale: Arc::clone(&registry_stale),
         registry_file,
         registry_lock: Arc::new(Mutex::new(())),
+        pubid: pubid::PubId::load_or_generate(&args.journal)
+            .with_context(|| "load public-id key")?,
     };
     if let Some(store) = &store {
         spawn_registry_reconcile(store.clone(), &app, registry_stale);
@@ -3037,8 +3073,8 @@ mod tests {
         )
         .await;
         assert_eq!(status, StatusCode::OK, "{v}");
-        assert_eq!(v["run_id"], 1);
-        let (status, _) = call(&h.router, "GET", "/jobs/1", Some(KEY), None).await;
+        let id = v["run_id"].as_str().unwrap_or_else(|| panic!("{v}"));
+        let (status, _) = call(&h.router, "GET", &format!("/jobs/{id}"), Some(KEY), None).await;
         assert_eq!(status, StatusCode::OK);
         let (status, _) = call(&h.router, "GET", "/jobs", Some(KEY), None).await;
         assert_eq!(status, StatusCode::OK);
@@ -3055,29 +3091,30 @@ mod tests {
         let h = harness(true);
         let mut later = submit_body("k");
         later["not_before"] = json!(9_999_999_999_999u64); // stays queued
-        let (status, _) = call(&h.router, "POST", "/jobs", Some(KEY), Some(later)).await;
+        let (status, v) = call(&h.router, "POST", "/jobs", Some(KEY), Some(later)).await;
         assert_eq!(status, StatusCode::OK);
-        for uri in ["/jobs", "/jobs/1"] {
-            let (status, _) = call(&h.router, "GET", uri, Some(READ_KEY), None).await;
+        let id = v["run_id"].as_str().unwrap_or_default().to_string();
+        for uri in ["/jobs".to_string(), format!("/jobs/{id}")] {
+            let (status, _) = call(&h.router, "GET", &uri, Some(READ_KEY), None).await;
             assert_eq!(status, StatusCode::OK, "GET {uri}");
         }
-        let routes: [(&str, &str, Option<Value>); 6] = [
-            ("POST", "/jobs", Some(submit_body("r"))),
-            ("GET", "/jobs/1/spec", None),
-            ("POST", "/jobs/1/cancel", None),
-            ("POST", "/admin/compact", None),
-            ("POST", "/admin/backup", Some(json!({ "name": "b" }))),
-            ("GET", "/admin/diagnostics", None),
+        let routes: [(&str, String, Option<Value>); 6] = [
+            ("POST", "/jobs".into(), Some(submit_body("r"))),
+            ("GET", format!("/jobs/{id}/spec"), None),
+            ("POST", format!("/jobs/{id}/cancel"), None),
+            ("POST", "/admin/compact".into(), None),
+            ("POST", "/admin/backup".into(), Some(json!({ "name": "b" }))),
+            ("GET", "/admin/diagnostics".into(), None),
         ];
         for (method, uri, body) in routes {
-            let (status, v) = call(&h.router, method, uri, Some(READ_KEY), body).await;
+            let (status, v) = call(&h.router, method, &uri, Some(READ_KEY), body).await;
             assert_eq!(
                 (status, v["code"].clone()),
                 (StatusCode::FORBIDDEN, json!("forbidden")),
                 "{method} {uri}"
             );
         }
-        let (_, v) = call(&h.router, "GET", "/jobs/1", Some(KEY), None).await;
+        let (_, v) = call(&h.router, "GET", &format!("/jobs/{id}"), Some(KEY), None).await;
         assert_eq!(v["state"], "queued", "the read key cancelled nothing");
     }
 
@@ -3090,7 +3127,7 @@ mod tests {
         body["not_before"] = json!(9_999_999_999_999u64); // stays queued
         let (status, v) = call(&h.router, "POST", "/jobs", Some(KEY), Some(body.clone())).await;
         assert_eq!(status, StatusCode::OK, "{v}");
-        let id = v["run_id"].as_u64().unwrap_or_else(|| panic!("{v}"));
+        let id = v["run_id"].as_str().unwrap_or_else(|| panic!("{v}"));
         let (status, v) = call(
             &h.router,
             "GET",
@@ -3144,7 +3181,10 @@ mod tests {
         )
         .await;
         assert_eq!(status, StatusCode::OK, "{v}");
-        let run_a = v["run_id"].as_u64().unwrap_or_else(|| panic!("{v}"));
+        let run_a = v["run_id"]
+            .as_str()
+            .unwrap_or_else(|| panic!("{v}"))
+            .to_string();
 
         let (status, v) = call(
             &h.router,
@@ -3155,7 +3195,7 @@ mod tests {
         )
         .await;
         assert_eq!(status, StatusCode::OK, "{v}");
-        let run_b = v["run_id"].as_u64().unwrap_or_else(|| panic!("{v}"));
+        let run_b = v["run_id"].as_str().unwrap_or_else(|| panic!("{v}"));
         assert_ne!(
             run_a, run_b,
             "the same op_key in different workspaces must not dedup across"
@@ -3171,8 +3211,8 @@ mod tests {
         .await;
         assert_eq!(status, StatusCode::OK, "{v}");
         assert_eq!(
-            v["run_id"].as_u64(),
-            Some(run_a),
+            v["run_id"].as_str(),
+            Some(run_a.as_str()),
             "the same key inside one workspace still dedups"
         );
     }
@@ -3363,7 +3403,7 @@ mod tests {
         )
         .await;
         assert_eq!(status, StatusCode::OK, "{v}");
-        let run_a = v["run_id"].as_u64().unwrap_or_else(|| panic!("{v}"));
+        let run_a = v["run_id"].as_str().unwrap_or_else(|| panic!("{v}"));
 
         // B's reads of A's run look exactly like a nonexistent run.
         let (status, v) = call(
@@ -3414,11 +3454,11 @@ mod tests {
         assert_eq!(status, StatusCode::OK, "{v}");
         let (status, v) = call(&h.router, "GET", "/jobs", Some(key_b), None).await;
         assert_eq!(status, StatusCode::OK, "{v}");
-        let ids: Vec<u64> = v["runs"]
+        let ids: Vec<&str> = v["runs"]
             .as_array()
             .unwrap_or_else(|| panic!("{v}"))
             .iter()
-            .filter_map(|r| r["id"].as_u64())
+            .filter_map(|r| r["id"].as_str())
             .collect();
         assert!(
             !ids.contains(&run_a),
@@ -3430,6 +3470,106 @@ mod tests {
         let (status, v) = call(&h.router, "GET", "/jobs", Some(key_a), None).await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(v["runs"].as_array().map(|r| r.len()), Some(1));
+    }
+
+    /// S2 review #7's required property: two submits from one workspace
+    /// must reveal nothing about other workspaces' volume. Workspace A
+    /// submits, workspace B submits fifty runs, A submits again — A's two
+    /// public ids are opaque strings indistinguishable from any other
+    /// pair (the test holds the key, so it *verifies* the internal gap is
+    /// really 51 while asserting nothing on the wire betrays it).
+    #[tokio::test]
+    async fn public_ids_hide_other_workspaces_volume() {
+        use durable_accounts::Memory;
+        let store = Arc::new(Memory::new());
+        let a = store
+            .create_workspace("a")
+            .await
+            .unwrap_or_else(|e| panic!("{e}"));
+        let b = store
+            .create_workspace("b")
+            .await
+            .unwrap_or_else(|e| panic!("{e}"));
+        let key_a = "dr_c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0";
+        let key_b = "dr_1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d";
+        for (ws, k) in [(a.id, key_a), (b.id, key_b)] {
+            store
+                .create_key(ws, "k", Permission::Admin, &sha256(k.as_bytes()), "dr_t")
+                .await
+                .unwrap_or_else(|e| panic!("{e}"));
+        }
+        let h = harness_store(true, None, Some(store.clone()));
+        register_step(&store, a.id, &h.app.engine).await;
+        register_step(&store, b.id, &h.app.engine).await;
+
+        async fn submit_n(router: &Router, key: &str, tag: &str, n: usize) -> Vec<String> {
+            let mut ids = Vec::new();
+            for i in 0..n {
+                let (_, _, v) = call_full(
+                    router,
+                    "POST",
+                    "/jobs",
+                    Some(key),
+                    Some(submit_body(&format!("{tag}-{i}"))),
+                )
+                .await;
+                ids.push(
+                    v["run_id"]
+                        .as_str()
+                        .unwrap_or_else(|| panic!("{v}"))
+                        .to_string(),
+                );
+            }
+            ids
+        }
+        let first = submit_n(&h.router, key_a, "a1", 1).await.remove(0);
+        let _b = submit_n(&h.router, key_b, "b", 50).await; // B's volume between A's two submits
+        let second = submit_n(&h.router, key_a, "a2", 1).await.remove(0);
+
+        // The wire forms: fixed-width opaque strings, nothing numeric.
+        for s in [&first, &second] {
+            assert_eq!(s.len(), 11, "public id {s}");
+            assert!(s.parse::<u64>().is_err(), "{s} must not be a bare integer");
+            assert_ne!(first, second, "distinct runs, distinct public ids");
+        }
+        // What A could never see without the key: the ids really are 51
+        // apart internally. The permutation hides it, not a mapping table
+        // that could lag.
+        let (ia, ib) = (
+            h.app
+                .pubid
+                .decode(&first)
+                .unwrap_or_else(|| panic!("{first}")),
+            h.app
+                .pubid
+                .decode(&second)
+                .unwrap_or_else(|| panic!("{second}")),
+        );
+        assert_eq!(ib - ia, 51, "B's 50 submits sit between A's two ids");
+        // A's *other* endpoints agree: the public id is the only id it
+        // ever sees — inspect, spec, cancel all take it verbatim.
+        let (status, _) = call(
+            &h.router,
+            "GET",
+            &format!("/jobs/{second}"),
+            Some(key_a),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        // And a numeric guess or a forged string still answers like a
+        // missing run — the permutation adds no new oracle.
+        for probe in ["1", &second[..5], "AAAAAAAAAAA"] {
+            let (status, _) = call(
+                &h.router,
+                "GET",
+                &format!("/jobs/{probe}"),
+                Some(key_a),
+                None,
+            )
+            .await;
+            assert_eq!(status, StatusCode::NOT_FOUND, "{probe}");
+        }
     }
 
     /// The coordinator's rule: no response body or header may carry the
@@ -3459,7 +3599,7 @@ mod tests {
         let internal = ws.id; // the id that must never leave the process
 
         // Seed a run + a workspace so the routes have data to show.
-        let (status, _) = call(
+        let (status, v) = call(
             &h.router,
             "POST",
             "/jobs",
@@ -3468,6 +3608,7 @@ mod tests {
         )
         .await;
         assert_eq!(status, StatusCode::OK);
+        let jid = v["run_id"].as_str().unwrap_or_default().to_string();
         let pid = ws.public_id.to_string();
 
         let routes: Vec<(String, Option<&str>)> = vec![
@@ -3476,8 +3617,8 @@ mod tests {
             (format!("/admin/workspaces/{pid}"), Some(KEY)),
             (format!("/admin/workspaces/{pid}/keys"), Some(KEY)),
             ("/jobs".into(), Some(token)),
-            ("/jobs/1".into(), Some(token)),
-            ("/jobs/1/spec".into(), Some(token)),
+            (format!("/jobs/{jid}"), Some(token)),
+            (format!("/jobs/{jid}/spec"), Some(token)),
             ("/admin/diagnostics".into(), Some(KEY)),
         ];
         fn scan_json(v: &Value, internal: u64, path: &str) {
@@ -4318,7 +4459,7 @@ mod tests {
     #[tokio::test]
     async fn reads_need_the_key_by_default() {
         let h = harness(false);
-        let (status, _) = call(
+        let (status, v) = call(
             &h.router,
             "POST",
             "/jobs",
@@ -4327,16 +4468,21 @@ mod tests {
         )
         .await;
         assert_eq!(status, StatusCode::OK);
-        for uri in ["/jobs", "/jobs/1", "/jobs?order=desc&limit=5"] {
+        let id = v["run_id"].as_str().unwrap_or_default().to_string();
+        for uri in [
+            "/jobs".to_string(),
+            format!("/jobs/{id}"),
+            "/jobs?order=desc&limit=5".to_string(),
+        ] {
             for key in [None, Some("wrong")] {
-                let (status, v) = call(&h.router, "GET", uri, key, None).await;
+                let (status, v) = call(&h.router, "GET", &uri, key, None).await;
                 assert_eq!(
                     (status, v["code"].clone()),
                     (StatusCode::UNAUTHORIZED, json!("unauthorized")),
                     "GET {uri} key={key:?}"
                 );
             }
-            let (status, _) = call(&h.router, "GET", uri, Some(KEY), None).await;
+            let (status, _) = call(&h.router, "GET", &uri, Some(KEY), None).await;
             assert_eq!(status, StatusCode::OK, "GET {uri} with the key");
         }
         for uri in ["/health", "/ready"] {
@@ -4514,7 +4660,11 @@ mod tests {
             Some(submit_body("b")),
         )
         .await;
-        assert_eq!((status, v["run_id"].clone()), (StatusCode::OK, json!(2)));
+        assert_eq!(status, StatusCode::OK, "{v}");
+        assert!(
+            v["run_id"].as_str().is_some_and(|s| s.len() == 11),
+            "the second submit returns an opaque public id: {v}"
+        );
     }
 
     /// `GET /jobs` is paged by run id: `limit` (default 100, at most 1000)
@@ -4533,20 +4683,44 @@ mod tests {
             .await;
             assert_eq!(status, StatusCode::OK);
         }
+        // Public ids are opaque strings; the test holds the key, so it
+        // checks the *decoded* sequence — a client sees only the strings.
         let ids = |v: &Value| -> Vec<u64> {
             v["runs"]
                 .as_array()
                 .unwrap_or_else(|| panic!("runs array: {v}"))
                 .iter()
-                .filter_map(|r| r["id"].as_u64())
+                .filter_map(|r| r["id"].as_str())
+                .map(|s| h.app.pubid.decode(s).unwrap_or_else(|| panic!("{s}")))
                 .collect()
         };
+        let cursor = |v: &Value| -> Option<u64> {
+            v["next_after"]
+                .as_str()
+                .map(|s| h.app.pubid.decode(s).unwrap_or_else(|| panic!("{s}")))
+        };
         let (_, v) = call(&h.router, "GET", "/jobs?limit=2", Some(KEY), None).await;
-        assert_eq!((ids(&v), v["next_after"].clone()), (vec![1, 2], json!(2)));
-        let (_, v) = call(&h.router, "GET", "/jobs?after=2&limit=2", Some(KEY), None).await;
-        assert_eq!((ids(&v), v["next_after"].clone()), (vec![3, 4], json!(4)));
-        let (_, v) = call(&h.router, "GET", "/jobs?after=4&limit=2", Some(KEY), None).await;
-        assert_eq!((ids(&v), v["next_after"].clone()), (vec![5], Value::Null));
+        assert_eq!((ids(&v), cursor(&v)), (vec![1, 2], Some(2)));
+        let after2 = v["next_after"].as_str().unwrap_or_default().to_string();
+        let (_, v) = call(
+            &h.router,
+            "GET",
+            &format!("/jobs?after={after2}&limit=2"),
+            Some(KEY),
+            None,
+        )
+        .await;
+        assert_eq!((ids(&v), cursor(&v)), (vec![3, 4], Some(4)));
+        let after4 = v["next_after"].as_str().unwrap_or_default().to_string();
+        let (_, v) = call(
+            &h.router,
+            "GET",
+            &format!("/jobs?after={after4}&limit=2"),
+            Some(KEY),
+            None,
+        )
+        .await;
+        assert_eq!((ids(&v), cursor(&v)), (vec![5], None));
         let (status, v) = call(&h.router, "GET", "/jobs?limit=100000", Some(KEY), None).await;
         assert_eq!(
             (status, ids(&v).len()),
@@ -4576,8 +4750,16 @@ mod tests {
                 .as_array()
                 .unwrap_or_else(|| panic!("runs array: {v}"))
                 .iter()
-                .filter_map(|r| r["id"].as_u64())
+                .filter_map(|r| r["id"].as_str())
+                .map(|s| h.app.pubid.decode(s).unwrap_or_else(|| panic!("{s}")))
                 .collect()
+        };
+        let before =
+            |v: &Value| -> Option<String> { v["next_before"].as_str().map(str::to_string) };
+        let dec = |v: &Value| -> Option<u64> {
+            v["next_before"]
+                .as_str()
+                .map(|s| h.app.pubid.decode(s).unwrap_or_else(|| panic!("{s}")))
         };
         let (_, v) = call(
             &h.router,
@@ -4587,25 +4769,27 @@ mod tests {
             None,
         )
         .await;
-        assert_eq!((ids(&v), v["next_before"].clone()), (vec![5, 4], json!(4)));
+        assert_eq!((ids(&v), dec(&v)), (vec![5, 4], Some(4)));
+        let b4 = before(&v).unwrap_or_default();
         let (_, v) = call(
             &h.router,
             "GET",
-            "/jobs?order=desc&before=4&limit=2",
+            &format!("/jobs?order=desc&before={b4}&limit=2"),
             Some(KEY),
             None,
         )
         .await;
-        assert_eq!((ids(&v), v["next_before"].clone()), (vec![3, 2], json!(2)));
+        assert_eq!((ids(&v), dec(&v)), (vec![3, 2], Some(2)));
+        let b2 = before(&v).unwrap_or_default();
         let (_, v) = call(
             &h.router,
             "GET",
-            "/jobs?order=desc&before=2&limit=2",
+            &format!("/jobs?order=desc&before={b2}&limit=2"),
             Some(KEY),
             None,
         )
         .await;
-        assert_eq!((ids(&v), v["next_before"].clone()), (vec![1], Value::Null));
+        assert_eq!((ids(&v), dec(&v)), (vec![1], None));
     }
 
     /// Request bodies are capped well below axum's 2 MB default: a submit
@@ -6007,7 +6191,7 @@ mod tests {
         )
         .await;
         assert_eq!(status, StatusCode::OK, "{v}");
-        let id = v["run_id"].as_u64().unwrap_or(0);
+        let id = v["run_id"].as_str().unwrap_or_default().to_string();
 
         // The run finishes only if the verifier accepted a call — poll
         // the scoped read for `done` within a bounded window.

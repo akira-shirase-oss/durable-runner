@@ -109,12 +109,39 @@ contract + reference verifier ship in `docs/HANDLERS.md`.
   `(ts, idem)` replay bound) and rotation semantics. `verify_sig` in
   the server's test module is the reference check; `spawn_verifier` is
   the live fixture.
+- **Per-workspace live-run quota** (`--max-live-runs-per-ws`, default
+  25,000 — a quarter of the global pool): a tenant at its share is
+  refused `503 at_capacity` while other workspaces keep admitting, so
+  one tenant can never fill every live slot. The accounting is rebuilt
+  from the index on replay like the global counters.
+- **Per-workspace run index**: `GET /jobs` pages read a `ws → run ids`
+  index instead of scanning the global index — a tenant's list cost is
+  its own size, and a page never touches another workspace's runs.
+- **Store-enforced handler bound** (S2 review #6): the 256-per-workspace
+  limit is now enforced inside the write itself — Postgres conditional
+  `INSERT … WHERE`, memory under the same lock — so a racing pair of
+  PUTs cannot both fit; the loser gets `409 registry_full`. Updating an
+  existing name at the bound stays legal.
+- **Opaque public run ids** (S2 #7): every run id crossing the API —
+  `run_id`, list `id`s, `next_after`/`next_before` cursors, and the
+  `/jobs/{id}` path — is a keyed 64-bit permutation (four-round Feistel
+  over HMAC-SHA256) of the internal sequence, rendered base64url.
+  Per run it is deterministic, storage-free and needs no journal
+  change; across runs it is uncorrelated — two submits from one
+  workspace reveal nothing about other workspaces' volume, and a
+  numeric guess, a truncated id or a forged string answers `404`
+  exactly like a missing run. The 32-byte key lives at
+  `<journal>/public_id.key` (mode 0600, generated on first boot);
+  losing it orphans every public id — never the runs.
 
 ### Security
 
 - Internal sequential workspace ids never appear in routes, response
   bodies, tokens or headers — workspaces cannot be enumerated or
   counted. A regression test scans every affected response for the u64.
+  The same now holds for internal run ids: only the permuted public id
+  ever leaves the process, so a tenant cannot read everyone else's
+  submission volume off a sequence gap (regression-tested end to end).
 - Handler-call signatures bind the run, step, attempt, idempotency key
   and exact body to the workspace's secret — a tampered body, stale
   timestamp, wrong-secret signature or replayed `(ts, idem)` fails the

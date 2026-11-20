@@ -315,6 +315,10 @@ pub struct Limits {
     /// Non-terminal runs the index may hold; submits beyond it are refused
     /// `AtCapacity` (dispatch drains them at a bounded rate).
     pub max_live_runs: usize,
+    /// One workspace's share of `max_live_runs` (S2 review #6): a single
+    /// tenant at this bound is refused `AtCapacity` while the rest of the
+    /// pool stays open — one tenant can never fill every live slot.
+    pub max_live_runs_per_ws: usize,
     /// Approximate bytes of every retained run (terminal ones stay seven
     /// days with their inputs); submits that would pass it are refused.
     pub max_index_bytes: u64,
@@ -331,6 +335,9 @@ impl Default for Limits {
             max_key_bytes: 256,
             max_name_bytes: 128,
             max_live_runs: 100_000,
+            // A quarter of the global pool: four tenants can each burst
+            // to their share; no one tenant reaches the global bound.
+            max_live_runs_per_ws: 25_000,
             // Sized for a 2 GB host (D-031): peak RSS has been measured at
             // up to 1.6 × index bytes, plus up to one snapshot during a
             // compaction, plus ~100 MiB.

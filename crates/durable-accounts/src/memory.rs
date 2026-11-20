@@ -237,9 +237,17 @@ impl AccountStore for Memory {
     async fn put_handler(&self, workspace: u64, name: &str, url: &str) -> Result<(), AccountError> {
         self.check_up()?;
         let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-        inner
+        // Same atomic bound as pg: count and insert under the one lock.
+        let key = (workspace, name.to_string());
+        let count = inner
             .handlers
-            .insert((workspace, name.to_string()), url.to_string());
+            .keys()
+            .filter(|(ws, _)| *ws == workspace)
+            .count();
+        if !inner.handlers.contains_key(&key) && count >= crate::MAX_HANDLERS_PER_WS {
+            return Err(AccountError::RegistryFull);
+        }
+        inner.handlers.insert(key, url.to_string());
         Ok(())
     }
 
@@ -316,6 +324,35 @@ mod tests {
                 .unwrap_or_else(|e| panic!("verify: {e}")),
             None
         );
+    }
+
+    /// Review S2 #6: the per-workspace handler bound lives in the store
+    /// itself so a racing pair of PUTs can never both pass it — here the
+    /// bound counts the workspace's rows, and updating an existing name
+    /// stays legal at the bound.
+    #[tokio::test]
+    async fn the_handler_bound_is_enforced_atomically() {
+        let store = Memory::new();
+        for i in 0..crate::MAX_HANDLERS_PER_WS {
+            store
+                .put_handler(1, &format!("h-{i}"), "https://a.test/x")
+                .await
+                .unwrap_or_else(|e| panic!("put {i}: {e}"));
+        }
+        assert!(matches!(
+            store.put_handler(1, "h-extra", "https://a.test/x").await,
+            Err(AccountError::RegistryFull)
+        ));
+        // An update of an existing name is not a new row — still allowed.
+        store
+            .put_handler(1, "h-0", "https://b.test/y")
+            .await
+            .unwrap_or_else(|e| panic!("update at the bound: {e}"));
+        // A different workspace has its own bound.
+        store
+            .put_handler(2, "h-x", "https://a.test/x")
+            .await
+            .unwrap_or_else(|e| panic!("ws 2 is unaffected: {e}"));
     }
 
     #[tokio::test]

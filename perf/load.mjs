@@ -249,17 +249,31 @@ async function startServer(journalDir, extra = []) {
   throw new Error('server never became healthy');
 }
 
+// Counted evidence for the result: 503 at_capacity responses are the
+// admission bounds working as designed (per-workspace share + global
+// pool); a submit retries them while drain frees slots, up to a hard
+// deadline, and the retry count is reported — backpressure made visible,
+// never an unbounded wait.
+let submit503s = 0;
 async function submit(opKey, steps = 1, auth = AUTH) {
   const t0 = performance.now();
+  const deadline = t0 + 90_000;
   try {
-    const r = await fetch(`${API}/jobs`, {
-      method: 'POST', headers: { 'content-type': 'application/json', ...auth },
-      body: JSON.stringify({
-        op_key: opKey,
-        spec: { version: 1, steps: Array.from({ length: steps }, (_, i) => ({ name: `s${i}`, handler: 'step' })), input_b64: INPUT_B64 },
-      }),
-    });
-    return { status: r.status, ms: performance.now() - t0, body: await r.text() };
+    for (;;) {
+      const r = await fetch(`${API}/jobs`, {
+        method: 'POST', headers: { 'content-type': 'application/json', ...auth },
+        body: JSON.stringify({
+          op_key: opKey,
+          spec: { version: 1, steps: Array.from({ length: steps }, (_, i) => ({ name: `s${i}`, handler: 'step' })), input_b64: INPUT_B64 },
+        }),
+      });
+      if (r.status !== 503 || performance.now() >= deadline) {
+        return { status: r.status, ms: performance.now() - t0, body: await r.text() };
+      }
+      submit503s++;
+      await r.arrayBuffer();
+      await sleep(150);
+    }
   } catch (e) {
     // A refused or reset connection is backpressure at the TCP layer (the
     // kernel's accept queue is full): record it under its own code so a
@@ -635,7 +649,7 @@ async function runWorkspaces() {
   const p99 = pct(lat, 0.99);
   const r = writeResult('workspaces', {
     params: { workspaces: n, submits_per_workspace: per, account_backend: backend, drain_budget_ms: drainBudgetMs, smoke: SMOKE },
-    sent, accepted, http_codes: codes, per_workspace: pageCounts, churn_registrations: churnOps, churn_errors: churnErrors,
+    sent, accepted, http_codes: codes, capacity_retries: submit503s, per_workspace: pageCounts, churn_registrations: churnOps, churn_errors: churnErrors,
     done_after_drain: done, drain_seconds: Math.round(drainSecs),
     drain_runs_per_s: drainSecs > 0 ? Math.round(done / drainSecs) : done,
     handler_calls: sigs,

@@ -20,7 +20,7 @@ use durable_domain::{
 };
 use durable_journal::{Journal, JournalError, JournalOptions, SpaceProbe};
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::ops::Bound;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -313,8 +313,14 @@ pub struct EngineCore {
     by_op: HashMap<(u64, OperationKey), RunId>,
     next_run: u64,
     /// Non-terminal runs and the index's approximate bytes, kept current
-    /// so admission is O(1).
+    /// so admission is O(1). `ws_live` is the same count per workspace —
+    /// the per-tenant admission bound (S2 review #6).
     live: usize,
+    ws_live: HashMap<u64, usize>,
+    /// Run ids per workspace, kept current with `runs`: `page`/
+    /// `page_newest` read it instead of scanning the global index —
+    /// a tenant's list cost is its own size, never everyone's (S2 #6).
+    ws_index: HashMap<u64, BTreeSet<RunId>>,
     index_bytes: u64,
     /// The torn tail the journal discarded when this core opened it.
     discarded_tail: Option<durable_journal::TornTail>,
@@ -360,6 +366,8 @@ impl EngineCore {
             by_op: HashMap::new(),
             next_run: 1,
             live: 0,
+            ws_live: HashMap::new(),
+            ws_index: HashMap::new(),
             index_bytes: 0,
             discarded_tail,
             journal_record_version_max: 1,
@@ -631,6 +639,11 @@ impl EngineCore {
                 if self.by_op.get(&dk) == Some(id) {
                     self.by_op.remove(&dk);
                 }
+                // Only terminal runs expire — live counts are untouched;
+                // the per-ws index loses the id either way.
+                if let Some(set) = self.ws_index.get_mut(&run.ws) {
+                    set.remove(id);
+                }
             }
         }
     }
@@ -662,6 +675,14 @@ impl EngineCore {
             .values()
             .filter(|r| !r.state.is_terminal())
             .count();
+        self.ws_live.clear();
+        self.ws_index.clear();
+        for r in self.runs.values() {
+            self.ws_index.entry(r.ws).or_default().insert(r.id);
+            if !r.state.is_terminal() {
+                *self.ws_live.entry(r.ws).or_default() += 1;
+            }
+        }
         self.index_bytes = self
             .runs
             .values()
@@ -710,6 +731,8 @@ impl EngineCore {
             }
             self.by_op.insert((ws, key.clone()), run_id);
             self.live += 1;
+            *self.ws_live.entry(ws).or_default() += 1;
+            self.ws_index.entry(ws).or_default().insert(run_id);
             self.index_bytes += Limits::run_bytes(&key, &spec);
             self.runs.insert(
                 run_id,
@@ -735,6 +758,9 @@ impl EngineCore {
         }
         if state.is_terminal() && !run.state.is_terminal() {
             self.live = self.live.saturating_sub(1);
+            if let Some(n) = self.ws_live.get_mut(&run.ws) {
+                *n = n.saturating_sub(1);
+            }
             // A finished run keeps only what dedup and inspection need (key,
             // state, step count, finish time): its input goes, and so do its
             // bytes from the capacity bound (D-030). Replay does the same.
@@ -829,6 +855,7 @@ impl EngineCore {
                                     // Capacity: a bounded index, refused explicitly (contract: "cap
                                     // memory and disk; reject overload explicitly").
         if self.live >= self.limits.max_live_runs
+            || self.ws_live.get(&ws).copied().unwrap_or(0) >= self.limits.max_live_runs_per_ws
             || self.index_bytes + Limits::run_bytes(&key, &spec) > self.limits.max_index_bytes
         {
             return Err(Refusal::AtCapacity.into());
@@ -1046,18 +1073,19 @@ impl EngineCore {
         after: Option<RunId>,
         limit: usize,
     ) -> (Vec<RunSummary>, Option<RunId>) {
+        // The per-workspace index: a tenant's page costs O(log n +
+        // limit) of *its own* runs, never a scan of everyone's.
+        let Some(set) = self.ws_index.get(&ws) else {
+            return (Vec::new(), None);
+        };
         let start = after.map_or(Bound::Unbounded, Bound::Excluded);
-        let mut it = self.runs.range((start, Bound::Unbounded));
+        let mut it = set.range((start, Bound::Unbounded));
         let page: Vec<RunSummary> = it
             .by_ref()
-            .filter(|(_, r)| r.ws == ws)
             .take(limit)
-            .map(|(_, r)| RunSummary::of(r))
+            .filter_map(|id| self.runs.get(id).map(|r| RunSummary::of(r)))
             .collect();
-        let next = match page.last() {
-            Some(last) => it.find(|(_, r)| r.ws == ws).map(|_| last.id),
-            None => None,
-        };
+        let next = page.last().and_then(|last| it.next().map(|_| last.id));
         (page, next)
     }
 
@@ -1082,18 +1110,17 @@ impl EngineCore {
         before: Option<RunId>,
         limit: usize,
     ) -> (Vec<RunSummary>, Option<RunId>) {
+        let Some(set) = self.ws_index.get(&ws) else {
+            return (Vec::new(), None);
+        };
         let end = before.map_or(Bound::Unbounded, Bound::Excluded);
-        let mut it = self.runs.range((Bound::Unbounded, end)).rev();
+        let mut it = set.range((Bound::Unbounded, end)).rev();
         let page: Vec<RunSummary> = it
             .by_ref()
-            .filter(|(_, r)| r.ws == ws)
             .take(limit)
-            .map(|(_, r)| RunSummary::of(r))
+            .filter_map(|id| self.runs.get(id).map(|r| RunSummary::of(r)))
             .collect();
-        let next = match page.last() {
-            Some(last) => it.find(|(_, r)| r.ws == ws).map(|_| last.id),
-            None => None,
-        };
+        let next = page.last().and_then(|last| it.next().map(|_| last.id));
         (page, next)
     }
 
@@ -2124,6 +2151,75 @@ mod tests {
             e.submit(OperationKey("bytes".into()), spec(), 3),
             Err(EngineError::Refused(Refusal::AtCapacity))
         ));
+    }
+
+    /// Review S2 #6: one tenant can no longer fill every live slot —
+    /// the per-workspace share refuses while other workspaces keep
+    /// admitting, and a finished run frees the share again. Replay keeps
+    /// the accounting (the counters are rebuilt from the index).
+    #[test]
+    fn live_run_quota_is_per_workspace() {
+        let (_d, mut e) = open();
+        e.limits.max_live_runs = 1_000_000; // global bound off the table
+        e.limits.max_live_runs_per_ws = 3;
+        for i in 0..3 {
+            e.submit_at(7, OperationKey(format!("a-{i}")), spec(), 0, 0)
+                .unwrap_or_else(|e| panic!("{e}"));
+        }
+        let written = e.diagnostics().records_written;
+        assert!(matches!(
+            e.submit_at(7, OperationKey("a-4".into()), spec(), 0, 0),
+            Err(EngineError::Refused(Refusal::AtCapacity))
+        ));
+        assert_eq!(
+            e.diagnostics().records_written,
+            written,
+            "nothing journaled"
+        );
+        // A second workspace is unaffected — its own share is empty.
+        e.submit_at(8, OperationKey("b-0".into()), spec(), 0, 0)
+            .unwrap_or_else(|e| panic!("ws 8 must admit: {e}"));
+        // A finished run frees ws 7's share.
+        let id = e
+            .submit_at(8, OperationKey("b-1".into()), spec(), 0, 0)
+            .unwrap_or_else(|e| panic!("{e}"));
+        e.cancel(id, 1).unwrap_or_else(|e| panic!("{e}"));
+        let (page, _) = e.page(7, None, 10);
+        e.cancel(page[0].id, 1).unwrap_or_else(|e| panic!("{e}"));
+        e.submit_at(7, OperationKey("a-4".into()), spec(), 0, 0)
+            .unwrap_or_else(|e| panic!("a finished run frees the share: {e}"));
+    }
+
+    /// Review S2 #6: `page`/`page_newest` read the per-workspace index —
+    /// a tenant's page is its own runs only, and the cursor never
+    /// yields a foreign id.
+    #[test]
+    fn workspace_pages_read_only_that_workspace() {
+        let (_d, mut e) = open();
+        let a: Vec<RunId> = (0..5)
+            .map(|i| {
+                e.submit_at(1, OperationKey(format!("a-{i}")), spec(), 0, 0)
+                    .unwrap_or_else(|e| panic!("{e}"))
+            })
+            .collect();
+        let _b: Vec<RunId> = (0..50)
+            .map(|i| {
+                e.submit_at(2, OperationKey(format!("b-{i}")), spec(), 0, 0)
+                    .unwrap_or_else(|e| panic!("{e}"))
+            })
+            .collect();
+        let (page, next) = e.page(1, None, 3);
+        assert_eq!(page.len(), 3);
+        assert_eq!(page[0].id, a[0]);
+        let (rest, _) = e.page(1, next, 10);
+        assert_eq!(rest.len(), 2, "page walks only ws-1's five runs");
+        assert!(rest.iter().all(|r| a.contains(&r.id)));
+        // Newest-first is the same index walked backwards.
+        let (newest, _) = e.page_newest(1, None, 1);
+        assert_eq!(newest[0].id, a[4]);
+        // An empty workspace is an empty page, not a scan miss.
+        let (empty, none) = e.page(99, None, 10);
+        assert!(empty.is_empty() && none.is_none());
     }
 
     /// Review finding 15(b): a run accepted with a key over today's bound

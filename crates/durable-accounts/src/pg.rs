@@ -301,19 +301,34 @@ impl AccountStore for Pg {
     }
 
     async fn put_handler(&self, workspace: u64, name: &str, url: &str) -> Result<(), AccountError> {
-        bounded(
+        // The bound enforced where it cannot be raced (S2 review #6):
+        // a row is written iff the name already exists (an update) or
+        // the workspace is under MAX_HANDLERS_PER_WS, inside the same
+        // statement — concurrent PUTs serialize on it honestly.
+        let done = bounded(
             sqlx::query(
                 "INSERT INTO handler_registrations (workspace_id, name, url) \
-                 VALUES ($1, $2, $3) \
+                 SELECT $1, $2, $3 \
+                 WHERE EXISTS ( \
+                     SELECT 1 FROM handler_registrations \
+                     WHERE workspace_id = $1 AND name = $2 \
+                 ) OR ( \
+                     SELECT count(*) FROM handler_registrations \
+                     WHERE workspace_id = $1 \
+                 ) < $4 \
                  ON CONFLICT (workspace_id, name) \
                  DO UPDATE SET url = $3, updated_at = now()",
             )
             .bind(to_i64(workspace, "workspace")?)
             .bind(name)
             .bind(url)
+            .bind(crate::MAX_HANDLERS_PER_WS as i64)
             .execute(&self.pool),
         )
         .await?;
+        if done.rows_affected() == 0 {
+            return Err(AccountError::RegistryFull);
+        }
         Ok(())
     }
 

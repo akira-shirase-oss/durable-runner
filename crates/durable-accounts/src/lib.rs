@@ -92,6 +92,11 @@ pub enum AccountError {
     /// The store answered but the operation itself failed.
     #[error("account store: {0}")]
     Store(String),
+    /// The write would pass the per-workspace handler bound — refused
+    /// atomically at the store so a racing pair of PUTs cannot both win
+    /// (S2 review #6: the route's pre-check is TOCTOU by nature).
+    #[error("handler registry is full ({MAX_HANDLERS_PER_WS} per workspace)")]
+    RegistryFull,
 }
 
 impl From<sqlx::Error> for AccountError {
@@ -117,6 +122,11 @@ impl From<sqlx::migrate::MigrateError> for AccountError {
 /// reads must never block a request indefinitely; the store being slow
 /// is the same failure as the store being down.
 pub const STORE_DEADLINE: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Handler registrations one workspace may hold — enforced by the
+/// store itself so a racing pair of PUTs cannot both fit (the engine's
+/// registry enforces the same bound independently).
+pub const MAX_HANDLERS_PER_WS: usize = 256;
 
 /// The account graph. Implemented by `Pg` (Neon) and `Memory` (tests and
 /// dialect-free fixtures). Every method is bounded by `STORE_DEADLINE` in

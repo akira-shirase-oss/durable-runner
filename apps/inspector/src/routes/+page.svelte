@@ -26,9 +26,9 @@
 	// Runs tab: paging works in both orders; `trail` walks back toward page 1.
 	let order = $state<Order>('desc');
 	let runs = $state<RunItem[]>([]);
-	let cursor = $state<number | null>(null);
-	let trail = $state<(number | null)[]>([]);
-	let nextCursor = $state<number | null>(null);
+	let cursor = $state<string | null>(null);
+	let trail = $state<(string | null)[]>([]);
+	let nextCursor = $state<string | null>(null);
 	// The phone layout's id column: widest id on this page, so keys stay
 	// aligned and ids never clip (capture.mjs asserts it).
 	let idCh = $derived(idChWidth(runs.map((r) => r.id)));
@@ -41,7 +41,7 @@
 	let steps = $state<{ name: string; handler: string }[]>([{ name: 'only', handler: '' }]);
 	let inputText = $state('');
 	let notBefore = $state('');
-	let lastRun = $state<number | null>(null);
+	let lastRun = $state<string | null>(null);
 
 	// Admin tab
 	let diag = $state<Diag | null>(null);
@@ -101,7 +101,7 @@
 		await refresh();
 	}
 
-	async function openDetail(id: number) {
+	async function openDetail(id: string) {
 		detail = null;
 		detailSpec = null;
 		detailErr = null;
@@ -122,7 +122,7 @@
 		}
 	}
 
-	async function cancel(id: number) {
+	async function cancel(id: string) {
 		try {
 			await cancelRun(id, apiKey);
 			notice = `run ${id} cancelled`;
