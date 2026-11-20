@@ -12,12 +12,15 @@
 #
 #   deploy/format-guard.sh /path/to/durable-server
 #
-# The journal's shape comes from the running server's /admin/diagnostics
-# when reachable, joined with what is read straight off the journal
-# files ("v"/"ws" fields — a v1-only journal legitimately has neither —
-# and gen-*/snapshot.bin DRIX headers). The file scan fails CLOSED: an
-# unreadable journal, a gen-* dir without a readable journal.log, or a
-# malformed snapshot is a refusal, never a silent "1".
+# The journal files are ALWAYS scanned — the running server's
+# /admin/diagnostics only ever RAISES the maxima, never replaces them,
+# because its numbers reflect journal open, not live commits or a live
+# compaction. The scan reads "v"/"ws" fields (a v1-only journal has
+# neither), gen-*/snapshot.bin DRIX headers, and journal.shape — the
+# sidecar a v1.0.2+ writer maintains before every record and swap.
+# rollback.sh/upgrade.sh run this on a quiesced journal; run it against
+# a live one anyway if you must — it errs toward refusal, never toward
+# admitting a binary the journal might have just outgrown.
 #
 # `$bin --journal-format` prints three numbers since v1.0.2 —
 # "<records> <snapshots> <parks-ws≠0>"; older binaries print only the
@@ -57,7 +60,7 @@ else
   shopt -s nullglob
   gens=( "$JOURNAL_ROOT"/gen-* )
   logs=()
-  for g in "${gens[@]}"; do
+  for g in ${gens[@]+"${gens[@]}"}; do
     f=$g/journal.log
     [[ -f $f && -r $f ]] || refuse "$g has no readable journal.log"
     logs+=("$f")
@@ -86,7 +89,7 @@ else
   # Snapshot formats: gen-*/snapshot.bin is a framed record whose
   # payload is "DRIX" + u16 version — so the magic sits at bytes 28-31
   # and the version at 32-33. Anything shorter cannot carry both.
-  for g in "${gens[@]}"; do
+  for g in ${gens[@]+"${gens[@]}"}; do
     sbin=$g/snapshot.bin
     [[ -e $sbin ]] || continue
     [[ -f $sbin && -r $sbin ]] || refuse "cannot read $sbin"
@@ -121,11 +124,16 @@ else
     sidecar=1
   fi
   # Ambiguity is a refusal, not an assumption: a snapshot CAN hide ws ≠ 0
-  # runs once compaction deleted their records. Without a sidecar the
-  # journal is provably clean only when its DRIX ≥ 2 snapshot predates
-  # ws-capable writers — i.e. records exist, none carries a ws field,
-  # and none is v3. Anything else could be a ws-aware writer that
-  # compacted and stopped before the sidecar existed.
+  # runs once compaction deleted their records. A sidecar-less DRIX ≥ 2
+  # journal is admitted only when its surviving records are consistent
+  # with a pre-workspace writer — none carries a ws field, none is v3,
+  # and the newest log is non-empty. That admits a v1.0.1 journal, whose
+  # snapshots cannot hold tenant runs. It cannot detect a lineage break:
+  # a deleted sidecar followed by an older-guard write would leave a
+  # tenant snapshot under clean records — refusing EVERY sidecar-less
+  # DRIX 2 journal would instead brick the legitimate v1.0.1 rollback
+  # this release exists to permit, so the residual stands (an admin
+  # deleting files is already outside the model).
   if (( sidecar == 0 && ssnap >= 2 )); then
     newest=""
     if (( ${#logs[@]} > 0 )); then

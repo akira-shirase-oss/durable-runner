@@ -33,17 +33,21 @@ impl Pg {
     /// non-loopback host must use `sslmode=verify-full` — `require`
     /// encrypts but does not verify the server's certificate, leaving
     /// `handler_secret` and `verify_key` grants open to a forged
-    /// endpoint. Loopback hosts (local development) are exempt.
+    /// endpoint. Literal loopback IPs (local development) are exempt.
     pub fn connect(url: &str) -> Result<Self, AccountError> {
         let opts = PgConnectOptions::from_str(url)
             .map_err(|e| AccountError::Store(format!("unusable DATABASE_URL: {e}")))?;
         let host = opts.get_host();
         let bare = host.trim_start_matches('[').trim_end_matches(']');
-        let loopback = host.eq_ignore_ascii_case("localhost")
-            || bare
-                .parse::<std::net::IpAddr>()
-                .map(|ip| ip.is_loopback())
-                .unwrap_or(false);
+        // Only literal loopback IPs are exempt — "localhost" is a NAME
+        // and resolves wherever the resolver says; a hosts-file edit or
+        // split-horizon DNS would turn an exempted "localhost" URL into
+        // plaintext to a remote host. Dev uses 127.0.0.1 or sets
+        // sslmode explicitly.
+        let loopback = bare
+            .parse::<std::net::IpAddr>()
+            .map(|ip| ip.is_loopback())
+            .unwrap_or(false);
         if !loopback && !matches!(opts.get_ssl_mode(), PgSslMode::VerifyFull) {
             return Err(AccountError::Store(format!(
                 "DATABASE_URL for non-loopback host {host:?} must use \
@@ -430,14 +434,17 @@ mod tests {
             Pg::connect("postgres://u:p@db.example.com/d?sslmode=verify-full").is_ok(),
             "verify-full is the only accepted non-loopback mode"
         );
-        // Loopback development targets are exempt — any mode allowed.
+        // Only literal loopback IPs are exempt — any mode allowed.
         for u in [
-            "postgres://u:p@localhost/d",
             "postgres://u:p@127.0.0.1/d",
             "postgres://u:p@[::1]/d?sslmode=disable",
         ] {
             assert!(Pg::connect(u).is_ok(), "{u} must connect");
         }
+        // "localhost" is a name, not an address: it resolves wherever
+        // the resolver points, so it needs verify-full like any name.
+        refused("postgres://u:p@localhost/d");
+        refused("postgres://u:p@localhost/d?sslmode=require");
     }
 
     #[tokio::test]

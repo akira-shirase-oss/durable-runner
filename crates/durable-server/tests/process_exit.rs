@@ -1,7 +1,10 @@
 //! Process-level proof for the compaction swap rule (D-019): a real OS
-//! error at the manifest swap makes `durable-server` exit non-zero, nothing
-//! is acknowledged after it, and a restart replays everything acknowledged
-//! before it.
+//! error BEFORE the manifest swap — the unwritable journal root fails
+//! the `journal.shape` write — is an ordinary compaction error: the
+//! process keeps serving, SIGTERM drains it cleanly, and a restart
+//! replays everything acknowledged. A failure AT or after the rename
+//! still poisons; the in-process fault drill covers that (an external
+//! permissions trick cannot reach past the sidecar write anymore).
 #![cfg(unix)]
 
 use std::os::unix::fs::PermissionsExt;
@@ -174,30 +177,27 @@ async fn failed_manifest_swap_exits_the_process_and_loses_nothing() {
         .await
         .map(|r| r.status().as_u16());
     assert_ne!(compact.ok(), Some(200), "the compaction failed");
+    // The unwritable root fails the journal.shape write — BEFORE the
+    // manifest swap, which is an ordinary compaction error, not a
+    // poison: the server keeps serving and drains cleanly on SIGTERM.
+    // (A post-rename failure still exits non-zero; the in-process fault
+    // injection at compaction step 3 proves that path.)
     let mut after = 0;
     for i in 0..30 {
         if submit(&c, &base, &format!("post-{i}")).await.is_some() {
             after += 1;
         }
     }
-    let deadline = Instant::now() + Duration::from_secs(5);
-    let status = loop {
-        if let Some(s) = server.try_wait().unwrap_or_else(|e| panic!("{e}")) {
-            break s;
-        }
-        if Instant::now() > deadline {
-            let _ = server.kill();
-            let _ = server.wait();
-            panic!("the server kept running after a failed manifest swap");
-        }
-        tokio::time::sleep(Duration::from_millis(25)).await;
-    };
-    drop(guard);
     assert_eq!(
-        after, 0,
-        "{after} submits acknowledged after the failed swap"
+        after, 30,
+        "a pre-swap compaction error must not stop the engine"
     );
-    assert!(!status.success(), "the server must exit non-zero: {status}");
+    drop(guard);
+    signal(&server, "-TERM");
+    let status = exit_within(&mut server, Duration::from_secs(15))
+        .await
+        .unwrap_or_else(|| panic!("the server did not drain after SIGTERM"));
+    assert!(status.success(), "a live engine drains to exit 0: {status}");
 
     let mut server = start(&journal, port);
     wait_healthy(&c, &base).await;

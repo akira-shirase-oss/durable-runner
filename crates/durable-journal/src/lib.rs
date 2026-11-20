@@ -396,6 +396,34 @@ pub fn read_shape(root: &Path) -> io::Result<Option<Shape>> {
                 format!("journal.shape: malformed line {line:?}"),
             ));
         };
+        let bit = match k {
+            "records" => 1,
+            "snapshots" => 2,
+            "ws" => 4,
+            _ => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("journal.shape: unknown key {k:?}"),
+                ));
+            }
+        };
+        // A duplicated key reads differently to a first-wins parser (the
+        // guard) than to a last-wins one — refuse rather than guess.
+        if seen & bit != 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("journal.shape: duplicate key {k:?}"),
+            ));
+        }
+        seen |= bit;
+        // Refuse a leading '+' too: the guard's regex requires ^[0-9]+$
+        // and a file only Rust accepted would disagree with it.
+        if v.starts_with('+') || v.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("journal.shape: bad {k} {v:?}"),
+            ));
+        }
         let n: u64 = v.parse().map_err(|_| {
             io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -405,19 +433,8 @@ pub fn read_shape(root: &Path) -> io::Result<Option<Shape>> {
         match k {
             "records" => shape.records = u8::try_from(n).map_err(|_| bad_shape(k))?,
             "snapshots" => shape.snapshots = u16::try_from(n).map_err(|_| bad_shape(k))?,
-            "ws" => shape.max_ws = n,
-            _ => {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    format!("journal.shape: unknown key {k:?}"),
-                ));
-            }
+            _ => shape.max_ws = n,
         }
-        seen |= match k {
-            "records" => 1,
-            "snapshots" => 2,
-            _ => 4,
-        };
     }
     if seen != 7 {
         return Err(io::Error::new(
@@ -438,7 +455,16 @@ fn bad_shape(k: &str) -> io::Error {
 /// Persist the shape: tmp file, fsync, rename, fsync the directory —
 /// same ordering as the manifest swap, owner-only like every journal
 /// file. Callers invoke this BEFORE the change the shape describes.
+/// Two threads can reach this (the commit path and the compaction
+/// swap), so the read-merge-write runs under one lock and the value
+/// persisted is never lower than what is already durable.
 pub fn write_shape(root: &Path, shape: Shape) -> io::Result<()> {
+    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let _guard = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let shape = match read_shape(root) {
+        Ok(Some(current)) => current.merged(shape),
+        _ => shape,
+    };
     let text = format!(
         "records={}\nsnapshots={}\nws={}\n",
         shape.records, shape.snapshots, shape.max_ws
@@ -852,6 +878,9 @@ impl Journal {
         tighten(&lock_path, FILE_MODE);
         tighten(&manifest_path_of(dir), FILE_MODE);
         tighten(&shape_path(dir), FILE_MODE);
+        // A crash can orphan the sidecar's temp file; it is not journal
+        // content and the next write_shape recreates it anyway.
+        let _ = fs::remove_file(dir.join("journal.shape.tmp"));
 
         // Manifest: keep the last valid one. First open creates generation
         // 1 and its log, then the manifest that names it (D-044), so a
@@ -1205,22 +1234,22 @@ impl Journal {
         write_snapshot_stream(&gdir, covered_seq, payload_len, write)?;
         self.compaction_step(2)?;
 
-        // 3. The atomic manifest swap — the single point that moves the
+        // 3. journal.shape claims what the swap is about to make true —
+        //    durable BEFORE the manifest names N+1 (a crash over-reports,
+        //    so the guard refuses more, never less). A failure here is an
+        //    ordinary compaction error: nothing has moved.
+        write_shape(&self.root, shape)?;
+        // 4. The atomic manifest swap — the single point that moves the
         //    world from generation N to N+1, and the point of no return.
-        //    The journal.shape sidecar goes first in the same chain: it
-        //    claims what the swap is about to make true (its rename lands
-        //    before the manifest's, so a crash over-reports — the guard
-        //    refuses more, never less). From the chain on, an error leaves
-        //    the manifest possibly naming N+1 while this writer points at
-        //    N: poison, never continue (appends would go where no restart
-        //    looks).
+        //    From the rename on, an error leaves the manifest possibly
+        //    naming N+1 while this writer points at N: poison, never
+        //    continue (appends would go where no restart looks).
         let tmp = self.root.join("manifest.json.tmp");
         write_private(
             &tmp,
             &serde_json::to_vec(&Manifest { generation: next }).map_err(io::Error::other)?,
         )?;
-        let swapped = write_shape(&self.root, shape)
-            .and_then(|()| fs::rename(&tmp, self.root.join("manifest.json")))
+        let swapped = fs::rename(&tmp, self.root.join("manifest.json"))
             .and_then(|()| self.compaction_step(3))
             .and_then(|()| sync_parent(&tmp))
             .and_then(|()| new_log.seek(SeekFrom::End(0)).map(|_| ()));
@@ -1489,7 +1518,7 @@ fn restore_with(from: &Path, to: &Path, step: &dyn Fn(RestoreStep)) -> Result<()
     for entry in fs::read_dir(to)? {
         let name = entry?.file_name();
         let n = name.to_string_lossy();
-        if n == "manifest.json" || n.starts_with("gen-") {
+        if n == "manifest.json" || n.starts_with("gen-") || n.starts_with("journal.shape") {
             return Err(JournalError::RestoreTargetNotEmpty);
         }
     }
@@ -1501,6 +1530,8 @@ fn restore_with(from: &Path, to: &Path, step: &dyn Fn(RestoreStep)) -> Result<()
         for f in &list.files {
             if let Some((g, _)) = f.path.split_once('/') {
                 let _ = fs::remove_dir_all(to.join(g));
+            } else {
+                let _ = fs::remove_file(to.join(&f.path));
             }
         }
         return Err(e);

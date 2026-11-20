@@ -71,7 +71,10 @@ OUT=$($CLI submit --op-key pilot/onboarding-email \
       --step prepare=step --step deliver=step \
       --input '{"user":"alice","template":"welcome"}')
 echo "submit -> $OUT"
-ID=$(echo "$OUT" | grep -o '[0-9]*')
+# Submit answers {"run_id":"<opaque public id>"} — digits can't be
+# scraped out of it; take the field verbatim.
+ID=$(echo "$OUT" | sed -n 's/.*"run_id":"\([^"]*\)".*/\1/p')
+[ -n "$ID" ] || fail "submit returned no run_id: $OUT"
 AGAIN=$($CLI submit --op-key pilot/onboarding-email --step prepare=step --step deliver=step \
       --input '{"user":"alice","template":"welcome"}')
 [ "$AGAIN" = "$OUT" ] || fail "resubmitting the op_key gave $AGAIN, not $OUT"

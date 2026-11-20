@@ -10,12 +10,19 @@ new=${1:?usage: upgrade.sh /path/to/new/durable-server}
 [[ -x $new ]] || { echo "$new not executable" >&2; exit 1; }
 
 # D-056: never swap in a binary that cannot read this journal — it would
-# refuse startup and turn the upgrade into an outage.
-deploy/format-guard.sh "$new"
+# refuse startup and turn the upgrade into an outage. The journal must be
+# quiescent when judged, so the unit stops first; a refused upgrade
+# restarts the running binary unchanged.
+systemctl stop durable-server
+if ! deploy/format-guard.sh "$new"; then
+  systemctl start durable-server
+  echo "upgrade refused — the previous binary was restarted" >&2
+  exit 1
+fi
 
 cp -a /usr/local/bin/durable-server /usr/local/bin/durable-server.prev
 install -m 0755 "$new" /usr/local/bin/durable-server
-systemctl restart durable-server
+systemctl start durable-server
 
 # /ready polls until replay finishes (bounded: 90s covers 800k runs at the
 # measured 1.7s on a droplet slower than this Mac — generous headroom).

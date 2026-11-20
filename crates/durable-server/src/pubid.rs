@@ -30,8 +30,17 @@ pub struct PubId {
 impl PubId {
     /// Load the key file or create it (0600) when absent — same lifecycle
     /// as the journal it sits beside, and deliberately outside it so no
-    /// journal record changes shape.
+    /// journal record changes shape. The journal dir may not exist yet
+    /// (first boot): create it owner-only, the mode the journal uses.
     pub fn load_or_generate(journal_dir: &Path) -> io::Result<Self> {
+        let mut d = std::fs::DirBuilder::new();
+        d.recursive(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::DirBuilderExt;
+            d.mode(0o700);
+        }
+        d.create(journal_dir)?;
         let path = journal_dir.join(KEY_FILE);
         let bytes = match std::fs::read(&path) {
             Ok(b) if b.len() == 32 => b,

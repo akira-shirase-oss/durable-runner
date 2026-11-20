@@ -38,13 +38,15 @@ enum Cmd {
     },
     /// Show one run's state.
     Inspect {
+        /// The opaque run id the server returned at submit.
         #[arg(long)]
-        run: u64,
+        run: String,
     },
     /// Cancel a run (stops scheduling; cannot undo remote effects).
     Cancel {
+        /// The opaque run id the server returned at submit.
         #[arg(long)]
-        run: u64,
+        run: String,
     },
     /// List one page of the live index (ids ascending, or newest first).
     List {
@@ -53,10 +55,10 @@ enum Cmd {
         newest: bool,
         /// Newest first: start before this run id.
         #[arg(long)]
-        before: Option<u64>,
+        before: Option<String>,
         /// Start after this run id (the previous page's `next_after`).
         #[arg(long)]
-        after: Option<u64>,
+        after: Option<String>,
         /// Page size (server clamps to 1..=1000; default 100).
         #[arg(long)]
         limit: Option<usize>,
@@ -189,10 +191,10 @@ async fn main() -> Result<()> {
                 q.push(("order", "desc".into()));
             }
             if let Some(b) = before {
-                q.push(("before", b.to_string()));
+                q.push(("before", b));
             }
             if let Some(a) = after {
-                q.push(("after", a.to_string()));
+                q.push(("after", a));
             }
             if let Some(l) = limit {
                 q.push(("limit", l.to_string()));

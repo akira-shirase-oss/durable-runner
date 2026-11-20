@@ -17,7 +17,7 @@ and headers:
 | header | meaning |
 |---|---|
 | `x-idempotency-key` | The same key, repeated as a header. |
-| `x-durable-run-id` | The run this call belongs to. |
+| `x-durable-run-id` | The run this call belongs to — the **opaque public id** (`run_id` from the submit response), never the internal sequence. |
 | `x-durable-step` | The step's index in the spec. |
 | `x-durable-attempt` | The attempt number (1 = first try). |
 | `x-durable-timestamp` | Unix seconds when the call was signed. |
@@ -49,10 +49,14 @@ ts\nmethod\npath\nrun\nstep\nattempt\nidem_key\nbody_sha256
 joined with `\n` (a newline can never appear inside any field —
 `idem_key` may carry `.`, so dot-joined fields were re-splittable),
 where `ts` is the `x-durable-timestamp` value, `method`/`path` are the
-request's method and URL path (a signature minted for one call replays
-nowhere else), `run`/`step`/`attempt` are the `x-durable-run-id`/
-`x-durable-step`/`x-durable-attempt` header values *verbatim* (and `-`
-when a header is absent — any other non-integer is refused outright),
+request's method and URL path **only — the query string is excluded**
+(a signature minted for one call replays nowhere else),
+`run`/`step`/`attempt` are the `x-durable-run-id`/`x-durable-step`/
+`x-durable-attempt` header values *verbatim* — `run` is the opaque
+public id, `step`/`attempt` are integers; any absent header signs as
+`-`, and a non-integer `step`/`attempt` is refused outright. When a
+signed header arrives duplicated, the **first** value is the one
+verified — your verifier must do the same,
 and `body_sha256` is the lowercase hex SHA-256 of the exact request
 body — for a probe (no body) the digest field is empty, so the
 canonical string ends in `\n`.

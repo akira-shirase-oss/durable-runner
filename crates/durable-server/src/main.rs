@@ -254,6 +254,10 @@ struct HttpHandler {
     /// The `--allow-local-handlers` opt-out the check shares with
     /// registration and the resolver.
     allow_local: bool,
+    /// `x-durable-run-id` carries the opaque public id, never the
+    /// global sequence — a raw one would tell the tenant how much work
+    /// every other workspace submitted between two of its calls.
+    pubid: pubid::PubId,
 }
 
 impl HttpHandler {
@@ -307,25 +311,18 @@ const SIG_HEADER: &str = "x-durable-signature";
 /// so a signature minted for one call replays nowhere else. Run/step/
 /// attempt are `-` on a compat (no-`Call`) path; `digest` is hex sha256
 /// of the body for a call and empty for a probe.
+#[allow(clippy::too_many_arguments)]
 fn sign_call(
     secret: &[u8; 32],
     ts: u64,
     method: &str,
     path: &str,
-    call: Option<Call>,
+    r: &str,
+    s: &str,
+    a: &str,
     idem_key: &str,
     body_digest: &str,
 ) -> String {
-    let (r, s, a) = call.map_or_else(
-        || ("-".into(), "-".into(), "-".into()),
-        |c| {
-            (
-                c.run.0.to_string(),
-                c.step.0.to_string(),
-                c.attempt.to_string(),
-            )
-        },
-    );
     let canonical = format!("{ts}\n{method}\n{path}\n{r}\n{s}\n{a}\n{idem_key}\n{body_digest}");
     let key = ring::hmac::Key::new(ring::hmac::HMAC_SHA256, secret);
     let tag = ring::hmac::sign(&key, canonical.as_bytes());
@@ -341,12 +338,23 @@ fn with_call(
     body_digest: &str,
     method: &str,
     path: &str,
+    pubid: &pubid::PubId,
 ) -> reqwest::RequestBuilder {
+    let (r, s, a) = call.map_or_else(
+        || ("-".to_string(), "-".to_string(), "-".to_string()),
+        |c| {
+            (
+                pubid.encode(c.run),
+                c.step.0.to_string(),
+                c.attempt.to_string(),
+            )
+        },
+    );
     let req = match call {
-        Some(c) => req
-            .header(RUN_ID_HEADER, c.run.0)
-            .header(STEP_HEADER, c.step.0)
-            .header(ATTEMPT_HEADER, c.attempt),
+        Some(_) => req
+            .header(RUN_ID_HEADER, &r)
+            .header(STEP_HEADER, &s)
+            .header(ATTEMPT_HEADER, &a),
         None => req,
     };
     match secret {
@@ -354,7 +362,7 @@ fn with_call(
             let ts = unix_secs();
             req.header(TS_HEADER, ts).header(
                 SIG_HEADER,
-                sign_call(secret, ts, method, path, call, idem_key, body_digest),
+                sign_call(secret, ts, method, path, &r, &s, &a, idem_key, body_digest),
             )
         }
         None => req,
@@ -390,6 +398,7 @@ impl HttpHandler {
             &digest,
             "POST",
             path,
+            &self.pubid,
         )
         .send()
         .await;
@@ -428,11 +437,20 @@ impl HttpHandler {
         // A probe signs an empty body digest — the same canonical
         // shape, GET and the URL's path bound in.
         let path = self.policy_url.as_ref().map_or("/", |u| u.path());
-        with_call(req, call, self.secret.as_deref(), idem_key, "", "GET", path)
-            .send()
-            .await
-            .map(|r| r.status().is_success())
-            .unwrap_or(false)
+        with_call(
+            req,
+            call,
+            self.secret.as_deref(),
+            idem_key,
+            "",
+            "GET",
+            path,
+            &self.pubid,
+        )
+        .send()
+        .await
+        .map(|r| r.status().is_success())
+        .unwrap_or(false)
     }
 }
 
@@ -472,6 +490,8 @@ struct HandlerFactory {
     /// `--allow-local-handlers` — dev/test opt-out shared by the
     /// registration check and the client's resolver.
     allow_local: bool,
+    /// The run-id encoder every built handler signs its headers with.
+    pubid: pubid::PubId,
 }
 
 impl HandlerFactory {
@@ -490,6 +510,7 @@ impl HandlerFactory {
             secret,
             policy_url: reqwest::Url::parse(url).ok(),
             allow_local: self.allow_local,
+            pubid: self.pubid.clone(),
         })
     }
 }
@@ -648,6 +669,7 @@ async fn registry_sync(
             Vec::new()
         };
         let secret = Some(Arc::new(ws.handler_secret));
+        let mut accepted = Vec::new();
         for r in &regs {
             // Re-check the stored URL at load: a row planted by an
             // --allow-local-handlers process or a direct store edit
@@ -661,7 +683,7 @@ async fn registry_sync(
                 continue;
             }
             set.push((r.name.clone(), factory.make_signed(&r.url, secret.clone())));
-            all.push(RegistryEntry {
+            accepted.push(RegistryEntry {
                 ws: ws.id,
                 name: r.name.clone(),
                 url: r.url.clone(),
@@ -678,6 +700,9 @@ async fn registry_sync(
             eprintln!("durable-server: registry reconcile skipped a workspace: {e}");
             continue;
         }
+        // The snapshot file mirrors what the engine actually armed — a
+        // refused set (over the per-ws bound, dead channel) never lands.
+        all.extend(accepted);
     }
     if refused > 0 {
         eprintln!(
@@ -983,6 +1008,7 @@ fn test_app(
     journal_dir: &Path,
     allow_local: bool,
 ) -> App {
+    let pubid = pubid::PubId::load_or_generate(journal_dir).unwrap_or_else(|e| panic!("{e}"));
     App {
         engine,
         keyring,
@@ -993,13 +1019,14 @@ fn test_app(
             timeout: Duration::from_secs(2),
             max_output: 1024 * 1024,
             allow_local,
+            pubid: pubid.clone(),
         }),
         flag_handlers: Arc::new(Vec::new()),
         registry_stale: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         registry_file: Arc::from(journal_dir.join("handlers.json").as_path()),
         registry_lock: Arc::new(Mutex::new(())),
         registry_epoch: Arc::new(std::sync::atomic::AtomicU64::new(0)),
-        pubid: pubid::PubId::load_or_generate(journal_dir).unwrap_or_else(|e| panic!("{e}")),
+        pubid,
     }
 }
 
@@ -2432,11 +2459,14 @@ async fn main() -> Result<()> {
     };
     let mut registry = Registry::default();
     let client = handler_client(args.allow_local_handlers)?;
+    let pubid =
+        pubid::PubId::load_or_generate(&args.journal).with_context(|| "load public-id key")?;
     let factory = Arc::new(HandlerFactory {
         client,
         timeout: Duration::from_millis(args.step_timeout_ms),
         max_output: cfg.limits.max_output_bytes,
         allow_local: args.allow_local_handlers,
+        pubid: pubid.clone(),
     });
     // A `--handler` flag URL obeys the same registration rule as the
     // route: literal-local refused unless --allow-local-handlers.
@@ -2522,8 +2552,7 @@ async fn main() -> Result<()> {
         registry_file,
         registry_lock: Arc::new(Mutex::new(())),
         registry_epoch: Arc::new(std::sync::atomic::AtomicU64::new(0)),
-        pubid: pubid::PubId::load_or_generate(&args.journal)
-            .with_context(|| "load public-id key")?,
+        pubid,
     };
     if let Some(store) = &store {
         spawn_registry_reconcile(store.clone(), &app, registry_stale);
@@ -4367,6 +4396,7 @@ mod tests {
             max_output: 1024,
             secret: None,
             allow_local: false,
+            pubid: pubid::PubId::ephemeral(),
         };
         let spec = StepSpec {
             name: "s".into(),
@@ -4395,6 +4425,7 @@ mod tests {
             max_output: 1024,
             secret: None,
             allow_local: true,
+            pubid: pubid::PubId::ephemeral(),
         };
         let call = tokio::spawn(async move { open.execute(&spec, b"hi", "k").await });
         let dialed = tokio::time::timeout(Duration::from_secs(2), listener.accept()).await;
@@ -4426,6 +4457,7 @@ mod tests {
             max_output: 1024,
             secret: None,
             allow_local: false,
+            pubid: pubid::PubId::ephemeral(),
         };
         let spec = StepSpec {
             name: "s".into(),
@@ -4990,6 +5022,7 @@ mod tests {
             timeout: Duration::from_secs(10),
             max_output: 1024,
             allow_local: true,
+            pubid: pubid::PubId::ephemeral(),
         }
     }
 
@@ -5140,6 +5173,7 @@ mod tests {
 
         let journal = tempfile::tempdir().unwrap_or_else(|e| panic!("{e}"));
         let mut reg = Registry::default();
+        let pid = pubid::PubId::ephemeral();
         reg.register(
             "step",
             Arc::new(HttpHandler {
@@ -5150,6 +5184,7 @@ mod tests {
                 max_output: 1024,
                 secret: None,
                 allow_local: true,
+                pubid: pid.clone(),
             }),
         );
         let cfg = ShellConfig {
@@ -5188,7 +5223,9 @@ mod tests {
             );
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
-        let id = run.0.to_string();
+        // The header carries the public id — the internal sequence
+        // would tell the handler how much other workspaces submitted.
+        let id = pid.encode(run);
         let row = |m: &str, step: &str, attempt: &str| {
             [
                 m.to_string(),
@@ -6148,14 +6185,20 @@ mod tests {
             return Err("stale timestamp");
         }
         let sig = get(SIG_HEADER).ok_or("missing signature")?;
-        // run/step/attempt are integers or `-` for the compat path —
-        // anything else is a field-smuggling attempt, refused outright.
+        // step/attempt are integers or `-` for the compat path — anything
+        // else is a field-smuggling attempt, refused outright. The run id
+        // is the opaque public id, bound into the signature verbatim
+        // (HTTP forbids the control bytes a re-split would need anyway).
         let num = |n: &str| match get(n) {
             None | Some("-") => Ok("-".to_string()),
             Some(v) if v.bytes().all(|b| b.is_ascii_digit()) => Ok(v.to_string()),
             Some(_) => Err("malformed call header"),
         };
-        let (r, s, a) = (num(RUN_ID_HEADER)?, num(STEP_HEADER)?, num(ATTEMPT_HEADER)?);
+        let (s, a) = (num(STEP_HEADER)?, num(ATTEMPT_HEADER)?);
+        let r = match get(RUN_ID_HEADER) {
+            None | Some("-") => "-".to_string(),
+            Some(v) => v.to_string(),
+        };
         let expected = {
             let key = ring::hmac::Key::new(ring::hmac::HMAC_SHA256, secret);
             let canonical =
@@ -6726,7 +6769,9 @@ mod tests {
                 1_700_000_000 + i,
                 "POST",
                 "/step",
-                Some(call),
+                &call.run.0.to_string(),
+                &call.step.0.to_string(),
+                &call.attempt.to_string(),
                 "k",
                 &digest,
             );
