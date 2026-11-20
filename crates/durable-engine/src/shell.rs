@@ -201,6 +201,11 @@ enum Read {
     Diag {
         reply: oneshot::Sender<crate::Diagnostics>,
     },
+    /// One workspace's diagnostics — the tenant-facing read.
+    DiagWs {
+        ws: u64,
+        reply: oneshot::Sender<crate::WorkspaceDiagnostics>,
+    },
 }
 
 /// Handle to the running engine. Cheap to clone; the channel capacities
@@ -453,6 +458,14 @@ impl Engine {
     pub async fn diag(&self) -> Result<crate::Diagnostics, EngineError> {
         let (reply, rx) = oneshot::channel();
         self.send_read(Read::Diag { reply })?;
+        answer(rx, self.reply_timeout).await
+    }
+
+    /// One workspace's diagnostics — the tenant-facing subset, never
+    /// another tenant's totals (S1 review).
+    pub async fn diag_ws(&self, ws: u64) -> Result<crate::WorkspaceDiagnostics, EngineError> {
+        let (reply, rx) = oneshot::channel();
+        self.send_read(Read::DiagWs { ws, reply })?;
         answer(rx, self.reply_timeout).await
     }
 
@@ -1265,6 +1278,9 @@ async fn actor(
                     let mut d = core.diagnostics();
                     d.errors = mon.errors.clone();
                     pipe.answer_read(core.last_index(), reply, d);
+                }
+                Some(Read::DiagWs { ws, reply }) => {
+                    pipe.answer_read(core.last_index(), reply, core.diagnostics_for(ws));
                 }
                 // Every handle is gone (the command channel closes with it).
                 None => {

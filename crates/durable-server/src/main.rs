@@ -1321,9 +1321,10 @@ async fn ready(State(app): State<App>) -> Response {
 }
 
 async fn diagnostics(
-    _: Authorized,
+    Authorized(auth): Authorized,
     State(app): State<App>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
+    ops_admin(&auth)?;
     let d = app.engine.diag().await?;
     let mut v = serde_json::to_value(d).unwrap_or_default();
     if let Some(o) = v.as_object_mut() {
@@ -1347,10 +1348,22 @@ fn ops_admin(auth: &Auth) -> Result<(), ApiError> {
         return Err(ApiError::new(
             StatusCode::FORBIDDEN,
             "forbidden",
-            "workspace management needs a workspace-0 admin key",
+            "this operation needs a workspace-0 admin key",
         ));
     }
     Ok(())
+}
+
+/// The tenant-facing counterpart of `/admin/diagnostics`: the calling
+/// workspace's own counts — never another tenant's, never the global
+/// totals (S1 review: diagnostics leaks tenant volume across the
+/// boundary, so the global view is ops-only).
+async fn workspace_diagnostics(
+    Authorized(auth): Authorized,
+    State(app): State<App>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let d = app.engine.diag_ws(auth.ws).await?;
+    Ok(Json(serde_json::to_value(d).unwrap_or_default()))
 }
 
 /// The configured account store — without one the workspace routes have
@@ -1835,9 +1848,10 @@ async fn delete_handler(
 }
 
 async fn compact(
-    _: Authorized,
+    Authorized(auth): Authorized,
     State(app): State<App>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
+    ops_admin(&auth)?;
     let gen = app.engine.compact().await?;
     Ok(Json(serde_json::json!({ "generation": gen })))
 }
@@ -1869,10 +1883,11 @@ fn backup_dest(root: &Path, name: &str) -> Result<PathBuf, ApiError> {
 }
 
 async fn backup(
-    _: Authorized,
+    Authorized(auth): Authorized,
     State(app): State<App>,
     J(req): J<BackupReq>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
+    ops_admin(&auth)?;
     let Some(root) = app.backup_root.as_deref() else {
         return Err(ApiError::new(
             StatusCode::FORBIDDEN,
@@ -1920,6 +1935,9 @@ fn router(app: App, ui_dir: Option<&Path>) -> Router {
         .route("/admin/compact", post(compact))
         .route("/admin/backup", post(backup))
         .route("/admin/diagnostics", get(diagnostics))
+        // The tenant's own counts — any authenticated key reads its own
+        // workspace's shape; another tenant's totals stay ops-only.
+        .route("/diagnostics", get(workspace_diagnostics))
         // S2-2: the account graph. Workspaces and keys are addressed by
         // public_id only — internal u64 ids never leave the process.
         .route("/whoami", get(whoami))
@@ -6118,5 +6136,67 @@ mod tests {
             mean < 10_000.0,
             "HMAC signing must stay microseconds, not {mean:.0} ns/call"
         );
+    }
+
+    /// S1 #1: a tenant's admin key is admin *of its workspace* — never
+    /// of the host. The global ops routes refuse it: diagnostics (every
+    /// tenant's totals), compact (engine-wide maintenance), backup
+    /// (whole-journal copies). Its own workspace's counts come from
+    /// GET /diagnostics — scoped, never another tenant's.
+    #[tokio::test]
+    async fn a_tenant_admin_key_never_reaches_the_ops_routes() {
+        use durable_accounts::Memory;
+        let store = Arc::new(Memory::new());
+        let ws = store
+            .create_workspace("tenant")
+            .await
+            .unwrap_or_else(|e| panic!("workspace: {e}"));
+        let token = "ws-tenant-key-0123456789abcdef";
+        store
+            .create_key(
+                ws.id,
+                "main",
+                Permission::Admin,
+                &sha256(token.as_bytes()),
+                "dr_te",
+            )
+            .await
+            .unwrap_or_else(|e| panic!("key: {e}"));
+        let h = harness_store(true, None, Some(store.clone()));
+        register_step(&store, ws.id, &h.app.engine).await;
+        // Give the tenant a run so its scoped diagnostics have a shape.
+        let (status, v) = call(
+            &h.router,
+            "POST",
+            "/jobs",
+            Some(token),
+            Some(submit_body("tenant-job")),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{v}");
+        for (method, uri, body) in [
+            ("GET", "/admin/diagnostics", None),
+            ("POST", "/admin/compact", None),
+            ("POST", "/admin/backup", Some(json!({ "name": "b" }))),
+        ] {
+            let (status, v) = call(&h.router, method, uri, Some(token), body).await;
+            assert_eq!(
+                (status, v["code"].clone()),
+                (StatusCode::FORBIDDEN, json!("forbidden")),
+                "{method} {uri} must refuse a tenant key"
+            );
+        }
+        // The scoped route answers the tenant's own shape only.
+        let (status, v) = call(&h.router, "GET", "/diagnostics", Some(token), None).await;
+        assert_eq!(status, StatusCode::OK, "{v}");
+        assert_eq!(v["live_runs"], json!(1), "{v}");
+        assert!(
+            v.get("workspaces_active").is_none() && v.get("records_written").is_none(),
+            "tenant diagnostics must not carry global fields: {v}"
+        );
+        // …and the ops key keeps the global view.
+        let (status, v) = call(&h.router, "GET", "/admin/diagnostics", Some(KEY), None).await;
+        assert_eq!(status, StatusCode::OK, "{v}");
+        assert!(v["records_written"].is_u64(), "{v}");
     }
 }

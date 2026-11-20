@@ -188,6 +188,18 @@ pub struct Diagnostics {
     pub workspace_scoped_live_runs: u64,
 }
 
+/// One workspace's own diagnostics — its shape only, never another
+/// tenant's (the S1 review: cross-tenant totals stay ops-only).
+#[derive(Debug, Clone, Serialize)]
+pub struct WorkspaceDiagnostics {
+    /// Runs this workspace holds in the index, terminal included.
+    pub live_runs: u64,
+    /// …of which are non-terminal.
+    pub active_runs: u64,
+    /// Run counts by state kind, this workspace only.
+    pub states: std::collections::BTreeMap<&'static str, u64>,
+}
+
 /// The index as snapshots before D-021 carried it (JSON, inputs as number
 /// arrays). Read only, so journals compacted by older builds still open;
 /// every new snapshot is the binary `snapshot::encode` format.
@@ -990,6 +1002,26 @@ impl EngineCore {
                 .values()
                 .filter(|r| r.ws != 0 && !r.state.is_terminal())
                 .count() as u64,
+        }
+    }
+
+    /// One workspace's diagnostics — the tenant-facing subset, computed
+    /// over that workspace's runs only so nothing cross-tenant leaks.
+    pub fn diagnostics_for(&self, ws: u64) -> WorkspaceDiagnostics {
+        let mut states = std::collections::BTreeMap::new();
+        let mut live_runs = 0u64;
+        let mut active_runs = 0u64;
+        for r in self.runs.values().filter(|r| r.ws == ws) {
+            *states.entry(r.state.kind()).or_insert(0u64) += 1;
+            live_runs += 1;
+            if !r.state.is_terminal() {
+                active_runs += 1;
+            }
+        }
+        WorkspaceDiagnostics {
+            live_runs,
+            active_runs,
+            states,
         }
     }
 
