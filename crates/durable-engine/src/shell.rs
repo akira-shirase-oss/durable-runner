@@ -3027,34 +3027,110 @@ mod tests {
     /// caller now gets `Timeout` within the reply deadline; the stuck
     /// submit may still commit later (its outcome was unknown, not
     /// refused), and a retry with the same op_key finds it.
+    ///
+    /// The clock is frozen for the whole test and `advance` is the only
+    /// thing that moves it: a deadline's firing is asserted as an
+    /// ordering fact (the task ends while syncs are still held, before
+    /// `release_syncs`), never as a wall-clock race a loaded machine
+    /// can lose.
     #[tokio::test]
     async fn replies_have_a_deadline_while_the_journal_is_stuck() {
+        tokio::time::pause();
+        // A paused clock still auto-advances to the next pending timer
+        // whenever the runtime has no runnable work — left alone it would
+        // fast-forward straight into every armed reply deadline while a
+        // real fsync is still in flight. A parked blocking task inhibits
+        // auto-advance, so `advance` below is the only thing that moves
+        // time.
+        let (uninhibit, inhibit_rx) = std::sync::mpsc::channel::<()>();
+        let inhibit = tokio::task::spawn_blocking(move || {
+            let _ = inhibit_rx.recv();
+        });
+        const DEADLINE: Duration = Duration::from_millis(300);
+        // `j` must finish within `by` of paused time — i.e. its reply
+        // deadline fired. A deadline-less implementation leaves it
+        // running (red-first against a mutant that drops the deadline).
+        async fn deadline_fires<Out: Send + 'static>(
+            j: tokio::task::JoinHandle<Out>,
+            by: Duration,
+        ) -> Out {
+            for _ in 0..4 {
+                tokio::task::yield_now().await; // let it arm its deadline
+            }
+            tokio::time::advance(by).await;
+            for _ in 0..20 {
+                if j.is_finished() {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+            assert!(
+                j.is_finished(),
+                "the reply deadline did not fire — the caller is hung"
+            );
+            j.await.unwrap_or_else(|e| panic!("join: {e}"))
+        }
         let d = tempfile::tempdir().unwrap_or_else(|e| panic!("{e}"));
         let faults = Arc::new(Faults::default());
         let cfg = ShellConfig {
-            reply_timeout: Duration::from_millis(300),
+            reply_timeout: DEADLINE,
             ..piped(&faults, GroupCommit::default())
         };
         let eng = spawn(d.path(), echo_registry(), cfg).unwrap_or_else(|e| panic!("{e}"));
+        // Frozen + inhibited: this submit's deadline cannot fire — only
+        // the real journal answer resolves it, however slow the fsync.
         let early = eng
             .submit_at(OperationKey("early".into()), spec1("echo"), FAR)
             .await
             .unwrap_or_else(|e| panic!("{e}"));
         faults.hold_syncs();
-        let r = bounded(eng.submit_at(OperationKey("stuck".into()), spec1("echo"), FAR)).await;
+        // Every deadline error below is asserted while the commit is
+        // still stuck — `release_syncs` has not been called.
+        let r = deadline_fires(
+            tokio::spawn({
+                let e = eng.clone();
+                async move {
+                    e.submit_at(OperationKey("stuck".into()), spec1("echo"), FAR)
+                        .await
+                }
+            }),
+            DEADLINE + Duration::from_millis(1),
+        )
+        .await;
         assert!(matches!(r, Err(EngineError::Timeout)), "{r:?}");
-        let r = bounded(eng.inspect(early)).await;
+        let r = deadline_fires(
+            tokio::spawn({
+                let e = eng.clone();
+                async move { e.inspect(early).await }
+            }),
+            DEADLINE + Duration::from_millis(1),
+        )
+        .await;
         assert!(
             matches!(r, Err(EngineError::Timeout)),
             "a read waits on the stuck commit: {r:?}"
         );
-        let r = bounded(eng.list(0, None, 10)).await;
+        let r = deadline_fires(
+            tokio::spawn({
+                let e = eng.clone();
+                async move { e.list(0, None, 10).await }
+            }),
+            DEADLINE + Duration::from_millis(1),
+        )
+        .await;
         assert!(matches!(r, Err(EngineError::Timeout)), "{r:?}");
         faults.release_syncs();
-        let again = bounded(eng.submit_at(OperationKey("stuck".into()), spec1("echo"), FAR))
+        // Still frozen: the retried submit cannot time out — it resolves
+        // when the real fsync lands, and dedup proves the timed-out
+        // original committed exactly once.
+        let again = eng
+            .submit_at(OperationKey("stuck".into()), spec1("echo"), FAR)
             .await
             .unwrap_or_else(|e| panic!("{e}"));
         assert_eq!(again, RunId(2), "the timed-out submit committed once");
+        drop(uninhibit);
+        tokio::time::resume();
+        inhibit.await.unwrap_or_else(|e| panic!("join: {e}"));
     }
 
     /// Answers Lost once its gate opens; counts its probes (which find the

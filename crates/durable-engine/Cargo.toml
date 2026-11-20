@@ -18,6 +18,9 @@ tokio = { version = "1", features = ["macros", "rt", "sync", "time"] }
 durable-journal = { path = "../durable-journal", features = ["fault-injection"] }
 proptest = "1"
 tempfile = "3"
+# Paused/injected clock for deadline tests (test-util enables
+# tokio::time::pause/advance) — test builds only.
+tokio = { version = "1", features = ["test-util"] }
 
 [lints]
 workspace = true
