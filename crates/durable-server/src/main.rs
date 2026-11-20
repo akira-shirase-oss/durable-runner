@@ -16,15 +16,17 @@ use axum::{
     Json, Router,
 };
 use clap::Parser;
+use durable_accounts::{AccountStore, Permission, Pg};
 use durable_domain::{JobSpec, Millis, OperationKey, RunId, RunState, StepSpec};
 use durable_engine::shell::{
     spawn, Call, Engine, Order, Outcome, Registry, ShellConfig, StepHandler,
 };
 use durable_engine::EngineError;
 use serde::Deserialize;
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
-use std::time::Duration;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 #[derive(Parser)]
 #[command(
@@ -349,12 +351,166 @@ fn sha256(bytes: &[u8]) -> [u8; 32] {
     out
 }
 
+/// Who an authenticated caller is: the workspace their key belongs to and
+/// what it may do there. `ws` is internal only — it never serializes into
+/// a response (S2-2 exposes `public_id` on workspace-facing surfaces).
+#[derive(Clone, Copy, Debug)]
+struct Auth {
+    ws: u64,
+    permission: Permission,
+}
+
+/// The outcome of checking one bearer: a verified grant, a verified
+/// negative, or a store that could not answer. An unreachable store is
+/// never collapsed into "denied" — the caller must fail closed.
+enum Verified {
+    Granted(Auth),
+    Denied,
+    Unavailable,
+}
+
+/// How long a verified grant (or denial) may serve without the store.
+/// Store-verified keys keep working through a Neon outage within this
+/// window; revocation inside this process invalidates write-through, so
+/// the TTL only bounds edits made outside the server.
+const GRANT_TTL: Duration = Duration::from_secs(60);
+/// Verified negatives are cached much shorter so a key created during a
+/// brief denial window becomes usable quickly.
+const DENY_TTL: Duration = Duration::from_secs(5);
+/// Bound on cached verifications.
+const KEY_CACHE_CAP: usize = 10_000;
+
+#[derive(Clone, Copy)]
+struct CacheEntry {
+    at: Instant,
+    outcome: Cached,
+}
+
+#[derive(Clone, Copy)]
+enum Cached {
+    Granted(Auth),
+    Denied,
+}
+
+/// Resolves bearers to `Auth`. Env keys always grant workspace 0 — the
+/// ops path that predates S2. When an `AccountStore` is configured,
+/// other bearers are checked against it through a bounded cache: cached
+/// grants survive a store outage for `GRANT_TTL`, anything the cache
+/// cannot answer fails closed as `accounts_unavailable`.
+struct Keyring {
+    api_key: ApiKey,
+    read_key: Option<ApiKey>,
+    store: Option<Arc<dyn AccountStore>>,
+    cache: Mutex<HashMap<[u8; 32], CacheEntry>>,
+}
+
+impl Keyring {
+    fn new(
+        api_key: ApiKey,
+        read_key: Option<ApiKey>,
+        store: Option<Arc<dyn AccountStore>>,
+    ) -> Self {
+        Self {
+            api_key,
+            read_key,
+            store,
+            cache: Mutex::new(HashMap::new()),
+        }
+    }
+
+    async fn verify(&self, bearer: &str) -> Verified {
+        if self.api_key.verify(bearer) {
+            return Verified::Granted(Auth {
+                ws: 0,
+                permission: Permission::Admin,
+            });
+        }
+        if self.read_key.as_ref().is_some_and(|k| k.verify(bearer)) {
+            return Verified::Granted(Auth {
+                ws: 0,
+                permission: Permission::Read,
+            });
+        }
+        let hash = sha256(bearer.as_bytes());
+        if let Some(outcome) = self.cached(hash) {
+            return outcome;
+        }
+        let Some(store) = &self.store else {
+            return Verified::Denied;
+        };
+        let verified = match store.verify_key(&hash).await {
+            Ok(Some(grant)) => Verified::Granted(Auth {
+                ws: grant.workspace,
+                permission: grant.permission,
+            }),
+            Ok(None) => Verified::Denied,
+            Err(_) => Verified::Unavailable,
+        };
+        self.remember(hash, &verified);
+        verified
+    }
+
+    fn cached(&self, hash: [u8; 32]) -> Option<Verified> {
+        let cache = self.cache.lock().unwrap_or_else(|e| e.into_inner());
+        let entry = cache.get(&hash)?;
+        let ttl = match entry.outcome {
+            Cached::Granted(_) => GRANT_TTL,
+            Cached::Denied => DENY_TTL,
+        };
+        if entry.at.elapsed() >= ttl {
+            return None;
+        }
+        Some(match entry.outcome {
+            Cached::Granted(auth) => Verified::Granted(auth),
+            Cached::Denied => Verified::Denied,
+        })
+    }
+
+    fn remember(&self, hash: [u8; 32], verified: &Verified) {
+        let outcome = match verified {
+            Verified::Granted(auth) => Cached::Granted(*auth),
+            Verified::Denied => Cached::Denied,
+            Verified::Unavailable => return, // outages are never cached
+        };
+        let mut cache = self.cache.lock().unwrap_or_else(|e| e.into_inner());
+        if cache.len() >= KEY_CACHE_CAP {
+            let now = Instant::now();
+            cache.retain(|_, e| {
+                now.duration_since(e.at)
+                    < match e.outcome {
+                        Cached::Granted(_) => GRANT_TTL,
+                        Cached::Denied => DENY_TTL,
+                    }
+            });
+            if cache.len() >= KEY_CACHE_CAP {
+                cache.clear();
+            }
+        }
+        cache.insert(
+            hash,
+            CacheEntry {
+                at: Instant::now(),
+                outcome,
+            },
+        );
+    }
+
+    /// Write-through invalidation: key revocation performed through this
+    /// process takes effect immediately instead of waiting out the TTL.
+    /// Test-only until S2-2 lands the revoke route that calls it.
+    #[cfg(test)]
+    fn invalidate(&self, bearer_hash: [u8; 32]) {
+        self.cache
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&bearer_hash);
+    }
+}
+
 #[derive(Clone)]
 struct App {
     engine: Engine,
-    api_key: ApiKey,
-    /// A key that may only read; `None` if none is configured.
-    read_key: Option<ApiKey>,
+    keyring: Arc<Keyring>,
     /// Reads need no key (`--open-reads`, loopback listeners only).
     open_reads: bool,
     /// Canonical backup directory; `None` disables `/admin/backup`.
@@ -380,11 +536,21 @@ fn unauthorized() -> ApiError {
     )
 }
 
-/// Proof that the request carried the API key. Every mutating and admin
-/// handler takes this as its first extractor, so it runs before the body
-/// is parsed and the route cannot be reached without the key. The
-/// read-only key is recognised and refused 403: it is valid, but not here.
-struct Authorized;
+fn accounts_unavailable() -> ApiError {
+    ApiError::new(
+        StatusCode::SERVICE_UNAVAILABLE,
+        "accounts_unavailable",
+        "the account store cannot answer right now; retry shortly — \
+         cached keys keep working, unknown bearers fail closed",
+    )
+}
+
+/// Proof that the request carried an admin-capable key: which workspace
+/// it belongs to travels in `auth.ws`. Every mutating and admin handler
+/// takes this as its first extractor, so it runs before the body is
+/// parsed. A read-permission key is recognised and refused 403: it is
+/// valid, but not here.
+struct Authorized(Auth);
 
 impl FromRequestParts<App> for Authorized {
     type Rejection = ApiError;
@@ -393,23 +559,23 @@ impl FromRequestParts<App> for Authorized {
         let Some(key) = bearer(parts) else {
             return Err(unauthorized());
         };
-        if app.api_key.verify(key) {
-            return Ok(Authorized);
-        }
-        if app.read_key.as_ref().is_some_and(|k| k.verify(key)) {
-            return Err(ApiError::new(
+        match app.keyring.verify(key).await {
+            Verified::Granted(auth) if auth.permission == Permission::Admin => Ok(Authorized(auth)),
+            Verified::Granted(_) => Err(ApiError::new(
                 StatusCode::FORBIDDEN,
                 "forbidden",
                 "this key may only read (DURABLE_READ_KEY); this route needs DURABLE_API_KEY",
-            ));
+            )),
+            Verified::Denied => Err(unauthorized()),
+            Verified::Unavailable => Err(accounts_unavailable()),
         }
-        Err(unauthorized())
     }
 }
 
-/// Proof that the request may read: the API key or the read-only key, or
-/// the server runs with `--open-reads` (loopback only). Taken first by
-/// every handler that shows runs (D-037).
+/// Proof that the request may read: any verified key, or the server runs
+/// with `--open-reads` (loopback only, resolving to workspace 0). Taken
+/// first by every handler that shows runs (D-037). The workspace scope
+/// for reads lands with S2-2's scoped API.
 struct ReadAuthorized;
 
 impl FromRequestParts<App> for ReadAuthorized {
@@ -423,12 +589,11 @@ impl FromRequestParts<App> for ReadAuthorized {
             return Ok(ReadAuthorized);
         }
         match bearer(parts) {
-            Some(key)
-                if app.api_key.verify(key)
-                    || app.read_key.as_ref().is_some_and(|k| k.verify(key)) =>
-            {
-                Ok(ReadAuthorized)
-            }
+            Some(key) => match app.keyring.verify(key).await {
+                Verified::Granted(_) => Ok(ReadAuthorized),
+                Verified::Denied => Err(unauthorized()),
+                Verified::Unavailable => Err(accounts_unavailable()),
+            },
             _ => Err(unauthorized()),
         }
     }
@@ -668,7 +833,7 @@ impl ApiError {
 }
 
 async fn submit(
-    _: Authorized,
+    Authorized(auth): Authorized,
     State(app): State<App>,
     J(req): J<SubmitReq>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
@@ -681,8 +846,8 @@ async fn submit(
     };
     let key = OperationKey(req.op_key);
     let run = match req.not_before {
-        Some(at) => app.engine.submit_at(key, spec, at).await,
-        None => app.engine.submit(key, spec).await,
+        Some(at) => app.engine.submit_at_scoped(auth.ws, key, spec, at).await,
+        None => app.engine.submit_scoped(auth.ws, key, spec).await,
     }?;
     Ok(Json(serde_json::json!({ "run_id": run.0 })))
 }
@@ -1032,6 +1197,32 @@ fn read_key_from_env(api_key: &ApiKey) -> Result<Option<ApiKey>> {
     Ok(Some(ApiKey::new(key)))
 }
 
+/// `DATABASE_URL`, when set, turns on the S2 account graph: API keys are
+/// verified against it (through the keyring's cache) and workspaces other
+/// than 0 become reachable. The pool is lazy — the server starts even if
+/// Neon is momentarily down and store-dependent auth then fails closed as
+/// `accounts_unavailable`. Migrations run best-effort at startup: a
+/// failure is logged loudly and surfaces as `accounts_unavailable` on the
+/// affected paths rather than a silent fallthrough to deny-all.
+async fn account_store_from_env() -> Result<Option<Arc<dyn AccountStore>>> {
+    const DATABASE_URL_ENV: &str = "DATABASE_URL";
+    let Ok(url) = std::env::var(DATABASE_URL_ENV) else {
+        return Ok(None);
+    };
+    if url.trim().is_empty() {
+        anyhow::bail!("{DATABASE_URL_ENV} is set but empty");
+    }
+    let store = Pg::connect(url.trim()).map_err(|e| anyhow::anyhow!("{DATABASE_URL_ENV}: {e}"))?;
+    match store.migrate().await {
+        Ok(()) => eprintln!("durable-server: account store connected, migrations applied"),
+        Err(e) => eprintln!(
+            "durable-server: WARNING account store unreachable at startup ({e}); \
+             serving anyway — store-verified keys answer accounts_unavailable until it returns"
+        ),
+    }
+    Ok(Some(Arc::new(store)))
+}
+
 /// Whether the request's `Host` is a loopback name: `localhost`, or an IP
 /// literal in 127.0.0.0/8 or `::1`, with or without a port. A missing or
 /// unparsable Host is not.
@@ -1094,6 +1285,7 @@ async fn main() -> Result<()> {
     }
     let api_key = api_key_from_env()?;
     let read_key = read_key_from_env(&api_key)?;
+    let store = account_store_from_env().await?;
     check_open_reads(&args.listen, args.open_reads)?;
     let backup_root = args
         .backup_root
@@ -1143,8 +1335,7 @@ async fn main() -> Result<()> {
     let stopped = engine.clone();
     let app = App {
         engine,
-        api_key,
-        read_key,
+        keyring: Arc::new(Keyring::new(api_key, read_key, store)),
         open_reads: args.open_reads,
         backup_root,
     };
@@ -1598,6 +1789,7 @@ mod tests {
 
     struct Harness {
         router: Router,
+        keyring: Arc<Keyring>,
         backups: tempfile::TempDir,
         _journal: tempfile::TempDir,
     }
@@ -1610,6 +1802,15 @@ mod tests {
     fn harness_with(
         with_backup_root: bool,
         free: Option<Arc<std::sync::atomic::AtomicU64>>,
+    ) -> Harness {
+        harness_store(with_backup_root, free, None)
+    }
+
+    /// `store`: an account store backing the keyring (S2-1 fixtures).
+    fn harness_store(
+        with_backup_root: bool,
+        free: Option<Arc<std::sync::atomic::AtomicU64>>,
+        store: Option<Arc<dyn AccountStore>>,
     ) -> Harness {
         let journal = tempfile::tempdir().unwrap_or_else(|e| panic!("{e}"));
         let backups = tempfile::tempdir().unwrap_or_else(|e| panic!("{e}"));
@@ -1631,15 +1832,20 @@ mod tests {
         let backup_root = with_backup_root.then(|| {
             prepare_backup_root(&backups.path().join("root")).unwrap_or_else(|e| panic!("{e}"))
         });
+        let keyring = Arc::new(Keyring::new(
+            ApiKey::new(KEY),
+            Some(ApiKey::new(READ_KEY)),
+            store,
+        ));
         let app = App {
             engine,
-            api_key: ApiKey::new(KEY),
-            read_key: Some(ApiKey::new(READ_KEY)),
+            keyring: keyring.clone(),
             open_reads: false,
             backup_root,
         };
         Harness {
             router: router(app, None),
+            keyring,
             backups,
             _journal: journal,
         }
@@ -1811,6 +2017,170 @@ mod tests {
         assert_eq!(status, StatusCode::NOT_FOUND);
     }
 
+    /// S2-1: a store-verified key submits into its own workspace, and
+    /// dedup is keyed on (workspace, op_key) — the same op_key under two
+    /// workspaces lands two independent runs, while a repeat inside one
+    /// workspace still dedups.
+    #[tokio::test]
+    async fn a_store_key_submits_into_its_workspace() {
+        use durable_accounts::Memory;
+        let store = Arc::new(Memory::new());
+        let ws = store
+            .create_workspace("alpha")
+            .await
+            .unwrap_or_else(|e| panic!("workspace: {e}"));
+        let token = "ws-alpha-key-0123456789abcdef";
+        store
+            .create_key(
+                ws.id,
+                "main",
+                Permission::Admin,
+                &sha256(token.as_bytes()),
+                "dr_al",
+            )
+            .await
+            .unwrap_or_else(|e| panic!("key: {e}"));
+        let h = harness_store(true, None, Some(store));
+
+        let (status, v) = call(
+            &h.router,
+            "POST",
+            "/jobs",
+            Some(token),
+            Some(submit_body("same-key")),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{v}");
+        let run_a = v["run_id"].as_u64().unwrap_or_else(|| panic!("{v}"));
+
+        let (status, v) = call(
+            &h.router,
+            "POST",
+            "/jobs",
+            Some(KEY),
+            Some(submit_body("same-key")),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{v}");
+        let run_b = v["run_id"].as_u64().unwrap_or_else(|| panic!("{v}"));
+        assert_ne!(
+            run_a, run_b,
+            "the same op_key in different workspaces must not dedup across"
+        );
+
+        let (status, v) = call(
+            &h.router,
+            "POST",
+            "/jobs",
+            Some(token),
+            Some(submit_body("same-key")),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{v}");
+        assert_eq!(
+            v["run_id"].as_u64(),
+            Some(run_a),
+            "the same key inside one workspace still dedups"
+        );
+    }
+
+    /// S2-1 failure case: a down account store fails closed on uncached
+    /// bearers (503 `accounts_unavailable`), while env ops keys and an
+    /// already-cached grant keep working inside the grant TTL.
+    #[tokio::test]
+    async fn a_down_account_store_fails_closed_but_keeps_cached_keys() {
+        use durable_accounts::Memory;
+        let store = Arc::new(Memory::new());
+        let ws = store
+            .create_workspace("beta")
+            .await
+            .unwrap_or_else(|e| panic!("workspace: {e}"));
+        let token = "ws-beta-key-0123456789abcdef";
+        store
+            .create_key(
+                ws.id,
+                "main",
+                Permission::Admin,
+                &sha256(token.as_bytes()),
+                "dr_be",
+            )
+            .await
+            .unwrap_or_else(|e| panic!("key: {e}"));
+        let h = harness_store(true, None, Some(store.clone()));
+
+        // First verified read caches the grant.
+        let (status, _) = call(&h.router, "GET", "/jobs", Some(token), None).await;
+        assert_eq!(status, StatusCode::OK);
+
+        store.set_unavailable(true);
+
+        let (status, _) = call(&h.router, "GET", "/jobs", Some(token), None).await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "a verified key inside its TTL survives the outage"
+        );
+
+        let (status, v) = call(
+            &h.router,
+            "POST",
+            "/jobs",
+            Some("stranger-key-0123456789abcdef"),
+            Some(submit_body("x")),
+        )
+        .await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{v}");
+        assert_eq!(v["code"], "accounts_unavailable");
+
+        // Env ops keys verify locally and never touch the store.
+        let (status, _) = call(
+            &h.router,
+            "POST",
+            "/jobs",
+            Some(KEY),
+            Some(submit_body("y")),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+    }
+
+    /// S2-1: revocation performed through this process invalidates the
+    /// cached grant write-through — the key denies immediately rather
+    /// than riding out its TTL.
+    #[tokio::test]
+    async fn a_revoked_key_denies_without_waiting_out_the_cache() {
+        use durable_accounts::Memory;
+        let store = Arc::new(Memory::new());
+        let ws = store
+            .create_workspace("gamma")
+            .await
+            .unwrap_or_else(|e| panic!("workspace: {e}"));
+        let token = "ws-gamma-key-0123456789abcdef";
+        let info = store
+            .create_key(
+                ws.id,
+                "main",
+                Permission::Admin,
+                &sha256(token.as_bytes()),
+                "dr_ga",
+            )
+            .await
+            .unwrap_or_else(|e| panic!("key: {e}"));
+        let h = harness_store(true, None, Some(store.clone()));
+
+        let (status, _) = call(&h.router, "GET", "/jobs", Some(token), None).await;
+        assert_eq!(status, StatusCode::OK);
+
+        store
+            .revoke_key(ws.id, info.id)
+            .await
+            .unwrap_or_else(|e| panic!("revoke: {e}"));
+        h.keyring.invalidate(sha256(token.as_bytes()));
+
+        let (status, _) = call(&h.router, "GET", "/jobs", Some(token), None).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+    }
+
     /// `--open-reads` serves reads without a key; it is refused at startup
     /// unless the listen address is a loopback IP.
     #[tokio::test]
@@ -1835,8 +2205,7 @@ mod tests {
         let r = router(
             App {
                 engine,
-                api_key: ApiKey::new(KEY),
-                read_key: None,
+                keyring: Arc::new(Keyring::new(ApiKey::new(KEY), None, None)),
                 open_reads: true,
                 backup_root: None,
             },
@@ -2515,8 +2884,7 @@ mod tests {
         let r = router(
             App {
                 engine,
-                api_key: ApiKey::new(KEY),
-                read_key: None,
+                keyring: Arc::new(Keyring::new(ApiKey::new(KEY), None, None)),
                 open_reads: false,
                 backup_root: None,
             },
@@ -3199,8 +3567,7 @@ mod tests {
         let r = router(
             App {
                 engine,
-                api_key: ApiKey::new(KEY),
-                read_key: None,
+                keyring: Arc::new(Keyring::new(ApiKey::new(KEY), None, None)),
                 open_reads: false,
                 backup_root: None,
             },
@@ -3233,8 +3600,7 @@ mod tests {
         let r = router(
             App {
                 engine,
-                api_key: ApiKey::new(KEY),
-                read_key: None,
+                keyring: Arc::new(Keyring::new(ApiKey::new(KEY), None, None)),
                 open_reads: false,
                 backup_root: None,
             },

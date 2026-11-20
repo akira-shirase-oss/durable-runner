@@ -107,6 +107,7 @@ pub fn idem_key(key: &OperationKey, step: StepIndex) -> String {
 
 enum Cmd {
     Submit {
+        ws: u64,
         key: OperationKey,
         spec: JobSpec,
         not_before: Option<Millis>,
@@ -243,7 +244,7 @@ impl Engine {
     }
 
     pub async fn submit(&self, key: OperationKey, spec: JobSpec) -> Result<RunId, EngineError> {
-        self.submit_inner(key, spec, None).await
+        self.submit_scoped(0, key, spec).await
     }
 
     /// Submit with a delayed start: the run queues until `not_before`.
@@ -253,17 +254,41 @@ impl Engine {
         spec: JobSpec,
         not_before: Millis,
     ) -> Result<RunId, EngineError> {
-        self.submit_inner(key, spec, Some(not_before)).await
+        self.submit_at_scoped(0, key, spec, not_before).await
+    }
+
+    /// Submit into a workspace: dedup is scoped to `(ws, key)`, so the
+    /// same key can run independently in different workspaces.
+    pub async fn submit_scoped(
+        &self,
+        ws: u64,
+        key: OperationKey,
+        spec: JobSpec,
+    ) -> Result<RunId, EngineError> {
+        self.submit_inner(ws, key, spec, None).await
+    }
+
+    /// `submit_at` scoped to a workspace.
+    pub async fn submit_at_scoped(
+        &self,
+        ws: u64,
+        key: OperationKey,
+        spec: JobSpec,
+        not_before: Millis,
+    ) -> Result<RunId, EngineError> {
+        self.submit_inner(ws, key, spec, Some(not_before)).await
     }
 
     async fn submit_inner(
         &self,
+        ws: u64,
         key: OperationKey,
         spec: JobSpec,
         not_before: Option<Millis>,
     ) -> Result<RunId, EngineError> {
         let (reply, rx) = oneshot::channel();
         self.send(Cmd::Submit {
+            ws,
             key,
             spec,
             not_before,
@@ -1041,7 +1066,7 @@ async fn actor(
             backlog_records < cfg.max_outbox_records && backlog_bytes < cfg.max_outbox_bytes;
         tokio::select! {
             cmd = rx.recv(), if accepting => match cmd {
-                Some(Cmd::Submit { key, spec, not_before, reply }) => {
+                Some(Cmd::Submit { ws, key, spec, not_before, reply }) => {
                     let now = wall_ms();
                     // Admission is where the allowlist bites: a step naming a
                     // handler outside the registry is a spec error, refused
@@ -1053,7 +1078,7 @@ async fn actor(
                         .map(|s| s.handler.clone());
                     let r = match missing {
                         Some(name) => Err(EngineError::UnregisteredHandler(name)),
-                        None => core.submit_at(0, key, spec, not_before.unwrap_or(now), now),
+                        None => core.submit_at(ws, key, spec, not_before.unwrap_or(now), now),
                     };
                     if let Err(e) = &r {
                         mon.returned(e);

@@ -13,6 +13,7 @@ axum = "0.8"
 # (hyper-util, through reqwest, still turns base64's defaults on; D-048).
 base64 = { version = "0.23", default-features = false, features = ["std"] }
 clap = { version = "4", features = ["derive"] }
+durable-accounts = { path = "../durable-accounts" }
 durable-domain = { path = "../durable-domain" }
 durable-engine = { path = "../durable-engine" }
 durable-journal = { path = "../durable-journal" }

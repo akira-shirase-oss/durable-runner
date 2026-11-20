@@ -101,6 +101,17 @@ target/release/durable-server \
   `DURABLE_API_KEY` (reads fall back to `DURABLE_READ_KEY`); the
   inspector asks for a key and sends it on every call. The pilot
   generates a fresh random key per run and exports it.
+- **Account store (S2).** `DATABASE_URL` pointing at Postgres (Neon in
+  production, `sslmode=verify-full` required there) enables the account
+  graph: store-issued API keys verify through a 60 s positive / 5 s
+  negative cache (bounded at 10k entries), and a submit under such a key
+  lands in the key's workspace — dedup keys on `(workspace, op_key)`.
+  Unset, the server runs exactly as before: the env keys are the only
+  keys and everything is workspace 0. The pool is lazy and migrations
+  run best-effort at startup, so a Neon outage never stops startup:
+  cached keys keep authenticating inside the TTL, uncached bearers fail
+  closed as `503 accounts_unavailable`, and already-accepted runs keep
+  executing — the store is never on the commit or dispatch path.
 - **Backup root.** `--backup-root DIR` is the only place backups are
   written; without it `/admin/backup` answers `403 backups_disabled`.
 
