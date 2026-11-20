@@ -136,6 +136,10 @@ pub trait AccountStore: Send + Sync {
 
     async fn create_workspace(&self, name: &str) -> Result<Workspace, AccountError>;
 
+    /// Workspaces, bounded to `limit` — the caller pages if the graph
+    /// ever grows beyond an ops dashboard's view.
+    async fn list_workspaces(&self, limit: u32) -> Result<Vec<Workspace>, AccountError>;
+
     /// Record a newly issued key. `key_hash` is sha256 of the secret the
     /// caller shows once; the store never sees the plaintext.
     async fn create_key(
@@ -147,8 +151,14 @@ pub trait AccountStore: Send + Sync {
         prefix: &str,
     ) -> Result<ApiKeyInfo, AccountError>;
 
-    /// Revoke a key. Returns whether a live key was actually revoked.
-    async fn revoke_key(&self, workspace: u64, key_id: u64) -> Result<bool, AccountError>;
+    /// Revoke a key. Returns its hash so the caller can invalidate a
+    /// cached verification write-through, or `None` if no live key by
+    /// that id existed in the workspace.
+    async fn revoke_key(
+        &self,
+        workspace: u64,
+        key_id: u64,
+    ) -> Result<Option<[u8; 32]>, AccountError>;
 
     async fn list_keys(&self, workspace: u64) -> Result<Vec<ApiKeyInfo>, AccountError>;
 

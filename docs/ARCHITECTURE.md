@@ -64,17 +64,35 @@ delete every superseded `gen-*` directory (retention). Runs on `POST
 | `GET /jobs?after=&limit=` | read key or API key (open only with `--open-reads` on loopback) | one page of runs, ids ascending (limit 100 default, 1000 max); `next_after` continues |
 | `GET /jobs?order=desc&before=&limit=` | read key or API key (same) | newest first; `next_before` continues (the inspector's view) |
 | `GET /jobs/{id}` | read key or API key (same) | inspect a run |
-| `POST /jobs` | API key | submit (dedup by `op_key`) |
+| `POST /jobs` | API key | submit (dedup by `(workspace, op_key)`) |
 | `GET /jobs/{id}/spec` | API key only | the steps and input a run was submitted with, as a submit body's `spec` (D-051) |
 | `POST /jobs/{id}/cancel` | API key | cancel (stops scheduling, never undoes) |
 | `POST /admin/compact` | API key | compact into a new generation |
 | `POST /admin/backup {name}` | API key | backup to `<backup-root>/<name>` only |
-| `GET /admin/diagnostics` | API key | bounded counts |
+| `GET /admin/diagnostics` | API key | bounded counts (incl. `workspaces_active`, a count only) |
+| `GET /whoami` | any key | the caller's workspace `public_id` + permission |
+| `GET /admin/workspaces` | ops key (workspace-0 admin) | bounded workspace list (S2) |
+| `POST /admin/workspaces {name}` | ops key | create a workspace; returns its `public_id` (UUIDv7) |
+| `GET /admin/workspaces/{public_id}` | ops key | one workspace by public id |
+| `GET /admin/workspaces/{public_id}/keys` | ops key | that workspace's keys (digest metadata only) |
+| `POST /admin/workspaces/{public_id}/keys {name, permission}` | ops key | mint a key; the `key` plaintext is returned only here |
+| `DELETE /admin/workspaces/{public_id}/keys/{key_id}` | ops key | revoke; cached grants are invalidated at once |
 | `/inspector/` | static files open; the UI sends its key on every call | SvelteKit UI |
 
 The key is `DURABLE_API_KEY`; the optional `DURABLE_READ_KEY` may only read
 (403 on every other route, D-037). Both are compared as SHA-256 digests in
 constant time.
+
+**Workspaces (S2).** With `DATABASE_URL` set, keys minted through
+`POST /admin/workspaces/{public_id}/keys` authenticate into their
+workspace: every `/jobs` route sees only that workspace's runs, and a
+run id from another workspace answers `404` — identical to a missing
+run, so a foreign id leaks nothing ("no oracle"). The ops routes are
+reachable only with a workspace-0 admin key (`DURABLE_API_KEY` counts);
+without `DATABASE_URL` they answer `404` with the reason in the error
+message. Workspace management routes take the workspace's `public_id`
+(a UUIDv7): the internal sequential id never appears in a route,
+response body or header, and a regression test scans for it.
 Request bodies are capped at 256 KiB; operation keys at 256 bytes and step
 and handler names at 128 (non-empty, no control characters in keys); a
 handler reply is read only up to the 256 KiB output limit.

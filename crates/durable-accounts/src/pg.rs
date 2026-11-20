@@ -158,6 +158,19 @@ impl AccountStore for Pg {
         })
     }
 
+    async fn list_workspaces(&self, limit: u32) -> Result<Vec<Workspace>, AccountError> {
+        let rows = bounded(
+            sqlx::query(
+                "SELECT id, public_id, name, handler_secret FROM workspaces \
+                 ORDER BY id LIMIT $1",
+            )
+            .bind(i64::from(limit))
+            .fetch_all(&self.pool),
+        )
+        .await?;
+        rows.iter().map(workspace_from).collect()
+    }
+
     async fn create_key(
         &self,
         workspace: u64,
@@ -189,18 +202,33 @@ impl AccountStore for Pg {
         })
     }
 
-    async fn revoke_key(&self, workspace: u64, key_id: u64) -> Result<bool, AccountError> {
-        let done = bounded(
+    async fn revoke_key(
+        &self,
+        workspace: u64,
+        key_id: u64,
+    ) -> Result<Option<[u8; 32]>, AccountError> {
+        let row = bounded(
             sqlx::query(
                 "UPDATE api_keys SET revoked_at = now() \
-                 WHERE id = $1 AND workspace_id = $2 AND revoked_at IS NULL",
+                 WHERE id = $1 AND workspace_id = $2 AND revoked_at IS NULL \
+                 RETURNING key_hash",
             )
             .bind(to_i64(key_id, "api key")?)
             .bind(to_i64(workspace, "workspace")?)
-            .execute(&self.pool),
+            .fetch_optional(&self.pool),
         )
         .await?;
-        Ok(done.rows_affected() > 0)
+        let Some(row) = row else {
+            return Ok(None);
+        };
+        let hash: Vec<u8> = row.try_get("key_hash")?;
+        let hash: [u8; 32] = hash.as_slice().try_into().map_err(|_| {
+            AccountError::Store(format!(
+                "api_keys.key_hash for id {key_id} is {} bytes, expected 32",
+                hash.len()
+            ))
+        })?;
+        Ok(Some(hash))
     }
 
     async fn list_keys(&self, workspace: u64) -> Result<Vec<ApiKeyInfo>, AccountError> {
@@ -346,7 +374,8 @@ mod tests {
         assert!(store
             .revoke_key(ws.id, info.id)
             .await
-            .unwrap_or_else(|e| panic!("revoke: {e}")));
+            .unwrap_or_else(|e| panic!("revoke: {e}"))
+            .is_some());
         assert_eq!(
             store
                 .verify_key(&hash(11))

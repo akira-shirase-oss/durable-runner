@@ -144,6 +144,9 @@ pub struct Diagnostics {
     pub active_runs: u64,
     pub index_bytes: u64,
     pub dedup_keys: u64,
+    /// Distinct workspaces with live runs — a count only, so diagnostics
+    /// never carries an internal workspace id.
+    pub workspaces_active: u64,
     pub states: std::collections::BTreeMap<&'static str, u64>,
     /// Whether the journal filesystem has its reserve free.
     pub space_ok: bool,
@@ -931,6 +934,12 @@ impl EngineCore {
             active_runs: self.live as u64,
             index_bytes: self.index_bytes,
             dedup_keys: self.by_op.len() as u64,
+            workspaces_active: self
+                .runs
+                .values()
+                .map(|r| r.ws)
+                .collect::<std::collections::BTreeSet<_>>()
+                .len() as u64,
             states,
             space_ok: self.space_ok(),
             errors: std::collections::BTreeMap::new(),
@@ -954,19 +963,27 @@ impl EngineCore {
         self.runs.values().map(|r| &**r)
     }
 
-    /// One page of the live index: up to `limit` runs with id > `after`,
-    /// in id order, plus the cursor for the next page (if any).
-    pub fn page(&self, after: Option<RunId>, limit: usize) -> (Vec<RunSummary>, Option<RunId>) {
+    /// One page of the live index for one workspace: up to `limit` runs
+    /// with id > `after`, in id order, plus the cursor for the next page
+    /// (if any). Runs of other workspaces are skipped inside the scan, so
+    /// a page's cursor never reveals another workspace's ids.
+    pub fn page(
+        &self,
+        ws: u64,
+        after: Option<RunId>,
+        limit: usize,
+    ) -> (Vec<RunSummary>, Option<RunId>) {
         let start = after.map_or(Bound::Unbounded, Bound::Excluded);
         let mut it = self.runs.range((start, Bound::Unbounded));
         let page: Vec<RunSummary> = it
             .by_ref()
+            .filter(|(_, r)| r.ws == ws)
             .take(limit)
             .map(|(_, r)| RunSummary::of(r))
             .collect();
-        let next = match (page.last(), it.next()) {
-            (Some(last), Some(_)) => Some(last.id),
-            _ => None,
+        let next = match page.last() {
+            Some(last) => it.find(|(_, r)| r.ws == ws).map(|_| last.id),
+            None => None,
         };
         (page, next)
     }
@@ -983,10 +1000,12 @@ impl EngineCore {
             .collect()
     }
 
-    /// One page newest first: up to `limit` runs with id < `before` (all
-    /// when `None`), ids descending, plus the cursor for the next page.
+    /// One page newest first for one workspace: up to `limit` runs with
+    /// id < `before` (all when `None`), ids descending, plus the cursor
+    /// for the next page. See `page` for the scan note.
     pub fn page_newest(
         &self,
+        ws: u64,
         before: Option<RunId>,
         limit: usize,
     ) -> (Vec<RunSummary>, Option<RunId>) {
@@ -994,12 +1013,13 @@ impl EngineCore {
         let mut it = self.runs.range((Bound::Unbounded, end)).rev();
         let page: Vec<RunSummary> = it
             .by_ref()
+            .filter(|(_, r)| r.ws == ws)
             .take(limit)
             .map(|(_, r)| RunSummary::of(r))
             .collect();
-        let next = match (page.last(), it.next()) {
-            (Some(last), Some(_)) => Some(last.id),
-            _ => None,
+        let next = match page.last() {
+            Some(last) => it.find(|(_, r)| r.ws == ws).map(|_| last.id),
+            None => None,
         };
         (page, next)
     }
@@ -1261,6 +1281,31 @@ mod tests {
         drop(e);
         let e = EngineCore::open(d.path()).unwrap_or_else(|e| panic!("{e}"));
         assert_eq!(e.run(run).unwrap_or_else(|| panic!("run")).ws, 0);
+    }
+
+    /// S2-2's isolation survives restart: scoped paging sees only its own
+    /// workspace's runs after a reopen — ws is journaled, not held.
+    #[test]
+    fn scoped_pages_stay_scoped_across_reopen() {
+        let (d, mut e) = open();
+        let a = e
+            .submit_at(1, OperationKey("shared".into()), spec(), 0, 0)
+            .unwrap_or_else(|e| panic!("{e}"));
+        let b = e
+            .submit_at(7, OperationKey("shared".into()), spec(), 0, 0)
+            .unwrap_or_else(|e| panic!("{e}"));
+        drop(e);
+        let e = EngineCore::open(d.path()).unwrap_or_else(|e| panic!("{e}"));
+        let (one, _) = e.page(1, None, 100);
+        assert_eq!(
+            one.iter().map(|s| s.id).collect::<Vec<_>>(),
+            vec![a],
+            "ws 1's page must not list ws 7's run"
+        );
+        let (seven, _) = e.page(7, None, 100);
+        assert_eq!(seven.iter().map(|s| s.id).collect::<Vec<_>>(), vec![b]);
+        let (none, _) = e.page(9, None, 100);
+        assert!(none.is_empty());
     }
 
     /// The released v1.0.0 binary reads up to v2 only: a v3 record must

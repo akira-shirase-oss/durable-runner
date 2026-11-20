@@ -4,6 +4,61 @@ All notable changes to Durable Runner are recorded here. The format
 follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the
 versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+S2-1 + S2-2: the account graph and the workspace-scoped API. With
+`DATABASE_URL` set, API keys minted per workspace authenticate into that
+workspace and nothing else; without it the server behaves exactly as
+v1.0.1 (every key lands in workspace 0). The journal remains the sole
+authority for jobs — the account store is consulted at ingress only,
+never inside the commit path, and already-accepted runs keep executing
+through a store outage.
+
+### Added
+
+- **`durable-accounts`**: the `AccountStore` trait over Postgres (sqlx,
+  `sslmode=verify-full`-capable) and an in-memory implementation for
+  tests. Schema `0001_init.sql`: workspaces (internal `u64` + external
+  `public_id` UUIDv7), accounts, members, api_keys (SHA-256 digests,
+  never plaintext), handler_registrations; the default workspace 0 is
+  seeded by migration.
+- **Keyring authentication**: bearer digests verify against the store
+  with a bounded write-through cache (60 s positive / 5 s negative TTL,
+  10k entries). Store-backed revocation invalidates the cache instantly;
+  an unreachable store answers `503 accounts_unavailable` for uncached
+  keys while cached grants keep working. `DURABLE_API_KEY` /
+  `DURABLE_READ_KEY` are unchanged and always land in workspace 0.
+- **Workspace-scoped API**: every `/jobs` route resolves the workspace
+  from the authenticated key — list, inspect, spec and cancel see only
+  that workspace's runs. A run id from another workspace answers `404`,
+  identical to a missing run (no existence oracle). Idempotency dedups
+  per `(workspace, op_key)` — the same key under two workspaces is two
+  runs.
+- **Workspace management routes** (`/admin/workspaces…`, workspace-0
+  admin only): create/list/get workspaces by `public_id` (UUIDv7); mint,
+  list and revoke API keys — minted `dr_…` plaintext is returned exactly
+  once, at creation. `GET /whoami` reports the caller's `public_id` and
+  permission.
+- **`Diagnostics.workspaces_active`**: distinct workspaces holding live
+  runs, as a count only — diagnostics never carries a workspace id.
+- **Neon CI workflow** (`.github/workflows/neon.yml`): the Postgres
+  store's contract tests run against real Neon behind a secret; absent,
+  the job skips with a visible notice rather than silently passing.
+
+### Security
+
+- Internal sequential workspace ids never appear in routes, response
+  bodies, tokens or headers — workspaces cannot be enumerated or
+  counted. A regression test scans every affected response for the u64.
+
+### Load evidence
+
+- `cargo test --workspace`: 198 tests green including the isolation
+  matrix (cross-workspace inspect/spec/cancel/list → 404), the key
+  lifecycle over HTTP (mint → submit → revoke → immediate 401), the
+  no-u64 leak scan, ops-scope refusal, outage semantics and
+  restart-preserved workspace tags.
+
 ## [1.0.1] - 2026-11-20
 
 S2-0: the v3 journal-record reader, shipped one release before any writer

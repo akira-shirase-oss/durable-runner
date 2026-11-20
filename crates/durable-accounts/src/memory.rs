@@ -123,6 +123,15 @@ impl AccountStore for Memory {
         Ok(workspace)
     }
 
+    async fn list_workspaces(&self, limit: u32) -> Result<Vec<Workspace>, AccountError> {
+        self.check_up()?;
+        let inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        let mut out: Vec<Workspace> = inner.workspaces.values().cloned().collect();
+        out.sort_by_key(|ws| ws.id);
+        out.truncate(limit as usize);
+        Ok(out)
+    }
+
     async fn create_key(
         &self,
         workspace: u64,
@@ -159,17 +168,21 @@ impl AccountStore for Memory {
         })
     }
 
-    async fn revoke_key(&self, workspace: u64, key_id: u64) -> Result<bool, AccountError> {
+    async fn revoke_key(
+        &self,
+        workspace: u64,
+        key_id: u64,
+    ) -> Result<Option<[u8; 32]>, AccountError> {
         self.check_up()?;
         let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         let Some(row) = inner.keys.get_mut(&key_id) else {
-            return Ok(false);
+            return Ok(None);
         };
         if row.workspace != workspace || row.revoked {
-            return Ok(false);
+            return Ok(None);
         }
         row.revoked = true;
-        Ok(true)
+        Ok(Some(row.hash))
     }
 
     async fn list_keys(&self, workspace: u64) -> Result<Vec<ApiKeyInfo>, AccountError> {
@@ -269,7 +282,8 @@ mod tests {
         assert!(store
             .revoke_key(ws.id, info.id)
             .await
-            .unwrap_or_else(|e| panic!("revoke: {e}")));
+            .unwrap_or_else(|e| panic!("revoke: {e}"))
+            .is_some());
         assert_eq!(
             store
                 .verify_key(&hash(7))

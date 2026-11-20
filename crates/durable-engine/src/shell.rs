@@ -135,6 +135,7 @@ enum Read {
         reply: oneshot::Sender<Option<Run>>,
     },
     List {
+        ws: u64,
         order: Order,
         limit: usize,
         reply: oneshot::Sender<RunPage>,
@@ -318,16 +319,27 @@ impl Engine {
         answer(rx, self.admin_timeout).await?
     }
 
-    /// One page of the live index in id order: at most
-    /// `min(limit, MAX_PAGE)` runs with id > `after`.
-    pub async fn list(&self, after: Option<RunId>, limit: usize) -> Result<RunPage, EngineError> {
-        self.list_in(Order::Oldest { after }, limit).await
+    /// One page of `ws`'s runs oldest-first (scoped: the caller's
+    /// workspace, never the global index).
+    pub async fn list(
+        &self,
+        ws: u64,
+        after: Option<RunId>,
+        limit: usize,
+    ) -> Result<RunPage, EngineError> {
+        self.list_in(ws, Order::Oldest { after }, limit).await
     }
 
     /// One page in either order, at most `min(limit, MAX_PAGE)` runs.
-    pub async fn list_in(&self, order: Order, limit: usize) -> Result<RunPage, EngineError> {
+    pub async fn list_in(
+        &self,
+        ws: u64,
+        order: Order,
+        limit: usize,
+    ) -> Result<RunPage, EngineError> {
         let (reply, rx) = oneshot::channel();
         self.send_read(Read::List {
+            ws,
             order,
             limit: limit.clamp(1, MAX_PAGE),
             reply,
@@ -1120,10 +1132,10 @@ async fn actor(
                 Some(Read::Inspect { run, reply }) => {
                     pipe.answer_read(core.last_index(), reply, core.run(run).cloned());
                 }
-                Some(Read::List { order, limit, reply }) => {
+                Some(Read::List { ws, order, limit, reply }) => {
                     let (runs, next) = match order {
-                        Order::Oldest { after } => core.page(after, limit),
-                        Order::Newest { before } => core.page_newest(before, limit),
+                        Order::Oldest { after } => core.page(ws, after, limit),
+                        Order::Newest { before } => core.page_newest(ws, before, limit),
                     };
                     pipe.answer_read(core.last_index(), reply, RunPage { runs, next });
                 }
@@ -1646,7 +1658,7 @@ mod tests {
     }
 
     async fn running_count(eng: &Engine) -> usize {
-        eng.list(None, MAX_PAGE)
+        eng.list(0, None, MAX_PAGE)
             .await
             .unwrap_or_default()
             .runs
@@ -1911,7 +1923,7 @@ mod tests {
             .unwrap_or_else(|| panic!("unregistered handler must be refused"));
         assert!(matches!(err, EngineError::UnregisteredHandler(_)));
         assert!(eng
-            .list(None, MAX_PAGE)
+            .list(0, None, MAX_PAGE)
             .await
             .unwrap_or_default()
             .runs
@@ -2377,7 +2389,7 @@ mod tests {
             matches!(r, Err(EngineError::Timeout)),
             "a read waits on the stuck commit: {r:?}"
         );
-        let r = bounded(eng.list(None, 10)).await;
+        let r = bounded(eng.list(0, None, 10)).await;
         assert!(matches!(r, Err(EngineError::Timeout)), "{r:?}");
         faults.release_syncs();
         let again = bounded(eng.submit_at(OperationKey("stuck".into()), spec1("echo"), FAR))
@@ -3032,7 +3044,7 @@ mod tests {
         let reads: Vec<_> = (0..200)
             .map(|_| {
                 let e = eng.clone();
-                tokio::spawn(async move { e.list(None, MAX_PAGE).await.map(|p| p.runs.len()) })
+                tokio::spawn(async move { e.list(0, None, MAX_PAGE).await.map(|p| p.runs.len()) })
             })
             .collect();
         let e = eng.clone();

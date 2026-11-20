@@ -5,12 +5,15 @@ HTTP handler registry behind an SSRF guard, signed handler calls. S1 (droplet)
 is blocked on the maintainer; S3 (dashboard, signup/login) consumes this API
 and is **not** built here.
 
-**Status (2026-11-19): approved by the coordinator** with three decisions
+**Status (2026-11-20): approved by the coordinator** with three decisions
 folded in below — store-trait testing, opaque external workspace ids, and
-S2-0 tagging its own v1.0.1 release. Implementation is **held** behind the
-maintainer's project ordering (Colophon ships first, then jsrt and Durable
-Runner); S2-0 builds when the hold is released. Backend only: no design or
-UI work for Durable Runner until the maintainer designs it.
+S2-0 tagging its own v1.0.1 release. The hold lifted 2026-11-19
+(maintainer: complete every in-development project). Landed on
+`devin/dr-s2`: **S2-0** (`e528686` + `e6951b5`, tagged v1.0.1 by the
+coordinator), **S2-1** (account store, keyring + cache, scoped submit,
+visible-skip Neon job), **S2-2** (scoped `/jobs`, workspace management
+routes by `public_id`, key lifecycle, no-u64-leak test). Backend only: no
+design or UI work for Durable Runner until the maintainer designs it.
 
 Exit gate (unchanged): **workspace A can never see, cancel or run handlers for
 workspace B; SSRF tests refuse private targets.** Plus the standing rule: every

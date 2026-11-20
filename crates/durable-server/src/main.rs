@@ -497,8 +497,6 @@ impl Keyring {
 
     /// Write-through invalidation: key revocation performed through this
     /// process takes effect immediately instead of waiting out the TTL.
-    /// Test-only until S2-2 lands the revoke route that calls it.
-    #[cfg(test)]
     fn invalidate(&self, bearer_hash: [u8; 32]) {
         self.cache
             .lock()
@@ -574,9 +572,9 @@ impl FromRequestParts<App> for Authorized {
 
 /// Proof that the request may read: any verified key, or the server runs
 /// with `--open-reads` (loopback only, resolving to workspace 0). Taken
-/// first by every handler that shows runs (D-037). The workspace scope
-/// for reads lands with S2-2's scoped API.
-struct ReadAuthorized;
+/// first by every handler that shows runs (D-037) — the workspace in
+/// `auth.ws` scopes what the read may see.
+struct ReadAuthorized(Auth);
 
 impl FromRequestParts<App> for ReadAuthorized {
     type Rejection = ApiError;
@@ -586,11 +584,14 @@ impl FromRequestParts<App> for ReadAuthorized {
         // page in the operator's browser can rebind its own name to
         // 127.0.0.1, and its requests then carry that name as Host (D-047).
         if app.open_reads && loopback_host(parts) {
-            return Ok(ReadAuthorized);
+            return Ok(ReadAuthorized(Auth {
+                ws: 0,
+                permission: Permission::Read,
+            }));
         }
         match bearer(parts) {
             Some(key) => match app.keyring.verify(key).await {
-                Verified::Granted(_) => Ok(ReadAuthorized),
+                Verified::Granted(auth) => Ok(ReadAuthorized(auth)),
                 Verified::Denied => Err(unauthorized()),
                 Verified::Unavailable => Err(accounts_unavailable()),
             },
@@ -868,16 +869,26 @@ fn state_name(s: &RunState) -> String {
     }
 }
 
+/// The run if it exists AND belongs to the caller's workspace — a
+/// cross-workspace id is 404, never 403: a foreign run id leaks nothing
+/// (S2-2's no-oracle rule).
+async fn scoped_run(app: &App, auth: &Auth, id: u64) -> Result<durable_domain::Run, ApiError> {
+    match app.engine.inspect(RunId(id)).await? {
+        Some(run) if run.ws == auth.ws => Ok(run),
+        _ => Err(ApiError::new(
+            StatusCode::NOT_FOUND,
+            "not_found",
+            "no such run",
+        )),
+    }
+}
+
 async fn inspect(
-    _: ReadAuthorized,
+    ReadAuthorized(auth): ReadAuthorized,
     State(app): State<App>,
     P(id): P<u64>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let run = app
-        .engine
-        .inspect(RunId(id))
-        .await?
-        .ok_or_else(|| ApiError::new(StatusCode::NOT_FOUND, "not_found", "no such run"))?;
+    let run = scoped_run(&app, &auth, id).await?;
     Ok(Json(serde_json::json!({
         "id": run.id.0,
         "key": run.key.0,
@@ -891,16 +902,12 @@ async fn inspect(
 /// (D-051): a controller that resubmits the same work under a new op_key needs it, and
 /// the input may be customer content, so the read key does not reveal it.
 async fn spec(
-    _: Authorized,
+    Authorized(auth): Authorized,
     State(app): State<App>,
     P(id): P<u64>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     use base64::Engine as _;
-    let run = app
-        .engine
-        .inspect(RunId(id))
-        .await?
-        .ok_or_else(|| ApiError::new(StatusCode::NOT_FOUND, "not_found", "no such run"))?;
+    let run = scoped_run(&app, &auth, id).await?;
     Ok(Json(serde_json::json!({
         "id": run.id.0,
         "key": run.key.0,
@@ -913,10 +920,13 @@ async fn spec(
 }
 
 async fn cancel(
-    _: Authorized,
+    Authorized(auth): Authorized,
     State(app): State<App>,
     P(id): P<u64>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
+    // The scope check happens before the cancel: a run's workspace is
+    // fixed at acceptance, so inspecting first cannot race.
+    scoped_run(&app, &auth, id).await?;
     app.engine.cancel(RunId(id)).await?;
     Ok(Json(serde_json::json!({ "cancelled": id })))
 }
@@ -935,7 +945,7 @@ struct ListQuery {
 }
 
 async fn list(
-    _: ReadAuthorized,
+    ReadAuthorized(auth): ReadAuthorized,
     State(app): State<App>,
     Q(q): Q<ListQuery>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
@@ -959,7 +969,10 @@ async fn list(
             after: q.after.map(RunId),
         }
     };
-    let page = app.engine.list_in(order, q.limit.unwrap_or(100)).await?;
+    let page = app
+        .engine
+        .list_in(auth.ws, order, q.limit.unwrap_or(100))
+        .await?;
     let items: Vec<serde_json::Value> = page
         .runs
         .iter()
@@ -1006,6 +1019,281 @@ async fn diagnostics(
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let d = app.engine.diag().await?;
     Ok(Json(serde_json::to_value(d).unwrap_or_default()))
+}
+
+// ---- S2: the account graph (workspaces + API keys) ----------------
+
+/// Workspace management is an ops surface: it takes a workspace-0 admin
+/// key (the env key, or a store key scoped to ws 0). Tenant self-service
+/// is the S3 slice's member/role surface.
+fn ops_admin(auth: &Auth) -> Result<(), ApiError> {
+    if auth.ws != 0 || auth.permission != Permission::Admin {
+        return Err(ApiError::new(
+            StatusCode::FORBIDDEN,
+            "forbidden",
+            "workspace management needs a workspace-0 admin key",
+        ));
+    }
+    Ok(())
+}
+
+/// The configured account store — without one the workspace routes have
+/// no graph to talk to: a 404 with the config reason, not a retryable
+/// outage.
+fn accounts(app: &App) -> Result<&Arc<dyn AccountStore>, ApiError> {
+    app.keyring.store.as_ref().ok_or_else(|| {
+        ApiError::new(
+            StatusCode::NOT_FOUND,
+            "not_found",
+            "no account store configured (DATABASE_URL is unset)",
+        )
+    })
+}
+
+/// A store failure as an API error: `Unavailable` fails closed as
+/// `accounts_unavailable`; anything else is a defect in the query or
+/// schema and is 500.
+fn store_err(e: durable_accounts::AccountError) -> ApiError {
+    use durable_accounts::AccountError as E;
+    match e {
+        E::Unavailable(_) => accounts_unavailable(),
+        E::Store(m) => {
+            eprintln!("durable-server: account store error: {m}");
+            ApiError::new(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "internal",
+                "internal error",
+            )
+        }
+    }
+}
+
+/// Resolve a workspace's public id to its row — the ONLY translation the
+/// API does; nothing internal crosses back out (D/S2: opaque ids).
+async fn workspace_by_public(
+    store: &Arc<dyn AccountStore>,
+    public_id: uuid::Uuid,
+) -> Result<durable_accounts::Workspace, ApiError> {
+    store
+        .workspace_by_public_id(public_id)
+        .await
+        .map_err(store_err)?
+        .ok_or_else(|| ApiError::new(StatusCode::NOT_FOUND, "not_found", "no such workspace"))
+}
+
+fn hex(bytes: &[u8]) -> String {
+    const T: &[u8; 16] = b"0123456789abcdef";
+    let mut s = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
+        s.push(T[(b >> 4) as usize] as char);
+        s.push(T[(b & 0xf) as usize] as char);
+    }
+    s
+}
+
+/// A fresh API key: `dr_` + 48 hex chars of CSPRNG. Only its sha256 is
+/// stored; the plaintext crosses exactly one boundary — this response.
+fn new_key_secret() -> String {
+    let mut b = [0u8; 24];
+    use ring::rand::SecureRandom as _;
+    // SystemRandom::fill only fails on catastrophic RNG loss; map it to a
+    // zeroed buffer refusal rather than issuing a weak key.
+    match ring::rand::SystemRandom::new().fill(&mut b) {
+        Ok(()) => format!("dr_{}", hex(&b)),
+        Err(_) => String::new(),
+    }
+}
+
+/// Who the caller is, as externals see it: the workspace's public id and
+/// the key's permission. No store configured (compat mode) means
+/// workspace 0 — the nil UUID.
+async fn whoami(
+    ReadAuthorized(auth): ReadAuthorized,
+    State(app): State<App>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let public_id = match &app.keyring.store {
+        Some(store) => match store.workspace_by_id(auth.ws).await {
+            Ok(Some(ws)) => ws.public_id.to_string(),
+            Ok(None) => uuid::Uuid::nil().to_string(),
+            Err(e) => return Err(store_err(e)),
+        },
+        None => uuid::Uuid::nil().to_string(),
+    };
+    Ok(Json(serde_json::json!({
+        "workspace": public_id,
+        "permission": auth.permission.as_str(),
+    })))
+}
+
+async fn list_workspaces(
+    Authorized(auth): Authorized,
+    State(app): State<App>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    ops_admin(&auth)?;
+    let store = accounts(&app)?;
+    let list = store.list_workspaces(1000).await.map_err(store_err)?;
+    let items: Vec<serde_json::Value> = list
+        .iter()
+        .map(|ws| {
+            serde_json::json!({
+                "public_id": ws.public_id,
+                "name": ws.name,
+            })
+        })
+        .collect();
+    Ok(Json(serde_json::json!({ "workspaces": items })))
+}
+
+#[derive(Deserialize)]
+struct WorkspaceReq {
+    name: String,
+}
+
+async fn create_workspace(
+    Authorized(auth): Authorized,
+    State(app): State<App>,
+    J(req): J<WorkspaceReq>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    ops_admin(&auth)?;
+    if req.name.trim().is_empty() || req.name.len() > 128 {
+        return Err(ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "bad_input",
+            "name must be 1..=128 characters",
+        ));
+    }
+    let store = accounts(&app)?;
+    let ws = store
+        .create_workspace(req.name.trim())
+        .await
+        .map_err(store_err)?;
+    Ok(Json(serde_json::json!({
+        "public_id": ws.public_id,
+        "name": ws.name,
+    })))
+}
+
+async fn get_workspace(
+    Authorized(auth): Authorized,
+    State(app): State<App>,
+    P(public_id): P<uuid::Uuid>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    ops_admin(&auth)?;
+    let store = accounts(&app)?;
+    let ws = workspace_by_public(store, public_id).await?;
+    Ok(Json(serde_json::json!({
+        "public_id": ws.public_id,
+        "name": ws.name,
+    })))
+}
+
+async fn list_workspace_keys(
+    Authorized(auth): Authorized,
+    State(app): State<App>,
+    P(public_id): P<uuid::Uuid>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    ops_admin(&auth)?;
+    let store = accounts(&app)?;
+    let ws = workspace_by_public(store, public_id).await?;
+    let keys = store.list_keys(ws.id).await.map_err(store_err)?;
+    let items: Vec<serde_json::Value> = keys
+        .iter()
+        .map(|k| {
+            serde_json::json!({
+                "id": k.id,
+                "name": k.name,
+                "prefix": k.prefix,
+                "permission": k.permission.as_str(),
+                "revoked": k.revoked,
+            })
+        })
+        .collect();
+    Ok(Json(serde_json::json!({ "keys": items })))
+}
+
+#[derive(Deserialize)]
+struct KeyReq {
+    name: String,
+    /// `admin` (submit + cancel + read) or `read`. Anything else is a
+    /// spec error at the boundary.
+    permission: String,
+}
+
+async fn create_workspace_key(
+    Authorized(auth): Authorized,
+    State(app): State<App>,
+    P(public_id): P<uuid::Uuid>,
+    J(req): J<KeyReq>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    ops_admin(&auth)?;
+    let permission = match req.permission.as_str() {
+        "admin" => Permission::Admin,
+        "read" => Permission::Read,
+        other => {
+            return Err(ApiError::new(
+                StatusCode::BAD_REQUEST,
+                "bad_input",
+                format!("permission must be admin or read, not {other:?}"),
+            ))
+        }
+    };
+    if req.name.trim().is_empty() || req.name.len() > 128 {
+        return Err(ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "bad_input",
+            "name must be 1..=128 characters",
+        ));
+    }
+    let secret = new_key_secret();
+    if secret.is_empty() {
+        return Err(ApiError::new(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "internal",
+            "could not draw a key secret",
+        ));
+    }
+    let store = accounts(&app)?;
+    let ws = workspace_by_public(store, public_id).await?;
+    let prefix = &secret[..secret.len().min(11)];
+    let info = store
+        .create_key(
+            ws.id,
+            req.name.trim(),
+            permission,
+            &sha256(secret.as_bytes()),
+            prefix,
+        )
+        .await
+        .map_err(store_err)?;
+    Ok(Json(serde_json::json!({
+        "id": info.id,
+        "name": info.name,
+        "prefix": info.prefix,
+        "permission": info.permission.as_str(),
+        // Shown exactly once: only its sha256 is stored.
+        "key": secret,
+    })))
+}
+
+async fn delete_workspace_key(
+    Authorized(auth): Authorized,
+    State(app): State<App>,
+    P((public_id, key_id)): P<(uuid::Uuid, u64)>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    ops_admin(&auth)?;
+    let store = accounts(&app)?;
+    let ws = workspace_by_public(store, public_id).await?;
+    match store.revoke_key(ws.id, key_id).await.map_err(store_err)? {
+        Some(hash) => {
+            app.keyring.invalidate(hash);
+            Ok(Json(serde_json::json!({ "revoked": key_id })))
+        }
+        None => Err(ApiError::new(
+            StatusCode::NOT_FOUND,
+            "not_found",
+            "no such key (or already revoked)",
+        )),
+    }
 }
 
 async fn compact(
@@ -1094,6 +1382,22 @@ fn router(app: App, ui_dir: Option<&Path>) -> Router {
         .route("/admin/compact", post(compact))
         .route("/admin/backup", post(backup))
         .route("/admin/diagnostics", get(diagnostics))
+        // S2-2: the account graph. Workspaces and keys are addressed by
+        // public_id only — internal u64 ids never leave the process.
+        .route("/whoami", get(whoami))
+        .route(
+            "/admin/workspaces",
+            get(list_workspaces).post(create_workspace),
+        )
+        .route("/admin/workspaces/{public_id}", get(get_workspace))
+        .route(
+            "/admin/workspaces/{public_id}/keys",
+            get(list_workspace_keys).post(create_workspace_key),
+        )
+        .route(
+            "/admin/workspaces/{public_id}/keys/{key_id}",
+            axum::routing::delete(delete_workspace_key),
+        )
         // A submit is at most 64 KiB of input (base64: ~88 KiB) plus its
         // spec; nothing legitimate comes near this.
         .layer(DefaultBodyLimit::max(MAX_REQUEST_BYTES))
@@ -2179,6 +2483,437 @@ mod tests {
 
         let (status, _) = call(&h.router, "GET", "/jobs", Some(token), None).await;
         assert_eq!(status, StatusCode::UNAUTHORIZED);
+    }
+
+    /// `call`, keeping the headers: the no-u64-leak scan checks them too.
+    async fn call_full(
+        router: &Router,
+        method: &str,
+        uri: &str,
+        key: Option<&str>,
+        body: Option<Value>,
+    ) -> (StatusCode, axum::http::HeaderMap, Value) {
+        let mut req = Request::builder().method(method).uri(uri);
+        if let Some(k) = key {
+            req = req.header("authorization", format!("Bearer {k}"));
+        }
+        let req = match body {
+            Some(b) => req
+                .header("content-type", "application/json")
+                .body(Body::from(b.to_string())),
+            None => req.body(Body::empty()),
+        }
+        .unwrap_or_else(|e| panic!("{e}"));
+        let res = router
+            .clone()
+            .oneshot(req)
+            .await
+            .unwrap_or_else(|e| panic!("{e}"));
+        let status = res.status();
+        let headers = res.headers().clone();
+        let bytes = res
+            .into_body()
+            .collect()
+            .await
+            .unwrap_or_else(|e| panic!("{e}"))
+            .to_bytes();
+        (
+            status,
+            headers,
+            serde_json::from_slice(&bytes).unwrap_or(Value::Null),
+        )
+    }
+
+    /// S2-2's isolation matrix, end to end: workspace B's key can neither
+    /// see nor cancel workspace A's run — every reach is 404, the same
+    /// answer a nonexistent id gets, so a foreign run leaks nothing.
+    #[tokio::test]
+    async fn workspaces_are_isolated_end_to_end() {
+        use durable_accounts::Memory;
+        let store = Arc::new(Memory::new());
+        let a = store
+            .create_workspace("a")
+            .await
+            .unwrap_or_else(|e| panic!("a: {e}"));
+        let b = store
+            .create_workspace("b")
+            .await
+            .unwrap_or_else(|e| panic!("b: {e}"));
+        let key_a = "ws-a-key-0123456789abcdef";
+        let key_b = "ws-b-key-0123456789abcdef";
+        store
+            .create_key(
+                a.id,
+                "k",
+                Permission::Admin,
+                &sha256(key_a.as_bytes()),
+                "dr_a",
+            )
+            .await
+            .unwrap_or_else(|e| panic!("ka: {e}"));
+        store
+            .create_key(
+                b.id,
+                "k",
+                Permission::Admin,
+                &sha256(key_b.as_bytes()),
+                "dr_b",
+            )
+            .await
+            .unwrap_or_else(|e| panic!("kb: {e}"));
+        let h = harness_store(true, None, Some(store));
+
+        let (status, v) = call(
+            &h.router,
+            "POST",
+            "/jobs",
+            Some(key_a),
+            Some(submit_body("s")),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{v}");
+        let run_a = v["run_id"].as_u64().unwrap_or_else(|| panic!("{v}"));
+
+        // B's reads of A's run look exactly like a nonexistent run.
+        let (status, v) = call(
+            &h.router,
+            "GET",
+            &format!("/jobs/{run_a}"),
+            Some(key_b),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{v}");
+        assert_eq!(v["code"], "not_found");
+        let (status, v) = call(&h.router, "GET", "/jobs/999999", Some(key_b), None).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(
+            v["code"], "not_found",
+            "a foreign id must read identically to a missing one"
+        );
+
+        let (status, v) = call(
+            &h.router,
+            "GET",
+            &format!("/jobs/{run_a}/spec"),
+            Some(key_b),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{v}");
+        let (status, v) = call(
+            &h.router,
+            "POST",
+            &format!("/jobs/{run_a}/cancel"),
+            Some(key_b),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{v}");
+
+        // B's list contains only B's runs.
+        let (status, v) = call(
+            &h.router,
+            "POST",
+            "/jobs",
+            Some(key_b),
+            Some(submit_body("s")),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{v}");
+        let (status, v) = call(&h.router, "GET", "/jobs", Some(key_b), None).await;
+        assert_eq!(status, StatusCode::OK, "{v}");
+        let ids: Vec<u64> = v["runs"]
+            .as_array()
+            .unwrap_or_else(|| panic!("{v}"))
+            .iter()
+            .filter_map(|r| r["id"].as_u64())
+            .collect();
+        assert!(
+            !ids.contains(&run_a),
+            "B's list must not show A's run: {ids:?}"
+        );
+        assert_eq!(ids.len(), 1, "B sees exactly its own run");
+
+        // A sees A.
+        let (status, v) = call(&h.router, "GET", "/jobs", Some(key_a), None).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(v["runs"].as_array().map(|r| r.len()), Some(1));
+    }
+
+    /// The coordinator's rule: no response body or header may carry the
+    /// internal sequential workspace id. Walks every response's JSON and
+    /// headers for a workspace-shaped field holding the u64.
+    #[tokio::test]
+    async fn no_response_or_header_carries_the_internal_ws_id() {
+        use durable_accounts::Memory;
+        let store = Arc::new(Memory::new());
+        let ws = store
+            .create_workspace("scan")
+            .await
+            .unwrap_or_else(|e| panic!("{e}"));
+        let token = "scan-key-0123456789abcdef";
+        store
+            .create_key(
+                ws.id,
+                "k",
+                Permission::Admin,
+                &sha256(token.as_bytes()),
+                "dr_s",
+            )
+            .await
+            .unwrap_or_else(|e| panic!("{e}"));
+        let h = harness_store(true, None, Some(store.clone()));
+        let internal = ws.id; // the id that must never leave the process
+
+        // Seed a run + a workspace so the routes have data to show.
+        let (status, _) = call(
+            &h.router,
+            "POST",
+            "/jobs",
+            Some(token),
+            Some(submit_body("r")),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let pid = ws.public_id.to_string();
+
+        let routes: Vec<(String, Option<&str>)> = vec![
+            ("/whoami".into(), Some(token)),
+            ("/admin/workspaces".into(), Some(KEY)),
+            (format!("/admin/workspaces/{pid}"), Some(KEY)),
+            (format!("/admin/workspaces/{pid}/keys"), Some(KEY)),
+            ("/jobs".into(), Some(token)),
+            ("/jobs/1".into(), Some(token)),
+            ("/jobs/1/spec".into(), Some(token)),
+            ("/admin/diagnostics".into(), Some(KEY)),
+        ];
+        fn scan_json(v: &Value, internal: u64, path: &str) {
+            match v {
+                Value::Object(map) => {
+                    for (k, val) in map {
+                        if matches!(
+                            k.as_str(),
+                            "ws" | "workspace_id" | "internal_id" | "workspace"
+                        ) && val.as_u64() == Some(internal)
+                        {
+                            panic!(
+                                "{path}: field {k:?} carries the internal workspace id {internal}"
+                            );
+                        }
+                        scan_json(val, internal, path);
+                    }
+                }
+                Value::Array(items) => items.iter().for_each(|v| scan_json(v, internal, path)),
+                _ => {}
+            }
+        }
+        for (uri, key) in routes {
+            let (status, headers, body) = call_full(&h.router, "GET", &uri, key, None).await;
+            assert_eq!(status, StatusCode::OK, "GET {uri}: {body}");
+            scan_json(&body, internal, &uri);
+            for (name, value) in headers.iter() {
+                if name.as_str().contains("workspace")
+                    || name.as_str() == "x-ws"
+                    || name.as_str() == "ws"
+                {
+                    assert_ne!(
+                        value.to_str().ok().and_then(|v| v.parse::<u64>().ok()),
+                        Some(internal),
+                        "GET {uri}: header {name} carries the internal workspace id"
+                    );
+                }
+            }
+        }
+    }
+
+    /// whoami exposes the workspace's public id and the key's permission —
+    /// env ops keys read as the nil UUID (workspace 0 / compat mode).
+    #[tokio::test]
+    async fn whoami_reports_public_id_and_permission() {
+        use durable_accounts::Memory;
+        let store = Arc::new(Memory::new());
+        let ws = store
+            .create_workspace("who")
+            .await
+            .unwrap_or_else(|e| panic!("{e}"));
+        let token = "who-key-0123456789abcdef";
+        store
+            .create_key(
+                ws.id,
+                "k",
+                Permission::Read,
+                &sha256(token.as_bytes()),
+                "dr_w",
+            )
+            .await
+            .unwrap_or_else(|e| panic!("{e}"));
+        let h = harness_store(true, None, Some(store));
+
+        let (status, v) = call(&h.router, "GET", "/whoami", Some(token), None).await;
+        assert_eq!(status, StatusCode::OK, "{v}");
+        assert_eq!(v["workspace"], json!(ws.public_id.to_string()));
+        assert_eq!(v["permission"], json!("read"));
+
+        let (status, v) = call(&h.router, "GET", "/whoami", Some(KEY), None).await;
+        assert_eq!(status, StatusCode::OK, "{v}");
+        assert_eq!(v["workspace"], json!(uuid::Uuid::nil().to_string()));
+        assert_eq!(v["permission"], json!("admin"));
+    }
+
+    /// The full ops path over HTTP: create workspace → create key → the
+    /// key submits → revoke → the key denies immediately (write-through).
+    #[tokio::test]
+    async fn the_key_lifecycle_over_http() {
+        use durable_accounts::Memory;
+        let store = Arc::new(Memory::new());
+        let h = harness_store(true, None, Some(store));
+
+        let (status, v) = call(
+            &h.router,
+            "POST",
+            "/admin/workspaces",
+            Some(KEY),
+            Some(json!({ "name": "tenant" })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{v}");
+        let pid = v["public_id"]
+            .as_str()
+            .unwrap_or_else(|| panic!("{v}"))
+            .to_string();
+        assert!(
+            uuid::Uuid::parse_str(&pid).is_ok(),
+            "public_id must be opaque: {v}"
+        );
+
+        let (status, v) = call(
+            &h.router,
+            "POST",
+            &format!("/admin/workspaces/{pid}/keys"),
+            Some(KEY),
+            Some(json!({ "name": "ci", "permission": "admin" })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{v}");
+        let key_id = v["id"].as_u64().unwrap_or_else(|| panic!("{v}"));
+        let issued = v["key"]
+            .as_str()
+            .unwrap_or_else(|| panic!("{v}"))
+            .to_string();
+        assert!(issued.starts_with("dr_"));
+
+        let (status, v) = call(
+            &h.router,
+            "POST",
+            "/jobs",
+            Some(&issued),
+            Some(submit_body("k")),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{v} — the issued key must submit");
+
+        let (status, v) = call(
+            &h.router,
+            "GET",
+            &format!("/admin/workspaces/{pid}/keys"),
+            Some(KEY),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{v}");
+        assert_eq!(v["keys"].as_array().map(|k| k.len()), Some(1));
+        assert_eq!(v["keys"][0]["prefix"].as_str().unwrap_or(""), &issued[..11]);
+
+        let (status, _) = call(
+            &h.router,
+            "DELETE",
+            &format!("/admin/workspaces/{pid}/keys/{key_id}"),
+            Some(KEY),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let (status, _) = call(&h.router, "GET", "/jobs", Some(&issued), None).await;
+        assert_eq!(
+            status,
+            StatusCode::UNAUTHORIZED,
+            "revoked denies at once, no TTL wait"
+        );
+    }
+
+    /// Ops scope: a non-ws-0 admin cannot reach the management surface.
+    #[tokio::test]
+    async fn workspace_management_needs_the_ops_scope() {
+        use durable_accounts::Memory;
+        let store = Arc::new(Memory::new());
+        let ws = store
+            .create_workspace("tenant")
+            .await
+            .unwrap_or_else(|e| panic!("{e}"));
+        let token = "tenant-admin-0123456789abcdef";
+        store
+            .create_key(
+                ws.id,
+                "k",
+                Permission::Admin,
+                &sha256(token.as_bytes()),
+                "dr_t",
+            )
+            .await
+            .unwrap_or_else(|e| panic!("{e}"));
+        let h = harness_store(true, None, Some(store));
+
+        let (status, _) = call(&h.router, "GET", "/admin/workspaces", Some(token), None).await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        let (status, _) = call(
+            &h.router,
+            "POST",
+            "/admin/workspaces",
+            Some(token),
+            Some(json!({ "name": "escalate" })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+    }
+
+    /// Unknown or malformed public ids: the unknown one is 404, the
+    /// unparseable one is the path extractor's 400 — never an oracle.
+    #[tokio::test]
+    async fn unknown_public_ids_are_404() {
+        use durable_accounts::Memory;
+        let h = harness_store(true, None, Some(Arc::new(Memory::new())));
+        let pid = uuid::Uuid::from_u128(0xfeed);
+        let (status, v) = call(
+            &h.router,
+            "GET",
+            &format!("/admin/workspaces/{pid}"),
+            Some(KEY),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{v}");
+        assert_eq!(v["code"], "not_found");
+        let (status, v) = call(
+            &h.router,
+            "GET",
+            "/admin/workspaces/not-a-uuid",
+            Some(KEY),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{v}");
+        assert_eq!(v["code"], "bad_path");
+    }
+
+    /// Compat mode (no DATABASE_URL): the workspace surface does not
+    /// exist — 404 with the config reason, not a retryable outage.
+    #[tokio::test]
+    async fn compat_mode_workspace_routes_are_404() {
+        let h = harness(true);
+        let (status, v) = call(&h.router, "GET", "/admin/workspaces", Some(KEY), None).await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{v}");
+        assert!(v["error"].as_str().unwrap_or("").contains("DATABASE_URL"));
     }
 
     /// `--open-reads` serves reads without a key; it is refused at startup
