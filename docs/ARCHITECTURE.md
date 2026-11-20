@@ -77,6 +77,9 @@ delete every superseded `gen-*` directory (retention). Runs on `POST
 | `GET /admin/workspaces/{public_id}/keys` | ops key | that workspace's keys (digest metadata only) |
 | `POST /admin/workspaces/{public_id}/keys {name, permission}` | ops key | mint a key; the `key` plaintext is returned only here |
 | `DELETE /admin/workspaces/{public_id}/keys/{key_id}` | ops key | revoke; cached grants are invalidated at once |
+| `GET /handlers` | workspace key | that workspace's handler registry (name → url) |
+| `PUT /handlers/{name} {url}` | workspace admin key | register or update a handler, ≤256 per workspace |
+| `DELETE /handlers/{name}` | workspace admin key | remove a registration |
 | `/inspector/` | static files open; the UI sends its key on every call | SvelteKit UI |
 
 The key is `DURABLE_API_KEY`; the optional `DURABLE_READ_KEY` may only read
@@ -93,6 +96,20 @@ without `DATABASE_URL` they answer `404` with the reason in the error
 message. Workspace management routes take the workspace's `public_id`
 (a UUIDv7): the internal sequential id never appears in a route,
 response body or header, and a regression test scans for it.
+
+**Handler registry (S2-4).** A step's `handler` resolves only inside the
+submitting workspace: registrations live in the account store, delivered
+to the engine's `(workspace, name)` registry through the bounded command
+channel, so dispatch never waits on the store. A spec naming a handler
+the workspace has not registered fails admission as
+`unregistered_handler` — before anything is journaled — and a foreign
+workspace's registrations are invisible. Startup loads the
+last-known-good snapshot (`<journal>/handlers.json`) before serving, and
+a 30 s reconciler refreshes the registry from store truth; a store
+outage leaves the in-memory set serving and raises `registry_stale` in
+`/admin/diagnostics`. Compat-mode `--handler` flags are workspace 0's
+registrations; a store row shadows a flag on a name conflict. The bound
+is 256 handlers per workspace, checked before the store write.
 Request bodies are capped at 256 KiB; operation keys at 256 bytes and step
 and handler names at 128 (non-empty, no control characters in keys); a
 handler reply is read only up to the 256 KiB output limit.

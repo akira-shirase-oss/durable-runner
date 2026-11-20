@@ -1,0 +1,48 @@
+{
+  "machine": {
+    "host": "maintainer-laptop",
+    "platform": "darwin/arm64",
+    "cpu": "Apple M2 Pro",
+    "cores": 12,
+    "mem_gb": 32,
+    "date": "2026-11-20T12:43:23.204Z",
+    "commit": "4656018"
+  },
+  "scenario": "workspaces",
+  "params": {
+    "workspaces": 2,
+    "submits_per_workspace": 60,
+    "account_backend": "memory",
+    "smoke": false
+  },
+  "sent": 120,
+  "http_codes": {
+    "200": 120
+  },
+  "per_workspace": {
+    "01a1f8fb-67c9-722b-973a-ae8d5d0f3b50": {
+      "runs": 60,
+      "pages": 1
+    },
+    "01a1f8fb-67ce-7136-9f52-a47a53f0a3cf": {
+      "runs": 60,
+      "pages": 1
+    }
+  },
+  "churn_registrations": 1213,
+  "done_after_drain": 120,
+  "latency_ms": {
+    "p50": 24.654708000000028,
+    "p99": 29.357208000000014,
+    "max": 29.91341699999998
+  },
+  "thresholds": {
+    "accepted": "every submit",
+    "sized": "60 runs per workspace",
+    "disjoint": "no run id shared across workspaces",
+    "oracle": "foreign run id → 404",
+    "done": "every accepted run",
+    "p99_ms": "<2000"
+  },
+  "verdict": "pass"
+}

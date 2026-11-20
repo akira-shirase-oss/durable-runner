@@ -42,6 +42,10 @@ pub enum EngineError {
     Stopped,
     #[error("unregistered handler: {0}")]
     UnregisteredHandler(String),
+    /// The workspace's handler registry is at its bound
+    /// (`MAX_HANDLERS_PER_WS`): the registration was refused.
+    #[error("handler registry is full (256 per workspace)")]
+    RegistryFull,
     /// The group commit holding this request's record failed. Nothing
     /// decided on the strength of it left the process; the engine stops
     /// and restart replay decides what is durable.

@@ -12,8 +12,12 @@ S2-0 tagging its own v1.0.1 release. The hold lifted 2026-11-19
 `devin/dr-s2`: **S2-0** (`e528686` + `e6951b5`, tagged v1.0.1 by the
 coordinator), **S2-1** (account store, keyring + cache, scoped submit,
 visible-skip Neon job), **S2-2** (scoped `/jobs`, workspace management
-routes by `public_id`, key lifecycle, no-u64-leak test). Backend only: no
-design or UI work for Durable Runner until the maintainer designs it.
+routes by `public_id`, key lifecycle, no-u64-leak test), **S2-3**
+(writer emits v3; v1.0.1 is the rollback floor), **S2-4** (per-workspace
+handler registry: store-authoritative rows, engine `(ws,name)` set,
+last-known-good snapshot + 30 s reconciler, `registry_stale` in
+diagnostics, 256-per-workspace bound). Backend only: no design or UI
+work for Durable Runner until the maintainer designs it.
 
 Exit gate (unchanged): **workspace A can never see, cancel or run handlers for
 workspace B; SSRF tests refuse private targets.** Plus the standing rule: every

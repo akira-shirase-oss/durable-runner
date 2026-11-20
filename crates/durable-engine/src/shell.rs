@@ -74,22 +74,61 @@ pub trait StepHandler: Send + Sync {
     }
 }
 
-/// Named handlers, populated by configuration. A step naming a handler not
-/// in the registry fails its attempt — it never silently runs.
+/// Handlers a single workspace may register (D-021 bound): enough for a
+/// tenant's real surface, small enough that a registration flood cannot
+/// grow the dispatch map without limit.
+pub const MAX_HANDLERS_PER_WS: usize = 256;
+
+/// Named handlers, populated by configuration, scoped per workspace
+/// (S2-4): a step naming a handler not registered *in the submitting
+/// workspace* fails its attempt — it never silently runs, and it never
+/// borrows another workspace's registration.
 #[derive(Default, Clone)]
 pub struct Registry {
-    handlers: HashMap<String, Arc<dyn StepHandler>>,
+    handlers: HashMap<(u64, String), Arc<dyn StepHandler>>,
 }
 
 impl Registry {
+    /// Compat registration: `--handler` flags land in workspace 0.
     pub fn register(&mut self, name: &str, h: Arc<dyn StepHandler>) {
-        self.handlers.insert(name.to_string(), h);
+        self.handlers.insert((0, name.to_string()), h);
     }
-    fn get(&self, name: &str) -> Option<Arc<dyn StepHandler>> {
-        self.handlers.get(name).cloned()
+    fn get(&self, ws: u64, name: &str) -> Option<Arc<dyn StepHandler>> {
+        self.handlers.get(&(ws, name.to_string())).cloned()
     }
-    pub fn contains(&self, name: &str) -> bool {
-        self.handlers.contains_key(name)
+    pub fn contains(&self, ws: u64, name: &str) -> bool {
+        self.handlers.contains_key(&(ws, name.to_string()))
+    }
+    /// Insert or replace one registration. Refuses past the per-workspace
+    /// bound — the account store also bounds, this is the engine's own.
+    fn put(&mut self, ws: u64, name: &str, h: Arc<dyn StepHandler>) -> Result<(), EngineError> {
+        let key = (ws, name.to_string());
+        if !self.handlers.contains_key(&key)
+            && self.handlers.keys().filter(|(w, _)| *w == ws).count() >= MAX_HANDLERS_PER_WS
+        {
+            return Err(EngineError::RegistryFull);
+        }
+        self.handlers.insert(key, h);
+        Ok(())
+    }
+    fn remove(&mut self, ws: u64, name: &str) {
+        self.handlers.remove(&(ws, name.to_string()));
+    }
+    /// Replace a workspace's whole set — how the store reconciler syncs.
+    /// Refuses past the bound; an oversized store answer is refused whole.
+    fn set_ws(
+        &mut self,
+        ws: u64,
+        handlers: Vec<(String, Arc<dyn StepHandler>)>,
+    ) -> Result<(), EngineError> {
+        if handlers.len() > MAX_HANDLERS_PER_WS {
+            return Err(EngineError::RegistryFull);
+        }
+        self.handlers.retain(|(w, _), _| *w != ws);
+        for (name, h) in handlers {
+            self.handlers.insert((ws, name), h);
+        }
+        Ok(())
     }
 }
 
@@ -122,6 +161,25 @@ enum Cmd {
     },
     Backup {
         dest: std::path::PathBuf,
+        reply: oneshot::Sender<Result<(), EngineError>>,
+    },
+    /// A handler registration written through the API (S2-4): the engine
+    /// learns it on the command channel — never by the actor reading a
+    /// database.
+    PutHandler {
+        ws: u64,
+        name: String,
+        handler: Arc<dyn StepHandler>,
+        reply: oneshot::Sender<Result<(), EngineError>>,
+    },
+    DeleteHandler {
+        ws: u64,
+        name: String,
+    },
+    /// The store reconciler's whole-set sync for one workspace.
+    SetWorkspaceHandlers {
+        ws: u64,
+        handlers: Vec<(String, Arc<dyn StepHandler>)>,
         reply: oneshot::Sender<Result<(), EngineError>>,
     },
 }
@@ -316,6 +374,50 @@ impl Engine {
     pub async fn backup_to(&self, dest: std::path::PathBuf) -> Result<(), EngineError> {
         let (reply, rx) = oneshot::channel();
         self.send(Cmd::Backup { dest, reply })?;
+        answer(rx, self.admin_timeout).await?
+    }
+
+    /// Register or replace a handler in one workspace's registry (S2-4).
+    /// The caller (an API route) has already persisted it to the account
+    /// store; this updates the dispatch view on the command channel.
+    pub async fn put_handler(
+        &self,
+        ws: u64,
+        name: &str,
+        handler: Arc<dyn StepHandler>,
+    ) -> Result<(), EngineError> {
+        let (reply, rx) = oneshot::channel();
+        self.send(Cmd::PutHandler {
+            ws,
+            name: name.to_string(),
+            handler,
+            reply,
+        })?;
+        answer(rx, self.reply_timeout).await?
+    }
+
+    /// Remove one registration. Fire-and-forget: there is nothing to
+    /// refuse — a run already in flight keeps its resolved handler.
+    pub fn delete_handler(&self, ws: u64, name: &str) -> Result<(), EngineError> {
+        self.send(Cmd::DeleteHandler {
+            ws,
+            name: name.to_string(),
+        })
+    }
+
+    /// Replace a workspace's whole handler set — the store reconciler's
+    /// sync point. Refuses an oversized set whole.
+    pub async fn set_workspace_handlers(
+        &self,
+        ws: u64,
+        handlers: Vec<(String, Arc<dyn StepHandler>)>,
+    ) -> Result<(), EngineError> {
+        let (reply, rx) = oneshot::channel();
+        self.send(Cmd::SetWorkspaceHandlers {
+            ws,
+            handlers,
+            reply,
+        })?;
         answer(rx, self.admin_timeout).await?
     }
 
@@ -898,6 +1000,10 @@ fn refuse(cmd: Cmd) {
         Cmd::Backup { reply, .. } => {
             let _ = reply.send(Err(EngineError::Stopped));
         }
+        Cmd::PutHandler { reply, .. } | Cmd::SetWorkspaceHandlers { reply, .. } => {
+            let _ = reply.send(Err(EngineError::Stopped));
+        }
+        Cmd::DeleteHandler { .. } => {}
     }
 }
 
@@ -988,7 +1094,7 @@ async fn drain(
 
 async fn actor(
     mut core: EngineCore,
-    registry: Registry,
+    mut registry: Registry,
     cfg: ShellConfig,
     (mut rx, mut read_rx, mut drain_rx): (
         mpsc::Receiver<Cmd>,
@@ -1081,12 +1187,12 @@ async fn actor(
                 Some(Cmd::Submit { ws, key, spec, not_before, reply }) => {
                     let now = wall_ms();
                     // Admission is where the allowlist bites: a step naming a
-                    // handler outside the registry is a spec error, refused
-                    // before anything is journaled.
+                    // handler outside *this workspace's* registry is a spec
+                    // error, refused before anything is journaled.
                     let missing = spec
                         .steps
                         .iter()
-                        .find(|s| !registry.contains(&s.handler))
+                        .find(|s| !registry.contains(ws, &s.handler))
                         .map(|s| s.handler.clone());
                     let r = match missing {
                         Some(name) => Err(EngineError::UnregisteredHandler(name)),
@@ -1122,6 +1228,15 @@ async fn actor(
                 Some(Cmd::Backup { dest, reply }) => {
                     pipe.collect(&mut core);
                     pipe.outbound.push_back(WriterMsg::Backup { dest, reply });
+                }
+                Some(Cmd::PutHandler { ws, name, handler, reply }) => {
+                    pipe.answer(core.last_index(), reply, registry.put(ws, &name, handler));
+                }
+                Some(Cmd::DeleteHandler { ws, name }) => {
+                    registry.remove(ws, &name);
+                }
+                Some(Cmd::SetWorkspaceHandlers { ws, handlers, reply }) => {
+                    pipe.answer(core.last_index(), reply, registry.set_ws(ws, handlers));
                 }
                 None => {
                     pipe.shutdown().await;
@@ -1342,7 +1457,7 @@ impl Exec<'_> {
         let Some(sspec) = r.spec.steps.get(step.0 as usize).cloned() else {
             return;
         };
-        let Some(handler) = self.registry.get(&sspec.handler) else {
+        let Some(handler) = self.registry.get(r.ws, &sspec.handler) else {
             return;
         };
         let idem = idem_key(&r.key, step);
@@ -1407,7 +1522,7 @@ impl Exec<'_> {
         let Some(sspec) = r.spec.steps.get(step.0 as usize).cloned() else {
             return;
         };
-        let Some(handler) = self.registry.get(&sspec.handler) else {
+        let Some(handler) = self.registry.get(r.ws, &sspec.handler) else {
             // Cannot probe an unregistered handler — reconcile as not-found
             // rather than leave the run stuck.
             let effects = self
@@ -1465,14 +1580,15 @@ fn tick(core: &mut EngineCore, exec: &mut Exec<'_>) {
     // call can only lose a journaled fact, and no commit is ever made for
     // a call that capacity would not allow.
     for (run, step, attempt) in core.due(now).into_iter().take(exec.per_tick) {
-        let Some(name) = core
-            .run(run)
-            .and_then(|r| r.spec.steps.get(step.0 as usize))
-            .map(|s| s.handler.clone())
-        else {
+        let Some((ws, name)) = core.run(run).and_then(|r| {
+            r.spec
+                .steps
+                .get(step.0 as usize)
+                .map(|s| (r.ws, s.handler.clone()))
+        }) else {
             continue;
         };
-        if !exec.registry.contains(&name) {
+        if !exec.registry.contains(ws, &name) {
             // The handler left the registry after this run was accepted:
             // it stays queued — registry repair or a cancel resolves it.
             // Refusing an event here would be noise; there is nothing to
@@ -1505,12 +1621,16 @@ fn run_effects(
             // The checkpoint commit already moved the run to Running — the
             // record IS this step's durable dispatch; just invoke it.
             Effect::DispatchStep { step, .. } => {
-                let name = core
+                let (ws, name) = core
                     .run(run)
-                    .and_then(|r| r.spec.steps.get(step.0 as usize))
-                    .map(|s| s.handler.clone())
+                    .and_then(|r| {
+                        r.spec
+                            .steps
+                            .get(step.0 as usize)
+                            .map(|s| (r.ws, s.handler.clone()))
+                    })
                     .unwrap_or_default();
-                if !exec.registry.contains(&name) {
+                if !exec.registry.contains(ws, &name) {
                     exec.fail(core, run, step, "unregistered handler");
                     continue;
                 }
@@ -1855,6 +1975,41 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
         panic!("run never reached a terminal state");
+    }
+
+    /// The per-workspace bound: `put` accepts 256 distinct names for one
+    /// workspace and refuses the 257th — an update to an existing name
+    /// never counts against the bound, and another workspace's names do
+    /// not either.
+    #[tokio::test(flavor = "current_thread")]
+    async fn the_registry_bound_is_per_workspace() {
+        let d = tempfile::tempdir().unwrap_or_else(|e| panic!("{e}"));
+        let eng = spawn(
+            d.path(),
+            Registry::default(),
+            ShellConfig {
+                tick_ms: 5,
+                ..Default::default()
+            },
+        )
+        .unwrap_or_else(|e| panic!("{e}"));
+        for i in 0..MAX_HANDLERS_PER_WS {
+            eng.put_handler(7, &format!("h{i}"), Arc::new(Echo))
+                .await
+                .unwrap_or_else(|e| panic!("h{i}: {e}"));
+        }
+        assert!(matches!(
+            eng.put_handler(7, "one-too-many", Arc::new(Echo)).await,
+            Err(EngineError::RegistryFull)
+        ));
+        // An update to an existing name is not a new registration.
+        eng.put_handler(7, "h0", Arc::new(Echo))
+            .await
+            .unwrap_or_else(|e| panic!("{e}"));
+        // …and workspace 8's bound is untouched by 7's full set.
+        eng.put_handler(8, "h0", Arc::new(Echo))
+            .await
+            .unwrap_or_else(|e| panic!("{e}"));
     }
 
     #[tokio::test(flavor = "current_thread")]

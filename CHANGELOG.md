@@ -14,6 +14,17 @@ authority for jobs — the account store is consulted at ingress only,
 never inside the commit path, and already-accepted runs keep executing
 through a store outage.
 
+S2-3: the writer now emits **v3** journal envelopes (`v:3` + `ws` on
+every record, including compat-mode workspace 0). v1.0.1 — shipped one
+release early per D-056 — is the rollback floor: v1.0.0's reader refuses
+a v3 journal cleanly, v1.0.1 replays mixed v2/v3 history and discards
+only demonstrably incomplete torn tails.
+
+S2-4: the **per-workspace handler registry**. A step's `handler` now
+resolves only inside the submitting workspace — a spec naming an
+unregistered or foreign-workspace handler fails admission as
+`unregistered_handler` before anything is journaled.
+
 ### Added
 
 - **`durable-accounts`**: the `AccountStore` trait over Postgres (sqlx,
@@ -49,6 +60,18 @@ through a store outage.
 - **Neon CI workflow** (`.github/workflows/neon.yml`): the Postgres
   store's contract tests run against real Neon behind a secret; absent,
   the job skips with a visible notice rather than silently passing.
+- **`GET/PUT/DELETE /handlers`** (S2-4): workspace-scoped registration
+  routes backed by the account store (`handler_registrations`); each
+  workspace is bounded at 256 handlers, checked before the store write.
+- **Engine `(workspace, name)` registry**: registrations reach the
+  engine over the same bounded command channel as submits — dispatch
+  never performs a store read. Compat `--handler` flags are workspace
+  0's registrations, shadowed by same-name store rows.
+- **Last-known-good snapshot** (`<journal>/handlers.json`, temp-file +
+  rename): loaded before serving at startup, refreshed by a 30 s
+  reconciler. A store outage keeps the in-memory set dispatching and
+  raises `registry_stale` in `/admin/diagnostics`; mutation and
+  reconciler writes to the file are serialized.
 
 ### Security
 
@@ -63,6 +86,10 @@ through a store outage.
   lifecycle over HTTP (mint → submit → revoke → immediate 401), the
   no-u64 leak scan, ops-scope refusal, outage semantics and
   restart-preserved workspace tags.
+- `load.mjs workspaces`: every workspace registers `step` through the
+  route, then 120 submits across 2 workspaces run concurrent with 1,213
+  register→delete churn ops — all admitted, all drained
+  (`perf/results/`).
 
 ## [1.0.1] - 2026-11-20
 

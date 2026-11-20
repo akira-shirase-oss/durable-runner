@@ -496,6 +496,37 @@ async function runWorkspaces() {
     })).json();
     keys.push({ public_id: w.public_id, auth: { authorization: `Bearer ${k.key}` } });
   }
+  // S2-4: handler names resolve per workspace — `step` exists only as a
+  // ws-0 flag registration, so every workspace registers it through the
+  // route before its submits can admit.
+  for (const ws of keys) {
+    const r = await fetch(`${API}/handlers/step`, {
+      method: 'PUT', headers: { 'content-type': 'application/json', ...ws.auth },
+      body: JSON.stringify({ url: `http://127.0.0.1:${HPORT}/step` }),
+    });
+    if (r.status !== 200) {
+      console.error(`handler registration failed: ${r.status} ${await r.text()}`);
+      h.kill(); s.kill(); return false;
+    }
+  }
+  // Registration churn concurrent with dispatch lookups: a second name
+  // flaps register→delete under the first workspace's key while the
+  // submit burst runs — the registry is rebuilt per workspace, never
+  // blocked.
+  let churnDone = false; let churnOps = 0;
+  const churn = (async () => {
+    while (!churnDone) {
+      const put = await fetch(`${API}/handlers/churn`, {
+        method: 'PUT', headers: { 'content-type': 'application/json', ...keys[0].auth },
+        body: JSON.stringify({ url: `http://127.0.0.1:${HPORT}/step` }),
+      });
+      const del = await fetch(`${API}/handlers/churn`, { method: 'DELETE', headers: keys[0].auth });
+      if (put.status !== 200 || del.status !== 200) {
+        console.error(`churn broke: put=${put.status} del=${del.status}`); return;
+      }
+      churnOps++; await sleep(5);
+    }
+  })();
   // Submit `per` runs per workspace, same op_key prefix in each — dedup is
   // per (workspace, key), so identical keys in two workspaces are two runs.
   const lat = []; const codes = {}; let sent = 0;
@@ -510,6 +541,7 @@ async function runWorkspaces() {
     if (i % 100 === 0) await sleep(50);
   }
   await sleep(15_000); // drain
+  churnDone = true; await churn;
   // Page each workspace's list: it must contain exactly its `per` runs and
   // no id another workspace owns.
   const owned = new Map(); // ws -> Set(run ids)
@@ -536,7 +568,7 @@ async function runWorkspaces() {
   const p99 = pct(lat, 0.99);
   const r = writeResult('workspaces', {
     params: { workspaces: n, submits_per_workspace: per, account_backend: backend, smoke: SMOKE },
-    sent, http_codes: codes, per_workspace: pageCounts,
+    sent, http_codes: codes, per_workspace: pageCounts, churn_registrations: churnOps,
     done_after_drain: done,
     latency_ms: { p50: pct(lat, 0.5), p99, max: pct(lat, 1) },
     thresholds: {

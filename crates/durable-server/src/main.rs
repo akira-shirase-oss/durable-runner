@@ -16,10 +16,10 @@ use axum::{
     Json, Router,
 };
 use clap::Parser;
-use durable_accounts::{AccountStore, Permission, Pg};
+use durable_accounts::{AccountError, AccountStore, Permission, Pg};
 use durable_domain::{JobSpec, Millis, OperationKey, RunId, RunState, StepSpec};
 use durable_engine::shell::{
-    spawn, Call, Engine, Order, Outcome, Registry, ShellConfig, StepHandler,
+    spawn, Call, Engine, Order, Outcome, Registry, ShellConfig, StepHandler, MAX_HANDLERS_PER_WS,
 };
 use durable_engine::EngineError;
 use serde::Deserialize;
@@ -323,6 +323,160 @@ impl StepHandler for HttpHandler {
     }
 }
 
+// ---- S2-4: the per-workspace handler registry ---------------------------
+
+/// Builds `HttpHandler`s for registered URLs through the one bounded
+/// client — the same limits every `--handler` flag gets.
+struct HandlerFactory {
+    client: reqwest::Client,
+    timeout: Duration,
+    max_output: usize,
+}
+
+impl HandlerFactory {
+    fn make(&self, url: &str) -> Arc<HttpHandler> {
+        Arc::new(HttpHandler {
+            client: self.client.clone(),
+            url: url.to_string(),
+            timeout: self.timeout,
+            max_output: self.max_output,
+        })
+    }
+}
+
+/// The same admission rule `parse_handler` enforces for `--handler`:
+/// http(s) with a host. The SSRF guard lands in S2-5 on top of this.
+fn valid_handler_url(url: &str) -> Result<String, ApiError> {
+    let parsed = reqwest::Url::parse(url).map_err(|e| {
+        ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "bad_handler_url",
+            format!("handler URL {url:?}: {e}"),
+        )
+    })?;
+    if !matches!(parsed.scheme(), "http" | "https") || parsed.host_str().is_none_or(str::is_empty) {
+        return Err(ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "bad_handler_url",
+            format!("handler URL {url:?} must be http:// or https:// with a host"),
+        ));
+    }
+    Ok(url.to_string())
+}
+
+/// One persisted registration: the internal ws id stays on disk (never an
+/// external surface), matching the journal's own records.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+struct RegistryEntry {
+    ws: u64,
+    name: String,
+    url: String,
+}
+
+/// The last-known-good registry (`<journal>/handlers.json`): read at
+/// startup so a restart during an account-store outage dispatches from
+/// the snapshot instead of losing every registered handler. Rebuildable
+/// from the store — it is a cache, never an authority.
+fn load_registry_file(path: &Path) -> Vec<RegistryEntry> {
+    match std::fs::read(path) {
+        Ok(b) => serde_json::from_slice(&b).unwrap_or_else(|e| {
+            eprintln!("durable-server: {path:?} is corrupt ({e}); ignoring it");
+            Vec::new()
+        }),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+        Err(e) => {
+            eprintln!("durable-server: cannot read {path:?}: {e}; ignoring it");
+            Vec::new()
+        }
+    }
+}
+
+/// Whole-file replace, tmp + rename: a crash mid-write leaves either the
+/// old snapshot or the new one, never a torn file.
+fn save_registry_file(path: &Path, entries: &[RegistryEntry]) -> Result<()> {
+    let tmp = path.with_extension("json.tmp");
+    std::fs::write(&tmp, serde_json::to_vec(entries)?)?;
+    std::fs::rename(&tmp, path)?;
+    Ok(())
+}
+
+/// How often the store reconciler refreshes the engine's registry and
+/// the snapshot file. Dispatch reads the in-memory registry — this loop
+/// is never in a call's path.
+const REGISTRY_SYNC: Duration = Duration::from_secs(30);
+/// Workspaces the reconciler walks per pass (bounded per D-021).
+const REGISTRY_SYNC_WS_LIMIT: u32 = 1024;
+
+/// One reconcile pass: store truth → engine registry + snapshot file.
+/// `flags` are the ws-0 `--handler` registrations — they union with the
+/// store's ws-0 rows (a store row shadows a flag on a name conflict).
+async fn registry_sync(
+    store: &Arc<dyn AccountStore>,
+    engine: &Engine,
+    factory: &HandlerFactory,
+    flags: &[(String, Arc<dyn StepHandler>)],
+    file: &Path,
+    lock: &Mutex<()>,
+) -> Result<(), AccountError> {
+    let workspaces = store.list_workspaces(REGISTRY_SYNC_WS_LIMIT).await?;
+    let mut all = Vec::new();
+    for ws in &workspaces {
+        let regs = store.list_handlers(ws.id).await?;
+        let mut set: Vec<(String, Arc<dyn StepHandler>)> = if ws.id == 0 {
+            flags.to_vec()
+        } else {
+            Vec::new()
+        };
+        for r in &regs {
+            set.push((r.name.clone(), factory.make(&r.url)));
+            all.push(RegistryEntry {
+                ws: ws.id,
+                name: r.name.clone(),
+                url: r.url.clone(),
+            });
+        }
+        engine
+            .set_workspace_handlers(ws.id, set)
+            .await
+            .map_err(|e| AccountError::Store(format!("engine refused handlers: {e}")))?;
+    }
+    // The file write is the only thing a route mutation can race with.
+    let _g = lock.lock().unwrap_or_else(|e| e.into_inner());
+    if let Err(e) = save_registry_file(file, &all) {
+        eprintln!("durable-server: cannot write {file:?}: {e}");
+    }
+    Ok(())
+}
+
+/// The reconciler loop: on a store error the engine keeps serving the
+/// last-known-good set and `registry_stale` reports it.
+fn spawn_registry_reconcile(
+    store: Arc<dyn AccountStore>,
+    app: &App,
+    stale: Arc<std::sync::atomic::AtomicBool>,
+) {
+    let engine = app.engine.clone();
+    let factory = Arc::clone(&app.handler_factory);
+    let flags = Arc::clone(&app.flag_handlers);
+    let file = app.registry_file.clone();
+    let lock = Arc::clone(&app.registry_lock);
+    tokio::spawn(async move {
+        loop {
+            match registry_sync(&store, &engine, &factory, &flags, &file, &lock).await {
+                Ok(()) => stale.store(false, std::sync::atomic::Ordering::Relaxed),
+                Err(e) => {
+                    stale.store(true, std::sync::atomic::Ordering::Relaxed);
+                    eprintln!(
+                        "durable-server: registry reconcile failed ({e}); \
+                         serving last-known-good handlers"
+                    );
+                }
+            }
+            tokio::time::sleep(REGISTRY_SYNC).await;
+        }
+    });
+}
+
 /// The API key, kept only as its SHA-256 digest. Comparing fixed-length
 /// digests in constant time leaks neither the key's bytes nor its length.
 #[derive(Clone)]
@@ -513,6 +667,45 @@ struct App {
     open_reads: bool,
     /// Canonical backup directory; `None` disables `/admin/backup`.
     backup_root: Option<Arc<Path>>,
+    /// Builds registered handlers through the bounded client (S2-4).
+    handler_factory: Arc<HandlerFactory>,
+    /// ws-0 `--handler` registrations — unioned into ws 0 on every
+    /// reconcile so a store row shadows but never silently deletes them.
+    flag_handlers: Arc<Vec<(String, Arc<dyn StepHandler>)>>,
+    /// The engine is serving the snapshot because the store could not
+    /// answer the last reconcile (`registry_stale` in diagnostics).
+    registry_stale: Arc<std::sync::atomic::AtomicBool>,
+    /// `<journal>/handlers.json`: the last-known-good registrations.
+    registry_file: Arc<Path>,
+    /// Serializes snapshot writes between routes and the reconciler.
+    registry_lock: Arc<Mutex<()>>,
+}
+
+/// Test constructor: the registry plumbing (`handlers.json`, factory,
+/// flags) points inside the test's journal dir like the real wiring.
+#[cfg(test)]
+fn test_app(
+    engine: Engine,
+    keyring: Arc<Keyring>,
+    open_reads: bool,
+    backup_root: Option<Arc<Path>>,
+    journal_dir: &Path,
+) -> App {
+    App {
+        engine,
+        keyring,
+        open_reads,
+        backup_root,
+        handler_factory: Arc::new(HandlerFactory {
+            client: handler_client().unwrap_or_else(|e| panic!("{e}")),
+            timeout: Duration::from_secs(2),
+            max_output: 1024 * 1024,
+        }),
+        flag_handlers: Arc::new(Vec::new()),
+        registry_stale: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        registry_file: Arc::from(journal_dir.join("handlers.json").as_path()),
+        registry_lock: Arc::new(Mutex::new(())),
+    }
 }
 
 /// The bearer token a request carries: `<scheme> <token>`, the scheme
@@ -746,6 +939,11 @@ impl From<EngineError> for ApiError {
             EngineError::UnregisteredHandler(_) => {
                 Self::new(StatusCode::CONFLICT, "unregistered_handler", e.to_string())
             }
+            EngineError::RegistryFull => Self::new(
+                StatusCode::CONFLICT,
+                "registry_full",
+                "the workspace's handler registry is at its bound",
+            ),
             EngineError::Stopped => Self::new(
                 StatusCode::SERVICE_UNAVAILABLE,
                 "engine_stopped",
@@ -1018,7 +1216,16 @@ async fn diagnostics(
     State(app): State<App>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let d = app.engine.diag().await?;
-    Ok(Json(serde_json::to_value(d).unwrap_or_default()))
+    let mut v = serde_json::to_value(d).unwrap_or_default();
+    if let Some(o) = v.as_object_mut() {
+        o.insert(
+            "registry_stale".into(),
+            serde_json::json!(app
+                .registry_stale
+                .load(std::sync::atomic::Ordering::Relaxed)),
+        );
+    }
+    Ok(Json(v))
 }
 
 // ---- S2: the account graph (workspaces + API keys) ----------------
@@ -1296,6 +1503,131 @@ async fn delete_workspace_key(
     }
 }
 
+// ---- S2-4: per-workspace handler registrations --------------------------
+
+/// Handler routes are tenant self-service: the caller's own workspace,
+/// admin permission required (Authorized). The store is authoritative;
+/// each write lands in the engine's dispatch registry and the snapshot.
+async fn list_handlers(
+    Authorized(auth): Authorized,
+    State(app): State<App>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let store = accounts(&app)?;
+    let regs = store.list_handlers(auth.ws).await.map_err(store_err)?;
+    let mut handlers: Vec<serde_json::Value> = Vec::new();
+    if auth.ws == 0 {
+        // Flag handlers are ws 0's too; a store row shadows them on a
+        // name conflict (store rows push after, the map keeps the last).
+        for (name, _) in app.flag_handlers.iter() {
+            handlers.push(serde_json::json!({ "name": name, "source": "flag" }));
+        }
+    }
+    for r in regs {
+        handlers.retain(|h| h["name"] != r.name);
+        handlers.push(serde_json::json!({ "name": r.name, "url": r.url }));
+    }
+    Ok(Json(serde_json::json!({ "handlers": handlers })))
+}
+
+#[derive(Deserialize)]
+struct PutHandlerReq {
+    url: String,
+}
+
+/// Rewrite the snapshot after a route mutation: the current file plus
+/// this change. Serialized with the reconciler's writes by `registry_lock`.
+fn registry_file_upsert(app: &App, entry: RegistryEntry) {
+    let _g = app.registry_lock.lock().unwrap_or_else(|e| e.into_inner());
+    let mut all = load_registry_file(&app.registry_file);
+    all.retain(|e| !(e.ws == entry.ws && e.name == entry.name));
+    all.push(entry);
+    if let Err(e) = save_registry_file(&app.registry_file, &all) {
+        eprintln!("durable-server: cannot write {:?}: {e}", app.registry_file);
+    }
+}
+
+fn registry_file_remove(app: &App, ws: u64, name: &str) {
+    let _g = app.registry_lock.lock().unwrap_or_else(|e| e.into_inner());
+    let mut all = load_registry_file(&app.registry_file);
+    all.retain(|e| !(e.ws == ws && e.name == name));
+    if let Err(e) = save_registry_file(&app.registry_file, &all) {
+        eprintln!("durable-server: cannot write {:?}: {e}", app.registry_file);
+    }
+}
+
+async fn put_handler(
+    Authorized(auth): Authorized,
+    State(app): State<App>,
+    P(name): P<String>,
+    Json(body): Json<PutHandlerReq>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let store = accounts(&app)?;
+    let name = name.trim();
+    if name.is_empty() || name.len() > 128 || name.chars().any(char::is_control) {
+        return Err(ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "bad_name",
+            "handler name must be 1-128 chars with no control characters",
+        ));
+    }
+    let url = valid_handler_url(body.url.trim())?;
+    // The 256 bound lives in the engine, but the store must never hold a
+    // row the engine refuses: one over-limit row would poison every
+    // later reconcile of this workspace's set. Check before writing —
+    // a concurrent PUT can still race past it, which the engine's own
+    // bound catches and a DELETE or the next reconcile heals.
+    let regs = store.list_handlers(auth.ws).await.map_err(store_err)?;
+    if !regs.iter().any(|r| r.name == name) && regs.len() >= MAX_HANDLERS_PER_WS {
+        return Err(ApiError::new(
+            StatusCode::CONFLICT,
+            "registry_full",
+            "the workspace's handler registry is at its bound",
+        ));
+    }
+    // Order is store → engine → snapshot: the store is the authority, so
+    // a row it accepted is never silently dropped. If the engine call
+    // fails the row stays and the next reconcile applies it; the client
+    // gets the engine's error and can retry or DELETE.
+    store
+        .put_handler(auth.ws, name, &url)
+        .await
+        .map_err(store_err)?;
+    app.engine
+        .put_handler(auth.ws, name, app.handler_factory.make(&url))
+        .await?;
+    registry_file_upsert(
+        &app,
+        RegistryEntry {
+            ws: auth.ws,
+            name: name.to_string(),
+            url: url.clone(),
+        },
+    );
+    Ok(Json(serde_json::json!({ "name": name, "url": url })))
+}
+
+async fn delete_handler(
+    Authorized(auth): Authorized,
+    State(app): State<App>,
+    P(name): P<String>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let store = accounts(&app)?;
+    let existed = store
+        .delete_handler(auth.ws, &name)
+        .await
+        .map_err(store_err)?;
+    if !existed {
+        return Err(ApiError::new(
+            StatusCode::NOT_FOUND,
+            "not_found",
+            "no such handler registration",
+        ));
+    }
+    app.engine.delete_handler(auth.ws, &name)?;
+    registry_file_remove(&app, auth.ws, &name);
+    Ok(Json(serde_json::json!({ "deleted": name })))
+}
+
 async fn compact(
     _: Authorized,
     State(app): State<App>,
@@ -1397,6 +1729,12 @@ fn router(app: App, ui_dir: Option<&Path>) -> Router {
         .route(
             "/admin/workspaces/{public_id}/keys/{key_id}",
             axum::routing::delete(delete_workspace_key),
+        )
+        // S2-4: the caller's own workspace's handler registry.
+        .route("/handlers", get(list_handlers))
+        .route(
+            "/handlers/{name}",
+            axum::routing::put(put_handler).delete(delete_handler),
         )
         // A submit is at most 64 KiB of input (base64: ~88 KiB) plus its
         // spec; nothing legitimate comes near this.
@@ -1635,16 +1973,16 @@ async fn main() -> Result<()> {
     };
     let mut registry = Registry::default();
     let client = handler_client()?;
+    let factory = Arc::new(HandlerFactory {
+        client,
+        timeout: Duration::from_millis(args.step_timeout_ms),
+        max_output: cfg.limits.max_output_bytes,
+    });
+    let mut flag_handlers: Vec<(String, Arc<dyn StepHandler>)> = Vec::new();
     for (name, url) in &args.handlers {
-        registry.register(
-            name,
-            Arc::new(HttpHandler {
-                client: client.clone(),
-                url: url.clone(),
-                timeout: Duration::from_millis(args.step_timeout_ms),
-                max_output: cfg.limits.max_output_bytes,
-            }),
-        );
+        let h = factory.make(url);
+        flag_handlers.push((name.clone(), h.clone()));
+        registry.register(name, h);
     }
     let engine =
         spawn(&args.journal, registry, cfg).map_err(|e| anyhow::anyhow!("engine open: {e}"))?;
@@ -1655,13 +1993,37 @@ async fn main() -> Result<()> {
             t.bytes, t.offset
         );
     }
+    // S2-4: the last-known-good registry, loaded before serving — a
+    // restart during an account-store outage still dispatches. The
+    // reconciler (below, store mode only) refreshes it.
+    let registry_file: Arc<Path> = Arc::from(args.journal.join("handlers.json").as_path());
+    if store.is_some() {
+        for entry in load_registry_file(&registry_file) {
+            let h = factory.make(&entry.url);
+            if let Err(e) = engine.put_handler(entry.ws, &entry.name, h).await {
+                eprintln!(
+                    "durable-server: snapshot handler {:?} refused at startup: {e}",
+                    entry.name
+                );
+            }
+        }
+    }
     let stopped = engine.clone();
+    let registry_stale = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let app = App {
         engine,
-        keyring: Arc::new(Keyring::new(api_key, read_key, store)),
+        keyring: Arc::new(Keyring::new(api_key, read_key, store.clone())),
         open_reads: args.open_reads,
         backup_root,
+        handler_factory: factory,
+        flag_handlers: Arc::new(flag_handlers),
+        registry_stale: Arc::clone(&registry_stale),
+        registry_file,
+        registry_lock: Arc::new(Mutex::new(())),
     };
+    if let Some(store) = &store {
+        spawn_registry_reconcile(store.clone(), &app, registry_stale);
+    }
     let router = router(app, args.ui_dir.as_deref());
     let listener = tokio::net::TcpListener::bind(&args.listen)
         .await
@@ -2113,6 +2475,7 @@ mod tests {
     struct Harness {
         router: Router,
         keyring: Arc<Keyring>,
+        app: App,
         backups: tempfile::TempDir,
         _journal: tempfile::TempDir,
     }
@@ -2160,18 +2523,28 @@ mod tests {
             Some(ApiKey::new(READ_KEY)),
             store,
         ));
-        let app = App {
-            engine,
-            keyring: keyring.clone(),
-            open_reads: false,
-            backup_root,
-        };
+        let app = test_app(engine, keyring.clone(), false, backup_root, journal.path());
         Harness {
-            router: router(app, None),
+            router: router(app.clone(), None),
             keyring,
+            app,
             backups,
             _journal: journal,
         }
+    }
+
+    /// Register `step` for `ws` the way a route PUT plus a reconcile
+    /// would: the store row, then the engine's in-process `Echo` — the
+    /// tests never want a real HTTP call. Workspaces other than 0 need
+    /// this before any `step` spec can admit (S2-4's scoped registry).
+    async fn register_step(store: &durable_accounts::Memory, ws: u64, eng: &Engine) {
+        store
+            .put_handler(ws, "step", "http://127.0.0.1:9/step")
+            .await
+            .unwrap_or_else(|e| panic!("{e}"));
+        eng.put_handler(ws, "step", Arc::new(Echo))
+            .await
+            .unwrap_or_else(|e| panic!("{e}"));
     }
 
     async fn call(
@@ -2363,7 +2736,8 @@ mod tests {
             )
             .await
             .unwrap_or_else(|e| panic!("key: {e}"));
-        let h = harness_store(true, None, Some(store));
+        let h = harness_store(true, None, Some(store.clone()));
+        register_step(&store, ws.id, &h.app.engine).await;
 
         let (status, v) = call(
             &h.router,
@@ -2580,7 +2954,9 @@ mod tests {
             )
             .await
             .unwrap_or_else(|e| panic!("kb: {e}"));
-        let h = harness_store(true, None, Some(store));
+        let h = harness_store(true, None, Some(store.clone()));
+        register_step(&store, a.id, &h.app.engine).await;
+        register_step(&store, b.id, &h.app.engine).await;
 
         let (status, v) = call(
             &h.router,
@@ -2683,6 +3059,7 @@ mod tests {
             .await
             .unwrap_or_else(|e| panic!("{e}"));
         let h = harness_store(true, None, Some(store.clone()));
+        register_step(&store, ws.id, &h.app.engine).await;
         let internal = ws.id; // the id that must never leave the process
 
         // Seed a run + a workspace so the routes have data to show.
@@ -2786,7 +3163,7 @@ mod tests {
     async fn the_key_lifecycle_over_http() {
         use durable_accounts::Memory;
         let store = Arc::new(Memory::new());
-        let h = harness_store(true, None, Some(store));
+        let h = harness_store(true, None, Some(store.clone()));
 
         let (status, v) = call(
             &h.router,
@@ -2820,6 +3197,17 @@ mod tests {
             .as_str()
             .unwrap_or_else(|| panic!("{v}"))
             .to_string();
+        // The workspace's internal id never left the process — the test
+        // finds it through the store to give the ws a `step` handler.
+        let ws_id = store
+            .list_workspaces(100)
+            .await
+            .unwrap_or_else(|e| panic!("{e}"))
+            .into_iter()
+            .find(|w| w.public_id.to_string() == pid)
+            .unwrap_or_else(|| panic!("workspace {pid}"))
+            .id;
+        register_step(&store, ws_id, &h.app.engine).await;
         assert!(issued.starts_with("dr_"));
 
         let (status, v) = call(
@@ -2935,6 +3323,337 @@ mod tests {
         assert!(v["error"].as_str().unwrap_or("").contains("DATABASE_URL"));
     }
 
+    /// S2-4's isolation: a handler registered in workspace A is invisible
+    /// to workspace B — B's spec naming it is `unregistered_handler`, B's
+    /// list is empty, and B cannot delete it. Registering/deleting is
+    /// scoped to the caller's own workspace.
+    #[tokio::test]
+    async fn a_workspaces_handlers_are_isolated() {
+        use durable_accounts::Memory;
+        let store = Arc::new(Memory::new());
+        let a = store
+            .create_workspace("a")
+            .await
+            .unwrap_or_else(|e| panic!("{e}"));
+        let b = store
+            .create_workspace("b")
+            .await
+            .unwrap_or_else(|e| panic!("{e}"));
+        let key_a = "ws-a-hkey-0123456789abcde";
+        let key_b = "ws-b-hkey-0123456789abcde";
+        store
+            .create_key(
+                a.id,
+                "k",
+                Permission::Admin,
+                &sha256(key_a.as_bytes()),
+                "dr_a",
+            )
+            .await
+            .unwrap_or_else(|e| panic!("{e}"));
+        store
+            .create_key(
+                b.id,
+                "k",
+                Permission::Admin,
+                &sha256(key_b.as_bytes()),
+                "dr_b",
+            )
+            .await
+            .unwrap_or_else(|e| panic!("{e}"));
+        let h = harness_store(true, None, Some(store));
+
+        let spec_with = |handler: &str| {
+            json!({"op_key": "o", "spec": {"version": 1,
+                "steps": [{"name": "s", "handler": handler}], "input_b64": "aGk="}})
+        };
+        // B's spec naming what only A will register → unregistered_handler.
+        let (status, v) = call(
+            &h.router,
+            "POST",
+            "/jobs",
+            Some(key_b),
+            Some(spec_with("h")),
+        )
+        .await;
+        assert_eq!(
+            (status, v["code"].as_str().unwrap_or("")),
+            (StatusCode::CONFLICT, "unregistered_handler"),
+            "{v}"
+        );
+
+        // A registers it — then A's spec submits while B's still refuses.
+        let (status, v) = call(
+            &h.router,
+            "PUT",
+            "/handlers/h",
+            Some(key_a),
+            Some(json!({ "url": "http://127.0.0.1:9/h" })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{v}");
+        let (status, v) = call(
+            &h.router,
+            "POST",
+            "/jobs",
+            Some(key_a),
+            Some(spec_with("h")),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{v}");
+        let (status, v) = call(
+            &h.router,
+            "POST",
+            "/jobs",
+            Some(key_b),
+            Some(spec_with("h")),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT, "{v}");
+
+        // Lists are scoped; deletes are scoped.
+        let (status, v) = call(&h.router, "GET", "/handlers", Some(key_b), None).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(v["handlers"].as_array().map(|h| h.len()), Some(0), "{v}");
+        let (status, v) = call(&h.router, "GET", "/handlers", Some(key_a), None).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(v["handlers"][0]["url"], "http://127.0.0.1:9/h", "{v}");
+        let (status, _) = call(&h.router, "DELETE", "/handlers/h", Some(key_b), None).await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "B cannot delete A's handler");
+
+        // Deleting under A removes it for A — the spec fails admission again.
+        let (status, _) = call(&h.router, "DELETE", "/handlers/h", Some(key_a), None).await;
+        assert_eq!(status, StatusCode::OK);
+        let (status, v) = call(
+            &h.router,
+            "POST",
+            "/jobs",
+            Some(key_a),
+            Some(spec_with("h")),
+        )
+        .await;
+        assert_eq!(
+            (status, v["code"].as_str().unwrap_or("")),
+            (StatusCode::CONFLICT, "unregistered_handler"),
+            "{v}"
+        );
+    }
+
+    /// A route PUT persists to the store, the engine AND the snapshot —
+    /// and the snapshot rebuilds a fresh engine's registry exactly the
+    /// way startup's load path does (the restart-during-outage case).
+    #[tokio::test]
+    async fn the_snapshot_rebuilds_the_registry_on_restart() {
+        use durable_accounts::Memory;
+        let store = Arc::new(Memory::new());
+        let a = store
+            .create_workspace("a")
+            .await
+            .unwrap_or_else(|e| panic!("{e}"));
+        let key_a = "snap-key-0123456789abcdefgh";
+        store
+            .create_key(
+                a.id,
+                "k",
+                Permission::Admin,
+                &sha256(key_a.as_bytes()),
+                "dr_a",
+            )
+            .await
+            .unwrap_or_else(|e| panic!("{e}"));
+        let h = harness_store(true, None, Some(store));
+        let (status, v) = call(
+            &h.router,
+            "PUT",
+            "/handlers/h",
+            Some(key_a),
+            Some(json!({ "url": "http://127.0.0.1:9/h" })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{v}");
+
+        // The snapshot on disk carries the entry…
+        let entries = load_registry_file(&h.app.registry_file);
+        assert_eq!(
+            entries,
+            vec![RegistryEntry {
+                ws: a.id,
+                name: "h".into(),
+                url: "http://127.0.0.1:9/h".into()
+            }]
+        );
+
+        // …and replaying it into a fresh engine — main()'s startup path —
+        // registers `h` in a's workspace so its spec admits.
+        let j2 = tempfile::tempdir().unwrap_or_else(|e| panic!("{e}"));
+        let engine2 = spawn(
+            j2.path(),
+            Registry::default(),
+            ShellConfig {
+                tick_ms: 5,
+                ..Default::default()
+            },
+        )
+        .unwrap_or_else(|e| panic!("{e}"));
+        for e in entries {
+            engine2
+                .put_handler(e.ws, &e.name, h.app.handler_factory.make(&e.url))
+                .await
+                .unwrap_or_else(|e| panic!("{e}"));
+        }
+        let spec = JobSpec {
+            version: 1,
+            steps: vec![StepSpec {
+                name: "s".into(),
+                handler: "h".into(),
+            }],
+            input: b"hi".to_vec(),
+        };
+        engine2
+            .submit_scoped(a.id, OperationKey("k".into()), spec)
+            .await
+            .unwrap_or_else(|e| panic!("snapshot-restored registry must admit: {e}"));
+    }
+
+    /// The 256 bound is enforced before the store write: seeded to the
+    /// limit, a 257th registration answers 409 `registry_full` and never
+    /// reaches the store — an update to an existing name still passes.
+    #[tokio::test]
+    async fn the_registry_bound_refuses_a_257th_name() {
+        use durable_accounts::Memory;
+        let store = Arc::new(Memory::new());
+        let a = store
+            .create_workspace("a")
+            .await
+            .unwrap_or_else(|e| panic!("{e}"));
+        let key_a = "cap-key-0123456789abcdefgh";
+        store
+            .create_key(
+                a.id,
+                "k",
+                Permission::Admin,
+                &sha256(key_a.as_bytes()),
+                "dr_a",
+            )
+            .await
+            .unwrap_or_else(|e| panic!("{e}"));
+        for i in 0..MAX_HANDLERS_PER_WS {
+            store
+                .put_handler(a.id, &format!("h{i}"), "http://127.0.0.1:9/h")
+                .await
+                .unwrap_or_else(|e| panic!("{e}"));
+        }
+        let h = harness_store(true, None, Some(store));
+        let (status, v) = call(
+            &h.router,
+            "PUT",
+            "/handlers/one-too-many",
+            Some(key_a),
+            Some(json!({ "url": "http://127.0.0.1:9/x" })),
+        )
+        .await;
+        assert_eq!(
+            (status, v["code"].as_str().unwrap_or("")),
+            (StatusCode::CONFLICT, "registry_full"),
+            "{v}"
+        );
+        let (status, v) = call(
+            &h.router,
+            "PUT",
+            "/handlers/h0",
+            Some(key_a),
+            Some(json!({ "url": "http://127.0.0.1:9/other" })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{v}");
+    }
+
+    /// The reconciler's outage path: with the store down the engine keeps
+    /// the last-known-good set — submits still admit and diagnostics says
+    /// `registry_stale` (the loop sets the flag on the same error).
+    #[tokio::test]
+    async fn a_store_outage_keeps_the_last_known_good_registry() {
+        use durable_accounts::Memory;
+        let store = Arc::new(Memory::new());
+        let a = store
+            .create_workspace("a")
+            .await
+            .unwrap_or_else(|e| panic!("{e}"));
+        let key_a = "lkg-key-0123456789abcdefg";
+        store
+            .create_key(
+                a.id,
+                "k",
+                Permission::Admin,
+                &sha256(key_a.as_bytes()),
+                "dr_a",
+            )
+            .await
+            .unwrap_or_else(|e| panic!("{e}"));
+        store
+            .put_handler(a.id, "h", "http://127.0.0.1:9/h")
+            .await
+            .unwrap_or_else(|e| panic!("{e}"));
+        let h = harness_store(true, None, Some(store.clone()));
+
+        // A healthy sync pushes store truth → engine + snapshot file.
+        registry_sync(
+            &h.app
+                .keyring
+                .store
+                .clone()
+                .unwrap_or_else(|| panic!("store")),
+            &h.app.engine,
+            &h.app.handler_factory,
+            &h.app.flag_handlers,
+            &h.app.registry_file,
+            &h.app.registry_lock,
+        )
+        .await
+        .unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(load_registry_file(&h.app.registry_file).len(), 1);
+
+        // Cache key_a's verification — a *cached* key keeps working
+        // through the outage; an unknown bearer would fail closed.
+        let (status, v) = call(&h.router, "GET", "/handlers", Some(key_a), None).await;
+        assert_eq!(status, StatusCode::OK, "{v}");
+
+        // The store dies: the next sync fails — the loop's stale flag —
+        // but the in-memory registry still admits under workspace a.
+        store.set_unavailable(true);
+        assert!(
+            registry_sync(
+                &h.app
+                    .keyring
+                    .store
+                    .clone()
+                    .unwrap_or_else(|| panic!("store")),
+                &h.app.engine,
+                &h.app.handler_factory,
+                &h.app.flag_handlers,
+                &h.app.registry_file,
+                &h.app.registry_lock,
+            )
+            .await
+            .is_err(),
+            "a down store must fail the reconcile, loudly"
+        );
+        h.app
+            .registry_stale
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        let spec = json!({"op_key": "o", "spec": {"version": 1,
+            "steps": [{"name": "s", "handler": "h"}], "input_b64": "aGk="}});
+        let (status, v) = call(&h.router, "POST", "/jobs", Some(key_a), Some(spec)).await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "{v} — LKG registry must still admit"
+        );
+        let (status, v) = call(&h.router, "GET", "/admin/diagnostics", Some(KEY), None).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(v["registry_stale"], json!(true), "{v}");
+    }
+
     /// `--open-reads` serves reads without a key; it is refused at startup
     /// unless the listen address is a loopback IP.
     #[tokio::test]
@@ -2957,12 +3676,13 @@ mod tests {
         let engine =
             spawn(journal.path(), reg, ShellConfig::default()).unwrap_or_else(|e| panic!("{e}"));
         let r = router(
-            App {
+            test_app(
                 engine,
-                keyring: Arc::new(Keyring::new(ApiKey::new(KEY), None, None)),
-                open_reads: true,
-                backup_root: None,
-            },
+                Arc::new(Keyring::new(ApiKey::new(KEY), None, None)),
+                true,
+                None,
+                journal.path(),
+            ),
             None,
         );
         let get = |host: Option<&'static str>| {
@@ -3636,12 +4356,13 @@ mod tests {
         let engine = spawn(journal.path(), Registry::default(), ShellConfig::default())
             .unwrap_or_else(|e| panic!("{e}"));
         let r = router(
-            App {
+            test_app(
                 engine,
-                keyring: Arc::new(Keyring::new(ApiKey::new(KEY), None, None)),
-                open_reads: false,
-                backup_root: None,
-            },
+                Arc::new(Keyring::new(ApiKey::new(KEY), None, None)),
+                false,
+                None,
+                journal.path(),
+            ),
             Some(ui.path()),
         );
         use base64::Engine as _;
@@ -4319,12 +5040,13 @@ mod tests {
         };
         let engine = spawn(journal.path(), reg, cfg).unwrap_or_else(|e| panic!("{e}"));
         let r = router(
-            App {
+            test_app(
                 engine,
-                keyring: Arc::new(Keyring::new(ApiKey::new(KEY), None, None)),
-                open_reads: false,
-                backup_root: None,
-            },
+                Arc::new(Keyring::new(ApiKey::new(KEY), None, None)),
+                false,
+                None,
+                journal.path(),
+            ),
             None,
         );
         fail.store(true, std::sync::atomic::Ordering::SeqCst);
@@ -4352,12 +5074,13 @@ mod tests {
         };
         let engine = spawn(journal.path(), reg, cfg).unwrap_or_else(|e| panic!("{e}"));
         let r = router(
-            App {
+            test_app(
                 engine,
-                keyring: Arc::new(Keyring::new(ApiKey::new(KEY), None, None)),
-                open_reads: false,
-                backup_root: None,
-            },
+                Arc::new(Keyring::new(ApiKey::new(KEY), None, None)),
+                false,
+                None,
+                journal.path(),
+            ),
             None,
         );
         faults.hold_syncs();
