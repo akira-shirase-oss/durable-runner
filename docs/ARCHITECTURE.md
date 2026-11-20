@@ -123,6 +123,21 @@ resolution). A refused call is a definitive failed attempt, never
 development and fixtures. The guard adds one OS lookup plus a CIDR
 scan per new connection; keep-alive calls pay nothing (measured in
 `ssrf.rs` tests).
+
+**Signed handler calls (S2-6).** Every call a store-registered handler
+receives carries `x-durable-timestamp` and `x-durable-signature`: hex
+HMAC-SHA256 under the workspace's 32-byte secret over
+`ts.run.step.attempt.idem_key.SHA256(body)` (probe: empty digest). The
+secret is drawn at workspace creation, shown once there and once at
+`POST /handler-secret` rotation, stored retrievably in the account
+store (a handler needs it to verify), never in `GET` responses or logs.
+Rotation re-arms the engine's whole registry for that workspace in the
+same request — old-secret signatures die immediately and in-flight
+calls fail honestly at the handler. The secret also rides the
+last-known-good `handlers.json` snapshot (0600, beside the journal), so
+a restart during a store outage still signs. Compat mode and `--handler`
+flags stay unsigned. The handler-side contract is `docs/HANDLERS.md`;
+`verify_sig` in the server's test module is the reference check.
 Request bodies are capped at 256 KiB; operation keys at 256 bytes and step
 and handler names at 128 (non-empty, no control characters in keys); a
 handler reply is read only up to the 256 KiB output limit.

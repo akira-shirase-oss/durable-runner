@@ -184,13 +184,21 @@ function startHandler(mode, stallMs = 0) {
   const src = `
     const DRLOAD = 'drload-handler-${HPORT}'; // in the command line: stale-reap marker
     const seen = new Set();
+    const sigs = { signed: 0, unsigned: 0, signedProbes: 0, unsignedProbes: 0 };
     require('node:http').createServer((req, res) => {
       const url = new URL(req.url, 'http://x');
+      if (req.method === 'GET' && url.pathname === '/stats') {
+        res.writeHead(200, {'content-type':'application/json'});
+        res.end(JSON.stringify(sigs)); return;
+      }
+      const signed = !!req.headers['x-durable-signature'];
       if (req.method === 'GET') {
+        signed ? sigs.signedProbes++ : sigs.unsignedProbes++;
         res.writeHead(seen.has(url.searchParams.get('idem_key')) ? 200 : 404).end(); return;
       }
       let b = ''; req.on('data', c => b += c);
       req.on('end', () => {
+        signed ? sigs.signed++ : sigs.unsigned++;
         const key = JSON.parse(b || '{}').idem_key || '';
         // Idempotent semantics: the key is recorded on receipt — the effect
         // is committed-or-in-flight from the runner's point of view, so a
@@ -567,17 +575,21 @@ async function runWorkspaces() {
   const foreign = [...owned.get(0)][0];
   const probe = await fetch(`${API}/jobs/${foreign}`, { headers: keys[1].auth });
   const done = (await diag()).states.done ?? 0;
+  // S2-6: every call this scenario dispatches went through a
+  // store-registered handler, so each must carry the signature headers.
+  const sigs = await fetch(`http://127.0.0.1:${HPORT}/stats`).then((r) => r.json())
+    .catch(() => ({ signed: -1, unsigned: -1 }));
   h.kill(); s.kill();
   const p99 = pct(lat, 0.99);
   const r = writeResult('workspaces', {
     params: { workspaces: n, submits_per_workspace: per, account_backend: backend, smoke: SMOKE },
     sent, http_codes: codes, per_workspace: pageCounts, churn_registrations: churnOps,
-    done_after_drain: done,
+    done_after_drain: done, handler_calls: sigs,
     latency_ms: { p50: pct(lat, 0.5), p99, max: pct(lat, 1) },
     thresholds: {
       accepted: 'every submit', sized: `${per} runs per workspace`,
       disjoint: 'no run id shared across workspaces', oracle: 'foreign run id → 404',
-      done: 'every accepted run', p99_ms: `<${P99_MS}`,
+      done: 'every accepted run', signed: 'every handler call signed', p99_ms: `<${P99_MS}`,
     },
     ...verdictOf([
       ['every submit accepted', Object.keys(codes).every((c) => c === '200')],
@@ -585,6 +597,7 @@ async function runWorkspaces() {
       ['run ids disjoint across workspaces', disjoint],
       ['a foreign run id answers 404', probe.status === 404],
       ['every accepted run finished', done >= sent * 0.99],
+      ['every handler call was signed', sigs.signed > 0 && sigs.unsigned === 0],
       [`p99 < ${P99_MS}ms`, p99 !== null && p99 < P99_MS],
     ]),
   });

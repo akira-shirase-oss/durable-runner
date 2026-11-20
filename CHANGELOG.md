@@ -28,6 +28,13 @@ unregistered or foreign-workspace handler fails admission as
 S2-5: the **SSRF guard**. No handler call may reach a non-global
 address — enforced where enforcement cannot be bypassed.
 
+S2-6: **signed handler calls**. Every call a store-registered handler
+receives carries `x-durable-timestamp` + `x-durable-signature`
+(HMAC-SHA256 under the workspace's secret over
+`ts.run.step.attempt.idem_key.SHA256(body)`); `POST /handler-secret`
+rotates and re-arms the engine in the same request; the handler-side
+contract + reference verifier ship in `docs/HANDLERS.md`.
+
 ### Added
 
 - **`durable-accounts`**: the `AccountStore` trait over Postgres (sqlx,
@@ -84,12 +91,34 @@ address — enforced where enforcement cannot be bypassed.
   forms — refuse at registration as `422 local_target_forbidden`; a
   refused call is a failed attempt, never "unknown".
   `--allow-local-handlers` is the explicit dev/fixture opt-out.
+- **Signed handler calls** (S2-6): store-registered handlers carry
+  `x-durable-timestamp` + `x-durable-signature` — hex HMAC-SHA256 under
+  the workspace's 32-byte secret over
+  `ts.run.step.attempt.idem_key.SHA256(body)`; probes sign the
+  empty-digest form. The secret rides `handlers.json` so a restart
+  during a store outage still signs. `--handler` flags and compat mode
+  stay unsigned.
+- **`POST /handler-secret`** (S2-6): draws a fresh workspace secret,
+  returns it exactly once, retires the old one immediately — the
+  engine's registrations are re-armed in the same request and
+  in-flight old-secret calls fail honestly at the handler. Workspace
+  creation (`POST /admin/workspaces`) also returns `handler_secret`
+  once; no `GET`, list or diagnostics endpoint ever carries it.
+- **`docs/HANDLERS.md`**: the handler contract — call, probe, the
+  canonical string, verification order (freshness ±300 s → recompute →
+  `(ts, idem)` replay bound) and rotation semantics. `verify_sig` in
+  the server's test module is the reference check; `spawn_verifier` is
+  the live fixture.
 
 ### Security
 
 - Internal sequential workspace ids never appear in routes, response
   bodies, tokens or headers — workspaces cannot be enumerated or
   counted. A regression test scans every affected response for the u64.
+- Handler-call signatures bind the run, step, attempt, idempotency key
+  and exact body to the workspace's secret — a tampered body, stale
+  timestamp, wrong-secret signature or replayed `(ts, idem)` fails the
+  handler's own check (each rejection class regression-tested).
 
 ### Load evidence
 

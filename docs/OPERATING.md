@@ -148,7 +148,10 @@ target/release/durable-server \
   key), `x-durable-run-id`, `x-durable-step` (the step's index) and
   `x-durable-attempt` (1 for the first try). A reconcile probe is `GET
   URL?idem_key=…` with the same run, step and attempt headers (the
-  attempt it reconciles); 200 means "it landed" (D-050).
+  attempt it reconciles); 200 means "it landed" (D-050). Calls from
+  store-registered handlers are additionally signed — `x-durable-timestamp`
+  + `x-durable-signature`; verification and rotation are the contract in
+  `docs/HANDLERS.md` (S2-6).
 - `--handler name=URL` is the allowlist — repeatable, `http://` or
   `https://` only; a submit naming a handler outside it is refused 409
   with `unregistered handler`. Calls go only to that URL: redirects are

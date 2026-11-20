@@ -14,16 +14,16 @@ CREATE TABLE IF NOT EXISTS workspaces (
 );
 
 -- Workspace 0 is the default workspace: every journal written before S2
--- decodes as ws 0, and the env ops keys grant ws 0. Seeded once.
+-- decodes as ws 0, and the env ops keys grant ws 0. Seeded once. The
+-- signing secret is a real CSPRNG draw (pgcrypto), 32 bytes as the
+-- reader enforces.
+CREATE EXTENSION IF NOT EXISTS pgcrypto;
 INSERT INTO workspaces (id, public_id, name, handler_secret)
 VALUES (
     0,
     '00000000-0000-0000-0000-000000000000',
     'default',
-    decode(
-        md5(random()::text || clock_timestamp()::text || random()::text),
-        'hex'
-    )
+    gen_random_bytes(32)
 )
 ON CONFLICT (id) DO NOTHING;
 

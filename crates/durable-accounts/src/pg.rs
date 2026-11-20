@@ -304,6 +304,23 @@ impl AccountStore for Pg {
         .await?;
         Ok(done.rows_affected() > 0)
     }
+
+    async fn rotate_handler_secret(
+        &self,
+        workspace: u64,
+    ) -> Result<Option<[u8; 32]>, AccountError> {
+        let mut secret = [0u8; 32];
+        getrandom::fill(&mut secret)
+            .map_err(|e| AccountError::Store(format!("cannot draw a handler secret: {e}")))?;
+        let done = bounded(
+            sqlx::query("UPDATE workspaces SET handler_secret = $2 WHERE id = $1")
+                .bind(to_i64(workspace, "workspace")?)
+                .bind(secret.as_slice())
+                .execute(&self.pool),
+        )
+        .await?;
+        Ok((done.rows_affected() > 0).then_some(secret))
+    }
 }
 
 /// Postgres-backed tests run only when `DURABLE_TEST_DATABASE_URL` points

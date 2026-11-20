@@ -18,7 +18,11 @@ handler registry: store-authoritative rows, engine `(ws,name)` set,
 last-known-good snapshot + 30 s reconciler, `registry_stale` in
 diagnostics, 256-per-workspace bound), **S2-5** (SSRF guard: resolver-
 integrated `is_local` + `PolicyResolver`, literal-local refusal at
-registration, `--allow-local-handlers` opt-out, zero-packet assertion).
+registration, `--allow-local-handlers` opt-out, zero-packet assertion),
+**S2-6** (signed calls: per-workspace HMAC secrets, `POST
+/handler-secret` rotation that re-arms the engine in-request, signed
+probes, secret inside `handlers.json`, `docs/HANDLERS.md` + reference
+verifier, signature counting in the workspace load scenario).
 Backend only: no design or UI work for Durable Runner until the
 maintainer designs it.
 

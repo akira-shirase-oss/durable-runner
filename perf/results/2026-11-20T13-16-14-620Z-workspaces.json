@@ -1,0 +1,58 @@
+{
+  "machine": {
+    "host": "maintainer-laptop",
+    "platform": "darwin/arm64",
+    "cpu": "Apple M2 Pro",
+    "cores": 12,
+    "mem_gb": 32,
+    "date": "2026-11-20T13:16:14.620Z",
+    "commit": "945ac27"
+  },
+  "scenario": "workspaces",
+  "params": {
+    "workspaces": 2,
+    "submits_per_workspace": 25000,
+    "account_backend": "memory",
+    "smoke": false
+  },
+  "sent": 50000,
+  "http_codes": {
+    "200": 50000
+  },
+  "per_workspace": {
+    "01a1f919-3f65-77f6-9b7e-5320e0317c0a": {
+      "runs": 25000,
+      "pages": 25
+    },
+    "01a1f919-3f70-7634-8ed3-1a1ca553e98a": {
+      "runs": 25000,
+      "pages": 25
+    }
+  },
+  "churn_registrations": 1665,
+  "done_after_drain": 19458,
+  "handler_calls": {
+    "signed": 19458,
+    "unsigned": 0,
+    "signedProbes": 0,
+    "unsignedProbes": 0
+  },
+  "latency_ms": {
+    "p50": 31.65691700000025,
+    "p99": 142.51304200000004,
+    "max": 262.1680000000015
+  },
+  "thresholds": {
+    "accepted": "every submit",
+    "sized": "25000 runs per workspace",
+    "disjoint": "no run id shared across workspaces",
+    "oracle": "foreign run id → 404",
+    "done": "every accepted run",
+    "signed": "every handler call signed",
+    "p99_ms": "<2000"
+  },
+  "verdict": "FAIL",
+  "failures": [
+    "every accepted run finished"
+  ]
+}

@@ -170,4 +170,11 @@ pub trait AccountStore: Send + Sync {
 
     /// Delete a handler registration. Returns whether one existed.
     async fn delete_handler(&self, workspace: u64, name: &str) -> Result<bool, AccountError>;
+
+    /// Draw a fresh handler-call signing secret for the workspace and
+    /// return it — the caller shows it exactly once (S2-6). `None` means
+    /// no such workspace. The old secret stops being valid the moment
+    /// this returns; in-flight calls signed with it fail honestly.
+    async fn rotate_handler_secret(&self, workspace: u64)
+        -> Result<Option<[u8; 32]>, AccountError>;
 }

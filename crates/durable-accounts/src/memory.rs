@@ -41,15 +41,26 @@ impl Memory {
         memory
     }
 
+    /// Draw a fresh secret — shared by create, rotate and the seeded
+    /// default workspace. A failure is a Store error, never a zero key.
+    fn draw_secret() -> Result<[u8; 32], AccountError> {
+        let mut secret = [0u8; 32];
+        getrandom::fill(&mut secret)
+            .map_err(|e| AccountError::Store(format!("cannot draw a handler secret: {e}")))?;
+        Ok(secret)
+    }
+
     /// Seed workspace 0 (`default`) so env-key fixtures look like a
-    /// migrated database does. Idempotent.
+    /// migrated database does. Idempotent. A broken CSPRNG is a dead
+    /// machine — panic rather than seed a zero secret.
     fn seed_default(&self) {
         let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        let secret = Self::draw_secret().unwrap_or_else(|e| panic!("{e}"));
         inner.workspaces.entry(0).or_insert_with(|| Workspace {
             id: 0,
             public_id: uuid::Uuid::nil(),
             name: "default".into(),
-            handler_secret: [0; 32],
+            handler_secret: secret,
         });
         self.next_workspace.store(1, Ordering::Relaxed);
     }
@@ -117,7 +128,7 @@ impl AccountStore for Memory {
             id,
             public_id: uuid::Uuid::now_v7(),
             name: name.to_string(),
-            handler_secret: [0; 32],
+            handler_secret: Self::draw_secret()?,
         };
         inner.workspaces.insert(id, workspace.clone());
         Ok(workspace)
@@ -239,6 +250,20 @@ impl AccountStore for Memory {
             .handlers
             .remove(&(workspace, name.to_string()))
             .is_some())
+    }
+
+    async fn rotate_handler_secret(
+        &self,
+        workspace: u64,
+    ) -> Result<Option<[u8; 32]>, AccountError> {
+        self.check_up()?;
+        let secret = Self::draw_secret()?;
+        let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(ws) = inner.workspaces.get_mut(&workspace) else {
+            return Ok(None);
+        };
+        ws.handler_secret = secret;
+        Ok(Some(secret))
     }
 }
 

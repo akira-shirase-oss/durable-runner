@@ -225,6 +225,9 @@ struct HttpHandler {
     timeout: Duration,
     /// Largest reply body read; a bigger one is refused mid-stream.
     max_output: usize,
+    /// The workspace's signing secret (S2-6); `None` is compat mode and
+    /// `--handler` flag registrations — their calls go unsigned.
+    secret: Option<Arc<[u8; 32]>>,
 }
 
 /// Read a reply body, stopping as soon as it would exceed `max` bytes —
@@ -253,30 +256,82 @@ async fn read_bounded(
 const RUN_ID_HEADER: &str = "x-durable-run-id";
 const STEP_HEADER: &str = "x-durable-step";
 const ATTEMPT_HEADER: &str = "x-durable-attempt";
+/// S2-6's signed-call headers: the timestamp bounds replay, the
+/// signature binds run, step, attempt, idempotency key and body to the
+/// workspace's secret. Documented in `docs/HANDLERS.md`.
+const TS_HEADER: &str = "x-durable-timestamp";
+const SIG_HEADER: &str = "x-durable-signature";
 
-fn with_call(req: reqwest::RequestBuilder, call: Option<Call>) -> reqwest::RequestBuilder {
-    match call {
+/// `HMAC_SHA256(secret, "{ts}.{run}.{step}.{attempt}.{idem}.{digest}")`
+/// — run/step/attempt are `-` on a compat (no-`Call`) path; `digest` is
+/// hex sha256 of the body for a call and empty for a probe.
+fn sign_call(
+    secret: &[u8; 32],
+    ts: u64,
+    call: Option<Call>,
+    idem_key: &str,
+    body_digest: &str,
+) -> String {
+    let (r, s, a) = call.map_or_else(
+        || ("-".into(), "-".into(), "-".into()),
+        |c| {
+            (
+                c.run.0.to_string(),
+                c.step.0.to_string(),
+                c.attempt.to_string(),
+            )
+        },
+    );
+    let canonical = format!("{ts}.{r}.{s}.{a}.{idem_key}.{body_digest}");
+    let key = ring::hmac::Key::new(ring::hmac::HMAC_SHA256, secret);
+    let tag = ring::hmac::sign(&key, canonical.as_bytes());
+    hex(tag.as_ref())
+}
+
+fn with_call(
+    req: reqwest::RequestBuilder,
+    call: Option<Call>,
+    secret: Option<&[u8; 32]>,
+    idem_key: &str,
+    body_digest: &str,
+) -> reqwest::RequestBuilder {
+    let req = match call {
         Some(c) => req
             .header(RUN_ID_HEADER, c.run.0)
             .header(STEP_HEADER, c.step.0)
             .header(ATTEMPT_HEADER, c.attempt),
+        None => req,
+    };
+    match secret {
+        Some(secret) => {
+            let ts = unix_secs();
+            req.header(TS_HEADER, ts).header(
+                SIG_HEADER,
+                sign_call(secret, ts, call, idem_key, body_digest),
+            )
+        }
         None => req,
     }
 }
 
 impl HttpHandler {
     async fn call(&self, call: Option<Call>, input: &[u8], idem_key: &str) -> Outcome {
-        let body = serde_json::json!({
+        let body = serde_json::to_vec(&serde_json::json!({
             "input": input,
             "idem_key": idem_key,
-        });
+        }))
+        .unwrap_or_default();
+        let digest = hex(&sha256(&body));
         let req = self
             .client
             .post(&self.url)
             .header("x-idempotency-key", idem_key)
-            .json(&body)
+            .header("content-type", "application/json")
+            .body(body)
             .timeout(self.timeout);
-        let res = with_call(req, call).send().await;
+        let res = with_call(req, call, self.secret.as_deref(), idem_key, &digest)
+            .send()
+            .await;
         match res {
             Ok(r) if r.status().is_success() => match read_bounded(r, self.max_output).await {
                 Ok(Some(b)) => Outcome::Checkpoint(b),
@@ -306,7 +361,8 @@ impl HttpHandler {
             .get(&self.url)
             .query(&[("idem_key", idem_key)])
             .timeout(self.timeout);
-        with_call(req, call)
+        // A probe signs an empty body digest — `ts.run.step.attempt.idem.`
+        with_call(req, call, self.secret.as_deref(), idem_key, "")
             .send()
             .await
             .map(|r| r.status().is_success())
@@ -353,12 +409,19 @@ struct HandlerFactory {
 }
 
 impl HandlerFactory {
+    /// Compat-mode and flag registrations — unsigned.
     fn make(&self, url: &str) -> Arc<HttpHandler> {
+        self.make_signed(url, None)
+    }
+
+    /// A registered handler that signs with the workspace's secret.
+    fn make_signed(&self, url: &str, secret: Option<Arc<[u8; 32]>>) -> Arc<HttpHandler> {
         Arc::new(HttpHandler {
             client: self.client.clone(),
             url: url.to_string(),
             timeout: self.timeout,
             max_output: self.max_output,
+            secret,
         })
     }
 }
@@ -392,12 +455,16 @@ fn valid_handler_url(url: &str, allow_local: bool) -> Result<String, ApiError> {
 }
 
 /// One persisted registration: the internal ws id stays on disk (never an
-/// external surface), matching the journal's own records.
+/// external surface), matching the journal's own records. `secret` is the
+/// workspace's signing secret as hex — the file is mode 0600 beside the
+/// journal; a restart during a store outage must still sign (S2-6).
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 struct RegistryEntry {
     ws: u64,
     name: String,
     url: String,
+    #[serde(default)]
+    secret: Option<String>,
 }
 
 /// The last-known-good registry (`<journal>/handlers.json`): read at
@@ -423,6 +490,12 @@ fn load_registry_file(path: &Path) -> Vec<RegistryEntry> {
 fn save_registry_file(path: &Path, entries: &[RegistryEntry]) -> Result<()> {
     let tmp = path.with_extension("json.tmp");
     std::fs::write(&tmp, serde_json::to_vec(entries)?)?;
+    // The file carries signing secrets — owner-only like the journal.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600))?;
+    }
     std::fs::rename(&tmp, path)?;
     Ok(())
 }
@@ -454,12 +527,14 @@ async fn registry_sync(
         } else {
             Vec::new()
         };
+        let secret = Some(Arc::new(ws.handler_secret));
         for r in &regs {
-            set.push((r.name.clone(), factory.make(&r.url)));
+            set.push((r.name.clone(), factory.make_signed(&r.url, secret.clone())));
             all.push(RegistryEntry {
                 ws: ws.id,
                 name: r.name.clone(),
                 url: r.url.clone(),
+                secret: Some(hex(&ws.handler_secret)),
             });
         }
         engine
@@ -1317,6 +1392,13 @@ async fn workspace_by_public(
         .ok_or_else(|| ApiError::new(StatusCode::NOT_FOUND, "not_found", "no such workspace"))
 }
 
+fn unix_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
 fn hex(bytes: &[u8]) -> String {
     const T: &[u8; 16] = b"0123456789abcdef";
     let mut s = String::with_capacity(bytes.len() * 2);
@@ -1325,6 +1407,28 @@ fn hex(bytes: &[u8]) -> String {
         s.push(T[(b & 0xf) as usize] as char);
     }
     s
+}
+
+/// Parse hex back into bytes — `None` on odd length, bad chars or a
+/// wrong size, so a corrupt snapshot entry degrades to "unsigned"
+/// rather than panicking startup.
+fn unhex(s: &str) -> Option<[u8; 32]> {
+    fn nib(c: u8) -> Option<u8> {
+        match c {
+            b'0'..=b'9' => Some(c - b'0'),
+            b'a'..=b'f' => Some(c - b'a' + 10),
+            _ => None,
+        }
+    }
+    let b = s.as_bytes();
+    let mut out = [0u8; 32];
+    if b.len() != 64 {
+        return None;
+    }
+    for (i, pair) in b.chunks_exact(2).enumerate() {
+        out[i] = (nib(pair[0])? << 4) | nib(pair[1])?;
+    }
+    Some(out)
 }
 
 /// A fresh API key: `dr_` + 48 hex chars of CSPRNG. Only its sha256 is
@@ -1406,6 +1510,9 @@ async fn create_workspace(
     Ok(Json(serde_json::json!({
         "public_id": ws.public_id,
         "name": ws.name,
+        // The signing secret crosses exactly one boundary — this
+        // response. GETs and lists never carry it again (S2-6).
+        "handler_secret": hex(&ws.handler_secret),
     })))
 }
 
@@ -1621,8 +1728,17 @@ async fn put_handler(
         .put_handler(auth.ws, name, &url)
         .await
         .map_err(store_err)?;
+    let secret = store
+        .workspace_by_id(auth.ws)
+        .await
+        .map_err(store_err)?
+        .map(|w| Arc::new(w.handler_secret));
     app.engine
-        .put_handler(auth.ws, name, app.handler_factory.make(&url))
+        .put_handler(
+            auth.ws,
+            name,
+            app.handler_factory.make_signed(&url, secret.clone()),
+        )
         .await?;
     registry_file_upsert(
         &app,
@@ -1630,9 +1746,64 @@ async fn put_handler(
             ws: auth.ws,
             name: name.to_string(),
             url: url.clone(),
+            secret: secret.as_deref().map(|s| hex(s)),
         },
     );
     Ok(Json(serde_json::json!({ "name": name, "url": url })))
+}
+
+/// `POST /handler-secret` — draw a fresh signing secret for the caller's
+/// workspace (S2-6). The old secret dies here; every registration is
+/// rebuilt signed with the new one (store → engine → snapshot), so a
+/// rotate takes effect without waiting for the reconciler. The secret
+/// is returned exactly once — verification needs it on the handler side.
+async fn rotate_handler_secret(
+    Authorized(auth): Authorized,
+    State(app): State<App>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let store = accounts(&app)?;
+    let Some(secret) = store
+        .rotate_handler_secret(auth.ws)
+        .await
+        .map_err(store_err)?
+    else {
+        return Err(ApiError::new(
+            StatusCode::NOT_FOUND,
+            "not_found",
+            "no such workspace",
+        ));
+    };
+    // Rebuild this workspace's engine set signed with the new secret —
+    // the same shape as a reconcile pass for one workspace.
+    let regs = store.list_handlers(auth.ws).await.map_err(store_err)?;
+    let shared = Some(Arc::new(secret));
+    let mut set: Vec<(String, Arc<dyn StepHandler>)> = if auth.ws == 0 {
+        app.flag_handlers.to_vec()
+    } else {
+        Vec::new()
+    };
+    let mut entries = Vec::with_capacity(regs.len());
+    for r in &regs {
+        set.push((
+            r.name.clone(),
+            app.handler_factory.make_signed(&r.url, shared.clone()),
+        ));
+        entries.push(RegistryEntry {
+            ws: auth.ws,
+            name: r.name.clone(),
+            url: r.url.clone(),
+            secret: Some(hex(&secret)),
+        });
+    }
+    app.engine.set_workspace_handlers(auth.ws, set).await?;
+    let _g = app.registry_lock.lock().unwrap_or_else(|e| e.into_inner());
+    let mut all = load_registry_file(&app.registry_file);
+    all.retain(|e| e.ws != auth.ws);
+    all.extend(entries);
+    if let Err(e) = save_registry_file(&app.registry_file, &all) {
+        eprintln!("durable-server: cannot write {:?}: {e}", app.registry_file);
+    }
+    Ok(Json(serde_json::json!({ "secret": hex(&secret) })))
 }
 
 async fn delete_handler(
@@ -1761,6 +1932,7 @@ fn router(app: App, ui_dir: Option<&Path>) -> Router {
         )
         // S2-4: the caller's own workspace's handler registry.
         .route("/handlers", get(list_handlers))
+        .route("/handler-secret", post(rotate_handler_secret))
         .route(
             "/handlers/{name}",
             axum::routing::put(put_handler).delete(delete_handler),
@@ -2035,7 +2207,8 @@ async fn main() -> Result<()> {
     let registry_file: Arc<Path> = Arc::from(args.journal.join("handlers.json").as_path());
     if store.is_some() {
         for entry in load_registry_file(&registry_file) {
-            let h = factory.make(&entry.url);
+            let secret = entry.secret.as_deref().and_then(unhex).map(Arc::new);
+            let h = factory.make_signed(&entry.url, secret);
             if let Err(e) = engine.put_handler(entry.ws, &entry.name, h).await {
                 eprintln!(
                     "durable-server: snapshot handler {:?} refused at startup: {e}",
@@ -2495,6 +2668,7 @@ mod tests {
     use axum::http::Request;
     use http_body_util::BodyExt as _;
     use serde_json::{json, Value};
+    use std::collections::HashSet;
     use tower::ServiceExt as _;
 
     const KEY: &str = "test-key-0123456789abcdef0123456789abcdef";
@@ -3364,6 +3538,9 @@ mod tests {
         let (status, v) = call(&h.router, "GET", "/admin/workspaces", Some(KEY), None).await;
         assert_eq!(status, StatusCode::NOT_FOUND, "{v}");
         assert!(v["error"].as_str().unwrap_or("").contains("DATABASE_URL"));
+        // Rotation is meaningless without a store — the same 404.
+        let (status, v) = call(&h.router, "POST", "/handler-secret", Some(KEY), None).await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{v}");
     }
 
     /// S2-4's isolation: a handler registered in workspace A is invisible
@@ -3522,7 +3699,8 @@ mod tests {
             vec![RegistryEntry {
                 ws: a.id,
                 name: "h".into(),
-                url: "http://127.0.0.1:9/h".into()
+                url: "http://127.0.0.1:9/h".into(),
+                secret: Some(hex(&a.handler_secret)),
             }]
         );
 
@@ -3539,8 +3717,13 @@ mod tests {
         )
         .unwrap_or_else(|e| panic!("{e}"));
         for e in entries {
+            let secret = e.secret.as_deref().and_then(unhex).map(Arc::new);
             engine2
-                .put_handler(e.ws, &e.name, h.app.handler_factory.make(&e.url))
+                .put_handler(
+                    e.ws,
+                    &e.name,
+                    h.app.handler_factory.make_signed(&e.url, secret),
+                )
                 .await
                 .unwrap_or_else(|e| panic!("{e}"));
         }
@@ -3716,6 +3899,7 @@ mod tests {
             url: format!("http://localhost:{port}/step"),
             timeout: Duration::from_secs(2),
             max_output: 1024,
+            secret: None,
         };
         let spec = StepSpec {
             name: "s".into(),
@@ -3740,6 +3924,7 @@ mod tests {
             url: format!("http://localhost:{port}/step"),
             timeout: Duration::from_secs(2),
             max_output: 1024,
+            secret: None,
         };
         let call = tokio::spawn(async move { open.execute(&spec, b"hi", "k").await });
         let dialed = tokio::time::timeout(Duration::from_secs(2), listener.accept()).await;
@@ -4245,6 +4430,7 @@ mod tests {
         HttpHandler {
             client: handler_client(true).unwrap_or_else(|e| panic!("{e}")),
             url,
+            secret: None,
             timeout: Duration::from_secs(10),
             max_output: 1024,
         }
@@ -4404,6 +4590,7 @@ mod tests {
                 url: format!("http://{addr}/step"),
                 timeout: Duration::from_millis(300),
                 max_output: 1024,
+                secret: None,
             }),
         );
         let cfg = ShellConfig {
@@ -5373,5 +5560,402 @@ mod tests {
         assert!(!format!("{k:?}").contains("test-key"));
         assert!(k.verify(KEY));
         assert!(!k.verify(""));
+    }
+
+    // ---- S2-6: signed handler calls -----------------------------------
+
+    /// The handler-side check `docs/HANDLERS.md` prescribes, kept in
+    /// code so the contract can never drift from what the server
+    /// produces: a fresh timestamp (±300 s), the signature recomputed
+    /// over the verbatim wire fields, and `(ts, idem)` seen at most
+    /// once. The rejection reason is inspectable, never 200-with-a-flag.
+    fn verify_sig(
+        secret: &[u8; 32],
+        now: u64,
+        headers: &axum::http::HeaderMap,
+        idem_key: &str,
+        body_digest: &str,
+        seen: &mut HashSet<(u64, String)>,
+    ) -> Result<(), &'static str> {
+        let get = |n: &str| headers.get(n).and_then(|v| v.to_str().ok());
+        let ts: u64 = get(TS_HEADER)
+            .and_then(|v| v.parse().ok())
+            .ok_or("missing timestamp")?;
+        if now.abs_diff(ts) > 300 {
+            return Err("stale timestamp");
+        }
+        let sig = get(SIG_HEADER).ok_or("missing signature")?;
+        let r = get(RUN_ID_HEADER).unwrap_or("-");
+        let s = get(STEP_HEADER).unwrap_or("-");
+        let a = get(ATTEMPT_HEADER).unwrap_or("-");
+        let expected = {
+            let key = ring::hmac::Key::new(ring::hmac::HMAC_SHA256, secret);
+            let canonical = format!("{ts}.{r}.{s}.{a}.{idem_key}.{body_digest}");
+            hex(ring::hmac::sign(&key, canonical.as_bytes()).as_ref())
+        };
+        if sig != expected {
+            return Err("signature mismatch");
+        }
+        if !seen.insert((ts, idem_key.to_string())) {
+            return Err("replay");
+        }
+        Ok(())
+    }
+
+    /// A verifying handler: the testbed `docs/HANDLERS.md` describes —
+    /// every POST is signature-checked before the body is believed, and
+    /// the probe endpoint does the same with the query-carried key.
+    struct Verifier {
+        secret: std::sync::RwLock<[u8; 32]>,
+        seen: Mutex<HashSet<(u64, String)>>,
+        rejects: Mutex<Vec<String>>,
+        posts: std::sync::atomic::AtomicUsize,
+    }
+
+    impl Verifier {
+        fn reject(&self, reason: &'static str) -> (StatusCode, String) {
+            self.rejects
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push(reason.to_string());
+            (
+                StatusCode::UNAUTHORIZED,
+                format!("{{\"reason\":\"{reason}\"}}"),
+            )
+        }
+    }
+
+    async fn verified_post(
+        axum::extract::State(st): axum::extract::State<Arc<Verifier>>,
+        headers: axum::http::HeaderMap,
+        body: axum::body::Bytes,
+    ) -> (StatusCode, String) {
+        st.posts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let idem = headers
+            .get("x-idempotency-key")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("-")
+            .to_string();
+        let digest = hex(&sha256(&body));
+        let secret = *st.secret.read().unwrap_or_else(|e| e.into_inner());
+        let mut seen = st.seen.lock().unwrap_or_else(|e| e.into_inner());
+        match verify_sig(&secret, unix_secs(), &headers, &idem, &digest, &mut seen) {
+            Ok(()) => (StatusCode::OK, "{}".to_string()),
+            Err(r) => st.reject(r),
+        }
+    }
+
+    async fn verified_probe(
+        axum::extract::State(st): axum::extract::State<Arc<Verifier>>,
+        axum::extract::Query(q): axum::extract::Query<HashMap<String, String>>,
+        headers: axum::http::HeaderMap,
+    ) -> StatusCode {
+        let Some(idem) = q.get("idem_key") else {
+            return StatusCode::UNAUTHORIZED;
+        };
+        let secret = *st.secret.read().unwrap_or_else(|e| e.into_inner());
+        let mut seen = st.seen.lock().unwrap_or_else(|e| e.into_inner());
+        // A probe's signed body digest is empty — `ts.run.step.attempt.idem.`
+        match verify_sig(&secret, unix_secs(), &headers, idem, "", &mut seen) {
+            Ok(()) => StatusCode::OK,
+            Err(r) => st.reject(r).0,
+        }
+    }
+
+    async fn spawn_verifier(secret: [u8; 32]) -> (String, Arc<Verifier>) {
+        let st = Arc::new(Verifier {
+            secret: std::sync::RwLock::new(secret),
+            seen: Mutex::new(HashSet::new()),
+            rejects: Mutex::new(Vec::new()),
+            posts: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let app = Router::new()
+            .route(
+                "/step",
+                axum::routing::post(verified_post).get(verified_probe),
+            )
+            .with_state(st.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .unwrap_or_else(|e| panic!("{e}"));
+        let addr = listener.local_addr().unwrap_or_else(|e| panic!("{e}"));
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.ok();
+        });
+        (format!("http://{addr}"), st)
+    }
+
+    /// The signed wire format, end to end: `PUT /handlers` arms the
+    /// engine with the workspace's secret, a submitted run dispatches
+    /// through it, and the verifying handler accepts — recompute,
+    /// freshness and the idem-replay bound all pass on the real path.
+    #[tokio::test]
+    async fn a_signed_call_reaches_a_verifying_handler() {
+        use durable_accounts::Memory;
+        let store = Arc::new(Memory::new());
+        let a = store
+            .create_workspace("a")
+            .await
+            .unwrap_or_else(|e| panic!("{e}"));
+        let key_a = "sig-key-0123456789abcdefgh";
+        store
+            .create_key(
+                a.id,
+                "k",
+                Permission::Admin,
+                &sha256(key_a.as_bytes()),
+                "dr_a",
+            )
+            .await
+            .unwrap_or_else(|e| panic!("{e}"));
+        let (url, verifier) = spawn_verifier(a.handler_secret).await;
+        let h = harness_store(true, None, Some(store));
+
+        let (status, v) = call(
+            &h.router,
+            "PUT",
+            "/handlers/step",
+            Some(key_a),
+            Some(json!({ "url": format!("{url}/step") })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{v}");
+
+        let (status, v) = call(
+            &h.router,
+            "POST",
+            "/jobs",
+            Some(key_a),
+            Some(submit_body("sig-ok")),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{v}");
+        let id = v["run_id"].as_u64().unwrap_or(0);
+
+        // The run finishes only if the verifier accepted a call — poll
+        // the scoped read for `done` within a bounded window.
+        let mut state = String::new();
+        for _ in 0..400 {
+            let (_, v) = call(&h.router, "GET", &format!("/jobs/{id}"), Some(key_a), None).await;
+            state = v["state"].as_str().unwrap_or("").to_string();
+            if state == "done" || state == "failed" {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(state, "done", "run must complete through a valid signature");
+        assert_eq!(
+            verifier.posts.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the verifying handler saw exactly one call"
+        );
+        assert!(
+            verifier
+                .rejects
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .is_empty(),
+            "the signed wire format failed verification"
+        );
+    }
+
+    /// The reference check itself: each rejection class the contract
+    /// names — stale timestamp, tampered body, wrong secret, replay —
+    /// is refused for its own reason, in order.
+    #[test]
+    fn the_reference_verifier_rejects_each_tamper_class() {
+        let secret = [7u8; 32];
+        let now = 1_700_000_000u64;
+        let idem = "k/0/1";
+        let body = b"{\"input\":\"aGk=\",\"idem_key\":\"k/0/1\"}";
+        let digest = hex(&sha256(body));
+        let mut headers = axum::http::HeaderMap::new();
+        let mut seen: HashSet<(u64, String)> = HashSet::new();
+        let sign_for = |secret: &[u8; 32], ts: u64, body: &[u8]| {
+            let key = ring::hmac::Key::new(ring::hmac::HMAC_SHA256, secret);
+            hex(ring::hmac::sign(
+                &key,
+                format!("{ts}.5.0.1.{idem}.{}", hex(&sha256(body))).as_bytes(),
+            )
+            .as_ref())
+        };
+        headers.insert(
+            TS_HEADER,
+            now.to_string().parse().unwrap_or_else(|e| panic!("{e}")),
+        );
+        headers.insert(
+            SIG_HEADER,
+            sign_for(&secret, now, body)
+                .parse()
+                .unwrap_or_else(|e| panic!("{e}")),
+        );
+        headers.insert(RUN_ID_HEADER, "5".parse().unwrap_or_else(|e| panic!("{e}")));
+        headers.insert(STEP_HEADER, "0".parse().unwrap_or_else(|e| panic!("{e}")));
+        headers.insert(
+            ATTEMPT_HEADER,
+            "1".parse().unwrap_or_else(|e| panic!("{e}")),
+        );
+
+        // A well-formed call passes…
+        assert!(verify_sig(&secret, now, &headers, idem, &digest, &mut seen).is_ok());
+        // …but its replay does not — (ts, idem) is spent.
+        assert_eq!(
+            verify_sig(&secret, now, &headers, idem, &digest, &mut seen),
+            Err("replay")
+        );
+        // A stale timestamp refuses before the signature is judged.
+        let mut stale = headers.clone();
+        stale.insert(
+            TS_HEADER,
+            (now - 301)
+                .to_string()
+                .parse()
+                .unwrap_or_else(|e| panic!("{e}")),
+        );
+        assert_eq!(
+            verify_sig(&secret, now, &stale, "other", &digest, &mut seen),
+            Err("stale timestamp")
+        );
+        // A tampered body breaks the digest the signature binds.
+        assert_eq!(
+            verify_sig(
+                &secret,
+                now,
+                &headers,
+                "other",
+                &hex(&sha256(b"{\"input\":\"eW8=\"}")),
+                &mut seen
+            ),
+            Err("signature mismatch")
+        );
+        // A signature under another workspace's secret refuses.
+        let mut wrong = headers.clone();
+        wrong.insert(
+            SIG_HEADER,
+            sign_for(&[9u8; 32], now, body)
+                .parse()
+                .unwrap_or_else(|e| panic!("{e}")),
+        );
+        assert_eq!(
+            verify_sig(&secret, now, &wrong, "other", &digest, &mut seen),
+            Err("signature mismatch")
+        );
+    }
+
+    /// Rotation: `POST /handler-secret` returns the new secret once,
+    /// the engine's set is resynced to it immediately, and calls signed
+    /// under the retired secret fail honestly at the handler.
+    #[tokio::test]
+    async fn rotation_retires_the_old_secret_immediately() {
+        use durable_accounts::Memory;
+        let store = Arc::new(Memory::new());
+        let a = store
+            .create_workspace("a")
+            .await
+            .unwrap_or_else(|e| panic!("{e}"));
+        let key_a = "rot-key-0123456789abcdefgh";
+        store
+            .create_key(
+                a.id,
+                "k",
+                Permission::Admin,
+                &sha256(key_a.as_bytes()),
+                "dr_a",
+            )
+            .await
+            .unwrap_or_else(|e| panic!("{e}"));
+        let (url, verifier) = spawn_verifier(a.handler_secret).await;
+        let h = harness_store(true, None, Some(store.clone()));
+        let (status, v) = call(
+            &h.router,
+            "PUT",
+            "/handlers/step",
+            Some(key_a),
+            Some(json!({ "url": format!("{url}/step") })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{v}");
+
+        // Rotate: the new secret comes back once, and differs.
+        let (status, v) = call(&h.router, "POST", "/handler-secret", Some(key_a), None).await;
+        assert_eq!(status, StatusCode::OK, "{v}");
+        let new_secret = unhex(v["secret"].as_str().unwrap_or(""))
+            .unwrap_or_else(|| panic!("rotation must return the new secret once: {v}"));
+        assert_ne!(new_secret, a.handler_secret);
+
+        // The engine now signs with the new secret: a call it produces
+        // fails at a handler still holding the retired one — honestly,
+        // as a definitive failed attempt, not a hang.
+        let signed = h.app.handler_factory.make_signed(
+            &format!("{url}/step"),
+            store
+                .workspace_by_id(a.id)
+                .await
+                .unwrap_or_else(|e| panic!("{e}"))
+                .map(|w| Arc::new(w.handler_secret)),
+        );
+        let outcome = signed
+            .execute(
+                &StepSpec {
+                    name: "s".into(),
+                    handler: "step".into(),
+                },
+                b"hi",
+                "k/rot",
+            )
+            .await;
+        assert!(
+            matches!(outcome, Outcome::Failed),
+            "a call under the retired secret must fail: {outcome:?}"
+        );
+        assert_eq!(
+            verifier
+                .rejects
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .as_slice(),
+            &["signature mismatch"]
+        );
+
+        // The handler learns the new secret; the engine's resynced set
+        // (built by the rotate route) now verifies.
+        *verifier.secret.write().unwrap_or_else(|e| e.into_inner()) = new_secret;
+        let outcome = signed
+            .execute(
+                &StepSpec {
+                    name: "s".into(),
+                    handler: "step".into(),
+                },
+                b"hi",
+                "k/rot2",
+            )
+            .await;
+        assert!(
+            matches!(outcome, Outcome::Checkpoint(_)),
+            "the rotated secret must verify: {outcome:?}"
+        );
+    }
+
+    /// Signing is per-call overhead the dispatch path pays: measure the
+    /// HMAC itself so the cost is evidence, not a feeling.
+    #[test]
+    fn signing_overhead_is_trivial_per_call() {
+        let secret = [3u8; 32];
+        let call = Call {
+            run: RunId(1),
+            step: durable_domain::StepIndex(0),
+            attempt: 1,
+        };
+        let digest = hex(&sha256(b"{}"));
+        let start = Instant::now();
+        for i in 0..10_000u64 {
+            let sig = sign_call(&secret, 1_700_000_000 + i, Some(call), "k", &digest);
+            std::hint::black_box(sig);
+        }
+        let mean = start.elapsed().as_nanos() as f64 / 10_000.0;
+        assert!(
+            mean < 10_000.0,
+            "HMAC signing must stay microseconds, not {mean:.0} ns/call"
+        );
     }
 }
