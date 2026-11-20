@@ -88,6 +88,12 @@ struct Args {
     /// held the workspaces drain to ~640 runs/s measured (S2-7).
     #[arg(long, default_value_t = 256)]
     max_in_flight: usize,
+    /// The share of `--max-in-flight` one workspace may hold at once —
+    /// a tenant's slow handler parks at most this many calls (S2
+    /// review #6). Compat (workspace-0 only) deployments wanting the
+    /// whole pool raise it to match `--max-in-flight`.
+    #[arg(long, default_value_t = 64)]
+    max_in_flight_per_ws: usize,
     /// Dispatches per scheduler tick (ticks every 50 ms, so the deferred
     /// dispatch rate is at most 20 × this per second — 64 capped a backlog
     /// at ~1,280/s, the measured ~1.3k/s workspaces bound; S2-7).
@@ -487,6 +493,15 @@ impl HandlerFactory {
 /// literal local target refused unless `--allow-local-handlers` (S2-5's
 /// registration layer — domains are judged at dial by the resolver).
 fn valid_handler_url(url: &str, allow_local: bool) -> Result<String, ApiError> {
+    // Bounded like everything else (S2 review #6): an unbounded URL is
+    // an unbounded registry row, snapshot line, and dial string.
+    if url.len() > 2048 {
+        return Err(ApiError::new(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "bad_handler_url",
+            "handler URL exceeds 2048 bytes".to_string(),
+        ));
+    }
     let parsed = reqwest::Url::parse(url).map_err(|e| {
         ApiError::new(
             StatusCode::BAD_REQUEST,
@@ -579,7 +594,16 @@ async fn registry_sync(
     let mut all = Vec::new();
     let mut refused = 0u64;
     for ws in &workspaces {
-        let regs = store.list_handlers(ws.id).await?;
+        // Per-workspace error isolation (S2 review #6): one bad row or
+        // engine refusal must not abort the pass for every later
+        // workspace — it drops out of handlers.json *and* the engine.
+        let regs = match store.list_handlers(ws.id).await {
+            Ok(r) => r,
+            Err(e) => {
+                eprintln!("durable-server: registry reconcile skipped a workspace: {e}");
+                continue;
+            }
+        };
         let mut set: Vec<(String, Arc<dyn StepHandler>)> = if ws.id == 0 {
             flags.to_vec()
         } else {
@@ -606,10 +630,10 @@ async fn registry_sync(
                 secret: Some(hex(&ws.handler_secret)),
             });
         }
-        engine
-            .set_workspace_handlers(ws.id, set)
-            .await
-            .map_err(|e| AccountError::Store(format!("engine refused handlers: {e}")))?;
+        if let Err(e) = engine.set_workspace_handlers(ws.id, set).await {
+            eprintln!("durable-server: registry reconcile skipped a workspace: {e}");
+            continue;
+        }
     }
     if refused > 0 {
         eprintln!(
@@ -723,6 +747,16 @@ enum Cached {
     Denied,
 }
 
+/// The only shape a store key can have (`new_key_secret`): `dr_` plus
+/// 48 lowercase hex — 51 chars. Non-conforming bearers deny cheaply.
+fn store_key_shape(bearer: &str) -> bool {
+    bearer.len() == 51
+        && bearer.starts_with("dr_")
+        && bearer[3..]
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+}
+
 /// Resolves bearers to `Auth`. Env keys always grant workspace 0 — the
 /// ops path that predates S2. When an `AccountStore` is configured,
 /// other bearers are checked against it through a bounded cache: cached
@@ -761,6 +795,13 @@ impl Keyring {
                 ws: 0,
                 permission: Permission::Read,
             });
+        }
+        // Store keys have exactly one shape — `dr_` + 48 hex. Anything
+        // else can never verify, so it is denied here without spending
+        // a store query (S2 review #6): an arbitrary-bearer flood used
+        // to price itself in Neon round-trips.
+        if !store_key_shape(bearer) {
+            return Verified::Denied;
         }
         let hash = sha256(bearer.as_bytes());
         if let Some(outcome) = self.cached(hash) {
@@ -814,7 +855,22 @@ impl Keyring {
                     }
             });
             if cache.len() >= KEY_CACHE_CAP {
-                cache.clear();
+                // Denials go before grants (S2 review #6): a negative
+                // costs one cheap re-check while a dropped grant costs
+                // a store round-trip under outage.
+                cache.retain(|_, e| matches!(e.outcome, Cached::Granted(_)));
+            }
+            if cache.len() >= KEY_CACHE_CAP {
+                // Still full of grants: evict the oldest-decaying
+                // tenth — the hot keys re-verify immediately; a flood
+                // of one-shot keys cannot displace all real ones.
+                let cutoff = KEY_CACHE_CAP - KEY_CACHE_CAP / 10;
+                let mut by_age: Vec<([u8; 32], Instant)> =
+                    cache.iter().map(|(k, e)| (*k, e.at)).collect();
+                by_age.sort_unstable_by_key(|(_, at)| *at);
+                for (k, _) in by_age.into_iter().take(cache.len() - cutoff) {
+                    cache.remove(&k);
+                }
             }
         }
         cache.insert(
@@ -2264,6 +2320,7 @@ async fn main() -> Result<()> {
             .then(|| Duration::from_secs(args.compact_every_secs)),
         max_snapshot_bytes: args.max_snapshot_bytes,
         max_in_flight: args.max_in_flight.max(1),
+        max_in_flight_per_ws: args.max_in_flight_per_ws.max(1),
         max_dispatch_per_tick: args.max_dispatch_per_tick.max(1),
         reply_timeout: Duration::from_millis(args.reply_timeout_ms.max(1)),
         limits: durable_domain::Limits {
@@ -2793,8 +2850,8 @@ mod tests {
     use std::collections::HashSet;
     use tower::ServiceExt as _;
 
-    const KEY: &str = "test-key-0123456789abcdef0123456789abcdef";
-    const READ_KEY: &str = "read-key-0123456789abcdef0123456789abcdef";
+    const KEY: &str = "dr_ab4ab4ab4ab4ab4ab4ab4ab4ab4ab4ab4ab4ab4ab4ab4ab4";
+    const READ_KEY: &str = "dr_aacaacaacaacaacaacaacaacaacaacaacaacaacaacaacaac";
 
     struct Echo;
     #[async_trait::async_trait]
@@ -3064,7 +3121,7 @@ mod tests {
             .create_workspace("alpha")
             .await
             .unwrap_or_else(|e| panic!("workspace: {e}"));
-        let token = "ws-alpha-key-0123456789abcdef";
+        let token = "dr_ab8ab8ab8ab8ab8ab8ab8ab8ab8ab8ab8ab8ab8ab8ab8ab8";
         store
             .create_key(
                 ws.id,
@@ -3131,7 +3188,7 @@ mod tests {
             .create_workspace("beta")
             .await
             .unwrap_or_else(|e| panic!("workspace: {e}"));
-        let token = "ws-beta-key-0123456789abcdef";
+        let token = "dr_abbabbabbabbabbabbabbabbabbabbabbabbabbabbabbabb";
         store
             .create_key(
                 ws.id,
@@ -3161,7 +3218,7 @@ mod tests {
             &h.router,
             "POST",
             "/jobs",
-            Some("stranger-key-0123456789abcdef"),
+            Some("dr_ab2ab2ab2ab2ab2ab2ab2ab2ab2ab2ab2ab2ab2ab2ab2ab2"),
             Some(submit_body("x")),
         )
         .await;
@@ -3191,7 +3248,7 @@ mod tests {
             .create_workspace("gamma")
             .await
             .unwrap_or_else(|e| panic!("workspace: {e}"));
-        let token = "ws-gamma-key-0123456789abcdef";
+        let token = "dr_abcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabc";
         let info = store
             .create_key(
                 ws.id,
@@ -3271,8 +3328,8 @@ mod tests {
             .create_workspace("b")
             .await
             .unwrap_or_else(|e| panic!("b: {e}"));
-        let key_a = "ws-a-key-0123456789abcdef";
-        let key_b = "ws-b-key-0123456789abcdef";
+        let key_a = "dr_ab7ab7ab7ab7ab7ab7ab7ab7ab7ab7ab7ab7ab7ab7ab7ab7";
+        let key_b = "dr_abaabaabaabaabaabaabaabaabaabaabaabaabaabaabaaba";
         store
             .create_key(
                 a.id,
@@ -3386,7 +3443,7 @@ mod tests {
             .create_workspace("scan")
             .await
             .unwrap_or_else(|e| panic!("{e}"));
-        let token = "scan-key-0123456789abcdef";
+        let token = "dr_aaeaaeaaeaaeaaeaaeaaeaaeaaeaaeaaeaaeaaeaaeaaeaae";
         store
             .create_key(
                 ws.id,
@@ -3472,7 +3529,7 @@ mod tests {
             .create_workspace("who")
             .await
             .unwrap_or_else(|e| panic!("{e}"));
-        let token = "who-key-0123456789abcdef";
+        let token = "dr_ab5ab5ab5ab5ab5ab5ab5ab5ab5ab5ab5ab5ab5ab5ab5ab5";
         store
             .create_key(
                 ws.id,
@@ -3597,7 +3654,7 @@ mod tests {
             .create_workspace("tenant")
             .await
             .unwrap_or_else(|e| panic!("{e}"));
-        let token = "tenant-admin-0123456789abcdef";
+        let token = "dr_ab3ab3ab3ab3ab3ab3ab3ab3ab3ab3ab3ab3ab3ab3ab3ab3";
         store
             .create_key(
                 ws.id,
@@ -3681,8 +3738,8 @@ mod tests {
             .create_workspace("b")
             .await
             .unwrap_or_else(|e| panic!("{e}"));
-        let key_a = "ws-a-hkey-0123456789abcde";
-        let key_b = "ws-b-hkey-0123456789abcde";
+        let key_a = "dr_ab6ab6ab6ab6ab6ab6ab6ab6ab6ab6ab6ab6ab6ab6ab6ab6";
+        let key_b = "dr_ab9ab9ab9ab9ab9ab9ab9ab9ab9ab9ab9ab9ab9ab9ab9ab9";
         store
             .create_key(
                 a.id,
@@ -3792,7 +3849,7 @@ mod tests {
             .create_workspace("a")
             .await
             .unwrap_or_else(|e| panic!("{e}"));
-        let key_a = "snap-key-0123456789abcdefgh";
+        let key_a = "dr_ab0ab0ab0ab0ab0ab0ab0ab0ab0ab0ab0ab0ab0ab0ab0ab0";
         store
             .create_key(
                 a.id,
@@ -3874,7 +3931,7 @@ mod tests {
             .create_workspace("a")
             .await
             .unwrap_or_else(|e| panic!("{e}"));
-        let key_a = "cap-key-0123456789abcdefgh";
+        let key_a = "dr_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
         store
             .create_key(
                 a.id,
@@ -3927,7 +3984,7 @@ mod tests {
             .create_workspace("a")
             .await
             .unwrap_or_else(|e| panic!("{e}"));
-        let key_a = "lkg-key-0123456789abcdefg";
+        let key_a = "dr_aabaabaabaabaabaabaabaabaabaabaabaabaabaabaabaab";
         store
             .create_key(
                 a.id,
@@ -4116,7 +4173,7 @@ mod tests {
             .create_workspace("a")
             .await
             .unwrap_or_else(|e| panic!("{e}"));
-        let key_a = "ssrf-key-0123456789abcdef";
+        let key_a = "dr_ab1ab1ab1ab1ab1ab1ab1ab1ab1ab1ab1ab1ab1ab1ab1ab1";
         store
             .create_key(
                 a.id,
@@ -5744,6 +5801,7 @@ mod tests {
     /// over the verbatim wire fields compared in constant time, and a
     /// signature seen at most once. The rejection reason is
     /// inspectable, never 200-with-a-flag.
+    #[allow(clippy::too_many_arguments)]
     fn verify_sig(
         secret: &[u8; 32],
         now: u64,
@@ -5916,7 +5974,7 @@ mod tests {
             .create_workspace("a")
             .await
             .unwrap_or_else(|e| panic!("{e}"));
-        let key_a = "sig-key-0123456789abcdefgh";
+        let key_a = "dr_aafaafaafaafaafaafaafaafaafaafaafaafaafaafaafaaf";
         store
             .create_key(
                 a.id,
@@ -6091,7 +6149,7 @@ mod tests {
             .create_workspace("a")
             .await
             .unwrap_or_else(|e| panic!("{e}"));
-        let key_a = "rot-key-0123456789abcdefgh";
+        let key_a = "dr_aadaadaadaadaadaadaadaadaadaadaadaadaadaadaadaad";
         store
             .create_key(
                 a.id,
@@ -6366,7 +6424,7 @@ mod tests {
             .create_workspace("tenant")
             .await
             .unwrap_or_else(|e| panic!("workspace: {e}"));
-        let token = "ws-tenant-key-0123456789abcdef";
+        let token = "dr_abdabdabdabdabdabdabdabdabdabdabdabdabdabdabdabd";
         store
             .create_key(
                 ws.id,

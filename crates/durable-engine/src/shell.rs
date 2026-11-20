@@ -553,6 +553,14 @@ pub struct ShellConfig {
     /// 32 permits held ~640 runs/s against a fast fixture while 256 gave
     /// ~5k/s; the journal/fsync path itself sustains ~33k/s (Echo bench).
     pub max_in_flight: usize,
+    /// The share of `max_in_flight` one workspace may hold at once (S2
+    /// review #6): without it a single tenant's slow handler parks every
+    /// permit and starves the rest — the measured default of 256 held
+    /// entirely by one tenant was the cross-tenant DoS. 64 keeps one
+    /// tenant to a quarter of the pool while it is full; a ws below its
+    /// cap can still use idle capacity up to the global bound.
+    /// Compat (ws-0 only) deployments wanting more raise the flag.
+    pub max_in_flight_per_ws: usize,
     /// Upper bound on dispatches (and on deadline expiries) per tick, so a
     /// backlog of due runs cannot monopolise the actor. This is the drain
     /// ceiling once permits stop throttling: 64 per 50 ms tick caps a
@@ -599,6 +607,7 @@ impl Default for ShellConfig {
     fn default() -> Self {
         Self {
             max_in_flight: 256,
+            max_in_flight_per_ws: 64,
             max_dispatch_per_tick: 512,
             tick_ms: 50,
             cmd_capacity: 1024,
@@ -1129,6 +1138,8 @@ async fn actor(
     let mut probes: JoinSet<ProbeJoin> = JoinSet::new();
     let mut live: HashMap<(RunId, StepIndex), AbortHandle> = HashMap::new();
     let mut waiting_probes = ProbeQueue::default();
+    let mut ws_load: HashMap<u64, u32> = HashMap::new();
+    let mut call_ws: HashMap<(RunId, StepIndex), u64> = HashMap::new();
     let sem = Arc::new(Semaphore::new(cfg.max_in_flight));
     let mut status = writer.status;
     let mut pipe = Pipeline::new(
@@ -1154,6 +1165,9 @@ async fn actor(
                 attempts: &mut attempts,
                 probes: &mut probes,
                 live: &mut live,
+                ws_load: &mut ws_load,
+                call_ws: &mut call_ws,
+                ws_cap: cfg.max_in_flight_per_ws as u32,
                 waiting_probes: &mut waiting_probes,
                 per_tick: cfg.max_dispatch_per_tick,
                 mon: &mut mon,
@@ -1290,6 +1304,11 @@ async fn actor(
             },
             Some(Ok((run, step, outcome, permit))) = attempts.join_next() => {
                 live.remove(&(run, step));
+                if let Some(ws) = call_ws.remove(&(run, step)) {
+                    if let Some(n) = ws_load.get_mut(&ws) {
+                        *n = n.saturating_sub(1);
+                    }
+                }
                 let (out, fail) = match outcome {
                     Outcome::Checkpoint(o) => (Some(o), None),
                     Outcome::Failed => (None, Some("failed".to_string())),
@@ -1302,6 +1321,11 @@ async fn actor(
                 run_effects(&mut core, &mut ex, effects, run, Some(permit));
             }
             Some(Ok((run, step, found, permit))) = probes.join_next() => {
+                if let Some(ws) = call_ws.remove(&(run, step)) {
+                    if let Some(n) = ws_load.get_mut(&ws) {
+                        *n = n.saturating_sub(1);
+                    }
+                }
                 let mut ex = exec!();
                 let effects = ex.mon.effects(core.reconciled(run, step, found, wall_ms()));
                 run_effects(&mut core, &mut ex, effects, run, Some(permit));
@@ -1433,6 +1457,13 @@ struct Exec<'a> {
     /// local call and free its permit (cancelling cannot undo a remote
     /// effect; the reconcile probe decides that).
     live: &'a mut HashMap<(RunId, StepIndex), AbortHandle>,
+    /// In-flight handler calls per workspace (attempts + probes): the
+    /// fairness counter for `max_in_flight_per_ws`. `call_ws` remembers
+    /// which workspace owns each spawned call so the join decrements the
+    /// right tenant. Bounded by `max_in_flight` entries each.
+    ws_load: &'a mut HashMap<u64, u32>,
+    call_ws: &'a mut HashMap<(RunId, StepIndex), u64>,
+    ws_cap: u32,
     waiting_probes: &'a mut ProbeQueue,
     per_tick: usize,
     mon: &'a mut Monitor,
@@ -1491,6 +1522,8 @@ impl Exec<'_> {
             (run, step, outcome, permit)
         });
         self.live.insert((run, step), handle);
+        *self.ws_load.entry(r.ws).or_default() += 1;
+        self.call_ws.insert((run, step), r.ws);
     }
 
     /// Fail a step's attempt (journaled; retry/terminal decided by domain).
@@ -1505,10 +1538,25 @@ impl Exec<'_> {
     /// A probe is a handler call, so it takes a permit like any other; with
     /// none free it waits in `waiting_probes` for the next tick.
     fn probe(&mut self, core: &mut EngineCore, run: RunId, step: StepIndex) {
+        // A probe is a handler call: the workspace fairness cap applies
+        // exactly like a dispatch's.
+        if self.ws_full(core, run) {
+            self.waiting_probes.push((run, step));
+            return;
+        }
         match self.sem.clone().try_acquire_owned() {
             Ok(permit) => self.probe_with(core, run, step, permit),
             Err(_) => self.waiting_probes.push((run, step)),
         }
+    }
+
+    /// True when the run's workspace already holds its fair share of
+    /// in-flight calls (S2 review #6): one tenant's slow handler parks
+    /// at most its own cap, never the whole pool.
+    fn ws_full(&self, core: &EngineCore, run: RunId) -> bool {
+        core.run(run)
+            .map(|r| self.ws_load.get(&r.ws).copied().unwrap_or(0) >= self.ws_cap)
+            .unwrap_or(false)
     }
 
     /// A probe is a handler call too: held until the record that made the
@@ -1560,6 +1608,8 @@ impl Exec<'_> {
             let found = handler.probe_call(call, &sspec, &idem).await;
             (run, step, found, permit)
         });
+        *self.ws_load.entry(r.ws).or_default() += 1;
+        self.call_ws.insert((run, step), r.ws);
     }
 }
 
@@ -1592,6 +1642,10 @@ fn tick(core: &mut EngineCore, exec: &mut Exec<'_>) {
     }
     // Probes that found no permit when their run started reconciling.
     while let Some((run, step)) = exec.waiting_probes.pop() {
+        if exec.ws_full(core, run) {
+            exec.waiting_probes.push((run, step)); // over fair share: wait, try others
+            continue;
+        }
         let Ok(permit) = exec.sem.clone().try_acquire_owned() else {
             exec.waiting_probes.push((run, step)); // back of the queue: no starvation of others
             break;
@@ -1616,6 +1670,11 @@ fn tick(core: &mut EngineCore, exec: &mut Exec<'_>) {
             // it stays queued — registry repair or a cancel resolves it.
             // Refusing an event here would be noise; there is nothing to
             // journal because nothing happened.
+            continue;
+        }
+        // Fairness (S2 review #6): a workspace at its in-flight share is
+        // skipped — its runs stay queued while others dispatch.
+        if exec.ws_load.get(&ws).copied().unwrap_or(0) >= exec.ws_cap {
             continue;
         }
         let Ok(permit) = exec.sem.clone().try_acquire_owned() else {
@@ -2105,6 +2164,51 @@ mod tests {
             .unwrap_or_else(|e| panic!("{e}"));
     }
 
+    /// S2 review #6: a tenant whose handler never answers may hold at
+    /// most `max_in_flight_per_ws` calls — the rest of the pool stays
+    /// free for everyone else. ws 7 parks its cap; ws 8's runs still
+    /// dispatch and finish. Without the cap ws 7 would hold every
+    /// permit in the global pool.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_full_workspace_cannot_starve_another() {
+        let d = tempfile::tempdir().unwrap_or_else(|e| panic!("{e}"));
+        let eng = spawn(
+            d.path(),
+            Registry::default(),
+            ShellConfig {
+                tick_ms: 5,
+                max_in_flight: 8,
+                max_in_flight_per_ws: 2,
+                ..Default::default()
+            },
+        )
+        .unwrap_or_else(|e| panic!("{e}"));
+        // ws 7's handler blocks every call forever; ws 8's is instant.
+        eng.put_handler(7, "block", Arc::new(Gated::default()))
+            .await
+            .unwrap_or_else(|e| panic!("{e}"));
+        eng.put_handler(8, "fast", Arc::new(Echo))
+            .await
+            .unwrap_or_else(|e| panic!("{e}"));
+        for i in 0..4 {
+            eng.submit_scoped(7, OperationKey(format!("a-{i}")), spec("block"))
+                .await
+                .unwrap_or_else(|e| panic!("a-{i}: {e}"));
+        }
+        // Give ws 7's dispatches a moment to land and park.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        for i in 0..4 {
+            let run = eng
+                .submit_scoped(8, OperationKey(format!("b-{i}")), spec("fast"))
+                .await
+                .unwrap_or_else(|e| panic!("b-{i}: {e}"));
+            assert!(
+                matches!(until_done(&eng, run).await, RunState::Done),
+                "b-{i} must finish while ws 7's calls hang forever"
+            );
+        }
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn submit_runs_to_done() {
         let d = tempfile::tempdir().unwrap_or_else(|e| panic!("{e}"));
@@ -2338,6 +2442,7 @@ mod tests {
         let sem = Arc::new(Semaphore::new(10));
         let (mut attempts, mut probes) = (JoinSet::new(), JoinSet::new());
         let (mut live, mut waiting) = (HashMap::new(), ProbeQueue::default());
+        let (mut ws_load, mut call_ws) = (HashMap::new(), HashMap::new());
         let mut mon = Monitor {
             health: Arc::default(),
             errors: BTreeMap::new(),
@@ -2350,6 +2455,9 @@ mod tests {
             attempts: &mut attempts,
             probes: &mut probes,
             live: &mut live,
+            ws_load: &mut ws_load,
+            call_ws: &mut call_ws,
+            ws_cap: 64,
             waiting_probes: &mut waiting,
             per_tick: 3,
             mon: &mut mon,
