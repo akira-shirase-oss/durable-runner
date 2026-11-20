@@ -233,6 +233,28 @@ struct HttpHandler {
     /// The workspace's signing secret (S2-6); `None` is compat mode and
     /// `--handler` flag registrations — their calls go unsigned.
     secret: Option<Arc<[u8; 32]>>,
+    /// The parsed URL for the call-time SSRF re-check (S2 review #3):
+    /// literal-IP hosts never reach the resolver — hyper dials them
+    /// directly — so a literal target planted by a store row, a file
+    /// edit, or an `--allow-local-handlers` process must be refused
+    /// here, at the last point before the wire. `None` = unparseable,
+    /// refused like any local target.
+    policy_url: Option<reqwest::Url>,
+    /// The `--allow-local-handlers` opt-out the check shares with
+    /// registration and the resolver.
+    allow_local: bool,
+}
+
+impl HttpHandler {
+    /// The dial-time check every call and probe must pass: a literal
+    /// local (or unparseable) target is a refused attempt — definitive,
+    /// nothing sent — mirroring `ssrf::refused`'s classification.
+    fn policy_ok(&self) -> bool {
+        match &self.policy_url {
+            Some(u) => ssrf::check_url(u, self.allow_local).is_ok(),
+            None => false,
+        }
+    }
 }
 
 /// Read a reply body, stopping as soon as it would exceed `max` bytes —
@@ -267,12 +289,18 @@ const ATTEMPT_HEADER: &str = "x-durable-attempt";
 const TS_HEADER: &str = "x-durable-timestamp";
 const SIG_HEADER: &str = "x-durable-signature";
 
-/// `HMAC_SHA256(secret, "{ts}.{run}.{step}.{attempt}.{idem}.{digest}")`
-/// — run/step/attempt are `-` on a compat (no-`Call`) path; `digest` is
-/// hex sha256 of the body for a call and empty for a probe.
+/// `HMAC_SHA256(secret, "{ts}\n{method}\n{path}\n{run}\n{step}\n{attempt}\n{idem}\n{digest}")`
+/// — newline-separated so no field can be re-split into its neighbours
+/// (`idem_key` may carry `.`; it cannot carry `\n` — the runner rejects
+/// control bytes in keys), and bound to the request's method and path
+/// so a signature minted for one call replays nowhere else. Run/step/
+/// attempt are `-` on a compat (no-`Call`) path; `digest` is hex sha256
+/// of the body for a call and empty for a probe.
 fn sign_call(
     secret: &[u8; 32],
     ts: u64,
+    method: &str,
+    path: &str,
     call: Option<Call>,
     idem_key: &str,
     body_digest: &str,
@@ -287,18 +315,21 @@ fn sign_call(
             )
         },
     );
-    let canonical = format!("{ts}.{r}.{s}.{a}.{idem_key}.{body_digest}");
+    let canonical = format!("{ts}\n{method}\n{path}\n{r}\n{s}\n{a}\n{idem_key}\n{body_digest}");
     let key = ring::hmac::Key::new(ring::hmac::HMAC_SHA256, secret);
     let tag = ring::hmac::sign(&key, canonical.as_bytes());
     hex(tag.as_ref())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn with_call(
     req: reqwest::RequestBuilder,
     call: Option<Call>,
     secret: Option<&[u8; 32]>,
     idem_key: &str,
     body_digest: &str,
+    method: &str,
+    path: &str,
 ) -> reqwest::RequestBuilder {
     let req = match call {
         Some(c) => req
@@ -312,7 +343,7 @@ fn with_call(
             let ts = unix_secs();
             req.header(TS_HEADER, ts).header(
                 SIG_HEADER,
-                sign_call(secret, ts, call, idem_key, body_digest),
+                sign_call(secret, ts, method, path, call, idem_key, body_digest),
             )
         }
         None => req,
@@ -321,6 +352,11 @@ fn with_call(
 
 impl HttpHandler {
     async fn call(&self, call: Option<Call>, input: &[u8], idem_key: &str) -> Outcome {
+        // Literal IPs skip the DNS resolver entirely — re-check the
+        // target at the last point before the wire.
+        if !self.policy_ok() {
+            return Outcome::Failed;
+        }
         let body = serde_json::to_vec(&serde_json::json!({
             "input": input,
             "idem_key": idem_key,
@@ -334,9 +370,18 @@ impl HttpHandler {
             .header("content-type", "application/json")
             .body(body)
             .timeout(self.timeout);
-        let res = with_call(req, call, self.secret.as_deref(), idem_key, &digest)
-            .send()
-            .await;
+        let path = self.policy_url.as_ref().map_or("/", |u| u.path());
+        let res = with_call(
+            req,
+            call,
+            self.secret.as_deref(),
+            idem_key,
+            &digest,
+            "POST",
+            path,
+        )
+        .send()
+        .await;
         match res {
             Ok(r) if r.status().is_success() => match read_bounded(r, self.max_output).await {
                 Ok(Some(b)) => Outcome::Checkpoint(b),
@@ -361,13 +406,18 @@ impl HttpHandler {
     /// `GET {url}?idem_key=…` → 200 means found; anything else is unknown
     /// → reported as not-found honestly (default trait behaviour).
     async fn ask(&self, call: Option<Call>, idem_key: &str) -> bool {
+        if !self.policy_ok() {
+            return false;
+        }
         let req = self
             .client
             .get(&self.url)
             .query(&[("idem_key", idem_key)])
             .timeout(self.timeout);
-        // A probe signs an empty body digest — `ts.run.step.attempt.idem.`
-        with_call(req, call, self.secret.as_deref(), idem_key, "")
+        // A probe signs an empty body digest — the same canonical
+        // shape, GET and the URL's path bound in.
+        let path = self.policy_url.as_ref().map_or("/", |u| u.path());
+        with_call(req, call, self.secret.as_deref(), idem_key, "", "GET", path)
             .send()
             .await
             .map(|r| r.status().is_success())
@@ -427,6 +477,8 @@ impl HandlerFactory {
             timeout: self.timeout,
             max_output: self.max_output,
             secret,
+            policy_url: reqwest::Url::parse(url).ok(),
+            allow_local: self.allow_local,
         })
     }
 }
@@ -525,6 +577,7 @@ async fn registry_sync(
 ) -> Result<(), AccountError> {
     let workspaces = store.list_workspaces(REGISTRY_SYNC_WS_LIMIT).await?;
     let mut all = Vec::new();
+    let mut refused = 0u64;
     for ws in &workspaces {
         let regs = store.list_handlers(ws.id).await?;
         let mut set: Vec<(String, Arc<dyn StepHandler>)> = if ws.id == 0 {
@@ -534,6 +587,17 @@ async fn registry_sync(
         };
         let secret = Some(Arc::new(ws.handler_secret));
         for r in &regs {
+            // Re-check the stored URL at load: a row planted by an
+            // --allow-local-handlers process or a direct store edit
+            // never reaches the registry (call-time policy still
+            // refuses it; dropping it here refuses it *honestly*).
+            let ok = reqwest::Url::parse(&r.url)
+                .map(|u| ssrf::check_url(&u, factory.allow_local).is_ok())
+                .unwrap_or(false);
+            if !ok {
+                refused += 1;
+                continue;
+            }
             set.push((r.name.clone(), factory.make_signed(&r.url, secret.clone())));
             all.push(RegistryEntry {
                 ws: ws.id,
@@ -546,6 +610,12 @@ async fn registry_sync(
             .set_workspace_handlers(ws.id, set)
             .await
             .map_err(|e| AccountError::Store(format!("engine refused handlers: {e}")))?;
+    }
+    if refused > 0 {
+        eprintln!(
+            "durable-server: registry reconcile dropped {refused} stored \
+             handler row(s) whose URL fails the SSRF policy"
+        );
     }
     // The file write is the only thing a route mutation can race with.
     let _g = lock.lock().unwrap_or_else(|e| e.into_inner());
@@ -2238,6 +2308,20 @@ async fn main() -> Result<()> {
     let registry_file: Arc<Path> = Arc::from(args.journal.join("handlers.json").as_path());
     if store.is_some() {
         for entry in load_registry_file(&registry_file) {
+            // Re-check the snapshot URL: the file may have been written
+            // under --allow-local-handlers or edited offline — a literal
+            // local target never enters the registry.
+            let ok = reqwest::Url::parse(&entry.url)
+                .map(|u| ssrf::check_url(&u, args.allow_local_handlers).is_ok())
+                .unwrap_or(false);
+            if !ok {
+                eprintln!(
+                    "durable-server: snapshot handler {:?} ({:?}) refused by the \
+                     SSRF policy at startup",
+                    entry.name, entry.url
+                );
+                continue;
+            }
             let secret = entry.secret.as_deref().and_then(unhex).map(Arc::new);
             let h = factory.make_signed(&entry.url, secret);
             if let Err(e) = engine.put_handler(entry.ws, &entry.name, h).await {
@@ -2268,6 +2352,13 @@ async fn main() -> Result<()> {
     let listener = tokio::net::TcpListener::bind(&args.listen)
         .await
         .with_context(|| format!("bind {}", args.listen))?;
+    if args.allow_local_handlers {
+        // A visible opt-out must be visible at startup too.
+        eprintln!(
+            "durable-server: --allow-local-handlers set — handler URLs may \
+             target local/private addresses"
+        );
+    }
     eprintln!("durable-server listening on {}", args.listen);
     let (stop_http, http_stopped) = tokio::sync::oneshot::channel::<()>();
     let limits = HttpLimits {
@@ -3925,12 +4016,15 @@ mod tests {
             .unwrap_or_else(|e| panic!("{e}"))
             .port();
         // The strict client — no --allow-local-handlers.
+        let url = format!("http://localhost:{port}/step");
         let h = HttpHandler {
             client: handler_client(false).unwrap_or_else(|e| panic!("{e}")),
-            url: format!("http://localhost:{port}/step"),
+            policy_url: reqwest::Url::parse(&url).ok(),
+            url,
             timeout: Duration::from_secs(2),
             max_output: 1024,
             secret: None,
+            allow_local: false,
         };
         let spec = StepSpec {
             name: "s".into(),
@@ -3950,12 +4044,15 @@ mod tests {
 
         // Positive control: the same URL through the opt-out client
         // dials — the flag is what fixtures run under.
+        let url = format!("http://localhost:{port}/step");
         let open = HttpHandler {
             client: handler_client(true).unwrap_or_else(|e| panic!("{e}")),
-            url: format!("http://localhost:{port}/step"),
+            policy_url: reqwest::Url::parse(&url).ok(),
+            url,
             timeout: Duration::from_secs(2),
             max_output: 1024,
             secret: None,
+            allow_local: true,
         };
         let call = tokio::spawn(async move { open.execute(&spec, b"hi", "k").await });
         let dialed = tokio::time::timeout(Duration::from_secs(2), listener.accept()).await;
@@ -3964,6 +4061,48 @@ mod tests {
             "the allow-local client must reach a loopback target"
         );
         let _ = call.await;
+    }
+
+    /// S2 review #3: a *literal* local IP never reaches the resolver —
+    /// hyper dials it directly — so the call-time policy check is what
+    /// refuses it. A planted literal (store row, snapshot, file edit)
+    /// fails the attempt and sends zero packets.
+    #[tokio::test]
+    async fn a_literal_local_url_is_refused_at_call_time() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .unwrap_or_else(|e| panic!("{e}"));
+        let addr = listener.local_addr().unwrap_or_else(|e| panic!("{e}"));
+        // A handler built the way a planted store/snapshot row builds
+        // it: strict policy, literal loopback URL.
+        let url = format!("http://{addr}/step");
+        let h = HttpHandler {
+            client: handler_client(false).unwrap_or_else(|e| panic!("{e}")),
+            policy_url: reqwest::Url::parse(&url).ok(),
+            url,
+            timeout: Duration::from_secs(2),
+            max_output: 1024,
+            secret: None,
+            allow_local: false,
+        };
+        let spec = StepSpec {
+            name: "s".into(),
+            handler: "h".into(),
+        };
+        let outcome = h.execute(&spec, b"hi", "k").await;
+        assert!(
+            matches!(outcome, Outcome::Failed),
+            "a literal local target must fail the attempt: {outcome:?}"
+        );
+        assert!(
+            !h.ask(None, "k").await,
+            "a probe to a literal local target is refused too"
+        );
+        let escaped = tokio::time::timeout(Duration::from_millis(400), listener.accept()).await;
+        assert!(
+            escaped.is_err(),
+            "a packet reached a literal local target — the call-time check failed"
+        );
     }
 
     /// S2-5 at registration: without `--allow-local-handlers` a literal
@@ -4460,10 +4599,12 @@ mod tests {
     fn http_handler(url: String) -> HttpHandler {
         HttpHandler {
             client: handler_client(true).unwrap_or_else(|e| panic!("{e}")),
+            policy_url: reqwest::Url::parse(&url).ok(),
             url,
             secret: None,
             timeout: Duration::from_secs(10),
             max_output: 1024,
+            allow_local: true,
         }
     }
 
@@ -4618,10 +4759,12 @@ mod tests {
             "step",
             Arc::new(HttpHandler {
                 client: handler_client(true).unwrap_or_else(|e| panic!("{e}")),
+                policy_url: reqwest::Url::parse(&format!("http://{addr}/step")).ok(),
                 url: format!("http://{addr}/step"),
                 timeout: Duration::from_millis(300),
                 max_output: 1024,
                 secret: None,
+                allow_local: true,
             }),
         );
         let cfg = ShellConfig {
@@ -5598,15 +5741,18 @@ mod tests {
     /// The handler-side check `docs/HANDLERS.md` prescribes, kept in
     /// code so the contract can never drift from what the server
     /// produces: a fresh timestamp (±300 s), the signature recomputed
-    /// over the verbatim wire fields, and `(ts, idem)` seen at most
-    /// once. The rejection reason is inspectable, never 200-with-a-flag.
+    /// over the verbatim wire fields compared in constant time, and a
+    /// signature seen at most once. The rejection reason is
+    /// inspectable, never 200-with-a-flag.
     fn verify_sig(
         secret: &[u8; 32],
         now: u64,
         headers: &axum::http::HeaderMap,
+        method: &str,
+        path: &str,
         idem_key: &str,
         body_digest: &str,
-        seen: &mut HashSet<(u64, String)>,
+        seen: &mut HashSet<String>,
     ) -> Result<(), &'static str> {
         let get = |n: &str| headers.get(n).and_then(|v| v.to_str().ok());
         let ts: u64 = get(TS_HEADER)
@@ -5616,18 +5762,32 @@ mod tests {
             return Err("stale timestamp");
         }
         let sig = get(SIG_HEADER).ok_or("missing signature")?;
-        let r = get(RUN_ID_HEADER).unwrap_or("-");
-        let s = get(STEP_HEADER).unwrap_or("-");
-        let a = get(ATTEMPT_HEADER).unwrap_or("-");
+        // run/step/attempt are integers or `-` for the compat path —
+        // anything else is a field-smuggling attempt, refused outright.
+        let num = |n: &str| match get(n) {
+            None | Some("-") => Ok("-".to_string()),
+            Some(v) if v.bytes().all(|b| b.is_ascii_digit()) => Ok(v.to_string()),
+            Some(_) => Err("malformed call header"),
+        };
+        let (r, s, a) = (num(RUN_ID_HEADER)?, num(STEP_HEADER)?, num(ATTEMPT_HEADER)?);
         let expected = {
             let key = ring::hmac::Key::new(ring::hmac::HMAC_SHA256, secret);
-            let canonical = format!("{ts}.{r}.{s}.{a}.{idem_key}.{body_digest}");
-            hex(ring::hmac::sign(&key, canonical.as_bytes()).as_ref())
+            let canonical =
+                format!("{ts}\n{method}\n{path}\n{r}\n{s}\n{a}\n{idem_key}\n{body_digest}");
+            ring::hmac::sign(&key, canonical.as_bytes())
         };
-        if sig != expected {
+        // Constant-time on the decoded tag: hex length leaks nothing
+        // (a wrong-length sig is simply not a tag).
+        use subtle::ConstantTimeEq as _;
+        let presented: Option<[u8; 32]> = unhex(sig);
+        let presented = presented.ok_or("signature mismatch")?;
+        if !bool::from(presented.ct_eq(expected.as_ref())) {
             return Err("signature mismatch");
         }
-        if !seen.insert((ts, idem_key.to_string())) {
+        // Replay is keyed on the signature itself: a re-split or
+        // re-minted variant is a new key, but an identical wire sig
+        // never runs the effect twice.
+        if !seen.insert(sig.to_string()) {
             return Err("replay");
         }
         Ok(())
@@ -5638,7 +5798,7 @@ mod tests {
     /// the probe endpoint does the same with the query-carried key.
     struct Verifier {
         secret: std::sync::RwLock<[u8; 32]>,
-        seen: Mutex<HashSet<(u64, String)>>,
+        seen: Mutex<HashSet<String>>,
         rejects: Mutex<Vec<String>>,
         posts: std::sync::atomic::AtomicUsize,
     }
@@ -5662,15 +5822,34 @@ mod tests {
         body: axum::body::Bytes,
     ) -> (StatusCode, String) {
         st.posts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        let idem = headers
+        // The idem key is taken from the *body* — what the effect will
+        // dedupe on — and the header must equal it. A header/body split
+        // is a smuggling attempt, refused before the signature check.
+        let header_idem = headers
             .get("x-idempotency-key")
-            .and_then(|v| v.to_str().ok())
-            .unwrap_or("-")
-            .to_string();
+            .and_then(|v| v.to_str().ok());
+        let body_idem = serde_json::from_slice::<serde_json::Value>(&body)
+            .ok()
+            .and_then(|v| v["idem_key"].as_str().map(str::to_string));
+        let (Some(h_idem), Some(idem)) = (header_idem, body_idem) else {
+            return st.reject("missing idempotency key");
+        };
+        if h_idem != idem {
+            return st.reject("idempotency key mismatch");
+        }
         let digest = hex(&sha256(&body));
         let secret = *st.secret.read().unwrap_or_else(|e| e.into_inner());
         let mut seen = st.seen.lock().unwrap_or_else(|e| e.into_inner());
-        match verify_sig(&secret, unix_secs(), &headers, &idem, &digest, &mut seen) {
+        match verify_sig(
+            &secret,
+            unix_secs(),
+            &headers,
+            "POST",
+            "/step",
+            &idem,
+            &digest,
+            &mut seen,
+        ) {
             Ok(()) => (StatusCode::OK, "{}".to_string()),
             Err(r) => st.reject(r),
         }
@@ -5686,8 +5865,17 @@ mod tests {
         };
         let secret = *st.secret.read().unwrap_or_else(|e| e.into_inner());
         let mut seen = st.seen.lock().unwrap_or_else(|e| e.into_inner());
-        // A probe's signed body digest is empty — `ts.run.step.attempt.idem.`
-        match verify_sig(&secret, unix_secs(), &headers, idem, "", &mut seen) {
+        // A probe's signed body digest is empty — GET bound to the path.
+        match verify_sig(
+            &secret,
+            unix_secs(),
+            &headers,
+            "GET",
+            "/step",
+            idem,
+            "",
+            &mut seen,
+        ) {
             Ok(()) => StatusCode::OK,
             Err(r) => st.reject(r).0,
         }
@@ -5801,12 +5989,12 @@ mod tests {
         let body = b"{\"input\":\"aGk=\",\"idem_key\":\"k/0/1\"}";
         let digest = hex(&sha256(body));
         let mut headers = axum::http::HeaderMap::new();
-        let mut seen: HashSet<(u64, String)> = HashSet::new();
+        let mut seen: HashSet<String> = HashSet::new();
         let sign_for = |secret: &[u8; 32], ts: u64, body: &[u8]| {
             let key = ring::hmac::Key::new(ring::hmac::HMAC_SHA256, secret);
             hex(ring::hmac::sign(
                 &key,
-                format!("{ts}.5.0.1.{idem}.{}", hex(&sha256(body))).as_bytes(),
+                format!("{ts}\nPOST\n/step\n5\n0\n1\n{idem}\n{}", hex(&sha256(body))).as_bytes(),
             )
             .as_ref())
         };
@@ -5828,11 +6016,18 @@ mod tests {
         );
 
         // A well-formed call passes…
-        assert!(verify_sig(&secret, now, &headers, idem, &digest, &mut seen).is_ok());
-        // …but its replay does not — (ts, idem) is spent.
+        assert!(
+            verify_sig(&secret, now, &headers, "POST", "/step", idem, &digest, &mut seen).is_ok()
+        );
+        // …but its replay does not — the signature is spent.
         assert_eq!(
-            verify_sig(&secret, now, &headers, idem, &digest, &mut seen),
+            verify_sig(&secret, now, &headers, "POST", "/step", idem, &digest, &mut seen),
             Err("replay")
+        );
+        // The same sig under a different path or method does not replay.
+        assert_eq!(
+            verify_sig(&secret, now, &headers, "GET", "/step", "other", "", &mut seen),
+            Err("signature mismatch")
         );
         // A stale timestamp refuses before the signature is judged.
         let mut stale = headers.clone();
@@ -5844,7 +6039,7 @@ mod tests {
                 .unwrap_or_else(|e| panic!("{e}")),
         );
         assert_eq!(
-            verify_sig(&secret, now, &stale, "other", &digest, &mut seen),
+            verify_sig(&secret, now, &stale, "POST", "/step", "other", &digest, &mut seen),
             Err("stale timestamp")
         );
         // A tampered body breaks the digest the signature binds.
@@ -5853,6 +6048,8 @@ mod tests {
                 &secret,
                 now,
                 &headers,
+                "POST",
+                "/step",
                 "other",
                 &hex(&sha256(b"{\"input\":\"eW8=\"}")),
                 &mut seen
@@ -5868,8 +6065,18 @@ mod tests {
                 .unwrap_or_else(|e| panic!("{e}")),
         );
         assert_eq!(
-            verify_sig(&secret, now, &wrong, "other", &digest, &mut seen),
+            verify_sig(&secret, now, &wrong, "POST", "/step", "other", &digest, &mut seen),
             Err("signature mismatch")
+        );
+        // Field smuggling: a non-integer attempt header refuses outright.
+        let mut smuggled = headers.clone();
+        smuggled.insert(
+            ATTEMPT_HEADER,
+            "1.x".parse().unwrap_or_else(|e| panic!("{e}")),
+        );
+        assert_eq!(
+            verify_sig(&secret, now, &smuggled, "POST", "/step", "other", &digest, &mut seen),
+            Err("malformed call header")
         );
     }
 
@@ -6128,7 +6335,15 @@ mod tests {
         let digest = hex(&sha256(b"{}"));
         let start = Instant::now();
         for i in 0..10_000u64 {
-            let sig = sign_call(&secret, 1_700_000_000 + i, Some(call), "k", &digest);
+            let sig = sign_call(
+                &secret,
+                1_700_000_000 + i,
+                "POST",
+                "/step",
+                Some(call),
+                "k",
+                &digest,
+            );
             std::hint::black_box(sig);
         }
         let mean = start.elapsed().as_nanos() as f64 / 10_000.0;

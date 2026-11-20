@@ -43,35 +43,44 @@ created (`POST /admin/workspaces` → `handler_secret`) or rotated (`POST
 /handler-secret`). The signature covers:
 
 ```
-ts.run.step.attempt.idem_key.body_sha256
+ts\nmethod\npath\nrun\nstep\nattempt\nidem_key\nbody_sha256
 ```
 
-joined with `.`, where `ts` is the `x-durable-timestamp` value,
-`run`/`step`/`attempt` are the `x-durable-run-id`/`x-durable-step`/
-`x-durable-attempt` header values *verbatim* (and `-` when a header is
-absent), and `body_sha256` is the lowercase hex SHA-256 of the exact
-request body — for a probe (no body) the digest field is empty, so the
-canonical string ends in `.`.
+joined with `\n` (a newline can never appear inside any field —
+`idem_key` may carry `.`, so dot-joined fields were re-splittable),
+where `ts` is the `x-durable-timestamp` value, `method`/`path` are the
+request's method and URL path (a signature minted for one call replays
+nowhere else), `run`/`step`/`attempt` are the `x-durable-run-id`/
+`x-durable-step`/`x-durable-attempt` header values *verbatim* (and `-`
+when a header is absent — any other non-integer is refused outright),
+and `body_sha256` is the lowercase hex SHA-256 of the exact request
+body — for a probe (no body) the digest field is empty, so the
+canonical string ends in `\n`.
 
 ```python
-canonical = f"{ts}.{run}.{step}.{attempt}.{idem_key}.{body_sha256_hex}"
+canonical = f"{ts}\n{method}\n{path}\n{run}\n{step}\n{attempt}\n{idem_key}\n{body_sha256_hex}"
 expected  = hmac_sha256(secret, canonical).hexdigest()
 ```
 
 A verifying handler checks, in order:
 
 1. **Freshness.** Reject `abs(now − ts) > 300` seconds.
-2. **Signature.** Recompute over the wire fields as received; compare
-   in constant time. Reject on mismatch.
-3. **Replay.** `(ts, idem_key)` must not have been seen before — a
-   bounded set: entries older than 600 s can be evicted, since the
-   freshness check already refuses them.
+2. **Idempotency key.** Take it from the *body* (`idem_key`) — the
+   value your dedupe actually uses — and require the
+   `x-idempotency-key` header to equal it. A header/body split is a
+   smuggling attempt.
+3. **Signature.** Recompute over the wire fields as received; compare
+   the decoded tag in constant time. Reject on mismatch.
+4. **Replay.** The *signature* must not have been seen before — keyed
+   on the signature itself so a re-minted variant cannot masquerade as
+   a retry of the same call. A bounded set: entries older than 600 s
+   can be evicted, since the freshness check already refuses them.
 
 Only then believe the body. `crates/durable-server/src/main.rs` carries
 the reference check (`verify_sig`, in the test module) plus a live
 fixture (`spawn_verifier`) exercised by the signed-call tests —
 rejects proven: tampered body, stale timestamp, wrong secret, replayed
-`(ts, idem_key)`.
+signature, non-integer call headers, cross-method/path replay.
 
 ## Rotation
 
