@@ -3,6 +3,7 @@
 //! HTTP endpoints configured at startup; the registry is the trust edge.
 
 mod addr_limits;
+mod ssrf;
 
 use addr_limits::{
     client_addr, ConnLimit, IpNet, RateLimit, TrustedProxies, DEFAULT_V6_PREFIX, MAX_LIMITED_ADDRS,
@@ -44,6 +45,12 @@ struct Args {
     /// HTTP handler registrations: name=URL (repeatable).
     #[arg(long = "handler", value_parser = parse_handler)]
     handlers: Vec<(String, String)>,
+    /// Permit handler URLs that target loopback/private/link-local
+    /// addresses — development and fixtures only. Without it, literal
+    /// local targets are refused at registration and any name that
+    /// resolves to one is refused before a packet leaves (S2-5).
+    #[arg(long)]
+    allow_local_handlers: bool,
     /// Attempt timeout per step call, ms (bounded by domain limits).
     #[arg(long, default_value_t = 20_000)]
     step_timeout_ms: u64,
@@ -194,10 +201,16 @@ fn parse_v6_prefix(s: &str) -> std::result::Result<u8, String> {
 /// input and idempotency key go only to the registered URL), it ignores
 /// the proxy environment variables (nothing outside the allowlist can
 /// route calls), and it gives up connecting after 5 s.
-fn handler_client() -> Result<reqwest::Client> {
+fn handler_client(allow_local: bool) -> Result<reqwest::Client> {
     reqwest::Client::builder()
         .redirect(reqwest::redirect::Policy::none())
         .no_proxy()
+        // The SSRF guard (S2-5): every name resolves through the OS and
+        // each returned address must pass `is_local` before reqwest is
+        // told it exists — the check is the resolution, so a DNS answer
+        // that flips local between registration and dispatch sends zero
+        // packets. No TOCTOU by construction.
+        .dns_resolver(ssrf::resolver(allow_local))
         .connect_timeout(Duration::from_secs(5))
         .build()
         .context("build the handler HTTP client")
@@ -276,6 +289,9 @@ impl HttpHandler {
             Ok(r) if r.status().is_client_error() => Outcome::Failed,
             Ok(_) => Outcome::Failed,
             Err(e) if e.is_timeout() => Outcome::Lost,
+            // The SSRF guard's refusal is definitive — the target is
+            // forbidden, so the attempt failed; nothing was sent.
+            Err(e) if ssrf::refused(&e) => Outcome::Failed,
             Err(e) if e.is_connect() => Outcome::Failed,
             Err(_) => Outcome::Lost, // genuinely unknown — reconcile
         }
@@ -331,6 +347,9 @@ struct HandlerFactory {
     client: reqwest::Client,
     timeout: Duration,
     max_output: usize,
+    /// `--allow-local-handlers` — dev/test opt-out shared by the
+    /// registration check and the client's resolver.
+    allow_local: bool,
 }
 
 impl HandlerFactory {
@@ -344,9 +363,10 @@ impl HandlerFactory {
     }
 }
 
-/// The same admission rule `parse_handler` enforces for `--handler`:
-/// http(s) with a host. The SSRF guard lands in S2-5 on top of this.
-fn valid_handler_url(url: &str) -> Result<String, ApiError> {
+/// The admission rule for a registered URL: http(s) with a host, and a
+/// literal local target refused unless `--allow-local-handlers` (S2-5's
+/// registration layer — domains are judged at dial by the resolver).
+fn valid_handler_url(url: &str, allow_local: bool) -> Result<String, ApiError> {
     let parsed = reqwest::Url::parse(url).map_err(|e| {
         ApiError::new(
             StatusCode::BAD_REQUEST,
@@ -361,6 +381,13 @@ fn valid_handler_url(url: &str) -> Result<String, ApiError> {
             format!("handler URL {url:?} must be http:// or https:// with a host"),
         ));
     }
+    ssrf::check_url(&parsed, allow_local).map_err(|why| {
+        ApiError::new(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "local_target_forbidden",
+            format!("handler URL {url:?} refused: {why}"),
+        )
+    })?;
     Ok(url.to_string())
 }
 
@@ -690,6 +717,7 @@ fn test_app(
     open_reads: bool,
     backup_root: Option<Arc<Path>>,
     journal_dir: &Path,
+    allow_local: bool,
 ) -> App {
     App {
         engine,
@@ -697,9 +725,10 @@ fn test_app(
         open_reads,
         backup_root,
         handler_factory: Arc::new(HandlerFactory {
-            client: handler_client().unwrap_or_else(|e| panic!("{e}")),
+            client: handler_client(allow_local).unwrap_or_else(|e| panic!("{e}")),
             timeout: Duration::from_secs(2),
             max_output: 1024 * 1024,
+            allow_local,
         }),
         flag_handlers: Arc::new(Vec::new()),
         registry_stale: Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -1570,7 +1599,7 @@ async fn put_handler(
             "handler name must be 1-128 chars with no control characters",
         ));
     }
-    let url = valid_handler_url(body.url.trim())?;
+    let url = valid_handler_url(body.url.trim(), app.handler_factory.allow_local)?;
     // The 256 bound lives in the engine, but the store must never hold a
     // row the engine refuses: one over-limit row would poison every
     // later reconcile of this workspace's set. Check before writing —
@@ -1972,12 +2001,19 @@ async fn main() -> Result<()> {
         ..Default::default()
     };
     let mut registry = Registry::default();
-    let client = handler_client()?;
+    let client = handler_client(args.allow_local_handlers)?;
     let factory = Arc::new(HandlerFactory {
         client,
         timeout: Duration::from_millis(args.step_timeout_ms),
         max_output: cfg.limits.max_output_bytes,
+        allow_local: args.allow_local_handlers,
     });
+    // A `--handler` flag URL obeys the same registration rule as the
+    // route: literal-local refused unless --allow-local-handlers.
+    for (_, url) in &args.handlers {
+        valid_handler_url(url, args.allow_local_handlers)
+            .map_err(|e| anyhow::anyhow!("--handler {url}: {}", e.message))?;
+    }
     let mut flag_handlers: Vec<(String, Arc<dyn StepHandler>)> = Vec::new();
     for (name, url) in &args.handlers {
         let h = factory.make(url);
@@ -2523,7 +2559,14 @@ mod tests {
             Some(ApiKey::new(READ_KEY)),
             store,
         ));
-        let app = test_app(engine, keyring.clone(), false, backup_root, journal.path());
+        let app = test_app(
+            engine,
+            keyring.clone(),
+            false,
+            backup_root,
+            journal.path(),
+            true,
+        );
         Harness {
             router: router(app.clone(), None),
             keyring,
@@ -3654,6 +3697,129 @@ mod tests {
         assert_eq!(v["registry_stale"], json!(true), "{v}");
     }
 
+    /// S2-5, the packet assertion: a handler URL whose *name* resolves
+    /// to a local address is refused inside the resolver — the loopback
+    /// listener sees zero connections. `localhost` always maps to a
+    /// loopback; a host that does not resolve at all fails the same way.
+    #[tokio::test]
+    async fn a_name_resolving_local_never_sends_a_packet() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .unwrap_or_else(|e| panic!("{e}"));
+        let port = listener
+            .local_addr()
+            .unwrap_or_else(|e| panic!("{e}"))
+            .port();
+        // The strict client — no --allow-local-handlers.
+        let h = HttpHandler {
+            client: handler_client(false).unwrap_or_else(|e| panic!("{e}")),
+            url: format!("http://localhost:{port}/step"),
+            timeout: Duration::from_secs(2),
+            max_output: 1024,
+        };
+        let spec = StepSpec {
+            name: "s".into(),
+            handler: "h".into(),
+        };
+        let outcome = h.execute(&spec, b"hi", "k").await;
+        assert!(
+            matches!(outcome, Outcome::Failed),
+            "a refused target is a failed attempt, not unknown: {outcome:?}"
+        );
+        // Zero packets: if even one escaped the guard it lands here.
+        let escaped = tokio::time::timeout(Duration::from_millis(400), listener.accept()).await;
+        assert!(
+            escaped.is_err(),
+            "a packet reached a refused target — the resolver let a local address through"
+        );
+
+        // Positive control: the same URL through the opt-out client
+        // dials — the flag is what fixtures run under.
+        let open = HttpHandler {
+            client: handler_client(true).unwrap_or_else(|e| panic!("{e}")),
+            url: format!("http://localhost:{port}/step"),
+            timeout: Duration::from_secs(2),
+            max_output: 1024,
+        };
+        let call = tokio::spawn(async move { open.execute(&spec, b"hi", "k").await });
+        let dialed = tokio::time::timeout(Duration::from_secs(2), listener.accept()).await;
+        assert!(
+            dialed.is_ok(),
+            "the allow-local client must reach a loopback target"
+        );
+        let _ = call.await;
+    }
+
+    /// S2-5 at registration: without `--allow-local-handlers` a literal
+    /// local target refuses at PUT with 422 `local_target_forbidden`;
+    /// a domain defers to the resolver and registers fine.
+    #[tokio::test]
+    async fn registration_refuses_literal_local_targets() {
+        use durable_accounts::Memory;
+        let store = Arc::new(Memory::new());
+        let a = store
+            .create_workspace("a")
+            .await
+            .unwrap_or_else(|e| panic!("{e}"));
+        let key_a = "ssrf-key-0123456789abcdef";
+        store
+            .create_key(
+                a.id,
+                "k",
+                Permission::Admin,
+                &sha256(key_a.as_bytes()),
+                "dr_a",
+            )
+            .await
+            .unwrap_or_else(|e| panic!("{e}"));
+        let journal = tempfile::tempdir().unwrap_or_else(|e| panic!("{e}"));
+        let engine = spawn(
+            journal.path(),
+            Registry::default(),
+            ShellConfig {
+                tick_ms: 5,
+                ..Default::default()
+            },
+        )
+        .unwrap_or_else(|e| panic!("{e}"));
+        // The strict app — allow_local false, as the shipped default runs.
+        let keyring = Arc::new(Keyring::new(ApiKey::new(KEY), None, Some(store)));
+        let r = router(
+            test_app(engine, keyring, false, None, journal.path(), false),
+            None,
+        );
+        for bad in [
+            "http://127.0.0.1:9/h",
+            "http://[::1]:9/h",
+            "http://169.254.169.254/latest/meta-data",
+            "http://2130706433/", // decimal loopback — normalized by the parser
+        ] {
+            let (status, v) = call(
+                &r,
+                "PUT",
+                "/handlers/h",
+                Some(key_a),
+                Some(json!({ "url": bad })),
+            )
+            .await;
+            assert_eq!(
+                (status, v["code"].as_str().unwrap_or("")),
+                (StatusCode::UNPROCESSABLE_ENTITY, "local_target_forbidden"),
+                "{bad} must refuse: {v}"
+            );
+        }
+        // A domain registers — the resolver judges it at call time.
+        let (status, v) = call(
+            &r,
+            "PUT",
+            "/handlers/h",
+            Some(key_a),
+            Some(json!({ "url": "https://handler.example/h" })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{v}");
+    }
+
     /// `--open-reads` serves reads without a key; it is refused at startup
     /// unless the listen address is a loopback IP.
     #[tokio::test]
@@ -3682,6 +3848,7 @@ mod tests {
                 true,
                 None,
                 journal.path(),
+                true,
             ),
             None,
         );
@@ -4076,7 +4243,7 @@ mod tests {
 
     fn http_handler(url: String) -> HttpHandler {
         HttpHandler {
-            client: handler_client().unwrap_or_else(|e| panic!("{e}")),
+            client: handler_client(true).unwrap_or_else(|e| panic!("{e}")),
             url,
             timeout: Duration::from_secs(10),
             max_output: 1024,
@@ -4233,7 +4400,7 @@ mod tests {
         reg.register(
             "step",
             Arc::new(HttpHandler {
-                client: handler_client().unwrap_or_else(|e| panic!("{e}")),
+                client: handler_client(true).unwrap_or_else(|e| panic!("{e}")),
                 url: format!("http://{addr}/step"),
                 timeout: Duration::from_millis(300),
                 max_output: 1024,
@@ -4362,6 +4529,7 @@ mod tests {
                 false,
                 None,
                 journal.path(),
+                true,
             ),
             Some(ui.path()),
         );
@@ -5046,6 +5214,7 @@ mod tests {
                 false,
                 None,
                 journal.path(),
+                true,
             ),
             None,
         );
@@ -5080,6 +5249,7 @@ mod tests {
                 false,
                 None,
                 journal.path(),
+                true,
             ),
             None,
         );

@@ -24,6 +24,7 @@ serde_json = "1"
 subtle = "2.6"
 tokio = { version = "1", features = ["macros", "net", "rt-multi-thread", "signal", "time"] }
 tower-http = { version = "0.7", features = ["fs", "timeout"] }
+url = "2"
 uuid = { version = "1", features = ["serde"] }
 # Served directly (not axum::serve) for a header timeout, a connection cap
 # and graceful shutdown (D-045). Both are already in the graph via axum.

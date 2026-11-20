@@ -57,7 +57,8 @@ BIN=$TARGET/release
 SRV=$BIN/durable-server
 CLI="$BIN/durable-cli --server http://127.0.0.1:$SRV_PORT"
 SERVE=("$SRV" --journal "$WORK/journal" --listen "127.0.0.1:$SRV_PORT"
-  --backup-root "$WORK/backups" --handler "step=http://127.0.0.1:$HND_PORT/step")
+  --backup-root "$WORK/backups" --handler "step=http://127.0.0.1:$HND_PORT/step"
+  --allow-local-handlers)
 
 step "start the pilot handler + the server (UI mounted at /inspector)"
 python3 examples/pilot/handler.py "$HND_PORT" &
@@ -113,7 +114,8 @@ kill -9 "$SRV_PID"
 wait "$SRV_PID" 2>/dev/null || true
 "$BIN/durable-cli" restore --from "$WORK/backups/pilot" --to "$WORK/restored"
 "$SRV" --journal "$WORK/restored" --listen "127.0.0.1:$RSRV_PORT" \
-  --handler "step=http://127.0.0.1:$HND_PORT/step" >"$WORK/restored.log" 2>&1 &
+  --handler "step=http://127.0.0.1:$HND_PORT/step" \
+  --allow-local-handlers >"$WORK/restored.log" 2>&1 &
 RSRV_PID=$!
 healthy "$RSRV_PORT"
 RCLI="$BIN/durable-cli --server http://127.0.0.1:$RSRV_PORT"

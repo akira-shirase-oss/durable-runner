@@ -40,6 +40,8 @@ fn server_cmd(journal: &Path, port: u16) -> Command {
         .args(["--listen", &format!("127.0.0.1:{port}")])
         .args(["--rate-limit-per-addr", &rate])
         .args(["--max-conns-per-addr", "0"])
+        // Every fixture handler lives on loopback — the S2-5 opt-out.
+        .arg("--allow-local-handlers")
         .env("DURABLE_API_KEY", KEY)
         .stdout(Stdio::null())
         .stderr(Stdio::null());

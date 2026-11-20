@@ -25,6 +25,9 @@ resolves only inside the submitting workspace — a spec naming an
 unregistered or foreign-workspace handler fails admission as
 `unregistered_handler` before anything is journaled.
 
+S2-5: the **SSRF guard**. No handler call may reach a non-global
+address — enforced where enforcement cannot be bypassed.
+
 ### Added
 
 - **`durable-accounts`**: the `AccountStore` trait over Postgres (sqlx,
@@ -72,6 +75,15 @@ unregistered or foreign-workspace handler fails admission as
   reconciler. A store outage keeps the in-memory set dispatching and
   raises `registry_stale` in `/admin/diagnostics`; mutation and
   reconciler writes to the file are serialized.
+- **SSRF guard** (`ssrf.rs`, S2-5): a `PolicyResolver` inside the
+  handler client's DNS path refuses every resolution containing a
+  non-global address — the check *is* the resolution, so a DNS answer
+  that flips local after registration sends zero packets (tested: a
+  loopback listener counts connections on a refused call). Literal
+  local targets — including parser-normalized decimal/hex/mapped-v6
+  forms — refuse at registration as `422 local_target_forbidden`; a
+  refused call is a failed attempt, never "unknown".
+  `--allow-local-handlers` is the explicit dev/fixture opt-out.
 
 ### Security
 
@@ -90,6 +102,9 @@ unregistered or foreign-workspace handler fails admission as
   route, then 120 submits across 2 workspaces run concurrent with 1,213
   register→delete churn ops — all admitted, all drained
   (`perf/results/`).
+- `ssrf.rs` overhead test: 200 real resolve+validate passes plus a
+  10k-iteration `is_local` scan — the guard costs one OS lookup per new
+  connection and nanoseconds per check (keep-alive calls pay nothing).
 
 ## [1.0.1] - 2026-11-20
 

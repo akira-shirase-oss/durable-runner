@@ -110,6 +110,19 @@ outage leaves the in-memory set serving and raises `registry_stale` in
 `/admin/diagnostics`. Compat-mode `--handler` flags are workspace 0's
 registrations; a store row shadows a flag on a name conflict. The bound
 is 256 handlers per workspace, checked before the store write.
+
+**SSRF guard (S2-5).** No handler call may reach a non-global address.
+Registration refuses literal local targets (`local_target_forbidden`);
+domains are judged at call time inside the handler client's DNS
+resolver — every address a name returns must pass the non-global check
+before reqwest is told it exists, so a DNS answer that flips local
+between registration and dispatch still sends zero packets (no
+validate-then-re-resolve gap; one local address refuses the whole
+resolution). A refused call is a definitive failed attempt, never
+"unknown". `--allow-local-handlers` opts both layers out for
+development and fixtures. The guard adds one OS lookup plus a CIDR
+scan per new connection; keep-alive calls pay nothing (measured in
+`ssrf.rs` tests).
 Request bodies are capped at 256 KiB; operation keys at 256 bytes and step
 and handler names at 128 (non-empty, no control characters in keys); a
 handler reply is read only up to the 256 KiB output limit.

@@ -25,7 +25,8 @@ target/release/durable-server \
   --listen 127.0.0.1:58300 \
   --ui-dir apps/inspector/build \
   --backup-root data/backups \
-  --handler step=http://127.0.0.1:58320/step
+  --handler step=http://127.0.0.1:58320/step \
+  --allow-local-handlers   # loopback handler — dev only
 ```
 
 - **Reserve.** `--reserve-bytes N` (default 64 MiB) must stay free on the
@@ -153,6 +154,13 @@ target/release/durable-server \
   with `unregistered handler`. Calls go only to that URL: redirects are
   not followed (a 3xx fails the attempt) and the proxy environment
   variables are ignored (D-039).
+- **SSRF guard (S2-5):** handler URLs targeting loopback, private,
+  link-local or other non-global addresses are refused — literal forms
+  at registration, and any name that *resolves* to one at call time,
+  inside the client's DNS resolver (a DNS answer that flips local after
+  registration still sends zero packets; `--allow-local-handlers` opts
+  out for development and fixtures — every loopback example here needs
+  it).
 - The journal directory is created on first run: `LOCK`, `manifest.json`,
   `gen-00000N/{journal.log,snapshot.bin}`, owner-only (directories 0700,
   files 0600; backups and restores too, D-038). Run the server as the

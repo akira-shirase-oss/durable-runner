@@ -195,7 +195,8 @@ mkdir /tmp/drill/journal && tar -C /tmp/drill/journal -xf /tmp/drill/backup.tar 
 # Second server on a drill port, SAME env (keys) but its own journal:
 DURABLE_API_KEY=$KEY DURABLE_READ_KEY=$RKEY \
   /usr/local/bin/durable-server --journal /tmp/drill/journal --listen 127.0.0.1:58399 \
-  --handler step=http://127.0.0.1:59010/step &
+  --handler step=http://127.0.0.1:59010/step \
+  --allow-local-handlers &
 curl -s http://127.0.0.1:58399/ready
 curl -s -H "authorization: Bearer $RKEY" 'http://127.0.0.1:58399/jobs?order=desc' | jq 'length'
 # Counts/state match the main server's at backup time → restore proven.

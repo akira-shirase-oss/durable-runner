@@ -16,8 +16,11 @@ routes by `public_id`, key lifecycle, no-u64-leak test), **S2-3**
 (writer emits v3; v1.0.1 is the rollback floor), **S2-4** (per-workspace
 handler registry: store-authoritative rows, engine `(ws,name)` set,
 last-known-good snapshot + 30 s reconciler, `registry_stale` in
-diagnostics, 256-per-workspace bound). Backend only: no design or UI
-work for Durable Runner until the maintainer designs it.
+diagnostics, 256-per-workspace bound), **S2-5** (SSRF guard: resolver-
+integrated `is_local` + `PolicyResolver`, literal-local refusal at
+registration, `--allow-local-handlers` opt-out, zero-packet assertion).
+Backend only: no design or UI work for Durable Runner until the
+maintainer designs it.
 
 Exit gate (unchanged): **workspace A can never see, cancel or run handlers for
 workspace B; SSRF tests refuse private targets.** Plus the standing rule: every

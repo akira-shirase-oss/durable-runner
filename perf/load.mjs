@@ -222,6 +222,9 @@ async function startServer(journalDir, extra = []) {
   // off so the admission flood can queue sockets the kernel will allow.
   const argv = ['--journal', journalDir, '--listen', `127.0.0.1:${PORT}`,
     '--handler', `step=http://127.0.0.1:${HPORT}/step`,
+    // The fixture handler lives on loopback — the S2-5 opt-out, always
+    // visible in argv.
+    '--allow-local-handlers',
     '--rate-limit-per-addr', '100000', '--max-conns-per-addr', '0', ...extra];
   const p = track(
     spawn(SRV, argv, { stdio: 'ignore', env: { ...process.env, DURABLE_API_KEY: API_KEY } }),
