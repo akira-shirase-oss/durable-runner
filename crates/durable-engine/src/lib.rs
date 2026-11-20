@@ -356,6 +356,10 @@ pub struct EngineCore {
     /// A binary that reads v3 must also know not to run those tenants'
     /// work — `journal_max_ws > 0` is what format-guard keys on.
     journal_max_ws: u64,
+    /// The shape already persisted to `journal.shape` — the sidecar the
+    /// format-guard reads with the server down. Written BEFORE the
+    /// journal change it describes and only ever upward.
+    persisted: durable_journal::Shape,
     pub limits: Limits,
     pub retry: RetryPolicy,
 }
@@ -394,6 +398,11 @@ impl EngineCore {
             journal_record_version_max: 1,
             snapshot_version_max: 1,
             journal_max_ws: 0,
+            persisted: durable_journal::Shape {
+                records: 0,
+                snapshots: 0,
+                max_ws: 0,
+            },
             limits: Limits::default(),
             retry: RetryPolicy::default(),
         };
@@ -485,7 +494,7 @@ impl EngineCore {
                  replay_total={t_replay:?} [read={t_read:?} decode={t_decode:?} apply={t_apply:?}] recount={:?}",
                 t.elapsed()
             );
-            return Ok(core);
+            return core.finish_open(dir);
         }
         if let Some(records) = durable_journal::records(&gdir)? {
             for r in records {
@@ -499,7 +508,62 @@ impl EngineCore {
         }
         core.next_run = max_run + 1;
         core.recount();
-        Ok(core)
+        core.finish_open(dir)
+    }
+
+    /// The post-replay steps every open path shares: recount is already
+    /// done; here the `journal.shape` sidecar is merged with what it
+    /// already claimed (a backup could hold either) and re-published at
+    /// the max — the format-guard reads it with the server down (D-056).
+    /// Missing or malformed heals here; during downtime a malformed one
+    /// refuses the guard instead.
+    fn finish_open(mut self, dir: &Path) -> Result<Self, EngineError> {
+        let disk = match durable_journal::read_shape(dir) {
+            Ok(d) => d,
+            // Malformed content heals at open — a rewrite publishes the
+            // true maxima. A real I/O error (unreadable file) still
+            // fails startup like any journal read.
+            Err(e) if e.kind() == std::io::ErrorKind::InvalidData => None,
+            Err(e) => return Err(JournalError::from(e).into()),
+        };
+        let shape = disk
+            .map(|d| self.shape().merged(d))
+            .unwrap_or_else(|| self.shape());
+        if disk != Some(shape) {
+            durable_journal::write_shape(dir, shape).map_err(JournalError::from)?;
+        }
+        self.persisted = shape;
+        Ok(self)
+    }
+
+    /// The journal root in either log mode (the piped writer keeps it in
+    /// `Pipe::root` — the sidecar is the core's file, not the writer's).
+    fn journal_root(&self) -> PathBuf {
+        match &self.log {
+            Log::Direct(j) => j.dir().to_path_buf(),
+            Log::Piped(p) => p.root.clone(),
+        }
+    }
+
+    /// The shape this journal would report now.
+    fn shape(&self) -> durable_journal::Shape {
+        durable_journal::Shape {
+            records: self.journal_record_version_max,
+            snapshots: self.snapshot_version_max,
+            max_ws: self.journal_max_ws,
+        }
+    }
+
+    /// Persist `journal.shape` when the live maxima pass what it already
+    /// claims — called BEFORE the record or manifest swap the shape
+    /// describes, so a crash over-reports (fail closed).
+    fn persist_shape(&mut self) -> Result<(), EngineError> {
+        let want = self.shape();
+        if want != self.persisted {
+            durable_journal::write_shape(&self.journal_root(), want).map_err(JournalError::from)?;
+            self.persisted = want;
+        }
+        Ok(())
     }
 
     /// Hand the journal to a group-commit writer: from now on commits are
@@ -716,13 +780,36 @@ impl EngineCore {
     /// Returns the new generation number. All or nothing.
     pub fn compact(&mut self, now: Millis) -> Result<u32, EngineError> {
         let plan = self.plan_compaction(now)?;
+        let shape = self.planned_compaction_shape(&plan.view);
         let Log::Direct(journal) = &mut self.log else {
             return Err(EngineError::Piped);
         };
-        journal.compact_with(0, plan.bytes, |w| snapshot::encode(&plan.view, w))?;
+        journal.compact_with(0, plan.bytes, |w| snapshot::encode(&plan.view, w), shape)?;
+        self.persisted = self.persisted.merged(shape);
         let generation = journal.generation();
         self.finish_compaction(&plan.expired);
         Ok(generation)
+    }
+
+    /// What a snapshot of `view` will make true on disk: the journal
+    /// shape — highest record version, DRIX version, and the view's max
+    /// workspace — persisted by `compact_with` inside the manifest swap
+    /// (S2 review: after `prune_superseded` deletes the records that
+    /// carried those facts, the sidecar is the server-down proof of
+    /// tenant runs in a snapshot). The in-memory maxima move with it:
+    /// diagnostics and the sidecar describe the same journal.
+    pub fn planned_compaction_shape(&mut self, view: &snapshot::View) -> durable_journal::Shape {
+        self.snapshot_version_max = self.snapshot_version_max.max(snapshot::VERSION);
+        self.journal_max_ws = self
+            .journal_max_ws
+            .max(view.runs.iter().map(|r| r.ws).max().unwrap_or(0));
+        self.shape()
+    }
+
+    /// The writer reports a compaction durably swapped: the sidecar it
+    /// wrote inside the swap is now the file's claim.
+    pub fn note_shape_persisted(&mut self, shape: durable_journal::Shape) {
+        self.persisted = self.persisted.merged(shape);
     }
 
     /// Whether the journal filesystem has its reserve free (readiness).
@@ -815,6 +902,12 @@ impl EngineCore {
             at: now,
             event: event.clone(),
         })?;
+        // Shape BEFORE the append it describes: a crash between the
+        // sidecar and the record leaves the file claiming more than the
+        // journal holds — the guard refuses more, never less.
+        self.journal_record_version_max = self.journal_record_version_max.max(ENVELOPE_VERSION);
+        self.journal_max_ws = self.journal_max_ws.max(ws);
+        self.persist_shape()?;
         match &mut self.log {
             // durable BEFORE applied below
             Log::Direct(j) => {
@@ -825,7 +918,6 @@ impl EngineCore {
             // durable.
             Log::Piped(p) => p.enqueue(payload)?,
         }
-        self.journal_record_version_max = self.journal_record_version_max.max(ENVELOPE_VERSION);
         self.apply_committed(ws, run, event, now)
     }
 
@@ -1185,6 +1277,82 @@ mod tests {
         let d = tempfile::tempdir().unwrap_or_else(|e| panic!("{e}"));
         let e = EngineCore::open(d.path()).unwrap_or_else(|e| panic!("{e}"));
         (d, e)
+    }
+
+    #[test]
+    fn the_shape_sidecar_tracks_the_journal() {
+        // Fresh open publishes the baseline (D-056's server-down scan).
+        let (d, mut e) = open();
+        let s = durable_journal::read_shape(d.path())
+            .unwrap_or_else(|e| panic!("{e}"))
+            .unwrap_or_else(|| panic!("no journal.shape"));
+        assert_eq!(
+            s,
+            durable_journal::Shape {
+                records: 1,
+                snapshots: 1,
+                max_ws: 0,
+            }
+        );
+
+        // The first ws ≠ 0 record writes the sidecar BEFORE its journal
+        // record — the file is what a downed server leaves the guard.
+        e.submit_at(7, OperationKey("t".into()), spec(), 0, 0)
+            .unwrap_or_else(|e| panic!("{e}"));
+        let s = durable_journal::read_shape(d.path())
+            .unwrap_or_else(|e| panic!("{e}"))
+            .unwrap_or_else(|| panic!("no journal.shape"));
+        assert_eq!(s.max_ws, 7);
+        assert_eq!(s.records, ENVELOPE_VERSION);
+        // Diagnostics and the sidecar describe the same journal — the
+        // live commit moved journal_max_ws, not only replay (S2 review).
+        assert_eq!(e.diagnostics().journal_max_ws, 7);
+    }
+
+    #[test]
+    fn compaction_moves_tenant_runs_into_the_snapshot_and_the_sidecar_knows() {
+        let (d, mut e) = open();
+        // A parked tenant run: it survives compaction inside snapshot.bin,
+        // where a grep of journal.log can no longer find its ws (S2
+        // review: the down-server hole).
+        let run = e
+            .submit_at(9, OperationKey("t".into()), spec(), 0, 0)
+            .unwrap_or_else(|e| panic!("{e}"));
+        e.compact(1).unwrap_or_else(|e| panic!("{e}"));
+        let s = durable_journal::read_shape(d.path())
+            .unwrap_or_else(|e| panic!("{e}"))
+            .unwrap_or_else(|| panic!("no journal.shape"));
+        assert_eq!(s.snapshots, snapshot::VERSION);
+        assert_eq!(s.max_ws, 9);
+        // The pruned journal.log really is silent about the tenant now.
+        let gen = d
+            .path()
+            .join(format!("gen-{:06}", e.diagnostics().generation));
+        let log =
+            std::fs::read_to_string(gen.join("journal.log")).unwrap_or_else(|e| panic!("{e}"));
+        assert!(!log.contains("\"ws\":9"), "{log}");
+        assert_eq!(
+            e.diagnostics().journal_snapshot_version_max,
+            snapshot::VERSION
+        );
+        // Reopen still parks it — the snapshot carried the ws.
+        drop(e);
+        let e2 = EngineCore::open(d.path()).unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(e2.diagnostics().journal_max_ws, 9);
+        assert!(e2.run(run).is_some());
+    }
+
+    #[test]
+    fn a_malformed_sidecar_heals_at_open_but_the_guard_refuses() {
+        let (d, e) = open();
+        drop(e);
+        std::fs::write(d.path().join("journal.shape"), "records=zzz\n")
+            .unwrap_or_else(|e| panic!("{e}"));
+        assert!(durable_journal::read_shape(d.path()).is_err());
+        let _e2 = EngineCore::open(d.path()).unwrap_or_else(|e| panic!("{e}"));
+        assert!(durable_journal::read_shape(d.path())
+            .unwrap_or_else(|e| panic!("{e}"))
+            .is_some());
     }
 
     #[test]

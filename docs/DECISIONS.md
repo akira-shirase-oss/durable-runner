@@ -968,16 +968,25 @@ format bump would make the service refuse to start. The rules:
   binary that can read what the journal holds.
 - **The guard enforces it anyway — on all three format dimensions.**
   `/admin/diagnostics` reports `journal_record_version_max`,
-  `journal_snapshot_version_max`, and `journal_max_ws` (tracked from
-  replay plus every commit and snapshot); server-down, the same facts
-  are scanned off the files. `durable-server --journal-format` prints
-  them from the binary's side:
+  `journal_snapshot_version_max`, and `journal_max_ws`, tracked from
+  replay AND from every live commit and compaction (the focused review
+  caught open-time numbers going stale). The files always outrank the
+  process: `journal.shape`, a sidecar the engine writes BEFORE the
+  record or manifest swap it describes and only upward, states the same
+  three maxima — including ws ≠ 0 runs that survive only inside
+  `snapshot.bin` after `prune_superseded` deleted their records, which
+  no grep can find. Server-down the guard reads the sidecar plus a
+  full scan; a DRIX ≥ 2 journal with no sidecar is ambiguous (a
+  ws-capable writer may have compacted before sidecars existed) and
+  refuses unless the records prove a pre-workspace writer.
+  `durable-server --journal-format` prints them from the binary's side:
   `<max record version> <max DRIX version> <parks ws ≠ 0>` since
   v1.0.2 (a lone integer before it means records only, snapshot
   capability from the release table, no parking). `deploy/upgrade.sh`
   and `deploy/rollback.sh` run `format-guard.sh`, which refuses —
   naming both versions — to swap in a binary below the journal's
-  highest on any of the three, and fails closed when it cannot tell.
+  highest on any of the three, and fails closed when it cannot tell
+  (missing fields refuse; they never default to zero).
   Snapshots are part of the check because a compaction can out-date an
   older reader without any new record version (the e6951b5 gap: v1.0.1
   wrote DRIX 2 while the guard compared records only); workspace scope

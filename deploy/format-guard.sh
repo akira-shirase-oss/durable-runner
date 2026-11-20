@@ -43,72 +43,109 @@ if [[ -r $KEY_FILE ]]; then
   jsnap=$(printf '%s' "$diag" | jq -r '.journal_snapshot_version_max // empty' 2>/dev/null || true)
   jws=$(printf '%s' "$diag" | jq -r '.journal_max_ws // empty' 2>/dev/null || true)
 fi
-if [[ -z $jmax || -z $jsnap || -z $jws ]]; then
-  # File scan — needed whenever diagnostics could not supply a field:
-  # server down entirely, or an older binary that reports record
-  # versions only. Fail CLOSED: an unreadable journal, a gen-* dir
-  # without a readable journal.log, or a malformed snapshot is a
-  # refusal, never a silent "1".
-  smax=1; ssnap=1; sws=0
-  if [[ ! -d $JOURNAL_ROOT ]]; then
-    :                                        # no journal at all
-  elif [[ ! -r $JOURNAL_ROOT || ! -x $JOURNAL_ROOT ]]; then
-    refuse "journal dir $JOURNAL_ROOT is not readable"
-  else
-    shopt -s nullglob
-    gens=( "$JOURNAL_ROOT"/gen-* )
-    logs=()
-    for g in "${gens[@]}"; do
-      f=$g/journal.log
-      [[ -f $f && -r $f ]] || refuse "$g has no readable journal.log"
-      logs+=("$f")
-    done
-    # Generations gone while a manifest names them is damage, not v1.
-    if (( ${#gens[@]} == 0 )) && [[ -f $JOURNAL_ROOT/manifest.json ]]; then
-      refuse "$JOURNAL_ROOT has a manifest but no gen-*/journal.log"
-    fi
-    for f in ${logs[@]+"${logs[@]}"}; do
-      # grep 0 = matches, 1 = no match (v1 records only — fine), >=2 = error.
-      if out=$(LC_ALL=C grep -ao '"v":[0-9]*' "$f" 2>/dev/null); then rc=0; else rc=$?; fi
-      (( rc < 2 )) || refuse "cannot scan $f (grep exit $rc)"
-      if [[ -n $out ]]; then
-        m=$(printf '%s\n' "$out" | sed 's/.*://' | sort -n | tail -1)
-        (( m > smax )) && smax=$m
-      fi
-      # Workspace-scoped history: a v3 record with ws ≠ 0 is what a
-      # pre-v1.0.2 binary cannot park — it would run tenant work on
-      # workspace-0's name-keyed handlers (S2 review). "ws":0 is the
-      # writer's own default, not tenant data.
-      if LC_ALL=C grep -aq '"ws":[1-9]' "$f" 2>/dev/null; then sws=1; fi
-    done
-    # Snapshot formats: gen-*/snapshot.bin is a framed record whose
-    # payload is "DRIX" + u16 version — so the magic sits at bytes 28-31
-    # and the version at 32-33. DRIX ≥ 2 means a workspace-aware writer
-    # compacted this journal; the ws fields inside are binary, not
-    # greppable, so the journal.log ws scan above is the only tenant
-    # check — keep it that way by refusing anything unparseable.
-    for g in "${gens[@]}"; do
-      sbin=$g/snapshot.bin
-      [[ -e $sbin ]] || continue
-      [[ -f $sbin && -r $sbin ]] || refuse "cannot read $sbin"
-      magic=$(dd bs=1 skip=28 count=4 <"$sbin" 2>/dev/null || true)
-      [[ $magic == DRIX ]] || refuse "$sbin is not a DRIX snapshot"
-      vb=$(od -An -j32 -N2 -tu1 <"$sbin" 2>/dev/null) || refuse "cannot scan $sbin"
-      [[ -n $vb ]] || refuse "$sbin is too short to carry a DRIX header"
-      read -r b0 b1 _ <<<"$vb"
-      sv=$(( b0 * 256 + b1 ))
-      (( sv > ssnap )) && ssnap=$sv
-    done
+# File scan — ALWAYS, and the max of it and diagnostics wins: a running
+# server's numbers reflect journal open, not what live commits and a
+# live compaction have written since (S2 review). Fail CLOSED: an
+# unreadable journal, a gen-* dir without a readable journal.log, or a
+# malformed snapshot/sidecar is a refusal, never a silent "1".
+smax=1; ssnap=1; sws=0
+if [[ ! -d $JOURNAL_ROOT ]]; then
+  :                                        # no journal at all
+elif [[ ! -r $JOURNAL_ROOT || ! -x $JOURNAL_ROOT ]]; then
+  refuse "journal dir $JOURNAL_ROOT is not readable"
+else
+  shopt -s nullglob
+  gens=( "$JOURNAL_ROOT"/gen-* )
+  logs=()
+  for g in "${gens[@]}"; do
+    f=$g/journal.log
+    [[ -f $f && -r $f ]] || refuse "$g has no readable journal.log"
+    logs+=("$f")
+  done
+  # Generations gone while a manifest names them is damage, not v1.
+  if (( ${#gens[@]} == 0 )) && [[ -f $JOURNAL_ROOT/manifest.json ]]; then
+    refuse "$JOURNAL_ROOT has a manifest but no gen-*/journal.log"
   fi
-  # Whatever the files hold outranks whatever a still-running older
-  # server reports — the journal is the authority, not the process.
-  [[ $smax =~ ^[0-9]+$ ]] && (( smax > ${jmax:-0} )) && jmax=$smax
-  [[ $ssnap =~ ^[0-9]+$ ]] && (( ssnap > ${jsnap:-0} )) && jsnap=$ssnap
-  [[ $sws =~ ^[0-9]+$ ]] && (( sws > ${jws:-0} )) && jws=$sws
+  ws_field_seen=0
+  for f in ${logs[@]+"${logs[@]}"}; do
+    # grep 0 = matches, 1 = no match (v1 records only — fine), >=2 = error.
+    if out=$(LC_ALL=C grep -ao '"v":[0-9]*' "$f" 2>/dev/null); then rc=0; else rc=$?; fi
+    (( rc < 2 )) || refuse "cannot scan $f (grep exit $rc)"
+    if [[ -n $out ]]; then
+      m=$(printf '%s\n' "$out" | sed 's/.*://' | sort -n | tail -1)
+      (( m > smax )) && smax=$m
+    fi
+    # Workspace-scoped history: a record with ws ≠ 0 is what a
+    # pre-v1.0.2 binary cannot park — it would run tenant work on
+    # workspace-0's name-keyed handlers (S2 review). "ws":0 is the
+    # writer's own default, not tenant data — but its presence still
+    # marks a sidecar-era writer, needed for the ambiguity check below.
+    if LC_ALL=C grep -aq '"ws":[1-9]' "$f" 2>/dev/null; then sws=1; fi
+    if LC_ALL=C grep -aq '"ws":' "$f" 2>/dev/null; then ws_field_seen=1; fi
+  done
+  # Snapshot formats: gen-*/snapshot.bin is a framed record whose
+  # payload is "DRIX" + u16 version — so the magic sits at bytes 28-31
+  # and the version at 32-33. Anything shorter cannot carry both.
+  for g in "${gens[@]}"; do
+    sbin=$g/snapshot.bin
+    [[ -e $sbin ]] || continue
+    [[ -f $sbin && -r $sbin ]] || refuse "cannot read $sbin"
+    sz=$(wc -c <"$sbin" | tr -d ' ')
+    (( sz >= 34 )) || refuse "$sbin is too short to carry a DRIX header"
+    magic=$(dd bs=1 skip=28 count=4 <"$sbin" 2>/dev/null || true)
+    [[ $magic == DRIX ]] || refuse "$sbin is not a DRIX snapshot"
+    vb=$(od -An -j32 -N2 -tu1 <"$sbin" 2>/dev/null) || refuse "cannot scan $sbin"
+    read -r b0 b1 _ <<<"$vb"
+    [[ -n ${b0:-} && -n ${b1:-} ]] || refuse "$sbin is too short to carry a DRIX header"
+    sv=$(( b0 * 256 + b1 ))
+    (( sv > ssnap )) && ssnap=$sv
+  done
+  # journal.shape — the sidecar a sidecar-era writer maintains: highest
+  # record version, snapshot version, and workspace id, including what
+  # now lives ONLY inside snapshot.bin (prune_superseded removed the
+  # records that carried it). It outranks the greppable scans; malformed
+  # or unreadable refuses.
+  sidecar=0
+  shape=$JOURNAL_ROOT/journal.shape
+  if [[ -e $shape ]]; then
+    [[ -f $shape && -r $shape ]] || refuse "cannot read $shape"
+    for k in records snapshots ws; do
+      v=$(LC_ALL=C grep -ao "^$k=[0-9][0-9]*\$" "$shape" 2>/dev/null | head -1 | cut -d= -f2 || true)
+      [[ $v =~ ^[0-9]+$ ]] || refuse "$shape is malformed (missing/bad $k)"
+      case $k in
+        records)   (( v > smax ))  && smax=$v ;;
+        snapshots) (( v > ssnap )) && ssnap=$v ;;
+        ws)        (( v > 0 ))     && sws=1 ;;
+      esac
+    done
+    sidecar=1
+  fi
+  # Ambiguity is a refusal, not an assumption: a snapshot CAN hide ws ≠ 0
+  # runs once compaction deleted their records. Without a sidecar the
+  # journal is provably clean only when its DRIX ≥ 2 snapshot predates
+  # ws-capable writers — i.e. records exist, none carries a ws field,
+  # and none is v3. Anything else could be a ws-aware writer that
+  # compacted and stopped before the sidecar existed.
+  if (( sidecar == 0 && ssnap >= 2 )); then
+    newest=""
+    if (( ${#logs[@]} > 0 )); then
+      newest=${logs[$((${#logs[@]} - 1))]}
+    fi
+    if (( ws_field_seen == 1 || smax >= 3 )) || [[ -z $newest || ! -s $newest ]]; then
+      sws=1
+    fi
+  fi
 fi
+# Whatever the files hold outranks whatever a still-running older
+# server reports — the journal is the authority, not the process.
+# (Defaults first: max() of two zeros must still land on a number.)
+jmax=${jmax:-0}; jsnap=${jsnap:-0}; jws=${jws:-0}
+[[ $smax =~ ^[0-9]+$ ]] && (( smax > jmax )) && jmax=$smax
+[[ $ssnap =~ ^[0-9]+$ ]] && (( ssnap > jsnap )) && jsnap=$ssnap
+[[ $sws =~ ^[0-9]+$ ]] && (( sws > jws )) && jws=$sws
 [[ $jmax =~ ^[0-9]+$ ]] || refuse "cannot determine the journal's record version"
 [[ $jsnap =~ ^[0-9]+$ ]] || refuse "cannot determine the journal's snapshot version"
-[[ $jws =~ ^[0-9]+$ ]] || jws=0
+[[ $jws =~ ^[0-9]+$ ]] || refuse "cannot determine the journal's workspace scope"
 bmax=""
 bout=$("$bin" --journal-format 2>/dev/null) || {
   echo "format-guard: $bin --journal-format failed — refusing" >&2

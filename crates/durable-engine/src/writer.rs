@@ -91,6 +91,7 @@ pub(crate) enum WriterMsg {
     Compact {
         view: crate::snapshot::View,
         bytes: u64,
+        shape: durable_journal::Shape,
         reply: oneshot::Sender<Result<u32, JournalError>>,
     },
     Backup {
@@ -177,10 +178,15 @@ fn run(
                     }
                 }
             }
-            WriterMsg::Compact { view, bytes, reply } => {
+            WriterMsg::Compact {
+                view,
+                bytes,
+                shape,
+                reply,
+            } => {
                 // Streamed: memory stays a buffer, not the snapshot's size.
                 let r = journal
-                    .compact_with(0, bytes, |w| crate::snapshot::encode(&view, w))
+                    .compact_with(0, bytes, |w| crate::snapshot::encode(&view, w), shape)
                     .map(|()| journal.generation());
                 drop(view); // release the shared runs promptly
                 match r {

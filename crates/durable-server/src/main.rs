@@ -2463,6 +2463,14 @@ async fn main() -> Result<()> {
     // restart during an account-store outage still dispatches. The
     // reconciler (below, store mode only) refreshes it.
     let registry_file: Arc<Path> = Arc::from(args.journal.join("handlers.json").as_path());
+    if let Ok(d) = engine.diag().await {
+        if d.workspace_scoped_live_runs > 0 {
+            eprintln!(
+                "durable-server: {} workspace-scoped run(s) live in the journal",
+                d.workspace_scoped_live_runs
+            );
+        }
+    }
     if store.is_some() {
         for entry in load_registry_file(&registry_file) {
             // Re-check the snapshot URL: the file may have been written
