@@ -193,3 +193,39 @@ pub trait AccountStore: Send + Sync {
     async fn rotate_handler_secret(&self, workspace: u64)
         -> Result<Option<[u8; 32]>, AccountError>;
 }
+
+/// Never-panics fuzzing for outside input this crate parses: the
+/// `api_keys.permission` value that comes back from a store. A panic is
+/// a red-first bug.
+#[cfg(test)]
+mod fuzz {
+    use super::*;
+    use proptest::prelude::*;
+
+    fn corpus(name: &str) -> Vec<String> {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../fuzz/corpus")
+            .join(name);
+        std::fs::read_dir(&dir)
+            .unwrap_or_else(|e| panic!("corpus {dir:?}: {e}"))
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_type().is_ok_and(|t| t.is_file()))
+            .filter_map(|e| std::fs::read_to_string(e.path()).ok())
+            .collect()
+    }
+
+    #[test]
+    fn fuzz_permission_seed_corpus() {
+        for s in corpus("permission") {
+            let _ = Permission::parse(&s);
+        }
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::default())]
+        #[test]
+        fn fuzz_permission_never_panics(s in any::<String>()) {
+            let _ = Permission::parse(&s);
+        }
+    }
+}

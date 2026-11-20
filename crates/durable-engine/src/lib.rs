@@ -2675,3 +2675,75 @@ mod tests {
         ));
     }
 }
+
+/// Never-panics fuzzing for the outside-input decoders this crate owns:
+/// the record envelope (three reader versions) and the DRIX snapshot.
+/// Seed corpora live under `fuzz/corpus/<target>/`; a panic is a
+/// red-first bug.
+#[cfg(test)]
+mod fuzz {
+    use super::*;
+    use proptest::prelude::*;
+
+    fn corpus(name: &str) -> Vec<Vec<u8>> {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../fuzz/corpus")
+            .join(name);
+        let mut out: Vec<Vec<u8>> = std::fs::read_dir(&dir)
+            .unwrap_or_else(|e| panic!("corpus {dir:?}: {e}"))
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_type().is_ok_and(|t| t.is_file()))
+            .filter_map(|e| std::fs::read(e.path()).ok())
+            .collect();
+        out.sort();
+        out
+    }
+
+    fn envelope_bytes(bytes: &[u8]) {
+        let _ = decode_envelope(bytes);
+        for reader in [1u8, 2, 3] {
+            let _ = decode_envelope_as(bytes, reader);
+        }
+    }
+
+    #[test]
+    fn fuzz_envelope_seed_corpus() {
+        for b in corpus("envelope") {
+            envelope_bytes(&b);
+        }
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::default())]
+        #[test]
+        fn fuzz_envelope_never_panics(bytes in proptest::collection::vec(any::<u8>(), 0..=4096)) {
+            envelope_bytes(&bytes);
+        }
+
+        #[test]
+        fn fuzz_envelope_text_never_panics(text in any::<String>()) {
+            envelope_bytes(text.as_bytes());
+        }
+    }
+
+    fn snapshot_bytes(bytes: &[u8]) {
+        let _ = crate::snapshot::decode(bytes);
+        let mut cur = std::io::Cursor::new(bytes);
+        let _ = crate::snapshot::decode_from(&mut cur, bytes.len() as u64);
+    }
+
+    #[test]
+    fn fuzz_snapshot_seed_corpus() {
+        for b in corpus("snapshot") {
+            snapshot_bytes(&b);
+        }
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::default())]
+        #[test]
+        fn fuzz_snapshot_never_panics(bytes in proptest::collection::vec(any::<u8>(), 0..=8192)) {
+            snapshot_bytes(&bytes);
+        }
+    }
+}

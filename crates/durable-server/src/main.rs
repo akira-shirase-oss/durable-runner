@@ -7128,4 +7128,243 @@ mod tests {
         assert_eq!(status, StatusCode::OK, "{v}");
         assert!(v["records_written"].is_u64(), "{v}");
     }
+
+    /// Never-panics fuzzing for every outside-input decoder this binary
+    /// owns: public ids and route ids, request JSON bodies + the input
+    /// base64 and admission rules behind them, signed-call headers,
+    /// `--handler`/`--trusted-proxies` strings, and `handlers.json`.
+    /// Seed corpora live under `fuzz/corpus/<target>/`; a panic is a
+    /// red-first bug.
+    mod fuzz {
+        use super::*;
+        use proptest::prelude::*;
+
+        fn corpus(name: &str) -> Vec<Vec<u8>> {
+            let dir = Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../../fuzz/corpus")
+                .join(name);
+            let mut out: Vec<Vec<u8>> = std::fs::read_dir(&dir)
+                .unwrap_or_else(|e| panic!("corpus {dir:?}: {e}"))
+                .filter_map(|e| e.ok())
+                .filter(|e| e.file_type().is_ok_and(|t| t.is_file()))
+                .filter_map(|e| std::fs::read(e.path()).ok())
+                .collect();
+            out.sort();
+            out
+        }
+
+        fn corpus_str(name: &str) -> Vec<String> {
+            corpus(name)
+                .into_iter()
+                .filter_map(|b| String::from_utf8(b).ok())
+                .collect()
+        }
+
+        fn pubid_decode(s: &str) {
+            let p = pubid::PubId::ephemeral();
+            let _ = p.decode(s);
+        }
+
+        #[test]
+        fn fuzz_pubid_seed_corpus() {
+            for s in corpus_str("pubid") {
+                pubid_decode(&s);
+            }
+        }
+
+        proptest! {
+            #![proptest_config(ProptestConfig::default())]
+            #[test]
+            fn fuzz_pubid_never_panics(s in any::<String>()) {
+                pubid_decode(&s);
+            }
+        }
+
+        /// `decode_id` on the real App: opaque-first for every workspace,
+        /// the numeric fallback only at ws 0.
+        fn decode_id_at(app: &App, s: &str) {
+            for ws in [0u64, 1, u64::MAX] {
+                let _ = decode_id(app, ws, s);
+            }
+        }
+
+        #[tokio::test]
+        async fn fuzz_decode_id_seed_corpus_and_prop() {
+            let journal = tempfile::tempdir().unwrap_or_else(|e| panic!("{e}"));
+            let mut reg = Registry::default();
+            reg.register("step", Arc::new(Echo));
+            let engine = spawn(journal.path(), reg, ShellConfig::default())
+                .unwrap_or_else(|e| panic!("{e}"));
+            let app = test_app(
+                engine,
+                Arc::new(Keyring::new(ApiKey::new(KEY), None, None)),
+                false,
+                None,
+                journal.path(),
+                true,
+            );
+            for s in corpus_str("decode-id") {
+                decode_id_at(&app, &s);
+            }
+            let mut runner = proptest::test_runner::TestRunner::default();
+            runner
+                .run(&any::<String>(), |s| {
+                    decode_id_at(&app, &s);
+                    Ok(())
+                })
+                .unwrap_or_else(|e| panic!("{e:?}"));
+        }
+
+        /// The signed-call verifier over arbitrary header bytes (the
+        /// values HTTP admits): ts parse, host, digit fields, hex sig.
+        fn sig_headers(parts: &[&str]) {
+            let secret = [7u8; 32];
+            let mut seen = HashSet::new();
+            let mut h = axum::http::HeaderMap::new();
+            for (name, v) in [
+                TS_HEADER,
+                SIG_HEADER,
+                "host",
+                RUN_ID_HEADER,
+                STEP_HEADER,
+                ATTEMPT_HEADER,
+            ]
+            .into_iter()
+            .zip(parts.iter().cycle())
+            {
+                if let Ok(v) = axum::http::HeaderValue::from_str(v) {
+                    h.insert(name, v);
+                }
+            }
+            let _ = verify_sig(
+                &secret,
+                1_700_000_000_000,
+                &h,
+                "POST",
+                "/step",
+                "i",
+                "d",
+                &mut seen,
+            );
+        }
+
+        #[test]
+        fn fuzz_sig_headers_seed_corpus() {
+            for b in corpus("sig-headers") {
+                let text = String::from_utf8_lossy(&b);
+                let mut lines = text.lines();
+                let ts = lines.next().unwrap_or("");
+                let sig = lines.next().unwrap_or("");
+                sig_headers(&[ts, sig]);
+            }
+        }
+
+        proptest! {
+            #![proptest_config(ProptestConfig::default())]
+            #[test]
+            fn fuzz_sig_headers_never_panics(
+                ts in any::<String>(),
+                sig in any::<String>(),
+                host in any::<String>(),
+                run in any::<String>(),
+                step in any::<String>(),
+                attempt in any::<String>(),
+            ) {
+                sig_headers(&[&ts, &sig, &host, &run, &step, &attempt]);
+            }
+
+            #[test]
+            fn fuzz_unhex_never_panics(s in any::<String>()) {
+                let _ = unhex(&s);
+            }
+        }
+
+        /// The submit body chain: JSON → base64 → JobSpec → admission.
+        fn submit_body_bytes(bytes: &[u8]) {
+            if let Ok(req) = serde_json::from_slice::<SubmitReq>(bytes) {
+                if let Ok(input) = base64_decode(&req.spec.input_b64) {
+                    let spec = JobSpec {
+                        version: req.spec.version,
+                        steps: req.spec.steps,
+                        input,
+                    };
+                    let l = durable_domain::Limits::default();
+                    let _ = l.admits(&spec);
+                    let _ = l.admits_key(&OperationKey(req.op_key));
+                }
+            }
+            if let Ok(req) = serde_json::from_slice::<PutHandlerReq>(bytes) {
+                let _ = reqwest::Url::parse(&req.url);
+            }
+        }
+
+        #[test]
+        fn fuzz_bodies_seed_corpus() {
+            for b in corpus("http-bodies") {
+                submit_body_bytes(&b);
+            }
+        }
+
+        proptest! {
+            #![proptest_config(ProptestConfig::default())]
+            #[test]
+            fn fuzz_bodies_never_panics(bytes in proptest::collection::vec(any::<u8>(), 0..=4096)) {
+                submit_body_bytes(&bytes);
+            }
+        }
+
+        #[test]
+        fn fuzz_handler_parse_seed_corpus() {
+            for s in corpus_str("handler-parse") {
+                let _ = parse_handler(&s);
+            }
+        }
+
+        proptest! {
+            #![proptest_config(ProptestConfig::default())]
+            #[test]
+            fn fuzz_handler_parse_never_panics(s in any::<String>()) {
+                let _ = parse_handler(&s);
+            }
+        }
+
+        #[test]
+        fn fuzz_ipnet_seed_corpus() {
+            for s in corpus_str("ipnet") {
+                let _ = addr_limits::IpNet::parse(&s);
+                let _ = parse_v6_prefix(&s);
+            }
+        }
+
+        proptest! {
+            #![proptest_config(ProptestConfig::default())]
+            #[test]
+            fn fuzz_ipnet_never_panics(s in any::<String>()) {
+                let _ = addr_limits::IpNet::parse(&s);
+                let _ = parse_v6_prefix(&s);
+            }
+        }
+
+        fn registry_file_bytes(bytes: &[u8]) {
+            let d = tempfile::tempdir().unwrap_or_else(|e| panic!("{e}"));
+            let p = d.path().join("handlers.json");
+            std::fs::write(&p, bytes).unwrap_or_else(|e| panic!("{e}"));
+            let _ = load_registry_file(&p);
+        }
+
+        #[test]
+        fn fuzz_registry_json_seed_corpus() {
+            for b in corpus("registry-json") {
+                registry_file_bytes(&b);
+            }
+        }
+
+        proptest! {
+            #![proptest_config(ProptestConfig::default())]
+            #[test]
+            fn fuzz_registry_json_never_panics(bytes in proptest::collection::vec(any::<u8>(), 0..=8192)) {
+                registry_file_bytes(&bytes);
+            }
+        }
+    }
 }

@@ -961,3 +961,39 @@ mod tests {
         assert!(r.next_run_at(NOW, 40, RunId(7)) <= NOW + r.max_delay_ms + r.jitter_cap_ms);
     }
 }
+
+/// Never-panics fuzzing for outside input: `JobSpec` deserialization
+/// (the `input_bytes` visitor accepts a base64 string or a byte array)
+/// and the admission rules on whatever survives it. A panic is a
+/// red-first bug.
+#[cfg(test)]
+mod fuzz {
+    use super::*;
+    use proptest::prelude::*;
+
+    fn jobspec_bytes(bytes: &[u8]) {
+        if let Ok(spec) = serde_json::from_slice::<JobSpec>(bytes) {
+            let l = Limits::default();
+            let _ = l.admits(&spec);
+        }
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::default())]
+        #[test]
+        fn fuzz_jobspec_never_panics(bytes in proptest::collection::vec(any::<u8>(), 0..=4096)) {
+            jobspec_bytes(&bytes);
+        }
+
+        #[test]
+        fn fuzz_jobspec_text_never_panics(text in any::<String>()) {
+            jobspec_bytes(text.as_bytes());
+        }
+
+        #[test]
+        fn fuzz_opkey_never_panics(key in any::<String>()) {
+            let l = Limits::default();
+            let _ = l.admits_key(&OperationKey(key));
+        }
+    }
+}

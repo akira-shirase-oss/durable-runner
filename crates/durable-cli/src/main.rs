@@ -342,3 +342,19 @@ mod tests {
         );
     }
 }
+
+/// Never-panics fuzzing for the CLI's outside-input parser (`--step`
+/// specs). A panic is a red-first bug.
+#[cfg(test)]
+mod fuzz {
+    use super::*;
+    use proptest::prelude::*;
+
+    proptest! {
+        #![proptest_config(ProptestConfig::default())]
+        #[test]
+        fn fuzz_parse_step_never_panics(s in any::<String>()) {
+            let _ = parse_step(&s);
+        }
+    }
+}

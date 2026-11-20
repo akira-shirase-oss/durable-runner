@@ -31,6 +31,12 @@ cargo clippy --workspace --all-targets --locked -- -D warnings
 step "tests"
 cargo test --workspace --locked
 
+step "fuzz smoke (never-panics decoders)"
+# Every outside-input parser/decoder has a fuzz_* proptest target with a
+# seed corpus in fuzz/corpus/. The suite runs each at the default count;
+# this pass runs them deeper — fixed iterations, not wall-clock time.
+PROPTEST_CASES="${FUZZ_CASES:-2048}" cargo test --workspace --locked fuzz
+
 step "architecture: the domain crate does no I/O"
 if grep -nE 'std::(fs|net|process|io|thread|env)|tokio|reqwest' crates/durable-domain/src/*.rs; then
   echo "durable-domain must stay pure (AGENTS.md non-negotiable 5)" >&2

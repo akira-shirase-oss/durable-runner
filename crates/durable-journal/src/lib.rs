@@ -3403,3 +3403,101 @@ mod tests {
         assert_eq!(b.len(), one + two);
     }
 }
+
+/// Never-panics fuzzing for every decoder of outside input (D-018's
+/// missing practices): the framed record stream, `journal.shape`, and
+/// `manifest.json`. Each `fuzz_*` test replays the seed corpus under
+/// `fuzz/corpus/<target>/` then runs a bounded proptest pass — a panic
+/// anywhere is a red-first bug.
+#[cfg(test)]
+mod fuzz {
+    use super::*;
+    use proptest::prelude::*;
+    use std::io::Write;
+
+    fn corpus(name: &str) -> Vec<Vec<u8>> {
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../fuzz/corpus")
+            .join(name);
+        let mut out: Vec<Vec<u8>> = std::fs::read_dir(&dir)
+            .unwrap_or_else(|e| panic!("corpus {dir:?}: {e}"))
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_type().is_ok_and(|t| t.is_file()))
+            .filter_map(|e| std::fs::read(e.path()).ok())
+            .collect();
+        out.sort();
+        out
+    }
+
+    fn at(dir: &Path, file: &str, bytes: &[u8]) -> PathBuf {
+        let p = dir.join(file);
+        let mut f = std::fs::File::create(&p).unwrap_or_else(|e| panic!("{e}"));
+        f.write_all(bytes).unwrap_or_else(|e| panic!("{e}"));
+        p
+    }
+
+    /// Bytes as journal.log: replay iterates to torn-tail or Corrupt —
+    /// never a panic, however the frames lie.
+    fn replay_bytes(bytes: &[u8]) {
+        let d = tempfile::tempdir().unwrap_or_else(|e| panic!("{e}"));
+        std::fs::write(d.path().join("journal.log"), bytes).unwrap_or_else(|e| panic!("{e}"));
+        if let Ok(Some(rs)) = records(d.path()) {
+            for r in rs {
+                let _ = r;
+            }
+        }
+    }
+
+    #[test]
+    fn fuzz_records_seed_corpus() {
+        for b in corpus("journal-records") {
+            replay_bytes(&b);
+        }
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::default())]
+        #[test]
+        fn fuzz_records_never_panics(bytes in proptest::collection::vec(any::<u8>(), 0..=8192)) {
+            replay_bytes(&bytes);
+        }
+    }
+
+    #[test]
+    fn fuzz_shape_seed_corpus() {
+        for b in corpus("journal-shape") {
+            let d = tempfile::tempdir().unwrap_or_else(|e| panic!("{e}"));
+            at(d.path(), "journal.shape", &b);
+            let _ = read_shape(d.path());
+        }
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::default())]
+        #[test]
+        fn fuzz_shape_never_panics(bytes in any::<Vec<u8>>()) {
+            let d = tempfile::tempdir().unwrap_or_else(|e| panic!("{e}"));
+            at(d.path(), "journal.shape", &bytes);
+            let _ = read_shape(d.path());
+        }
+    }
+
+    #[test]
+    fn fuzz_manifest_seed_corpus() {
+        for b in corpus("journal-manifest") {
+            let d = tempfile::tempdir().unwrap_or_else(|e| panic!("{e}"));
+            at(d.path(), "manifest.json", &b);
+            let _ = read_manifest(d.path());
+        }
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::default())]
+        #[test]
+        fn fuzz_manifest_never_panics(text in any::<String>()) {
+            let d = tempfile::tempdir().unwrap_or_else(|e| panic!("{e}"));
+            at(d.path(), "manifest.json", text.as_bytes());
+            let _ = read_manifest(d.path());
+        }
+    }
+}
