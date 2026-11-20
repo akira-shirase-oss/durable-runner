@@ -126,8 +126,10 @@ scan per new connection; keep-alive calls pay nothing (measured in
 
 **Signed handler calls (S2-6).** Every call a store-registered handler
 receives carries `x-durable-timestamp` and `x-durable-signature`: hex
-HMAC-SHA256 under the workspace's 32-byte secret over
-`ts.run.step.attempt.idem_key.SHA256(body)` (probe: empty digest). The
+HMAC-SHA256 under the workspace's 32-byte secret over the newline-joined
+`ts\nmethod\nauthority\npath\nrun\nstep\nattempt\nidem_key\nSHA256(body)`
+(`authority` is the `Host` header verbatim, `run` the opaque public id;
+probe: empty digest). The
 secret is drawn at workspace creation, shown once there and once at
 `POST /handler-secret` rotation, stored retrievably in the account
 store (a handler needs it to verify), never in `GET` responses or logs.

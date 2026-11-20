@@ -8,8 +8,10 @@ versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 S2-1 + S2-2: the account graph and the workspace-scoped API. With
 `DATABASE_URL` set, API keys minted per workspace authenticate into that
-workspace and nothing else; without it the server behaves exactly as
-v1.0.1 (every key lands in workspace 0). The journal remains the sole
+workspace and nothing else; without it the server behaves as v1.0.1
+(every key lands in workspace 0 — which still accepts v1.0.1's bare
+numeric run ids, though every id it issues is now opaque). The journal
+remains the sole
 authority for jobs — the account store is consulted at ingress only,
 never inside the commit path, and already-accepted runs keep executing
 through a store outage.
@@ -30,8 +32,10 @@ address — enforced where enforcement cannot be bypassed.
 
 S2-6: **signed handler calls**. Every call a store-registered handler
 receives carries `x-durable-timestamp` + `x-durable-signature`
-(HMAC-SHA256 under the workspace's secret over
-`ts.run.step.attempt.idem_key.SHA256(body)`); `POST /handler-secret`
+(HMAC-SHA256 under the workspace's secret over the newline-joined
+`ts\nmethod\nauthority\npath\nrun\nstep\nattempt\nidem_key\nSHA256(body)` —
+`authority` is the `Host` header value verbatim, `run` the opaque
+public id); `POST /handler-secret`
 rotates and re-arms the engine in the same request; the handler-side
 contract + reference verifier ship in `docs/HANDLERS.md`.
 
@@ -93,11 +97,12 @@ contract + reference verifier ship in `docs/HANDLERS.md`.
   `--allow-local-handlers` is the explicit dev/fixture opt-out.
 - **Signed handler calls** (S2-6): store-registered handlers carry
   `x-durable-timestamp` + `x-durable-signature` — hex HMAC-SHA256 under
-  the workspace's 32-byte secret over
-  `ts.run.step.attempt.idem_key.SHA256(body)`; probes sign the
-  empty-digest form. The secret rides `handlers.json` so a restart
-  during a store outage still signs. `--handler` flags and compat mode
-  stay unsigned.
+  the workspace's 32-byte secret over the newline-joined
+  `ts\nmethod\nauthority\npath\nrun\nstep\nattempt\nidem_key\nSHA256(body)`
+  (`authority` is the `Host` header verbatim, `run` the opaque
+  public id); probes sign the empty-digest form.
+  The secret rides `handlers.json` so a restart during a store outage
+  still signs. `--handler` flags and compat mode stay unsigned.
 - **`POST /handler-secret`** (S2-6): draws a fresh workspace secret,
   returns it exactly once, retires the old one immediately — the
   engine's registrations are re-armed in the same request and
@@ -106,7 +111,7 @@ contract + reference verifier ship in `docs/HANDLERS.md`.
   once; no `GET`, list or diagnostics endpoint ever carries it.
 - **`docs/HANDLERS.md`**: the handler contract — call, probe, the
   canonical string, verification order (freshness ±300 s → recompute →
-  `(ts, idem)` replay bound) and rotation semantics. `verify_sig` in
+  a signature seen before is replay) and rotation semantics. `verify_sig` in
   the server's test module is the reference check; `spawn_verifier` is
   the live fixture.
 - **Per-workspace live-run quota** (`--max-live-runs-per-ws`, default
@@ -144,8 +149,8 @@ contract + reference verifier ship in `docs/HANDLERS.md`.
   submission volume off a sequence gap (regression-tested end to end).
 - Handler-call signatures bind the run, step, attempt, idempotency key
   and exact body to the workspace's secret — a tampered body, stale
-  timestamp, wrong-secret signature or replayed `(ts, idem)` fails the
-  handler's own check (each rejection class regression-tested).
+  timestamp, wrong-secret signature or a signature already seen fails
+  the handler's own check (each rejection class regression-tested).
 
 ### Load evidence
 

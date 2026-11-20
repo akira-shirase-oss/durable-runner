@@ -343,6 +343,17 @@ pub struct EngineCore {
     /// a tenant's list cost is its own size, never everyone's (S2 #6).
     ws_index: HashMap<u64, BTreeSet<RunId>>,
     index_bytes: u64,
+    /// `index_bytes` split by workspace — the per-tenant share bound
+    /// (S2 re-review): one tenant's retained runs can never crowd the
+    /// whole index.
+    ws_index_bytes: HashMap<u64, u64>,
+    /// Retained runs by state kind, maintained with every transition so
+    /// `diagnostics` is O(states), not O(retained runs) (S2 re-review:
+    /// a tenant-readable diagnostics route must never stall the actor).
+    state_counts: std::collections::BTreeMap<&'static str, u64>,
+    /// Non-terminal runs with `ws != 0` — `workspace_scoped_live_runs`
+    /// in diagnostics without a full scan.
+    scoped_live: u64,
     /// The torn tail the journal discarded when this core opened it.
     discarded_tail: Option<durable_journal::TornTail>,
     /// Highest record `v` present in the journal: bumped by replay and by
@@ -394,6 +405,9 @@ impl EngineCore {
             ws_live: HashMap::new(),
             ws_index: HashMap::new(),
             index_bytes: 0,
+            ws_index_bytes: HashMap::new(),
+            state_counts: std::collections::BTreeMap::new(),
+            scoped_live: 0,
             discarded_tail,
             journal_record_version_max: 1,
             snapshot_version_max: 1,
@@ -717,17 +731,28 @@ impl EngineCore {
     pub fn finish_compaction(&mut self, expired: &[RunId]) {
         for id in expired {
             if let Some(run) = self.runs.remove(id) {
-                self.index_bytes = self
-                    .index_bytes
-                    .saturating_sub(Limits::run_bytes(&run.key, &run.spec));
+                let bytes = Limits::run_bytes(&run.key, &run.spec);
+                self.index_bytes = self.index_bytes.saturating_sub(bytes);
+                if let Some(n) = self.ws_index_bytes.get_mut(&run.ws) {
+                    *n = n.saturating_sub(bytes);
+                }
+                if self.ws_index_bytes.get(&run.ws) == Some(&0) {
+                    self.ws_index_bytes.remove(&run.ws);
+                }
                 let dk = (run.ws, run.key.clone());
                 if self.by_op.get(&dk) == Some(id) {
                     self.by_op.remove(&dk);
+                }
+                if let Some(n) = self.state_counts.get_mut(run.state.kind()) {
+                    *n = n.saturating_sub(1);
                 }
                 // Only terminal runs expire — live counts are untouched;
                 // the per-ws index loses the id either way.
                 if let Some(set) = self.ws_index.get_mut(&run.ws) {
                     set.remove(id);
+                }
+                if self.ws_index.get(&run.ws).is_some_and(|s| s.is_empty()) {
+                    self.ws_index.remove(&run.ws);
                 }
             }
         }
@@ -762,17 +787,23 @@ impl EngineCore {
             .count();
         self.ws_live.clear();
         self.ws_index.clear();
+        self.ws_index_bytes.clear();
+        self.state_counts.clear();
+        self.scoped_live = 0;
+        self.index_bytes = 0;
         for r in self.runs.values() {
             self.ws_index.entry(r.ws).or_default().insert(r.id);
+            *self.state_counts.entry(r.state.kind()).or_default() += 1;
+            let bytes = Limits::run_bytes(&r.key, &r.spec);
+            self.index_bytes += bytes;
+            *self.ws_index_bytes.entry(r.ws).or_default() += bytes;
             if !r.state.is_terminal() {
                 *self.ws_live.entry(r.ws).or_default() += 1;
+                if r.ws != 0 {
+                    self.scoped_live += 1;
+                }
             }
         }
-        self.index_bytes = self
-            .runs
-            .values()
-            .map(|r| Limits::run_bytes(&r.key, &r.spec))
-            .sum();
     }
 
     /// Compact (direct mode): expire 7-day-old terminal runs, snapshot the
@@ -840,12 +871,16 @@ impl EngineCore {
             self.by_op.insert((ws, key.clone()), run_id);
             self.live += 1;
             *self.ws_live.entry(ws).or_default() += 1;
+            if ws != 0 {
+                self.scoped_live += 1;
+            }
             self.ws_index.entry(ws).or_default().insert(run_id);
-            self.index_bytes += Limits::run_bytes(&key, &spec);
-            self.runs.insert(
-                run_id,
-                Arc::new(Run::accepted(run_id, ws, key, spec, not_before)),
-            );
+            let bytes = Limits::run_bytes(&key, &spec);
+            self.index_bytes += bytes;
+            *self.ws_index_bytes.entry(ws).or_default() += bytes;
+            let run = Arc::new(Run::accepted(run_id, ws, key, spec, not_before));
+            *self.state_counts.entry(run.state.kind()).or_default() += 1;
+            self.runs.insert(run_id, run);
             return Ok(vec![]);
         }
         let run = self.runs.get(&run_id).ok_or(Refusal::StaleReply)?;
@@ -858,6 +893,7 @@ impl EngineCore {
                 run_ws: run.ws,
             });
         }
+        let old_kind = run.state.kind();
         let (state, effects) = reduce(run, &event, now, &self.limits, &self.retry)?;
         // Copies the run only if a compaction's view still shares it.
         let run = Arc::make_mut(self.runs.get_mut(&run_id).ok_or(Refusal::StaleReply)?);
@@ -869,11 +905,23 @@ impl EngineCore {
             if let Some(n) = self.ws_live.get_mut(&run.ws) {
                 *n = n.saturating_sub(1);
             }
+            if run.ws != 0 {
+                self.scoped_live = self.scoped_live.saturating_sub(1);
+            }
             // A finished run keeps only what dedup and inspection need (key,
             // state, step count, finish time): its input goes, and so do its
             // bytes from the capacity bound (D-030). Replay does the same.
             let input = std::mem::take(&mut run.spec.input);
             self.index_bytes = self.index_bytes.saturating_sub(input.len() as u64);
+            if let Some(n) = self.ws_index_bytes.get_mut(&run.ws) {
+                *n = n.saturating_sub(input.len() as u64);
+            }
+        }
+        if state.kind() != old_kind {
+            if let Some(n) = self.state_counts.get_mut(old_kind) {
+                *n = n.saturating_sub(1);
+            }
+            *self.state_counts.entry(state.kind()).or_default() += 1;
         }
         run.state = state;
         Ok(effects)
@@ -972,10 +1020,19 @@ impl EngineCore {
         self.limits.admits_key(&key)?;
         self.limits.admits(&spec)?; // limits refuse before anything is written
                                     // Capacity: a bounded index, refused explicitly (contract: "cap
-                                    // memory and disk; reject overload explicitly").
+                                    // memory and disk; reject overload explicitly"). The per-
+                                    // workspace share is bounded the way the live pool is: a tenant
+                                    // may use at most `max_index_bytes_per_ws`, and never more than
+                                    // a quarter of the global index (S2 re-review).
+        let run_bytes = Limits::run_bytes(&key, &spec);
         if self.live >= self.limits.max_live_runs
             || self.ws_live.get(&ws).copied().unwrap_or(0) >= self.limits.max_live_runs_per_ws
-            || self.index_bytes + Limits::run_bytes(&key, &spec) > self.limits.max_index_bytes
+            || self.index_bytes + run_bytes > self.limits.max_index_bytes
+            || self.ws_index_bytes.get(&ws).copied().unwrap_or(0) + run_bytes
+                > self
+                    .limits
+                    .max_index_bytes_per_ws
+                    .min(self.limits.max_index_bytes / 4)
         {
             return Err(Refusal::AtCapacity.into());
         }
@@ -1094,12 +1151,11 @@ impl EngineCore {
     }
 
     /// Bounded diagnostics: counts, never rows — O(number of states),
-    /// safe to expose on a busy server.
+    /// safe to expose on a busy server. The histogram and workspace
+    /// counts are the maintained counters, not a scan of the index:
+    /// a tenant-scoped caller hitting this route must never pin the
+    /// actor for O(retained runs) (S2 re-review).
     pub fn diagnostics(&self) -> Diagnostics {
-        let mut states = std::collections::BTreeMap::new();
-        for r in self.runs.values() {
-            *states.entry(r.state.kind()).or_insert(0u64) += 1;
-        }
         let (generation, records_written, stale_generations, batches) = match &self.log {
             Log::Direct(j) => (
                 j.generation(),
@@ -1126,13 +1182,8 @@ impl EngineCore {
             active_runs: self.live as u64,
             index_bytes: self.index_bytes,
             dedup_keys: self.by_op.len() as u64,
-            workspaces_active: self
-                .runs
-                .values()
-                .map(|r| r.ws)
-                .collect::<std::collections::BTreeSet<_>>()
-                .len() as u64,
-            states,
+            workspaces_active: self.ws_index.len() as u64,
+            states: self.state_counts.clone(),
             space_ok: self.space_ok(),
             errors: std::collections::BTreeMap::new(),
             journal_batches,
@@ -1143,25 +1194,25 @@ impl EngineCore {
             journal_record_version_max: self.journal_record_version_max,
             journal_snapshot_version_max: self.snapshot_version_max,
             journal_max_ws: self.journal_max_ws,
-            workspace_scoped_live_runs: self
-                .runs
-                .values()
-                .filter(|r| r.ws != 0 && !r.state.is_terminal())
-                .count() as u64,
+            workspace_scoped_live_runs: self.scoped_live,
         }
     }
 
     /// One workspace's diagnostics — the tenant-facing subset, computed
-    /// over that workspace's runs only so nothing cross-tenant leaks.
+    /// over that workspace's runs only so nothing cross-tenant leaks and
+    /// the cost is this workspace's set, never everyone's.
     pub fn diagnostics_for(&self, ws: u64) -> WorkspaceDiagnostics {
         let mut states = std::collections::BTreeMap::new();
         let mut live_runs = 0u64;
         let mut active_runs = 0u64;
-        for r in self.runs.values().filter(|r| r.ws == ws) {
-            *states.entry(r.state.kind()).or_insert(0u64) += 1;
-            live_runs += 1;
-            if !r.state.is_terminal() {
-                active_runs += 1;
+        if let Some(ids) = self.ws_index.get(&ws) {
+            for id in ids {
+                let Some(r) = self.runs.get(id) else { continue };
+                *states.entry(r.state.kind()).or_insert(0u64) += 1;
+                live_runs += 1;
+                if !r.state.is_terminal() {
+                    active_runs += 1;
+                }
             }
         }
         WorkspaceDiagnostics {
@@ -2543,7 +2594,14 @@ mod tests {
         let first = e
             .submit(OperationKey("cap-0".into()), job(), 0)
             .unwrap_or_else(|e| panic!("{e}"));
-        e.limits.max_index_bytes = e.diagnostics().index_bytes + 1000; // room for no second job
+        // Room for no second job under either bound: the per-workspace
+        // share is capped at a quarter of the global index (S2 re-review
+        // N4), so the global bound is raised enough for the quarter to
+        // admit exactly one job and no more.
+        let job_bytes = Limits::run_bytes(&OperationKey("cap-1".into()), &job());
+        let ws0_left = e.diagnostics().index_bytes; // ws 0's bytes so far
+        e.limits.max_index_bytes = ws0_left + 4 * job_bytes;
+        e.limits.max_index_bytes_per_ws = ws0_left - 4096 + job_bytes;
         assert!(matches!(
             e.submit(OperationKey("cap-1".into()), job(), 0),
             Err(EngineError::Refused(Refusal::AtCapacity))

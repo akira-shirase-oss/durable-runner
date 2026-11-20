@@ -88,6 +88,11 @@ struct Args {
     /// `at_capacity`. Default 512 MiB, sized for a 2 GB host (D-031).
     #[arg(long, default_value_t = durable_domain::Limits::default().max_index_bytes)]
     max_index_bytes: u64,
+    /// One workspace's share of the index bytes — a single tenant at
+    /// this bound is refused while the rest keep submitting. The
+    /// effective share is also capped at a quarter of `max_index_bytes`.
+    #[arg(long, default_value_t = durable_domain::Limits::default().max_index_bytes_per_ws)]
+    max_index_bytes_per_ws: u64,
     /// Handler calls (attempts and probes) in flight at once. A submit
     /// burst saturates the permits and defers the rest to the tick — 32
     /// held the workspaces drain to ~640 runs/s measured (S2-7).
@@ -304,18 +309,21 @@ const ATTEMPT_HEADER: &str = "x-durable-attempt";
 const TS_HEADER: &str = "x-durable-timestamp";
 const SIG_HEADER: &str = "x-durable-signature";
 
-/// `HMAC_SHA256(secret, "{ts}\n{method}\n{path}\n{run}\n{step}\n{attempt}\n{idem}\n{digest}")`
+/// `HMAC_SHA256(secret, "{ts}\n{method}\n{authority}\n{path}\n{run}\n{step}\n{attempt}\n{idem}\n{digest}")`
 /// — newline-separated so no field can be re-split into its neighbours
 /// (`idem_key` may carry `.`; it cannot carry `\n` — the runner rejects
-/// control bytes in keys), and bound to the request's method and path
-/// so a signature minted for one call replays nowhere else. Run/step/
-/// attempt are `-` on a compat (no-`Call`) path; `digest` is hex sha256
-/// of the body for a call and empty for a probe.
+/// control bytes in keys), and bound to the request's method, target
+/// authority and path so a signature minted for one call replays
+/// nowhere else — not even a same-path handler at a different host in
+/// the same workspace (S3). Run/step/attempt are `-` on a compat
+/// (no-`Call`) path; `digest` is hex sha256 of the body for a call and
+/// empty for a probe.
 #[allow(clippy::too_many_arguments)]
 fn sign_call(
     secret: &[u8; 32],
     ts: u64,
     method: &str,
+    authority: &str,
     path: &str,
     r: &str,
     s: &str,
@@ -323,7 +331,8 @@ fn sign_call(
     idem_key: &str,
     body_digest: &str,
 ) -> String {
-    let canonical = format!("{ts}\n{method}\n{path}\n{r}\n{s}\n{a}\n{idem_key}\n{body_digest}");
+    let canonical =
+        format!("{ts}\n{method}\n{authority}\n{path}\n{r}\n{s}\n{a}\n{idem_key}\n{body_digest}");
     let key = ring::hmac::Key::new(ring::hmac::HMAC_SHA256, secret);
     let tag = ring::hmac::sign(&key, canonical.as_bytes());
     hex(tag.as_ref())
@@ -337,6 +346,7 @@ fn with_call(
     idem_key: &str,
     body_digest: &str,
     method: &str,
+    authority: &str,
     path: &str,
     pubid: &pubid::PubId,
 ) -> reqwest::RequestBuilder {
@@ -362,7 +372,18 @@ fn with_call(
             let ts = unix_secs();
             req.header(TS_HEADER, ts).header(
                 SIG_HEADER,
-                sign_call(secret, ts, method, path, &r, &s, &a, idem_key, body_digest),
+                sign_call(
+                    secret,
+                    ts,
+                    method,
+                    authority,
+                    path,
+                    &r,
+                    &s,
+                    &a,
+                    idem_key,
+                    body_digest,
+                ),
             )
         }
         None => req,
@@ -389,7 +410,7 @@ impl HttpHandler {
             .header("content-type", "application/json")
             .body(body)
             .timeout(self.timeout);
-        let path = self.policy_url.as_ref().map_or("/", |u| u.path());
+        let (authority, path) = self.authority_and_path();
         let res = with_call(
             req,
             call,
@@ -397,7 +418,8 @@ impl HttpHandler {
             idem_key,
             &digest,
             "POST",
-            path,
+            &authority,
+            &path,
             &self.pubid,
         )
         .send()
@@ -435,8 +457,8 @@ impl HttpHandler {
             .query(&[("idem_key", idem_key)])
             .timeout(self.timeout);
         // A probe signs an empty body digest — the same canonical
-        // shape, GET and the URL's path bound in.
-        let path = self.policy_url.as_ref().map_or("/", |u| u.path());
+        // shape, GET and the URL's authority+path bound in.
+        let (authority, path) = self.authority_and_path();
         with_call(
             req,
             call,
@@ -444,13 +466,38 @@ impl HttpHandler {
             idem_key,
             "",
             "GET",
-            path,
+            &authority,
+            &path,
             &self.pubid,
         )
         .send()
         .await
         .map(|r| r.status().is_success())
         .unwrap_or(false)
+    }
+
+    /// The signed authority is the request's `Host` header value
+    /// verbatim — brackets on an IPv6 literal, a port only when the URL
+    /// names a non-default one — so a verifying handler signs what it
+    /// actually received (S3: a sig minted for `a/step` never verifies
+    /// at `b/step`).
+    fn authority_and_path(&self) -> (String, String) {
+        self.policy_url
+            .as_ref()
+            .map(|u| {
+                let host = match u.host() {
+                    Some(url::Host::Ipv6(ip)) => format!("[{ip}]"),
+                    Some(url::Host::Ipv4(ip)) => ip.to_string(),
+                    Some(url::Host::Domain(d)) => d.to_string(),
+                    None => String::new(),
+                };
+                let authority = match u.port() {
+                    Some(p) => format!("{host}:{p}"),
+                    None => host,
+                };
+                (authority, u.path().to_string())
+            })
+            .unwrap_or_else(|| ("".into(), "/".into()))
     }
 }
 
@@ -615,6 +662,110 @@ const REGISTRY_SYNC: Duration = Duration::from_secs(30);
 /// Workspaces the reconciler walks per pass (bounded per D-021).
 const REGISTRY_SYNC_WS_LIMIT: u32 = 1024;
 
+/// One serialized write to `handlers.json` (S3): every mutation and every
+/// reconcile snapshot goes through the writer thread — the load, merge,
+/// tmp-write and two fsyncs run off the async workers, and the epoch
+/// check happens under the same serialization the file gets.
+enum RegistryWrite {
+    /// Replace the `(ws, name)` row with `entry`.
+    Upsert {
+        entry: RegistryEntry,
+        ack: tokio::sync::oneshot::Sender<()>,
+    },
+    /// Drop the `(ws, name)` row.
+    Remove {
+        ws: u64,
+        name: String,
+        ack: tokio::sync::oneshot::Sender<()>,
+    },
+    /// Replace one workspace's whole set (a secret rotation).
+    ReplaceWs {
+        ws: u64,
+        entries: Vec<RegistryEntry>,
+        ack: tokio::sync::oneshot::Sender<()>,
+    },
+    /// A reconcile pass's whole-file snapshot, taken at `epoch_seen`.
+    /// `preserve_ws` holds workspaces the pass saw but could not arm —
+    /// their last-known-good rows carry forward so a refused set never
+    /// strands a workspace's handlers at the next restart (S2 review N2).
+    Snapshot {
+        entries: Vec<RegistryEntry>,
+        preserve_ws: Vec<u64>,
+        epoch_seen: u64,
+        /// The pass is settled when the writer has decided — applied or
+        /// discarded as stale, either way the sender hears about it.
+        ack: tokio::sync::oneshot::Sender<()>,
+    },
+}
+
+/// The single writer of `handlers.json`. Mutations apply in send order;
+/// a reconcile snapshot lands only while the epoch it read still holds —
+/// the check is inside the serialization, so an overtaken pass can never
+/// overwrite a mutation that already won.
+fn registry_writer(
+    path: PathBuf,
+    epoch: Arc<std::sync::atomic::AtomicU64>,
+    rx: std::sync::mpsc::Receiver<RegistryWrite>,
+) {
+    while let Ok(op) = rx.recv() {
+        let mut all = load_registry_file(&path);
+        let ack = match op {
+            RegistryWrite::Upsert { entry, ack } => {
+                all.retain(|e| !(e.ws == entry.ws && e.name == entry.name));
+                all.push(entry);
+                ack
+            }
+            RegistryWrite::Remove { ws, name, ack } => {
+                all.retain(|e| !(e.ws == ws && e.name == name));
+                ack
+            }
+            RegistryWrite::ReplaceWs { ws, entries, ack } => {
+                all.retain(|e| e.ws != ws);
+                all.extend(entries);
+                ack
+            }
+            RegistryWrite::Snapshot {
+                entries,
+                preserve_ws,
+                epoch_seen,
+                ack,
+            } => {
+                if epoch.load(std::sync::atomic::Ordering::Acquire) == epoch_seen {
+                    all.retain(|e| preserve_ws.contains(&e.ws));
+                    all.extend(entries);
+                    if let Err(e) = save_registry_file(&path, &all) {
+                        eprintln!("durable-server: cannot write {path:?}: {e}");
+                    }
+                } else {
+                    eprintln!(
+                        "durable-server: registry reconcile discarded a pass overtaken by a mutation"
+                    );
+                }
+                let _ = ack.send(());
+                continue;
+            }
+        };
+        if let Err(e) = save_registry_file(&path, &all) {
+            eprintln!("durable-server: cannot write {path:?}: {e}");
+        }
+        let _ = ack.send(());
+    }
+}
+
+/// Spawn the registry writer thread; the sender goes in `App`.
+fn spawn_registry_writer(
+    path: Arc<Path>,
+    epoch: Arc<std::sync::atomic::AtomicU64>,
+) -> std::sync::mpsc::SyncSender<RegistryWrite> {
+    let (tx, rx) = std::sync::mpsc::sync_channel::<RegistryWrite>(512);
+    let path = path.to_path_buf();
+    std::thread::Builder::new()
+        .name("registry-writer".into())
+        .spawn(move || registry_writer(path, epoch, rx))
+        .unwrap_or_else(|e| panic!("registry writer thread: {e}"));
+    tx
+}
+
 /// One reconcile pass: store truth → engine registry + snapshot file.
 /// `flags` are the ws-0 `--handler` registrations — they union with the
 /// store's ws-0 rows (a store row shadows a flag on a name conflict).
@@ -623,8 +774,7 @@ async fn registry_sync(
     engine: &Engine,
     factory: &HandlerFactory,
     flags: &[(String, Arc<dyn StepHandler>)],
-    file: &Path,
-    lock: &Mutex<()>,
+    tx: &std::sync::mpsc::SyncSender<RegistryWrite>,
     epoch: &std::sync::atomic::AtomicU64,
 ) -> Result<(), AccountError> {
     // A mutation anywhere in the pass's read window makes its applies
@@ -651,15 +801,19 @@ async fn registry_sync(
         workspaces.extend(page);
     }
     let mut all = Vec::new();
+    let mut preserve_ws = Vec::new();
     let mut refused = 0u64;
     for ws in &workspaces {
         // Per-workspace error isolation (S2 review #6): one bad row or
         // engine refusal must not abort the pass for every later
-        // workspace — it drops out of handlers.json *and* the engine.
+        // workspace — the engine keeps that workspace's last-armed set,
+        // and the writer carries its file rows forward (`preserve_ws`)
+        // so a restart still has them (S2 review N2).
         let regs = match store.list_handlers(ws.id).await {
             Ok(r) => r,
             Err(e) => {
                 eprintln!("durable-server: registry reconcile skipped a workspace: {e}");
+                preserve_ws.push(ws.id);
                 continue;
             }
         };
@@ -698,6 +852,9 @@ async fn registry_sync(
         }
         if let Err(e) = engine.set_workspace_handlers(ws.id, set).await {
             eprintln!("durable-server: registry reconcile skipped a workspace: {e}");
+            // The engine keeps the last-armed set; the file keeps its
+            // rows for the same reason.
+            preserve_ws.push(ws.id);
             continue;
         }
         // The snapshot file mirrors what the engine actually armed — a
@@ -714,12 +871,32 @@ async fn registry_sync(
         eprintln!("durable-server: registry reconcile discarded a pass overtaken by a mutation");
         return Ok(());
     }
-    // The file write is the only thing a route mutation can race with.
-    let _g = lock.lock().unwrap_or_else(|e| e.into_inner());
-    if let Err(e) = save_registry_file(file, &all) {
-        eprintln!("durable-server: cannot write {file:?}: {e}");
+    // The writer checks the epoch again under its own serialization —
+    // an overtaken pass can never land over a mutation that already won.
+    let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
+    if tx
+        .try_send(RegistryWrite::Snapshot {
+            entries: all,
+            preserve_ws,
+            epoch_seen: e0,
+            ack: ack_tx,
+        })
+        .is_err()
+    {
+        eprintln!("durable-server: registry writer unavailable; the file keeps last-known-good");
+        return Ok(());
     }
-    Ok(())
+    // The pass is settled when the writer decides — applied or dropped
+    // as stale, either way a bounded wait hears about it.
+    match tokio::time::timeout(std::time::Duration::from_secs(10), ack_rx).await {
+        Ok(Ok(())) => Ok(()),
+        _ => {
+            eprintln!("durable-server: registry writer did not settle a reconcile pass");
+            Err(AccountError::Unavailable(
+                "registry writer did not settle the pass".into(),
+            ))
+        }
+    }
 }
 
 /// The reconciler loop: on a store error the engine keeps serving the
@@ -732,12 +909,11 @@ fn spawn_registry_reconcile(
     let engine = app.engine.clone();
     let factory = Arc::clone(&app.handler_factory);
     let flags = Arc::clone(&app.flag_handlers);
-    let file = app.registry_file.clone();
-    let lock = Arc::clone(&app.registry_lock);
+    let tx = app.registry_tx.clone();
     let epoch = Arc::clone(&app.registry_epoch);
     tokio::spawn(async move {
         loop {
-            match registry_sync(&store, &engine, &factory, &flags, &file, &lock, &epoch).await {
+            match registry_sync(&store, &engine, &factory, &flags, &tx, &epoch).await {
                 Ok(()) => stale.store(false, std::sync::atomic::Ordering::Relaxed),
                 Err(e) => {
                     stale.store(true, std::sync::atomic::Ordering::Relaxed);
@@ -982,14 +1158,15 @@ struct App {
     /// The engine is serving the snapshot because the store could not
     /// answer the last reconcile (`registry_stale` in diagnostics).
     registry_stale: Arc<std::sync::atomic::AtomicBool>,
-    /// `<journal>/handlers.json`: the last-known-good registrations.
+    /// `<journal>/handlers.json`: the last-known-good registrations —
+    /// written only by the registry writer thread, fed by this channel
+    /// (the load/merge/fsync work stays off the async workers — S3).
     registry_file: Arc<Path>,
-    /// Serializes snapshot writes between routes and the reconciler.
-    registry_lock: Arc<Mutex<()>>,
-    /// Bumped by every route mutation (PUT/DELETE/rotate). A reconcile
-    /// pass that sees it move mid-flight discards its stale apply — the
-    /// mutation already wrote the engine and the file itself, so re-
-    /// applying a pass read *before* it would resurrect it (S3).
+    registry_tx: std::sync::mpsc::SyncSender<RegistryWrite>,
+    /// Bumped by every route mutation (PUT/DELETE/rotate) BEFORE the
+    /// store write, so a reconcile pass that overlaps the mutation
+    /// always sees the epoch move. The writer re-checks it under its
+    /// own serialization before a snapshot may land (S3).
     registry_epoch: Arc<std::sync::atomic::AtomicU64>,
     /// Opaque public run ids (S2 #7): every run id crosses the API
     /// through this keyed permutation, so no response reveals the
@@ -1009,6 +1186,11 @@ fn test_app(
     allow_local: bool,
 ) -> App {
     let pubid = pubid::PubId::load_or_generate(journal_dir).unwrap_or_else(|e| panic!("{e}"));
+    let registry_epoch = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let registry_tx = spawn_registry_writer(
+        Arc::from(journal_dir.join("handlers.json").as_path()),
+        Arc::clone(&registry_epoch),
+    );
     App {
         engine,
         keyring,
@@ -1024,8 +1206,8 @@ fn test_app(
         flag_handlers: Arc::new(Vec::new()),
         registry_stale: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         registry_file: Arc::from(journal_dir.join("handlers.json").as_path()),
-        registry_lock: Arc::new(Mutex::new(())),
-        registry_epoch: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        registry_tx,
+        registry_epoch,
         pubid,
     }
 }
@@ -1397,8 +1579,21 @@ fn not_found() -> ApiError {
     ApiError::new(StatusCode::NOT_FOUND, "not_found", "no such run")
 }
 
-fn decode_id(app: &App, s: &str) -> Result<u64, ApiError> {
-    app.pubid.decode(s).ok_or_else(not_found)
+fn decode_id(app: &App, ws: u64, s: &str) -> Result<u64, ApiError> {
+    // Opaque first: an issued public id must always resolve to itself —
+    // the permutation could in principle produce an all-digit string, and
+    // a numeric-first read would misroute it to a different internal run.
+    if let Some(id) = app.pubid.decode(s) {
+        return Ok(id);
+    }
+    // v1.0.1 compat (N7): the compat workspace's legacy ids are the bare
+    // internal numbers. A short digit string never decodes as an opaque
+    // id (wrong byte count), so every realistic legacy id reaches here;
+    // every other workspace's ids stay opaque-only.
+    if ws == 0 && !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit()) {
+        return s.parse::<u64>().map_err(|_| not_found());
+    }
+    Err(not_found())
 }
 
 /// The run if it exists AND belongs to the caller's workspace — a
@@ -1416,7 +1611,7 @@ async fn inspect(
     State(app): State<App>,
     P(id): P<String>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let run = scoped_run(&app, &auth, decode_id(&app, &id)?).await?;
+    let run = scoped_run(&app, &auth, decode_id(&app, auth.ws, &id)?).await?;
     Ok(Json(serde_json::json!({
         "id": app.pubid.encode(run.id),
         "key": run.key.0,
@@ -1435,7 +1630,7 @@ async fn spec(
     P(id): P<String>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     use base64::Engine as _;
-    let run = scoped_run(&app, &auth, decode_id(&app, &id)?).await?;
+    let run = scoped_run(&app, &auth, decode_id(&app, auth.ws, &id)?).await?;
     Ok(Json(serde_json::json!({
         "id": app.pubid.encode(run.id),
         "key": run.key.0,
@@ -1454,7 +1649,7 @@ async fn cancel(
 ) -> Result<Json<serde_json::Value>, ApiError> {
     // The scope check happens before the cancel: a run's workspace is
     // fixed at acceptance, so inspecting first cannot race.
-    let internal = decode_id(&app, &id)?;
+    let internal = decode_id(&app, auth.ws, &id)?;
     scoped_run(&app, &auth, internal).await?;
     app.engine.cancel(RunId(internal)).await?;
     Ok(Json(serde_json::json!({ "cancelled": id })))
@@ -1492,7 +1687,7 @@ async fn list(
     // Cursors are public ids like every other boundary value (S2 #7):
     // a malformed one is a client bug — 400, never a lookup.
     let decode_cursor = |s: Option<String>| -> Result<Option<u64>, ApiError> {
-        s.map(|c| decode_id(&app, &c))
+        s.map(|c| decode_id(&app, auth.ws, &c))
             .transpose()
             .map_err(|_| ApiError::new(StatusCode::BAD_REQUEST, "bad_query", "malformed cursor"))
     };
@@ -1925,25 +2120,41 @@ struct PutHandlerReq {
     url: String,
 }
 
-/// Rewrite the snapshot after a route mutation: the current file plus
-/// this change. Serialized with the reconciler's writes by `registry_lock`.
-fn registry_file_upsert(app: &App, entry: RegistryEntry) {
-    let _g = app.registry_lock.lock().unwrap_or_else(|e| e.into_inner());
-    let mut all = load_registry_file(&app.registry_file);
-    all.retain(|e| !(e.ws == entry.ws && e.name == entry.name));
-    all.push(entry);
-    if let Err(e) = save_registry_file(&app.registry_file, &all) {
-        eprintln!("durable-server: cannot write {:?}: {e}", app.registry_file);
+/// Rewrite the snapshot after a route mutation — the actual
+/// load/merge/fsync runs on the registry writer thread; the route waits
+/// for its ack (bounded) so the response still means "the snapshot has
+/// it" (S3: no synchronous fsync on an async worker).
+async fn registry_write(
+    app: &App,
+    op: impl FnOnce(tokio::sync::oneshot::Sender<()>) -> RegistryWrite,
+) {
+    let (ack, rx) = tokio::sync::oneshot::channel();
+    if app.registry_tx.try_send(op(ack)).is_err() {
+        eprintln!(
+            "durable-server: registry writer queue full; {:?} converges at the next reconcile",
+            app.registry_file
+        );
+        return;
+    }
+    if tokio::time::timeout(Duration::from_secs(10), rx)
+        .await
+        .is_err()
+    {
+        eprintln!("durable-server: registry writer did not ack within 10 s");
     }
 }
 
-fn registry_file_remove(app: &App, ws: u64, name: &str) {
-    let _g = app.registry_lock.lock().unwrap_or_else(|e| e.into_inner());
-    let mut all = load_registry_file(&app.registry_file);
-    all.retain(|e| !(e.ws == ws && e.name == name));
-    if let Err(e) = save_registry_file(&app.registry_file, &all) {
-        eprintln!("durable-server: cannot write {:?}: {e}", app.registry_file);
-    }
+async fn registry_file_upsert(app: &App, entry: RegistryEntry) {
+    registry_write(app, |ack| RegistryWrite::Upsert { entry, ack }).await
+}
+
+async fn registry_file_remove(app: &App, ws: u64, name: &str) {
+    let name = name.to_string();
+    registry_write(app, |ack| RegistryWrite::Remove { ws, name, ack }).await
+}
+
+async fn registry_file_replace_ws(app: &App, ws: u64, entries: Vec<RegistryEntry>) {
+    registry_write(app, |ack| RegistryWrite::ReplaceWs { ws, entries, ack }).await
 }
 
 async fn put_handler(
@@ -1978,13 +2189,16 @@ async fn put_handler(
     // Order is store → engine → snapshot: the store is the authority, so
     // a row it accepted is never silently dropped. If the engine call
     // fails the row stays and the next reconcile applies it; the client
-    // gets the engine's error and can retry or DELETE.
+    // gets the engine's error and can retry or DELETE. The epoch bumps
+    // BEFORE the store write (S3): a reconcile pass overlapping this
+    // mutation always sees the epoch move — bumping after the write
+    // would leave a window where a stale pass still reads the old epoch.
+    app.registry_epoch
+        .fetch_add(1, std::sync::atomic::Ordering::Release);
     store
         .put_handler(auth.ws, name, &url)
         .await
         .map_err(store_err)?;
-    app.registry_epoch
-        .fetch_add(1, std::sync::atomic::Ordering::Release);
     let secret = store
         .workspace_by_id(auth.ws)
         .await
@@ -2015,7 +2229,8 @@ async fn put_handler(
             url: url.clone(),
             secret: secret.as_deref().map(|s| hex(s)),
         },
-    );
+    )
+    .await;
     Ok(Json(serde_json::json!({ "name": name, "url": url })))
 }
 
@@ -2029,6 +2244,9 @@ async fn rotate_handler_secret(
     State(app): State<App>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let store = accounts(&app)?;
+    // Bump before the store write — same epoch ordering as PUT (S3).
+    app.registry_epoch
+        .fetch_add(1, std::sync::atomic::Ordering::Release);
     let Some(secret) = store
         .rotate_handler_secret(auth.ws)
         .await
@@ -2040,8 +2258,6 @@ async fn rotate_handler_secret(
             "no such workspace",
         ));
     };
-    app.registry_epoch
-        .fetch_add(1, std::sync::atomic::Ordering::Release);
     // Rebuild this workspace's engine set signed with the new secret —
     // the same shape as a reconcile pass for one workspace.
     let regs = store.list_handlers(auth.ws).await.map_err(store_err)?;
@@ -2065,13 +2281,7 @@ async fn rotate_handler_secret(
         });
     }
     app.engine.set_workspace_handlers(auth.ws, set).await?;
-    let _g = app.registry_lock.lock().unwrap_or_else(|e| e.into_inner());
-    let mut all = load_registry_file(&app.registry_file);
-    all.retain(|e| e.ws != auth.ws);
-    all.extend(entries);
-    if let Err(e) = save_registry_file(&app.registry_file, &all) {
-        eprintln!("durable-server: cannot write {:?}: {e}", app.registry_file);
-    }
+    registry_file_replace_ws(&app, auth.ws, entries).await;
     Ok(Json(serde_json::json!({ "secret": hex(&secret) })))
 }
 
@@ -2081,6 +2291,9 @@ async fn delete_handler(
     P(name): P<String>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let store = accounts(&app)?;
+    // Bump before the store write — same epoch ordering as PUT (S3).
+    app.registry_epoch
+        .fetch_add(1, std::sync::atomic::Ordering::Release);
     let existed = store
         .delete_handler(auth.ws, &name)
         .await
@@ -2092,10 +2305,8 @@ async fn delete_handler(
             "no such handler registration",
         ));
     }
-    app.registry_epoch
-        .fetch_add(1, std::sync::atomic::Ordering::Release);
     app.engine.delete_handler(auth.ws, &name)?;
-    registry_file_remove(&app, auth.ws, &name);
+    registry_file_remove(&app, auth.ws, &name).await;
     Ok(Json(serde_json::json!({ "deleted": name })))
 }
 
@@ -2453,6 +2664,7 @@ async fn main() -> Result<()> {
             max_live_runs: args.max_live_runs,
             max_live_runs_per_ws: args.max_live_runs_per_ws,
             max_index_bytes: args.max_index_bytes,
+            max_index_bytes_per_ws: args.max_index_bytes_per_ws,
             ..durable_domain::Limits::default()
         },
         ..Default::default()
@@ -2541,6 +2753,8 @@ async fn main() -> Result<()> {
     }
     let stopped = engine.clone();
     let registry_stale = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let registry_epoch = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let registry_tx = spawn_registry_writer(registry_file.clone(), Arc::clone(&registry_epoch));
     let app = App {
         engine,
         keyring: Arc::new(Keyring::new(api_key, read_key, store.clone())),
@@ -2550,8 +2764,8 @@ async fn main() -> Result<()> {
         flag_handlers: Arc::new(flag_handlers),
         registry_stale: Arc::clone(&registry_stale),
         registry_file,
-        registry_lock: Arc::new(Mutex::new(())),
-        registry_epoch: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        registry_tx,
+        registry_epoch,
         pubid,
     };
     if let Some(store) = &store {
@@ -3197,6 +3411,49 @@ mod tests {
         let (status, _) = call(&h.router, "GET", "/health", None, None).await;
         assert_eq!(status, StatusCode::OK);
         let (status, _) = call(&h.router, "GET", "/admin/diagnostics", Some(KEY), None).await;
+        assert_eq!(status, StatusCode::OK);
+    }
+
+    /// N7 compat: workspace 0 still answers v1.0.1's bare numeric run
+    /// ids — a v1.0.1 client holding `"1"` keeps working. The issued id
+    /// stays opaque, and numeric resolution never opens for a nonzero
+    /// workspace (their internal ids would leak across tenants).
+    #[tokio::test]
+    async fn workspace_zero_still_answers_numeric_run_ids() {
+        let h = harness(true);
+        let (status, v) = call(
+            &h.router,
+            "POST",
+            "/jobs",
+            Some(KEY),
+            Some(submit_body("k")),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{v}");
+        let opaque = v["run_id"].as_str().unwrap_or_else(|| panic!("{v}"));
+        assert!(
+            !opaque.chars().all(|c| c.is_ascii_digit()),
+            "issued ids are opaque: {opaque}"
+        );
+        // RunId(1) is the first run — resolvable both ways.
+        let (status, v2) = call(&h.router, "GET", "/jobs/1", Some(KEY), None).await;
+        assert_eq!(status, StatusCode::OK, "{v2}");
+        assert_eq!(v2["id"].as_str(), Some(opaque), "same run, either id");
+        // A numeric id never issued is still an honest 404 — the
+        // fallback resolves only real internal ids.
+        let (status, _) = call(&h.router, "GET", "/jobs/424242", Some(KEY), None).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        // The opaque form routes normally — and because the opaque
+        // decode runs first, an issued id can never be misread as a
+        // compat number.
+        let (status, _) = call(
+            &h.router,
+            "GET",
+            &format!("/jobs/{opaque}"),
+            Some(KEY),
+            None,
+        )
+        .await;
         assert_eq!(status, StatusCode::OK);
     }
 
@@ -4323,8 +4580,7 @@ mod tests {
             &h.app.engine,
             &h.app.handler_factory,
             &h.app.flag_handlers,
-            &h.app.registry_file,
-            &h.app.registry_lock,
+            &h.app.registry_tx,
             &h.app.registry_epoch,
         )
         .await
@@ -4349,8 +4605,7 @@ mod tests {
                 &h.app.engine,
                 &h.app.handler_factory,
                 &h.app.flag_handlers,
-                &h.app.registry_file,
-                &h.app.registry_lock,
+                &h.app.registry_tx,
                 &h.app.registry_epoch,
             )
             .await
@@ -6181,6 +6436,9 @@ mod tests {
         let ts: u64 = get(TS_HEADER)
             .and_then(|v| v.parse().ok())
             .ok_or("missing timestamp")?;
+        // The destination is signed: the `Host` header verbatim, so a
+        // call minted for `a/step` verifies at `a/step` and nowhere else.
+        let authority = get("host").ok_or("missing host header")?;
         if now.abs_diff(ts) > 300 {
             return Err("stale timestamp");
         }
@@ -6201,8 +6459,9 @@ mod tests {
         };
         let expected = {
             let key = ring::hmac::Key::new(ring::hmac::HMAC_SHA256, secret);
-            let canonical =
-                format!("{ts}\n{method}\n{path}\n{r}\n{s}\n{a}\n{idem_key}\n{body_digest}");
+            let canonical = format!(
+                "{ts}\n{method}\n{authority}\n{path}\n{r}\n{s}\n{a}\n{idem_key}\n{body_digest}"
+            );
             ring::hmac::sign(&key, canonical.as_bytes())
         };
         // Constant-time on the decoded tag: hex length leaks nothing
@@ -6423,10 +6682,18 @@ mod tests {
             let key = ring::hmac::Key::new(ring::hmac::HMAC_SHA256, secret);
             hex(ring::hmac::sign(
                 &key,
-                format!("{ts}\nPOST\n/step\n5\n0\n1\n{idem}\n{}", hex(&sha256(body))).as_bytes(),
+                format!(
+                    "{ts}\nPOST\nh.test:8080\n/step\n5\n0\n1\n{idem}\n{}",
+                    hex(&sha256(body))
+                )
+                .as_bytes(),
             )
             .as_ref())
         };
+        headers.insert(
+            "host",
+            "h.test:8080".parse().unwrap_or_else(|e| panic!("{e}")),
+        );
         headers.insert(
             TS_HEADER,
             now.to_string().parse().unwrap_or_else(|e| panic!("{e}")),
@@ -6456,6 +6723,17 @@ mod tests {
         // The same sig under a different path or method does not replay.
         assert_eq!(
             verify_sig(&secret, now, &headers, "GET", "/step", "other", "", &mut seen),
+            Err("signature mismatch")
+        );
+        // Nor at a different destination: a sig minted for h.test:8080
+        // never verifies at another host — S3's cross-handler replay.
+        let mut elsewhere = headers.clone();
+        elsewhere.insert(
+            "host",
+            "other.test:9".parse().unwrap_or_else(|e| panic!("{e}")),
+        );
+        assert_eq!(
+            verify_sig(&secret, now, &elsewhere, "POST", "/step", idem, &digest, &mut seen),
             Err("signature mismatch")
         );
         // A stale timestamp refuses before the signature is judged.
@@ -6752,8 +7030,12 @@ mod tests {
     }
 
     /// Signing is per-call overhead the dispatch path pays: measure the
-    /// HMAC itself so the cost is evidence, not a feeling.
+    /// HMAC itself so the cost is evidence, not a feeling. A wall-clock
+    /// bound inside the unit suite is flaky by construction under
+    /// parallel load, so it runs as a measurement probe:
+    /// `cargo test -p durable-server signing_overhead -- --ignored`.
     #[test]
+    #[ignore = "measurement, not a regression test"]
     fn signing_overhead_is_trivial_per_call() {
         let secret = [3u8; 32];
         let call = Call {
@@ -6768,6 +7050,7 @@ mod tests {
                 &secret,
                 1_700_000_000 + i,
                 "POST",
+                "127.0.0.1:9",
                 "/step",
                 &call.run.0.to_string(),
                 &call.step.0.to_string(),

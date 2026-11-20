@@ -758,15 +758,21 @@ enum Held {
     /// An answer to a caller. `Some(err)`: the commit failed — the caller
     /// gets `CommitFailed` (or, for a read, the engine stops).
     Reply(HeldReply),
+    /// A dispatch whose record is not yet durable. The workspace slot is
+    /// charged from `dispatch`, through this wait, to the task's end —
+    /// the share a run owns exists from the journal write, not the spawn
+    /// (S2 re-review N3).
     Fire {
         run: RunId,
         step: StepIndex,
         permit: OwnedSemaphorePermit,
+        slot: WsSlot,
     },
     Probe {
         run: RunId,
         step: StepIndex,
         permit: OwnedSemaphorePermit,
+        slot: WsSlot,
     },
 }
 
@@ -1455,8 +1461,18 @@ fn release(core: &mut EngineCore, ex: &mut Exec<'_>) {
         };
         match held {
             Held::Reply(answer) => answer(None),
-            Held::Fire { run, step, permit } => ex.start_attempt(core, run, step, permit),
-            Held::Probe { run, step, permit } => ex.start_probe(core, run, step, permit),
+            Held::Fire {
+                run,
+                step,
+                permit,
+                slot,
+            } => ex.start_attempt(core, run, step, permit, slot),
+            Held::Probe {
+                run,
+                step,
+                permit,
+                slot,
+            } => ex.start_probe(core, run, step, permit, slot),
         }
     }
 }
@@ -1479,6 +1495,11 @@ impl ProbeQueue {
         let item = self.order.pop_front()?;
         self.queued.remove(&item);
         Some(item)
+    }
+    /// Entries waiting right now — the tick's drain is bounded by this
+    /// so a queue that only refills cannot spin the actor (S2 N1).
+    fn len(&self) -> usize {
+        self.order.len()
     }
 }
 
@@ -1564,33 +1585,42 @@ struct Exec<'a> {
 impl Exec<'_> {
     /// Invoke a step's handler for the run's current attempt under
     /// `permit` — once the record that made it `Running` (committed only
-    /// because this permit was held) is durable. Until then it is held.
+    /// because this permit was held) is durable. Until then it is held,
+    /// and its workspace slot rides with it (S2 N3).
     fn fire(
         &mut self,
         core: &EngineCore,
         run: RunId,
         step: StepIndex,
         permit: OwnedSemaphorePermit,
+        slot: WsSlot,
     ) {
         let needs = core.last_index();
         if needs <= self.pipe.durable {
-            self.start_attempt(core, run, step, permit);
+            self.start_attempt(core, run, step, permit, slot);
         } else {
-            self.pipe
-                .held
-                .push_back((needs, Held::Fire { run, step, permit }));
+            self.pipe.held.push_back((
+                needs,
+                Held::Fire {
+                    run,
+                    step,
+                    permit,
+                    slot,
+                },
+            ));
         }
     }
 
     /// The call itself, for a run still `Running` this step (a cancel
     /// committed while the dispatch was held means no call: the permit
-    /// returns).
+    /// and the workspace slot return).
     fn start_attempt(
         &mut self,
         core: &EngineCore,
         run: RunId,
         step: StepIndex,
         permit: OwnedSemaphorePermit,
+        slot: WsSlot,
     ) {
         let Some(r) = core.run(run) else { return };
         let attempt = match r.state {
@@ -1608,7 +1638,6 @@ impl Exec<'_> {
         let idem = idem_key(&r.key, step);
         let input = r.spec.input.clone();
         let call = Call { run, step, attempt };
-        let slot = WsSlot::take(self.inflight, r.ws);
         let handle = self.attempts.spawn(async move {
             let outcome = handler.execute_call(call, &sspec, &input, &idem).await;
             drop(slot); // the slot returns at task end — panic and abort included
@@ -1627,46 +1656,48 @@ impl Exec<'_> {
     }
 
     /// Probe for a reconciling step; the verdict returns through the loop.
-    /// A probe is a handler call, so it takes a permit like any other; with
-    /// none free it waits in `waiting_probes` for the next tick.
+    /// A probe is a handler call, so it takes a permit and a workspace
+    /// slot like any other; with either missing it waits in
+    /// `waiting_probes` for the next tick.
     fn probe(&mut self, core: &mut EngineCore, run: RunId, step: StepIndex) {
         // A probe is a handler call: the workspace fairness cap applies
         // exactly like a dispatch's.
-        if self.ws_full(core, run) {
+        let Some(ws) = core.run(run).map(|r| r.ws) else {
+            return;
+        };
+        if self.inflight.count(ws) >= self.ws_cap {
             self.waiting_probes.push((run, step));
             return;
         }
         match self.sem.clone().try_acquire_owned() {
-            Ok(permit) => self.probe_with(core, run, step, permit),
+            Ok(permit) => self.probe_with(core, run, step, permit, WsSlot::take(self.inflight, ws)),
             Err(_) => self.waiting_probes.push((run, step)),
         }
     }
 
-    /// True when the run's workspace already holds its fair share of
-    /// in-flight calls (S2 review #6): one tenant's slow handler parks
-    /// at most its own cap, never the whole pool.
-    fn ws_full(&self, core: &EngineCore, run: RunId) -> bool {
-        core.run(run)
-            .map(|r| self.inflight.count(r.ws) >= self.ws_cap)
-            .unwrap_or(false)
-    }
-
     /// A probe is a handler call too: held until the record that made the
-    /// run `Reconciling` is durable.
+    /// run `Reconciling` is durable — its workspace slot rides along.
     fn probe_with(
         &mut self,
         core: &mut EngineCore,
         run: RunId,
         step: StepIndex,
         permit: OwnedSemaphorePermit,
+        slot: WsSlot,
     ) {
         let needs = core.last_index();
         if needs <= self.pipe.durable {
-            self.start_probe(core, run, step, permit);
+            self.start_probe(core, run, step, permit, slot);
         } else {
-            self.pipe
-                .held
-                .push_back((needs, Held::Probe { run, step, permit }));
+            self.pipe.held.push_back((
+                needs,
+                Held::Probe {
+                    run,
+                    step,
+                    permit,
+                    slot,
+                },
+            ));
         }
     }
 
@@ -1676,6 +1707,7 @@ impl Exec<'_> {
         run: RunId,
         step: StepIndex,
         permit: OwnedSemaphorePermit,
+        slot: WsSlot,
     ) {
         let Some(r) = core.run(run) else { return };
         let attempt = match r.state {
@@ -1696,7 +1728,6 @@ impl Exec<'_> {
         };
         let idem = idem_key(&r.key, step);
         let call = Call { run, step, attempt };
-        let slot = WsSlot::take(self.inflight, r.ws);
         let handle = self.probes.spawn(async move {
             let found = handler.probe_call(call, &sspec, &idem).await;
             drop(slot); // the slot returns at task end — panic and abort included
@@ -1733,23 +1764,34 @@ fn tick(core: &mut EngineCore, exec: &mut Exec<'_>) {
             .effects(core.step_finished(run, step, None, None, now));
         run_effects(core, exec, effects, run, None);
     }
-    // Probes that found no permit when their run started reconciling.
-    while let Some((run, step)) = exec.waiting_probes.pop() {
-        if exec.ws_full(core, run) {
-            exec.waiting_probes.push((run, step)); // over fair share: wait, try others
-            continue;
-        }
-        let Ok(permit) = exec.sem.clone().try_acquire_owned() else {
-            exec.waiting_probes.push((run, step)); // back of the queue: no starvation of others
+    // Probes that found no permit or workspace share when their run
+    // started reconciling. Each entry gets ONE try per tick, bounded by
+    // the queue's length at entry (S2 re-review N1): a queue full of
+    // over-share workspaces used to spin this loop forever — submits,
+    // dispatch and the shutdown drain all starved behind it.
+    let mut probes_left = exec.waiting_probes.len();
+    while probes_left > 0 {
+        probes_left -= 1;
+        let Some((run, step)) = exec.waiting_probes.pop() else {
             break;
         };
-        exec.probe_with(core, run, step, permit);
+        exec.probe(core, run, step);
     }
-    // Dispatch: permit first, then the journal commits StepDispatched,
-    // then the handler is invoked — a crash between the commit and the
-    // call can only lose a journaled fact, and no commit is ever made for
-    // a call that capacity would not allow.
-    for (run, step, attempt) in core.due(now).into_iter().take(exec.per_tick) {
+    // Dispatch: permit and workspace slot first, then the journal commits
+    // StepDispatched, then the handler is invoked — a crash between the
+    // commit and the call can only lose a journaled fact, and no commit
+    // is ever made for a call that capacity would not allow.
+    //
+    // The per-tick budget counts only dispatch that actually happens
+    // (S2 re-review N2): an entry that cannot dispatch — its handler left
+    // the registry, its workspace is at share — is skipped for free, so
+    // a tenant whose queue heads the due order can never starve the runs
+    // behind it.
+    let mut budget = exec.per_tick;
+    for (run, step, attempt) in core.due(now) {
+        if budget == 0 {
+            break;
+        }
         let Some((ws, name)) = core.run(run).and_then(|r| {
             r.spec
                 .steps
@@ -1773,11 +1815,17 @@ fn tick(core: &mut EngineCore, exec: &mut Exec<'_>) {
         let Ok(permit) = exec.sem.clone().try_acquire_owned() else {
             break; // at capacity: the rest stay queued for a later tick
         };
+        // The workspace share is charged AT the dispatch (S2 re-review
+        // N3): the slot rides the held-fire through the fsync wait, so a
+        // run waiting undurable already owns its place — charging at
+        // spawn let one workspace take the whole pool in a single tick.
+        let slot = WsSlot::take(exec.inflight, ws);
         if let Err(e) = core.dispatch(run, step, attempt, now) {
-            exec.mon.handled(&e); // stale claim or no space; the permit returns
+            exec.mon.handled(&e); // stale claim or no space; permit + slot return
             continue;
         }
-        exec.fire(core, run, step, permit);
+        exec.fire(core, run, step, permit, slot);
+        budget -= 1;
     }
 }
 
@@ -1809,6 +1857,13 @@ fn run_effects(
                     exec.fail(core, run, step, "unregistered handler");
                     continue;
                 }
+                // The workspace share rule is the tick's (S2 N3): at cap
+                // the run stays journaled Running and the deadline sweep
+                // reconciles it — it is never silently skipped, and it
+                // never crowds another workspace out of its share.
+                if exec.inflight.count(ws) >= exec.ws_cap {
+                    continue;
+                }
                 // Every DispatchStep comes from an event carrying a permit,
                 // so this always fires; if it ever cannot, the run stays
                 // journaled Running and the deadline sweep reconciles it —
@@ -1817,13 +1872,17 @@ fn run_effects(
                     .take()
                     .or_else(|| exec.sem.clone().try_acquire_owned().ok())
                 {
-                    exec.fire(core, run, step, p);
+                    let slot = WsSlot::take(exec.inflight, ws);
+                    exec.fire(core, run, step, p, slot);
                 }
             }
-            Effect::Reconcile { step } => match permit.take() {
-                Some(p) => exec.probe_with(core, run, step, p),
-                None => exec.probe(core, run, step),
-            },
+            Effect::Reconcile { step } => {
+                // The finishing call's permit is spent on its verdict, so
+                // the probe re-enters the normal path — it queues if the
+                // workspace is at share or the pool is empty (S2 N1/N3).
+                drop(permit.take());
+                exec.probe(core, run, step);
+            }
             // Wakes are covered by the ticker; checkpoints are already in
             // the journaled record; terminal transitions are recorded.
             Effect::ScheduleWake { .. }
@@ -3875,5 +3934,255 @@ mod tests {
             "a full command channel must refuse, not queue ({landed} landed)"
         );
         assert!(landed >= 1, "the channel still admits what fits");
+    }
+    /// S2 re-review N1: a waiting-probe queue whose every entry belongs
+    /// to a full workspace must not spin the actor — each entry gets one
+    /// try per tick, then waits for the next. ws 7: one run's execute
+    /// hangs holding the workspace's only share; the deadline sweep
+    /// reconciles it and the probe queues on the full workspace. ws 8's
+    /// submit must still answer.
+    // The engine runs on its own thread+runtime: a pinned actor deadlocks
+    // whatever runtime hosts it, and on the test's own runtime the pin
+    // would stop the test's timeout from ever being polled — the failure
+    // would hang the suite instead of being reported.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_full_waiting_probe_queue_cannot_pin_the_actor() {
+        let d = tempfile::tempdir().unwrap_or_else(|e| panic!("{e}"));
+        let dir = d.path().to_path_buf();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap_or_else(|e| panic!("rt: {e}"))
+                .block_on(async move {
+                    let eng = spawn(
+                        &dir,
+                        Registry::default(),
+                        ShellConfig {
+                            tick_ms: 5,
+                            max_in_flight: 4,
+                            max_in_flight_per_ws: 1,
+                            limits: fast_limits(),
+                            ..Default::default()
+                        },
+                    )
+                    .unwrap_or_else(|e| panic!("{e}"));
+                    let _ = tx.send(eng);
+                    std::future::pending::<()>().await; // host the actor
+                });
+        });
+        let eng = rx
+            .recv_timeout(Duration::from_secs(5))
+            .unwrap_or_else(|e| panic!("engine spawn: {e}"));
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let entered = Arc::new(tokio::sync::Notify::new());
+        eng.put_handler(
+            7,
+            "hang",
+            Arc::new(HangOnce {
+                calls: calls.clone(),
+                freeze: None,
+                entered: entered.clone(),
+            }),
+        )
+        .await
+        .unwrap_or_else(|e| panic!("{e}"));
+        eng.put_handler(8, "fast", Arc::new(Echo))
+            .await
+            .unwrap_or_else(|e| panic!("{e}"));
+        // ws 7's only share is held by an execute that never returns;
+        // when the deadline sweep reconciles it the queued probe finds
+        // the workspace full and waits in `waiting_probes`. The old
+        // `while let pop` drain then pops and re-pushes that one entry
+        // forever — the tick never ends, and the actor can never answer
+        // another workspace again.
+        let _r1 = eng
+            .submit_scoped(7, OperationKey("a-0".into()), spec("hang"))
+            .await
+            .unwrap_or_else(|e| panic!("a-0: {e}"));
+        bounded(entered.notified()).await; // the attempt is in-flight
+                                           // 300 ms covers the 100 ms deadline, the sweep's probe() → queue,
+                                           // and the drain tick that would spin on it.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        // The actor must still answer other workspaces' commands.
+        let run = bounded(eng.submit_scoped(8, OperationKey("b-0".into()), spec("fast")))
+            .await
+            .unwrap_or_else(|e| panic!("b-0: {e}"));
+        assert!(matches!(
+            bounded(until_done(&eng, run)).await,
+            RunState::Done
+        ));
+    }
+
+    /// S2 re-review N2: a due entry that cannot dispatch (its handler is
+    /// gone, its workspace at share) must not consume the per-tick
+    /// budget — otherwise dead-head entries starve every later due run.
+    /// ws 7's handler was deleted after its runs were submitted; ws 8's
+    /// run sits behind hundreds of them in due order and must still run.
+    #[tokio::test(flavor = "current_thread")]
+    async fn dead_head_due_entries_do_not_starve_dispatch() {
+        let d = tempfile::tempdir().unwrap_or_else(|e| panic!("{e}"));
+        let eng = spawn(
+            d.path(),
+            Registry::default(),
+            ShellConfig {
+                tick_ms: 10,
+                max_dispatch_per_tick: 1,
+                ..Default::default()
+            },
+        )
+        .unwrap_or_else(|e| panic!("{e}"));
+        eng.put_handler(7, "ghost", Arc::new(Echo))
+            .await
+            .unwrap_or_else(|e| panic!("{e}"));
+        eng.put_handler(8, "fast", Arc::new(Echo))
+            .await
+            .unwrap_or_else(|e| panic!("{e}"));
+        // Dozen runs whose handler is about to vanish, due together
+        // shortly — `not_before` keeps every one of them queued at the
+        // head of ws 8's run in due order (lower ids win ties), so none
+        // drain before the victim submits. One dead-head entry would
+        // suffice under per-tick=1; twelve is margin.
+        let due_at = wall_ms() + 300;
+        for i in 0..12 {
+            eng.submit_at_scoped(7, OperationKey(format!("g-{i}")), spec("ghost"), due_at)
+                .await
+                .unwrap_or_else(|e| panic!("g-{i}: {e}"));
+        }
+        eng.delete_handler(7, "ghost")
+            .unwrap_or_else(|e| panic!("{e}"));
+        let run = eng
+            .submit_at_scoped(8, OperationKey("b-0".into()), spec("fast"), due_at)
+            .await
+            .unwrap_or_else(|e| panic!("b-0: {e}"));
+        assert!(matches!(
+            bounded(until_done(&eng, run)).await,
+            RunState::Done
+        ));
+    }
+
+    /// S2 re-review N3: the per-workspace share is charged when the
+    /// dispatch is journaled, not when the task spawns — otherwise every
+    /// dispatch held behind the writer's fsync passes a stale check and
+    /// one workspace takes the whole permit pool in a single tick.
+    #[tokio::test(flavor = "current_thread")]
+    async fn the_workspace_share_is_charged_at_dispatch() {
+        use std::sync::atomic::Ordering::SeqCst;
+        let d = tempfile::tempdir().unwrap_or_else(|e| panic!("{e}"));
+        let faults = Arc::new(Faults::default());
+        let h = Gated::default();
+        let eng = spawn(
+            d.path(),
+            Registry::default(),
+            ShellConfig {
+                max_in_flight: 8,
+                max_in_flight_per_ws: 2,
+                max_dispatch_per_tick: 8,
+                ..piped(&faults, GroupCommit::default())
+            },
+        )
+        .unwrap_or_else(|e| panic!("{e}"));
+        eng.put_handler(7, "block", Arc::new(h.clone()))
+            .await
+            .unwrap_or_else(|e| panic!("{e}"));
+        // All eight runs become due together AFTER the writer's fsync is
+        // frozen: every StepDispatched waits undurable in the pipeline,
+        // and under the old accounting (load rises at spawn) all eight
+        // pass the workspace check — no task's spawn can raise the
+        // counter while the fsync is held. Submitting without
+        // `not_before` would let each run dispatch and spawn during the
+        // submit loop itself, closing the race window this test needs.
+        let due_at = wall_ms() + 300;
+        let mut runs = Vec::new();
+        for i in 0..8 {
+            runs.push(
+                eng.submit_at_scoped(7, OperationKey(format!("a-{i}")), spec1("block"), due_at)
+                    .await
+                    .unwrap_or_else(|e| panic!("a-{i}: {e}")),
+            );
+        }
+        faults.hold_syncs();
+        tokio::time::sleep(Duration::from_millis(450)).await;
+        faults.release_syncs();
+        // The gate stays closed: every task that spawned parks inside
+        // the handler's `in_flight` count. Under charge-at-spawn all 8
+        // spawn and park; under charge-at-dispatch only the share of 2
+        // can ever exist. Poll for the parked plateau rather than a
+        // fixed sleep — spawn scheduling under load is not the
+        // measurement.
+        let mut stable = 0u32;
+        let mut last = 0usize;
+        for _ in 0..300 {
+            let now = h.calls.load(SeqCst);
+            if now == last {
+                stable += 1;
+            } else {
+                stable = 0;
+                last = now;
+            }
+            if stable >= 15 {
+                break; // parked plateau: nothing else is coming
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(
+            h.peak.load(SeqCst) <= 2,
+            "ws 7 held {} in-flight calls over its share of 2",
+            h.peak.load(SeqCst)
+        );
+        h.gate.add_permits(8);
+        for r in runs {
+            assert!(matches!(bounded(until_done(&eng, r)).await, RunState::Done));
+        }
+    }
+
+    /// S2 re-review N4: the index byte bound is per-workspace as well as
+    /// global — one tenant's max-size runs must not put every workspace
+    /// at_capacity.
+    #[tokio::test(flavor = "current_thread")]
+    async fn one_workspace_cannot_fill_the_whole_index() {
+        let d = tempfile::tempdir().unwrap_or_else(|e| panic!("{e}"));
+        // Bound the whole index at about four runs: under a global-only
+        // bound one workspace can hold all four shares.
+        let per = Limits::run_bytes(&OperationKey("seed".into()), &spec("echo"));
+        let eng = spawn(
+            d.path(),
+            Registry::default(),
+            ShellConfig {
+                tick_ms: 5,
+                limits: Limits {
+                    max_index_bytes: per * 4,
+                    ..Limits::default()
+                },
+                ..Default::default()
+            },
+        )
+        .unwrap_or_else(|e| panic!("{e}"));
+        eng.put_handler(7, "echo", Arc::new(Echo))
+            .await
+            .unwrap_or_else(|e| panic!("{e}"));
+        eng.put_handler(8, "echo", Arc::new(Echo))
+            .await
+            .unwrap_or_else(|e| panic!("{e}"));
+        eng.submit_scoped(7, OperationKey("seed".into()), spec("echo"))
+            .await
+            .unwrap_or_else(|e| panic!("seed: {e}"));
+        // ws 7 can fill its own share — but not the whole index.
+        let mut refused = 0;
+        for i in 0..8 {
+            match eng
+                .submit_scoped(7, OperationKey(format!("a-{i}")), spec("echo"))
+                .await
+            {
+                Ok(_) => {}
+                Err(EngineError::Refused(durable_domain::Refusal::AtCapacity)) => refused += 1,
+                Err(e) => panic!("a-{i}: {e}"),
+            }
+        }
+        assert!(refused >= 4, "ws 7 admitted past a fair share of the index");
+        eng.submit_scoped(8, OperationKey("b-0".into()), spec("echo"))
+            .await
+            .unwrap_or_else(|e| panic!("ws 8 must still admit while ws 7 is full: {e}"));
     }
 }

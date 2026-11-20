@@ -322,6 +322,12 @@ pub struct Limits {
     /// Approximate bytes of every retained run (terminal ones stay seven
     /// days with their inputs); submits that would pass it are refused.
     pub max_index_bytes: u64,
+    /// One workspace's share of the index bytes (S2 re-review): a single
+    /// tenant's retained runs are refused `AtCapacity` past the smaller
+    /// of this bound and a quarter of `max_index_bytes` — the same
+    /// fairness share `max_live_runs_per_ws` gives the live pool, so no
+    /// one tenant's bytes can crowd every workspace out of the index.
+    pub max_index_bytes_per_ws: u64,
 }
 
 impl Default for Limits {
@@ -342,6 +348,9 @@ impl Default for Limits {
             // up to 1.6 × index bytes, plus up to one snapshot during a
             // compaction, plus ~100 MiB.
             max_index_bytes: 512 * 1024 * 1024,
+            // A quarter of the global index: four tenants can each burst
+            // to their share; no one tenant reaches the global bound.
+            max_index_bytes_per_ws: 128 * 1024 * 1024,
         }
     }
 }

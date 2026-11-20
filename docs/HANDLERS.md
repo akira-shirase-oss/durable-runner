@@ -43,7 +43,7 @@ created (`POST /admin/workspaces` → `handler_secret`) or rotated (`POST
 /handler-secret`). The signature covers:
 
 ```
-ts\nmethod\npath\nrun\nstep\nattempt\nidem_key\nbody_sha256
+ts\nmethod\nauthority\npath\nrun\nstep\nattempt\nidem_key\nbody_sha256
 ```
 
 joined with `\n` (a newline can never appear inside any field —
@@ -51,6 +51,10 @@ joined with `\n` (a newline can never appear inside any field —
 where `ts` is the `x-durable-timestamp` value, `method`/`path` are the
 request's method and URL path **only — the query string is excluded**
 (a signature minted for one call replays nowhere else),
+`authority` is the request's **`Host` header value verbatim** —
+brackets on an IPv6 literal, a port only when the URL names a
+non-default one — so a signature minted for `a/step` never verifies at
+`b/step`, even when both handlers share the workspace's secret,
 `run`/`step`/`attempt` are the `x-durable-run-id`/`x-durable-step`/
 `x-durable-attempt` header values *verbatim* — `run` is the opaque
 public id, `step`/`attempt` are integers; any absent header signs as
@@ -62,7 +66,7 @@ body — for a probe (no body) the digest field is empty, so the
 canonical string ends in `\n`.
 
 ```python
-canonical = f"{ts}\n{method}\n{path}\n{run}\n{step}\n{attempt}\n{idem_key}\n{body_sha256_hex}"
+canonical = f"{ts}\n{method}\n{host_header}\n{path}\n{run}\n{step}\n{attempt}\n{idem_key}\n{body_sha256_hex}"
 expected  = hmac_sha256(secret, canonical).hexdigest()
 ```
 
