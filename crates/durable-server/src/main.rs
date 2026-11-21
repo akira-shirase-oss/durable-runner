@@ -145,9 +145,11 @@ struct Args {
     /// decided durable, before exiting non-zero instead of 0.
     #[arg(long, default_value_t = 30)]
     drain_timeout_secs: u64,
-    /// Print the highest journal record version this binary can read and
-    /// exit. deploy/upgrade.sh and deploy/rollback.sh compare it against
-    /// the journal's highest version (D-056).
+    /// Print this binary's journal-format capabilities and exit:
+    /// `<max record version> <max snapshot (DRIX) version> <parks ws≠0>`
+    /// — three numbers for v1.0.2+, a single number before it.
+    /// deploy/upgrade.sh and deploy/rollback.sh compare them against the
+    /// journal's highest versions (D-056).
     #[arg(long)]
     journal_format: bool,
 }
@@ -1089,7 +1091,14 @@ fn prepare_backup_root(dir: &Path) -> Result<Arc<Path>> {
 async fn main() -> Result<()> {
     let args = Args::parse();
     if args.journal_format {
-        println!("{}", durable_engine::READER_VERSION);
+        // "<records> <snapshots> <parks ws≠0>": a single integer before
+        // v1.0.2 meant records only; the snapshot reader and the ws-park
+        // guarantee are what a rollback needs to know (D-056, S2 review).
+        println!(
+            "{} {} 1",
+            durable_engine::READER_VERSION,
+            durable_engine::snapshot::VERSION
+        );
         return Ok(());
     }
     let api_key = api_key_from_env()?;
@@ -1139,6 +1148,16 @@ async fn main() -> Result<()> {
              its last frame, which was never acknowledged)",
             t.bytes, t.offset
         );
+    }
+    if let Ok(d) = engine.diag().await {
+        if d.parked_runs > 0 {
+            eprintln!(
+                "durable-server: {} run(s) parked — ws ≠ 0 work is held, not executed \
+                 (a rollback floor does not dispatch tenant work); parked runs still \
+                 occupy live-run and index capacity",
+                d.parked_runs
+            );
+        }
     }
     let stopped = engine.clone();
     let app = App {

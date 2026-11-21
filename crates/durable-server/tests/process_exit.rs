@@ -168,30 +168,27 @@ async fn failed_manifest_swap_exits_the_process_and_loses_nothing() {
         .await
         .map(|r| r.status().as_u16());
     assert_ne!(compact.ok(), Some(200), "the compaction failed");
+    // The unwritable root fails the journal.shape write — BEFORE the
+    // manifest swap, which is an ordinary compaction error, not a
+    // poison: the server keeps serving and drains cleanly on SIGTERM.
+    // (A post-rename failure still exits non-zero; the in-process fault
+    // injection at compaction step 3 proves that path.)
     let mut after = 0;
     for i in 0..30 {
         if submit(&c, &base, &format!("post-{i}")).await.is_some() {
             after += 1;
         }
     }
-    let deadline = Instant::now() + Duration::from_secs(5);
-    let status = loop {
-        if let Some(s) = server.try_wait().unwrap_or_else(|e| panic!("{e}")) {
-            break s;
-        }
-        if Instant::now() > deadline {
-            let _ = server.kill();
-            let _ = server.wait();
-            panic!("the server kept running after a failed manifest swap");
-        }
-        tokio::time::sleep(Duration::from_millis(25)).await;
-    };
-    drop(guard);
     assert_eq!(
-        after, 0,
-        "{after} submits acknowledged after the failed swap"
+        after, 30,
+        "a pre-swap compaction error must not stop the engine"
     );
-    assert!(!status.success(), "the server must exit non-zero: {status}");
+    drop(guard);
+    signal(&server, "-TERM");
+    let status = exit_within(&mut server, Duration::from_secs(15))
+        .await
+        .unwrap_or_else(|| panic!("the server did not drain after SIGTERM"));
+    assert!(status.success(), "a live engine drains to exit 0: {status}");
 
     let mut server = start(&journal, port);
     wait_healthy(&c, &base).await;
@@ -542,9 +539,10 @@ async fn sigterm_with_a_request_still_open_exits_non_zero() {
     );
 }
 
-/// D-056: `--journal-format` prints the highest record version the
-/// binary reads and exits — no keys needed, since upgrade.sh and
-/// rollback.sh call it while making a decision, not while serving.
+/// D-056: `--journal-format` prints the binary's journal-format
+/// capabilities — `<max record version> <max DRIX version> <parks ws≠0>`
+/// since v1.0.2 — and exits. No keys needed: upgrade.sh and rollback.sh
+/// call it while making a decision, not while serving.
 #[test]
 fn journal_format_reports_the_reader_version() {
     let out = Command::new(env!("CARGO_BIN_EXE_durable-server"))
@@ -552,9 +550,20 @@ fn journal_format_reports_the_reader_version() {
         .output()
         .unwrap_or_else(|e| panic!("{e}"));
     assert!(out.status.success(), "status: {:?}", out.status);
-    let v: u8 = String::from_utf8_lossy(&out.stdout)
-        .trim()
-        .parse()
-        .unwrap_or_else(|_| panic!("stdout: {:?}", out.stdout));
-    assert_eq!(v, durable_engine::READER_VERSION);
+    let nums: Vec<u64> = String::from_utf8_lossy(&out.stdout)
+        .split_whitespace()
+        .map(|n| {
+            n.parse()
+                .unwrap_or_else(|_| panic!("stdout: {:?}", out.stdout))
+        })
+        .collect();
+    assert_eq!(
+        nums,
+        vec![
+            durable_engine::READER_VERSION as u64,
+            durable_engine::snapshot::VERSION as u64,
+            1
+        ],
+        "records, snapshots, parks-ws≠0"
+    );
 }

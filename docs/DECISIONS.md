@@ -966,10 +966,67 @@ format bump would make the service refuse to start. The rules:
   it (`READER_VERSION`) at least one release before any writer emits it
   (`ENVELOPE_VERSION`). Rolling back one release then always lands on a
   binary that can read what the journal holds.
-- **The guard enforces it anyway.** `/admin/diagnostics` reports
-  `journal_record_version_max` (tracked from replay plus every commit);
-  `durable-server --journal-format` prints the binary's reader version.
-  `deploy/upgrade.sh` and `deploy/rollback.sh` run `format-guard.sh`,
-  which refuses — naming both versions — to swap in a binary whose
-  reader is below the journal's highest, and fails closed when it
-  cannot tell.
+- **The guard enforces it anyway — on all three format dimensions.**
+  `/admin/diagnostics` reports `journal_record_version_max`,
+  `journal_snapshot_version_max`, and `journal_max_ws`, tracked from
+  replay AND from every live commit and compaction (the focused review
+  caught open-time numbers going stale). The files always outrank the
+  process: `journal.shape`, a sidecar the engine writes BEFORE the
+  record or manifest swap it describes and only upward, states the same
+  three maxima — including ws ≠ 0 runs that survive only inside
+  `snapshot.bin` after `prune_superseded` deleted their records, which
+  no grep can find. Server-down the guard reads the sidecar plus a
+  full scan; a DRIX ≥ 2 journal with no sidecar is ambiguous — every
+  workspace-aware writer (v1.0.1+) stamps `"ws"` on each record, so no
+  record set can prove such a journal is pre-workspace — and refuses
+  every non-parking binary.
+  `durable-server --journal-format` prints them from the binary's side:
+  `<max record version> <max DRIX version> <parks ws ≠ 0>` since
+  v1.0.2 (a lone integer before it means records only, snapshot
+  capability from the release table, no parking). `deploy/upgrade.sh`
+  and `deploy/rollback.sh` run `format-guard.sh`, which refuses —
+  naming both versions — to swap in a binary below the journal's
+  highest on any of the three, and fails closed when it cannot tell
+  (missing fields refuse; they never default to zero).
+  Snapshots are part of the check because a compaction can out-date an
+  older reader without any new record version (the e6951b5 gap: v1.0.1
+  wrote DRIX 2 while the guard compared records only); workspace scope
+  is part of it because a binary that cannot park ws ≠ 0 runs would
+  execute tenant work on workspace 0's name-keyed handlers.
+
+## D-057: the backup set is one agreed contract across versions
+
+The S2 re-review found the branches disagreeing: v1.0.2's file list
+admitted generation paths only while the workspace branch listed
+`journal.shape` and `public_id.key` beside them — so an S2 backup
+could never restore under v1.0.2, breaking the rollback floor for a
+backup taken after upgrade but before the first new-format commit.
+The agreed contract, decided for both branches:
+
+- **A backup MAY list**: `gen-NNNNNN/{journal.log, snapshot.bin,
+  snapshot.json}`, plus the journal-dir flats `journal.shape` and
+  `public_id.key`. Every version's restore accepts the whole set —
+  a listed flat is copied, sized and checksummed like any file.
+- **v1.0.x WRITES generation files only.** `journal.shape` is rebuilt
+  from replayed maxima at open, and a backup listing it could never
+  restore under v1.0.1 (its list admits generation paths only) — so
+  carrying it buys nothing and costs the current rollback floor.
+  `public_id.key` does not exist under v1.0.x; when the directory
+  holds one anyway (restored from an S2 backup), it travels — the
+  permutation key is install identity a backup cannot regenerate.
+- **S2 WRITES both flats.** `journal.shape` preserves forward claims
+  a replay alone cannot reconstruct (a ws scope claim survives the
+  compaction that deleted its records); `public_id.key` keeps every
+  public id a client holds decodable on the restored instance —
+  without it the minted ids orphan to 404.
+- Whether a restored journal can then RUN under the binary is a
+  separate, unchanged gate: record/snapshot/ws versions and the
+  D-056 format guard, never the file list. v1.0.2's reader is
+  record-3, so an S2 journal that already wrote v3 records still
+  restores and opens — every workspace-tagged run parks instead of
+  executing (and keeps surviving compaction inside snapshot.bin)
+  until an S2 binary picks the journal up again. And one asymmetry
+  an operator must know: a v1.0.2 backup of a directory that holds
+  `public_id.key` lists that key, and a backup listing it is refused
+  by v1.0.1's restore, which admits generation paths only — the
+  rollback floor for a key-holding backup is this release.

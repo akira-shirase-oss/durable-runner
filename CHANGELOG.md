@@ -4,6 +4,93 @@ All notable changes to Durable Runner are recorded here. The format
 follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the
 versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.0.2] - 2026-11-20
+
+Rollback-safety release: the independent review of the workspace work
+found two ways v1.0.1 was an unsafe rollback floor, both fixed here.
+
+### Fixed
+
+- **Runs of any workspace ≠ 0 are parked, never executed.** This binary
+  replays v3 records faithfully but its handler registry is name-keyed
+  and workspace-blind — dispatching a tenant run would POST the tenant's
+  input and idempotency key to workspace 0's same-named handler. Parked
+  runs (queued, running past deadline, or crash-orphaned in Reconciling)
+  are now excluded from dispatch, the deadline sweep, and startup's
+  orphan re-probe; they surface as `parked_runs` in diagnostics.
+- **format-guard checks the snapshot (DRIX) version.** v1.0.1 wrote
+  DRIX 2 on every compaction, but D-056's guard compared record versions
+  only — so a rollback to v1.0.0 (which reads DRIX 1) passed the guard
+  and then refused startup. The guard now refuses any binary whose
+  snapshot reader is older than the journal's highest DRIX version.
+- **format-guard refuses non-parking binaries once ws ≠ 0 records
+  exist.** A v3 journal carrying tenant runs refuses any binary that
+  cannot park them — regardless of record-version compatibility.
+
+### Changed
+
+- `--journal-format` now prints three numbers —
+  `<max record version> <max DRIX version> <parks ws ≠ 0>` —
+  `3 2 1` for this release. Older binaries print one number; the guard
+  maps that to the release table (record-reader 3 ⇒ DRIX 2, older ⇒
+  DRIX 1, no parking).
+- Diagnostics grew `journal_snapshot_version_max`, `journal_max_ws`,
+  and `parked_runs` so the guard sees the journal's shape while the
+  server is up; the maxima now track **live commits and live
+  compactions**, not journal open alone.
+- **`journal.shape` sidecar.** The engine persists the journal's shape
+  (highest record version, highest DRIX version, highest workspace id)
+  to `<journal>/journal.shape`, written BEFORE the record or manifest
+  swap it describes and only ever upward — so after `prune_superseded`
+  deletes the generations that held ws ≠ 0 records, the down-server
+  guard can still see tenant runs living inside `snapshot.bin`. The
+  sidecar stays OUT of backups this build writes: open rebuilds it
+  from the replayed maxima, and a backup listing it would refuse
+  under the v1.0.1 restore tool (its file list admits generation
+  paths only).
+- **Restore accepts the agreed backup set (D-057).** The file list a
+  backup may carry is one contract across versions: generation files,
+  plus the journal-dir flats `journal.shape` and `public_id.key` that
+  newer releases write. v1.0.2 still writes generation files only,
+  but it now restores all of them — an S2 backup whose journal this
+  binary still reads (record ≤ 3, DRIX ≤ 2) is a legitimate rollback
+  target. v1.0.2 issues no public ids; a restored `public_id.key` is
+  carried forward so a later S2 boot does not orphan the ids it
+  issued — and its presence means that backup no longer restores
+  under v1.0.1, whose file list admits generation paths only: the
+  floor for a key-holding backup becomes this release. A backup
+  taken on a key-holding directory carries the key forward. Whether
+  the restored journal can then run under this binary is the
+  unchanged D-056 gate (record/snapshot/ws versions), never the file
+  list.
+- **format-guard always scans the files** and takes the max of files
+  and `/admin/diagnostics` — a running server's numbers were open-time
+  facts that live commits could leave behind. A DRIX ≥ 2 snapshot with
+  no sidecar is ambiguous: every ws-aware writer stamps a `ws` field on
+  every record since v1.0.1, so a sidecar-less journal can never prove
+  a pre-workspace writer made it — the guard refuses it for every
+  non-parking binary.
+
+### Rollback note (read before downgrading)
+
+- **v1.0.0** is not a safe floor once any compaction has run under
+  v1.0.1 or later: DRIX 2 snapshots fail v1.0.0 startup (safe, but the
+  rollback is the outage).
+- **v1.0.1** is not a safe floor once any ws ≠ 0 data may exist —
+  including parked runs living only inside a snapshot. Its
+  workspace-blind registry would dispatch tenant work on workspace 0's
+  handlers. `journal.shape` is the proof; an ambiguous journal
+  (DRIX ≥ 2, no sidecar, ws-capable records) is refused too.
+- A v1.0.1-era journal is **indistinguishable** from a ws-aware one —
+  v1.0.1 already stamps `"ws":0` on every record, so no sidecar-less
+  DRIX ≥ 2 journal can prove it never saw tenant data: the guard
+  refuses v1.0.1 on any of them. Compaction under v1.0.1 breaks
+  **v1.0.0 only**, not v1.0.1.
+- Parked runs hold live-run and index capacity like any open run;
+  after a rollback, enough parked tenants can admit-refuse workspace 0
+  submits (`at_capacity`). The count is logged at startup and reported
+  as `parked_runs`.
+
 ## [1.0.1] - 2026-11-20
 
 S2-0: the v3 journal-record reader, shipped one release before any writer

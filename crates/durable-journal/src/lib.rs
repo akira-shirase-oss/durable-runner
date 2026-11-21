@@ -334,6 +334,163 @@ pub fn gen_dir_path(root: &Path, generation: u32) -> PathBuf {
     root.join(format!("gen-{generation:06}"))
 }
 
+/// The journal's format shape, as a small text sidecar (`journal.shape`)
+/// at the journal root — what the format-guard reads with the server
+/// DOWN (D-056). Records are greppable, but compaction's
+/// `prune_superseded` deletes the generations that held them: after that,
+/// tenant runs live only inside `snapshot.bin`, whose payload is binary.
+/// The sidecar states the shape plainly instead.
+///
+/// Monotonic: a field only moves up, and a writer persists it BEFORE the
+/// journal change it describes (the record carrying a new version or a
+/// ws ≠ 0, the manifest swap installing a snapshot). A crash then
+/// over-reports — the guard refuses more than strictly necessary, which
+/// is the closed direction; under-reporting is what must never happen.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Shape {
+    /// Highest record `v` written or replayed.
+    pub records: u8,
+    /// Highest snapshot (DRIX) version installed.
+    pub snapshots: u16,
+    /// Highest workspace id any record or snapshot run carried;
+    /// `> 0` means tenant runs may exist in a snapshot alone.
+    pub max_ws: u64,
+}
+
+impl Shape {
+    /// Component-wise maximum — replay's view merged with what the
+    /// sidecar already claimed.
+    pub fn merged(self, other: Shape) -> Self {
+        Self {
+            records: self.records.max(other.records),
+            snapshots: self.snapshots.max(other.snapshots),
+            max_ws: self.max_ws.max(other.max_ws),
+        }
+    }
+}
+
+/// Where the shape sidecar lives.
+pub fn shape_path(root: &Path) -> PathBuf {
+    root.join("journal.shape")
+}
+
+/// Read the sidecar; `Ok(None)` when absent. A malformed one is an
+/// error — callers decide whether to heal (engine open) or refuse
+/// (format-guard).
+pub fn read_shape(root: &Path) -> io::Result<Option<Shape>> {
+    let text = match fs::read_to_string(shape_path(root)) {
+        Ok(t) => t,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e),
+    };
+    let mut shape = Shape {
+        records: 0,
+        snapshots: 0,
+        max_ws: 0,
+    };
+    let mut seen = 0u8;
+    for line in text.lines() {
+        let Some((k, v)) = line.split_once('=') else {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("journal.shape: malformed line {line:?}"),
+            ));
+        };
+        let bit = match k {
+            "records" => 1,
+            "snapshots" => 2,
+            "ws" => 4,
+            _ => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("journal.shape: unknown key {k:?}"),
+                ));
+            }
+        };
+        // A duplicated key reads differently to a first-wins parser (the
+        // guard) than to a last-wins one — refuse rather than guess.
+        if seen & bit != 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("journal.shape: duplicate key {k:?}"),
+            ));
+        }
+        seen |= bit;
+        // Refuse a leading '+' too: the guard's regex requires ^[0-9]+$
+        // and a file only Rust accepted would disagree with it.
+        if v.starts_with('+') || v.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("journal.shape: bad {k} {v:?}"),
+            ));
+        }
+        let n: u64 = v.parse().map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("journal.shape: bad {k} {v:?}"),
+            )
+        })?;
+        match k {
+            "records" => shape.records = u8::try_from(n).map_err(|_| bad_shape(k))?,
+            "snapshots" => shape.snapshots = u16::try_from(n).map_err(|_| bad_shape(k))?,
+            _ => shape.max_ws = n,
+        }
+    }
+    if seen != 7 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "journal.shape: missing records/snapshots/ws",
+        ));
+    }
+    Ok(Some(shape))
+}
+
+fn bad_shape(k: &str) -> io::Error {
+    io::Error::new(
+        io::ErrorKind::InvalidData,
+        format!("journal.shape: {k} out of range"),
+    )
+}
+
+/// Persist the shape: tmp file, fsync, rename, fsync the directory —
+/// same ordering as the manifest swap, owner-only like every journal
+/// file. Callers invoke this BEFORE the change the shape describes.
+///
+/// Two threads can reach this (the commit path and the compaction
+/// swap), so the read-merge-write runs under one lock and the value
+/// persisted is never lower than what is already durable.
+///
+/// `SHAPE_HOLD`/`SHAPE_PARKED` are a test seam: parked inside the merge
+/// window, one writer proves the mutex keeps a second writer out.
+#[cfg(test)]
+static SHAPE_HOLD: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+#[cfg(test)]
+static SHAPE_PARKED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+pub fn write_shape(root: &Path, shape: Shape) -> io::Result<()> {
+    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let _guard = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let shape = match read_shape(root) {
+        Ok(Some(current)) => current.merged(shape),
+        _ => shape,
+    };
+    #[cfg(test)]
+    if SHAPE_HOLD.load(std::sync::atomic::Ordering::Acquire) {
+        SHAPE_PARKED.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        while SHAPE_HOLD.load(std::sync::atomic::Ordering::Acquire) {
+            std::thread::yield_now();
+        }
+    }
+    let text = format!(
+        "records={}\nsnapshots={}\nws={}\n",
+        shape.records, shape.snapshots, shape.max_ws
+    );
+    let tmp = root.join("journal.shape.tmp");
+    write_private(&tmp, text.as_bytes())?;
+    fs::rename(&tmp, shape_path(root))?;
+    sync_parent(&shape_path(root))
+}
+
 fn crc(payload: &[u8]) -> u32 {
     let mut h = crc32fast::Hasher::new();
     h.update(payload);
@@ -736,6 +893,10 @@ impl Journal {
         fs2::FileExt::try_lock_exclusive(&lock_file).map_err(|_| JournalError::SecondWriter)?;
         tighten(&lock_path, FILE_MODE);
         tighten(&manifest_path_of(dir), FILE_MODE);
+        tighten(&shape_path(dir), FILE_MODE);
+        // A crash can orphan the sidecar's temp file; it is not journal
+        // content and the next write_shape recreates it anyway.
+        let _ = fs::remove_file(dir.join("journal.shape.tmp"));
 
         // Manifest: keep the last valid one. First open creates generation
         // 1 and its log, then the manifest that names it (D-044), so a
@@ -1023,11 +1184,17 @@ impl Journal {
     /// covering live state plus a fresh empty log — then atomically swap
     /// the manifest. A crash at any point opens either the old complete
     /// generation or the new one, never a mixture (contract §02).
-    pub fn compact(&mut self, snapshot: &Snapshot) -> Result<(), JournalError> {
+    /// `shape` is the caller's claim about what the journal will hold once
+    /// the swap lands — persisted to `journal.shape` before the manifest
+    /// moves (D-056's server-down sidecar).
+    pub fn compact(&mut self, snapshot: &Snapshot, shape: Shape) -> Result<(), JournalError> {
         let payload = &snapshot.payload;
-        self.compact_with(snapshot.covered_seq, payload.len() as u64, |w| {
-            w.write_all(payload)
-        })
+        self.compact_with(
+            snapshot.covered_seq,
+            payload.len() as u64,
+            |w| w.write_all(payload),
+            shape,
+        )
     }
 
     /// `compact`, with the snapshot payload streamed by `write` (exactly
@@ -1038,6 +1205,7 @@ impl Journal {
         covered_seq: u64,
         payload_len: u64,
         write: impl FnOnce(&mut dyn Write) -> io::Result<()>,
+        shape: Shape,
     ) -> Result<(), JournalError> {
         if self.poisoned {
             return Err(JournalError::Poisoned);
@@ -1082,7 +1250,13 @@ impl Journal {
         write_snapshot_stream(&gdir, covered_seq, payload_len, write)?;
         self.compaction_step(2)?;
 
-        // 3. The atomic manifest swap — the single point that moves the
+        // 3. journal.shape claims what the swap is about to make true —
+        //    durable BEFORE the manifest names N+1 (a crash over-reports,
+        //    so the guard refuses more, never less). A failure here is an
+        //    ordinary compaction error: nothing has moved.
+        write_shape(&self.root, shape)?;
+
+        // 4. The atomic manifest swap — the single point that moves the
         //    world from generation N to N+1, and the point of no return.
         //    From the rename on, an error leaves the manifest possibly
         //    naming N+1 while this writer points at N: poison, never
@@ -1208,6 +1382,22 @@ impl Journal {
                 File::open(&gd)?.sync_data()?;
             }
         }
+        // journal.shape stays OUT of the backup (S2 re-review): the open
+        // path rebuilds it from the replayed maxima, and a backup listing
+        // it would no longer restore under the v1.0.1 CLI (its file list
+        // admits generation paths only). public_id.key travels when the
+        // directory holds one — only an S2-restored dir does, and the
+        // permutation key is the one piece of install identity a backup
+        // cannot regenerate: dropping it orphans every public id.
+        let key = self.root.join("public_id.key");
+        if key.exists() {
+            let (bytes, crc32) = copy_file_durably(&key, &partial.join("public_id.key"))?;
+            list.files.push(BackupFile {
+                path: "public_id.key".into(),
+                bytes,
+                crc32: Some(crc32),
+            });
+        }
         // What restore verifies against (D-044): every file, its size and
         // checksum, and the generation the manifest names.
         write_private(
@@ -1240,9 +1430,12 @@ impl Journal {
 
 impl Journal {
     /// Bytes a backup copies: every generation's log and snapshot plus the
-    /// manifest.
+    /// manifest, and `public_id.key` when the directory holds one.
     fn backup_bytes(&self) -> Result<u64, JournalError> {
         let mut total = fs::metadata(self.root.join("manifest.json"))?.len();
+        if let Ok(m) = fs::metadata(self.root.join("public_id.key")) {
+            total += m.len();
+        }
         for entry in fs::read_dir(&self.root)? {
             let entry = entry?;
             let is_gen = entry
@@ -1346,7 +1539,11 @@ fn restore_with(from: &Path, to: &Path, step: &dyn Fn(RestoreStep)) -> Result<()
     for entry in fs::read_dir(to)? {
         let name = entry?.file_name();
         let n = name.to_string_lossy();
-        if n == "manifest.json" || n.starts_with("gen-") {
+        if n == "manifest.json"
+            || n.starts_with("gen-")
+            || n.starts_with("journal.shape")
+            || n.starts_with("public_id.key")
+        {
             return Err(JournalError::RestoreTargetNotEmpty);
         }
     }
@@ -1354,10 +1551,12 @@ fn restore_with(from: &Path, to: &Path, step: &dyn Fn(RestoreStep)) -> Result<()
     step(RestoreStep::Copied);
     if let Err(e) = copied {
         // Nothing was published: take back what was copied, so the target
-        // holds no generation a later restore or open would trip on.
+        // holds no generation or flat a later restore or open trips on.
         for f in &list.files {
             if let Some((g, _)) = f.path.split_once('/') {
                 let _ = fs::remove_dir_all(to.join(g));
+            } else {
+                let _ = fs::remove_file(to.join(&f.path));
             }
         }
         return Err(e);
@@ -1504,10 +1703,17 @@ fn backup_list(from: &Path, generation: u32) -> Result<BackupList, JournalError>
         if !seen.insert(f.path.as_str()) {
             return Err(bad(format!("{BACKUP_LIST} lists {} twice", f.path)));
         }
-        let ok = f
-            .path
-            .split_once('/')
-            .is_some_and(|(g, file)| canonical_gen(g).is_some() && SNAPSHOT_FILES.contains(&file));
+        // The agreed set (S2 re-review finding 7): generation files, plus
+        // the journal-dir flats an S2 writer carries. This build never
+        // lists them in a backup it writes (the sidecar is derivable at
+        // open and v1.0.1's restore admits generation paths only), but a
+        // restore must accept them so an S2 backup of a still-v2 journal
+        // stays a legitimate rollback target.
+        let ok = f.path == "journal.shape"
+            || f.path == "public_id.key"
+            || f.path.split_once('/').is_some_and(|(g, file)| {
+                canonical_gen(g).is_some() && SNAPSHOT_FILES.contains(&file)
+            });
         if !ok {
             return Err(bad(format!("{BACKUP_LIST} lists {:?}", f.path)));
         }
@@ -1937,6 +2143,13 @@ fn sync_parent(path: &Path) -> io::Result<()> {
 mod tests {
     use super::*;
 
+    /// The shape the engine would claim for these test snapshots.
+    const SHAPE: Shape = Shape {
+        records: 2,
+        snapshots: 2,
+        max_ws: 0,
+    };
+
     #[test]
     fn append_then_replay_round_trips() {
         let dir = tempfile::tempdir().unwrap_or_else(|e| panic!("{e}"));
@@ -2161,7 +2374,10 @@ mod tests {
             covered_seq: 0,
             payload: vec![7; 512],
         };
-        assert!(matches!(j.compact(&big), Err(JournalError::NoSpace { .. })));
+        assert!(matches!(
+            j.compact(&big, SHAPE),
+            Err(JournalError::NoSpace { .. })
+        ));
         assert!(
             !gen_dir_path(dir.path(), 2).exists(),
             "a refused compaction leaves no partial generation"
@@ -2191,7 +2407,7 @@ mod tests {
             2,
             "no refused write left a record"
         );
-        j.compact(&big).unwrap_or_else(|e| panic!("{e}"));
+        j.compact(&big, SHAPE).unwrap_or_else(|e| panic!("{e}"));
         j.backup_to(&dest).unwrap_or_else(|e| panic!("{e}"));
         assert_eq!(j.generation(), 2);
         assert!(dest.join("gen-000002/snapshot.bin").exists());
@@ -2261,9 +2477,9 @@ mod tests {
             payload: b"state".to_vec(),
         };
         j.append(b"one").unwrap_or_else(|e| panic!("{e}"));
-        j.compact(&snap()).unwrap_or_else(|e| panic!("{e}"));
+        j.compact(&snap(), SHAPE).unwrap_or_else(|e| panic!("{e}"));
         j.append(b"two").unwrap_or_else(|e| panic!("{e}"));
-        j.compact(&snap()).unwrap_or_else(|e| panic!("{e}"));
+        j.compact(&snap(), SHAPE).unwrap_or_else(|e| panic!("{e}"));
         assert_eq!(gen_dirs(dir.path()), vec!["gen-000003".to_string()]);
         drop(j);
         let j = Journal::open(dir.path()).unwrap_or_else(|e| panic!("{e}"));
@@ -2301,7 +2517,7 @@ mod tests {
             payload: b"stale".to_vec(),
         };
         assert!(
-            j.compact(&snap).is_err(),
+            j.compact(&snap, SHAPE).is_err(),
             "memory and manifest disagree: refuse"
         );
         assert!(j.is_poisoned(), "and never write again");
@@ -2321,7 +2537,7 @@ mod tests {
             covered_seq: 0,
             payload: vec![7u8; 4096],
         };
-        j.compact(&snap).unwrap_or_else(|e| panic!("{e}"));
+        j.compact(&snap, SHAPE).unwrap_or_else(|e| panic!("{e}"));
         drop(j);
         let file = gen_dir_path(dir.path(), 2).join("snapshot.bin");
         let mut bytes = fs::read(&file).unwrap_or_else(|e| panic!("binary snapshot: {e}"));
@@ -2955,10 +3171,13 @@ mod tests {
         j.append(b"secret input").unwrap_or_else(|e| panic!("{e}"));
         assert_eq!(mode(&root), 0o700);
         check(&root);
-        j.compact(&Snapshot {
-            covered_seq: 0,
-            payload: b"state".to_vec(),
-        })
+        j.compact(
+            &Snapshot {
+                covered_seq: 0,
+                payload: b"state".to_vec(),
+            },
+            SHAPE,
+        )
         .unwrap_or_else(|e| panic!("{e}"));
         check(&root);
         let backups = d.path().join("backups");
@@ -3139,5 +3358,307 @@ mod tests {
         assert_eq!(batch_len(one) as usize, two);
         assert_eq!(batch_len(one + HEADER_LEN + 2) as usize, two);
         assert_eq!(b.len(), one + two);
+    }
+
+    /// v1.0.2 re-review: the sidecar parser must refuse anything ambiguous
+    /// (guard parity) — duplicate keys, `+N`, unknown keys, missing keys,
+    /// empty values. A loose read under-reports the format and admits a
+    /// binary that cannot park the journal's runs.
+    #[test]
+    fn the_sidecar_parser_is_strict() {
+        let d = tempfile::tempdir().unwrap_or_else(|e| panic!("{e}"));
+        let root = d.path().join("j");
+        fs::create_dir(&root).unwrap_or_else(|e| panic!("{e}"));
+        let sp = shape_path(&root);
+        for bad in [
+            "records=2\nsnapshots=2\nws=1\nws=2\n",    // duplicate key
+            "records=2\nsnapshots=2\nws=+1\n",         // leading plus
+            "records=2\nsnapshots=2\nws=\n",           // empty value
+            "records=2\nsnapshots=2\nfoo=1\n",         // unknown key
+            "records=2\nsnapshots=2\n",                // missing key
+            "records=2\nws=1\nsnapshots=2\nextra=0\n", // unknown key
+        ] {
+            fs::write(&sp, bad).unwrap_or_else(|e| panic!("{e}"));
+            assert!(read_shape(&root).is_err(), "accepted {bad:?}");
+        }
+        fs::write(&sp, "records=2\nsnapshots=2\nws=1\n").unwrap_or_else(|e| panic!("{e}"));
+        let s = read_shape(&root)
+            .unwrap_or_else(|e| panic!("{e}"))
+            .unwrap_or_else(|| panic!("no shape"));
+        assert_eq!((s.records, s.snapshots, s.max_ws), (2, 2, 1));
+    }
+
+    /// A crash between the sidecar tmp write and its rename leaves
+    /// `journal.shape.tmp`; the next open must sweep it so a stale partial
+    /// file can't confuse a later write.
+    #[test]
+    fn an_orphaned_sidecar_tmp_is_swept_at_open() {
+        let d = tempfile::tempdir().unwrap_or_else(|e| panic!("{e}"));
+        let root = d.path().join("j");
+        {
+            let mut j = Journal::open(&root).unwrap_or_else(|e| panic!("{e}"));
+            j.append(&record(0)).unwrap_or_else(|e| panic!("{e}"));
+        }
+        fs::write(root.join("journal.shape.tmp"), "records=9\n").unwrap_or_else(|e| panic!("{e}"));
+        let _j = Journal::open(&root).unwrap_or_else(|e| panic!("{e}"));
+        assert!(
+            !root.join("journal.shape.tmp").exists(),
+            "orphaned tmp survived open"
+        );
+    }
+
+    /// A restore target that already holds sidecar files is a partially
+    /// restored or live journal — refuse rather than clobber maxima.
+    #[test]
+    fn restore_refuses_a_target_holding_sidecar_files() {
+        let d = tempfile::tempdir().unwrap_or_else(|e| panic!("{e}"));
+        let backup = backup_of_three(d.path());
+        let to = d.path().join("to");
+        fs::create_dir(&to).unwrap_or_else(|e| panic!("{e}"));
+        fs::write(to.join("journal.shape"), "records=2\nsnapshots=2\nws=0\n")
+            .unwrap_or_else(|e| panic!("{e}"));
+        assert!(
+            restore_backup(&backup, &to).is_err(),
+            "restored over a stale sidecar"
+        );
+        let to2 = d.path().join("to2");
+        fs::create_dir(&to2).unwrap_or_else(|e| panic!("{e}"));
+        fs::write(to2.join("journal.shape.tmp"), "records=2\n").unwrap_or_else(|e| panic!("{e}"));
+        assert!(
+            restore_backup(&backup, &to2).is_err(),
+            "restored over a stale sidecar tmp"
+        );
+    }
+
+    /// The sidecar stays OUT of backup.json: a v1.0.1 restore tool refuses
+    /// any path outside a generation, so carrying it would brick
+    /// cross-version restores. A restored journal rebuilds it from replayed
+    /// maxima at open.
+    #[test]
+    fn the_sidecar_stays_out_of_the_backup() {
+        let d = tempfile::tempdir().unwrap_or_else(|e| panic!("{e}"));
+        let src = d.path().join("src");
+        {
+            let mut j = Journal::open(&src).unwrap_or_else(|e| panic!("{e}"));
+            j.append(&record(0)).unwrap_or_else(|e| panic!("{e}"));
+            // Force a sidecar the backup must NOT carry.
+            write_shape(&src, SHAPE).unwrap_or_else(|e| panic!("{e}"));
+            assert!(shape_path(&src).exists());
+        }
+        let dest = d.path().join("backup");
+        {
+            let j = Journal::open(&src).unwrap_or_else(|e| panic!("{e}"));
+            j.backup_to(&dest).unwrap_or_else(|e| panic!("{e}"));
+        }
+        assert!(
+            !dest.join("journal.shape").exists(),
+            "sidecar leaked into the backup"
+        );
+        let to = d.path().join("to");
+        restore_backup(&dest, &to).unwrap_or_else(|e| panic!("{e}"));
+        assert!(!shape_path(&to).exists(), "restore materialized a sidecar");
+        let j = Journal::open(&to).unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(j.records_written(), 1);
+    }
+
+    /// The agreed backup set (S2 re-review finding 7): an S2 backup lists
+    /// the journal-dir flats `journal.shape` and `public_id.key` beside
+    /// the generations. This build never writes them into a backup — the
+    /// sidecar is derivable at open and v1.0.1's restore admits only
+    /// generation paths — but restore must ACCEPT them: an S2 backup of
+    /// a still-v2 journal is a legitimate rollback target, and the key
+    /// must land intact or every public id the install issued orphans.
+    #[test]
+    fn restore_accepts_the_s2_backup_set() {
+        let d = tempfile::tempdir().unwrap_or_else(|e| panic!("{e}"));
+        let backup = backup_of_three(d.path());
+        // Give the backup the two flat entries an S2 writer lists: real
+        // files, real checksums, added to backup.json.
+        let key = [7u8; 32];
+        fs::write(backup.join("public_id.key"), key).unwrap_or_else(|e| panic!("{e}"));
+        write_shape(&backup, SHAPE).unwrap_or_else(|e| panic!("{e}"));
+        let list_path = backup.join(BACKUP_LIST);
+        let mut list: serde_json::Value =
+            serde_json::from_slice(&fs::read(&list_path).unwrap_or_else(|e| panic!("{e}")))
+                .unwrap_or_else(|e| panic!("{e}"));
+        for name in ["journal.shape", "public_id.key"] {
+            let bytes = fs::read(backup.join(name)).unwrap_or_else(|e| panic!("{e}"));
+            let mut h = crc32fast::Hasher::new();
+            h.update(&bytes);
+            list["files"]
+                .as_array_mut()
+                .unwrap_or_else(|| panic!("files"))
+                .push(serde_json::json!({
+                    "path": name,
+                    "bytes": bytes.len() as u64,
+                    "crc32": h.finalize(),
+                }));
+        }
+        fs::write(
+            &list_path,
+            serde_json::to_vec(&list).unwrap_or_else(|e| panic!("{e}")),
+        )
+        .unwrap_or_else(|e| panic!("{e}"));
+        let to = d.path().join("to");
+        restore_backup(&backup, &to).unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(
+            fs::read(to.join("public_id.key")).unwrap_or_else(|e| panic!("{e}")),
+            key,
+            "the restored key differs — every public id would rename"
+        );
+        assert!(to.join("journal.shape").exists());
+        let j = Journal::open(&to).unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(j.records_written(), 3);
+        // A target already holding a stale key is refused — the old key
+        // must never silently survive a restore that carries another.
+        let stale = d.path().join("stale");
+        fs::create_dir(&stale).unwrap_or_else(|e| panic!("{e}"));
+        fs::write(stale.join("public_id.key"), [9u8; 32]).unwrap_or_else(|e| panic!("{e}"));
+        assert!(
+            restore_backup(&backup, &stale).is_err(),
+            "restored onto a stale public_id.key"
+        );
+        // And a backup taken on the restored dir carries the key forward:
+        // an install that once held it must never let a later restore
+        // orphan the ids it was issued under.
+        drop(j);
+        let backup2 = d.path().join("backup2");
+        Journal::open(&to)
+            .unwrap_or_else(|e| panic!("{e}"))
+            .backup_to(&backup2)
+            .unwrap_or_else(|e| panic!("{e}"));
+        assert!(
+            backup2.join("public_id.key").exists(),
+            "a backup of a key-holding dir dropped the key"
+        );
+        let to2 = d.path().join("to2");
+        restore_backup(&backup2, &to2).unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(
+            fs::read(to2.join("public_id.key")).unwrap_or_else(|e| panic!("{e}")),
+            key
+        );
+    }
+
+    /// A1 (S1 re-review): the read-merge inside `write_shape` is the only
+    /// thing keeping a seeded claim from being lowered by a later,
+    /// smaller one — a restore or upgrade can legitimately leave the
+    /// sidecar ahead of the journal's own records.
+    #[test]
+    fn write_shape_never_lowers_a_seeded_maximum() {
+        let d = tempfile::tempdir().unwrap_or_else(|e| panic!("{e}"));
+        let root = d.path().join("j");
+        fs::create_dir(&root).unwrap_or_else(|e| panic!("{e}"));
+        write_shape(
+            &root,
+            Shape {
+                records: 1,
+                snapshots: 1,
+                max_ws: 9,
+            },
+        )
+        .unwrap_or_else(|e| panic!("{e}"));
+        write_shape(
+            &root,
+            Shape {
+                records: 1,
+                snapshots: 1,
+                max_ws: 3,
+            },
+        )
+        .unwrap_or_else(|e| panic!("{e}"));
+        let s = read_shape(&root)
+            .unwrap_or_else(|e| panic!("{e}"))
+            .unwrap_or_else(|| panic!("no journal.shape"));
+        assert_eq!(s.max_ws, 9, "a lower claim lowered the sidecar");
+    }
+
+    /// A1 (S1 re-review): the mutex around the read-merge-write is the
+    /// only thing keeping a second writer out of the race window. t1 is
+    /// parked after its merge and before its write; a serialized t2 must
+    /// stay outside (PARKED stays 1) — if the lock were gone it would
+    /// slip in (PARKED 2) having read the pre-t1 file, and one writer's
+    /// bump would be lost.
+    ///
+    /// The two waits are bound detection, not ordering: under a working
+    /// lock t2 can *never* enter while t1 parks, so a longer probe only
+    /// finds the same exclusion — never a false failure.
+    #[test]
+    fn racing_shape_writes_serialize_on_the_lock() {
+        use std::sync::atomic::Ordering;
+        let d = tempfile::tempdir().unwrap_or_else(|e| panic!("{e}"));
+        let root = d.path().join("j");
+        fs::create_dir(&root).unwrap_or_else(|e| panic!("{e}"));
+        write_shape(
+            &root,
+            Shape {
+                records: 1,
+                snapshots: 1,
+                max_ws: 3,
+            },
+        )
+        .unwrap_or_else(|e| panic!("{e}"));
+
+        SHAPE_PARKED.store(0, Ordering::Release);
+        SHAPE_HOLD.store(true, Ordering::Release);
+        let r1 = root.clone();
+        let t1 = std::thread::spawn(move || {
+            write_shape(
+                &r1,
+                Shape {
+                    records: 1,
+                    snapshots: 5,
+                    max_ws: 0,
+                },
+            )
+            .unwrap_or_else(|e| panic!("{e}"));
+        });
+        // t1 must reach the hold; never reaching it is a bug, not a
+        // timing race — bounded so the test fails instead of hanging.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while SHAPE_PARKED.load(Ordering::Acquire) < 1 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the first writer never parked inside the merge window"
+            );
+            std::thread::yield_now();
+        }
+        let r2 = root.clone();
+        let t2 = std::thread::spawn(move || {
+            write_shape(
+                &r2,
+                Shape {
+                    records: 2,
+                    snapshots: 1,
+                    max_ws: 0,
+                },
+            )
+            .unwrap_or_else(|e| panic!("{e}"));
+        });
+        // Probe the exclusion: a lock-less t2 reaches the hold in
+        // microseconds; two seconds gives it ~10^4 times that to slip in.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while std::time::Instant::now() < deadline {
+            assert_eq!(
+                SHAPE_PARKED.load(Ordering::Acquire),
+                1,
+                "a second writer entered the merge window — the lock is gone"
+            );
+            std::thread::yield_now();
+        }
+        SHAPE_HOLD.store(false, Ordering::Release);
+        t1.join().unwrap_or_else(|_| panic!("t1 panicked"));
+        t2.join().unwrap_or_else(|_| panic!("t2 panicked"));
+        let s = read_shape(&root)
+            .unwrap_or_else(|e| panic!("{e}"))
+            .unwrap_or_else(|| panic!("no journal.shape"));
+        assert_eq!(
+            s,
+            Shape {
+                records: 2,
+                snapshots: 5,
+                max_ws: 3
+            },
+            "serialized writes must land the component-wise max of both"
+        );
     }
 }

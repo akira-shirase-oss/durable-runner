@@ -10,12 +10,44 @@ new=${1:?usage: upgrade.sh /path/to/new/durable-server}
 [[ -x $new ]] || { echo "$new not executable" >&2; exit 1; }
 
 # D-056: never swap in a binary that cannot read this journal — it would
-# refuse startup and turn the upgrade into an outage.
-deploy/format-guard.sh "$new"
+# refuse startup and turn the upgrade into an outage. The journal must be
+# quiescent when judged, so the unit stops first; a refused upgrade
+# restarts the running binary unchanged.
+if ! systemctl stop durable-server; then
+  # If the unit is still active after a failed stop the journal is not
+  # quiescent — refuse rather than race live commits.
+  if systemctl is-active --quiet durable-server; then
+    echo "upgrade: stop failed and the unit is still active — journal not quiescent" >&2
+    exit 1
+  fi
+  echo "upgrade: stop reported an error but the unit is down — continuing" >&2
+fi
+# Files-only: the unit is down, so anything answering the port is a
+# squatter — the diagnostics path would leak the admin key and could
+# feed arithmetic-injection JSON into the guard's merges.
+if ! FORMAT_GUARD_FILES_ONLY=1 deploy/format-guard.sh "$new"; then
+  if ! systemctl start durable-server; then
+    echo "upgrade refused AND the restart failed — the service is DOWN" >&2
+    exit 1
+  fi
+  echo "upgrade refused — the previous binary was restarted" >&2
+  exit 1
+fi
 
 cp -a /usr/local/bin/durable-server /usr/local/bin/durable-server.prev
 install -m 0755 "$new" /usr/local/bin/durable-server
-systemctl restart durable-server
+if ! systemctl start durable-server; then
+  # The start failed while the NEW binary is installed: restore the
+  # previous one and bring it up before reporting down.
+  echo "upgrade: start failed — restoring the previous binary" >&2
+  cp -a /usr/local/bin/durable-server.prev /usr/local/bin/durable-server
+  if ! systemctl start durable-server; then
+    echo "upgrade: the restored binary failed to start too — the service is DOWN; investigate: journalctl -u durable-server" >&2
+    exit 1
+  fi
+  echo "upgrade failed — the previous binary was restored and started" >&2
+  exit 1
+fi
 
 # /ready polls until replay finishes (bounded: 90s covers 800k runs at the
 # measured 1.7s on a droplet slower than this Mac — generous headroom).
@@ -26,8 +58,11 @@ for _ in $(seq 360); do
 done
 if [[ "${code:-000}" != 200 ]]; then
   echo "upgrade: /ready never came up — rolling back" >&2
-  mv /usr/local/bin/durable-server.prev /usr/local/bin/durable-server
-  systemctl restart durable-server
+  cp -a /usr/local/bin/durable-server.prev /usr/local/bin/durable-server
+  if ! systemctl restart durable-server; then
+    echo "upgrade: the rollback failed to start — the service is DOWN; investigate: journalctl -u durable-server" >&2
+    exit 1
+  fi
   exit 1
 fi
 deploy/smoke.sh --local-only

@@ -166,6 +166,17 @@ pub struct Diagnostics {
     /// The highest record version present in the journal. Upgrade and
     /// rollback refuse to run a binary whose reader is older (D-056).
     pub journal_record_version_max: u8,
+    /// The highest snapshot (DRIX) format version the journal holds —
+    /// the same rollback gate needs it: a compacted journal can out-date
+    /// an older reader even when no new record version was ever written.
+    pub journal_snapshot_version_max: u16,
+    /// The highest workspace id the journal carries; nonzero means a
+    /// v3-writing binary's tenant work is present and a rollback must
+    /// know how to park it rather than run it on workspace-0 handlers.
+    pub journal_max_ws: u64,
+    /// Non-terminal runs parked because they belong to a workspace ≠ 0:
+    /// replayed faithfully, never dispatched or probed by this binary.
+    pub parked_runs: u64,
 }
 
 /// The index as snapshots before D-021 carried it (JSON, inputs as number
@@ -289,6 +300,18 @@ pub struct EngineCore {
     /// Highest record `v` present in the journal: bumped by replay and by
     /// every commit this binary writes (D-056's rollback guard).
     journal_record_version_max: u8,
+    /// Highest snapshot (DRIX) version the loaded journal holds — bumping
+    /// the record reader without the snapshot reader left rollback able
+    /// to strand itself on a compacted journal (S2 review).
+    snapshot_version_max: u16,
+    /// Highest workspace id any replayed record or snapshot run carried.
+    /// A binary that reads v3 must also know not to run those tenants'
+    /// work — `journal_max_ws > 0` is what format-guard keys on.
+    journal_max_ws: u64,
+    /// The shape already persisted to `journal.shape` — the sidecar the
+    /// format-guard reads with the server down. Written BEFORE the
+    /// journal change it describes and only ever upward.
+    persisted: durable_journal::Shape,
     pub limits: Limits,
     pub retry: RetryPolicy,
 }
@@ -323,6 +346,13 @@ impl EngineCore {
             index_bytes: 0,
             discarded_tail,
             journal_record_version_max: 1,
+            snapshot_version_max: 1,
+            journal_max_ws: 0,
+            persisted: durable_journal::Shape {
+                records: 0,
+                snapshots: 0,
+                max_ws: 0,
+            },
             limits: Limits::default(),
             retry: RetryPolicy::default(),
         };
@@ -331,15 +361,17 @@ impl EngineCore {
             // and the checksum verified before the result is used (D-028).
             Some(durable_journal::SnapshotSource::Binary(mut r)) => {
                 let len = r.remaining();
-                let (next_run, runs) =
+                let (ver, next_run, runs) =
                     snapshot::decode_from(&mut r, len).map_err(JournalError::CorruptSnapshot)?;
                 r.finish()?;
+                core.snapshot_version_max = core.snapshot_version_max.max(ver);
                 core.install(next_run, runs);
             }
             Some(durable_journal::SnapshotSource::Legacy(snap)) => {
                 if snap.payload.starts_with(snapshot::MAGIC) {
-                    let (next_run, runs) =
+                    let (ver, next_run, runs) =
                         snapshot::decode(&snap.payload).map_err(JournalError::CorruptSnapshot)?;
+                    core.snapshot_version_max = core.snapshot_version_max.max(ver);
                     core.install(next_run, runs);
                 } else {
                     let idx: LegacyIndex = serde_json::from_slice(&snap.payload)?;
@@ -396,6 +428,7 @@ impl EngineCore {
                     t_decode += t.elapsed();
                     max_run = max_run.max(env.run);
                     core.journal_record_version_max = core.journal_record_version_max.max(env.v);
+                    core.journal_max_ws = core.journal_max_ws.max(env.ws);
                     let t = std::time::Instant::now();
                     core.apply_committed(env.ws, RunId(env.run), env.event, env.at)?;
                     t_apply += t.elapsed();
@@ -411,7 +444,7 @@ impl EngineCore {
                  replay_total={t_replay:?} [read={t_read:?} decode={t_decode:?} apply={t_apply:?}] recount={:?}",
                 t.elapsed()
             );
-            return Ok(core);
+            return core.finish_open(dir);
         }
         if let Some(records) = durable_journal::records(&gdir)? {
             for r in records {
@@ -419,12 +452,68 @@ impl EngineCore {
                 let env = decode_envelope(&r.payload)?;
                 max_run = max_run.max(env.run);
                 core.journal_record_version_max = core.journal_record_version_max.max(env.v);
+                core.journal_max_ws = core.journal_max_ws.max(env.ws);
                 core.apply_committed(env.ws, RunId(env.run), env.event, env.at)?;
             }
         }
         core.next_run = max_run + 1;
         core.recount();
-        Ok(core)
+        core.finish_open(dir)
+    }
+
+    /// The post-replay steps every open path shares: recount is already
+    /// done; here the `journal.shape` sidecar is merged with what it
+    /// already claimed (a backup could hold either) and re-published at
+    /// the max — the format-guard reads it with the server down (D-056).
+    /// Missing or malformed heals here; during downtime a malformed one
+    /// refuses the guard instead.
+    fn finish_open(mut self, dir: &Path) -> Result<Self, EngineError> {
+        let disk = match durable_journal::read_shape(dir) {
+            Ok(d) => d,
+            // Malformed content heals at open — a rewrite publishes the
+            // true maxima. A real I/O error (unreadable file) still
+            // fails startup like any journal read.
+            Err(e) if e.kind() == std::io::ErrorKind::InvalidData => None,
+            Err(e) => return Err(JournalError::from(e).into()),
+        };
+        let shape = disk
+            .map(|d| self.shape().merged(d))
+            .unwrap_or_else(|| self.shape());
+        if disk != Some(shape) {
+            durable_journal::write_shape(dir, shape).map_err(JournalError::from)?;
+        }
+        self.persisted = shape;
+        Ok(self)
+    }
+
+    /// The journal root in either log mode (the piped writer keeps it in
+    /// `Pipe::root` — the sidecar is the core's file, not the writer's).
+    fn journal_root(&self) -> PathBuf {
+        match &self.log {
+            Log::Direct(j) => j.dir().to_path_buf(),
+            Log::Piped(p) => p.root.clone(),
+        }
+    }
+
+    /// The shape this journal would report now.
+    fn shape(&self) -> durable_journal::Shape {
+        durable_journal::Shape {
+            records: self.journal_record_version_max,
+            snapshots: self.snapshot_version_max,
+            max_ws: self.journal_max_ws,
+        }
+    }
+
+    /// Persist `journal.shape` when the live maxima pass what it already
+    /// claims — called BEFORE the record or manifest swap the shape
+    /// describes, so a crash over-reports (fail closed).
+    fn persist_shape(&mut self) -> Result<(), EngineError> {
+        let want = self.shape();
+        if want != self.persisted {
+            durable_journal::write_shape(&self.journal_root(), want).map_err(JournalError::from)?;
+            self.persisted = want;
+        }
+        Ok(())
     }
 
     /// Hand the journal to a group-commit writer: from now on commits are
@@ -596,6 +685,9 @@ impl EngineCore {
             .values()
             .map(|r| ((r.ws, r.key.clone()), r.id))
             .collect();
+        self.journal_max_ws = self
+            .journal_max_ws
+            .max(runs.values().map(|r| r.ws).max().unwrap_or(0));
         self.runs = runs;
         self.next_run = next_run;
     }
@@ -625,13 +717,36 @@ impl EngineCore {
     /// Returns the new generation number. All or nothing.
     pub fn compact(&mut self, now: Millis) -> Result<u32, EngineError> {
         let plan = self.plan_compaction(now)?;
+        let shape = self.planned_compaction_shape(&plan.view);
         let Log::Direct(journal) = &mut self.log else {
             return Err(EngineError::Piped);
         };
-        journal.compact_with(0, plan.bytes, |w| snapshot::encode(&plan.view, w))?;
+        journal.compact_with(0, plan.bytes, |w| snapshot::encode(&plan.view, w), shape)?;
+        self.persisted = self.persisted.merged(shape);
         let generation = journal.generation();
         self.finish_compaction(&plan.expired);
         Ok(generation)
+    }
+
+    /// What a snapshot of `view` will make true on disk: the journal
+    /// shape — highest record version, DRIX version, and the view's max
+    /// workspace — persisted by `compact_with` inside the manifest swap
+    /// (S2 review: after `prune_superseded` deletes the records that
+    /// carried those facts, the sidecar is the server-down proof of
+    /// tenant runs in a snapshot). The in-memory maxima move with it:
+    /// diagnostics and the sidecar describe the same journal.
+    pub fn planned_compaction_shape(&mut self, view: &snapshot::View) -> durable_journal::Shape {
+        self.snapshot_version_max = self.snapshot_version_max.max(snapshot::VERSION);
+        self.journal_max_ws = self
+            .journal_max_ws
+            .max(view.runs.iter().map(|r| r.ws).max().unwrap_or(0));
+        self.shape()
+    }
+
+    /// The writer reports a compaction durably swapped: the sidecar it
+    /// wrote inside the swap is now the file's claim.
+    pub fn note_shape_persisted(&mut self, shape: durable_journal::Shape) {
+        self.persisted = self.persisted.merged(shape);
     }
 
     /// Whether the journal filesystem has its reserve free (readiness).
@@ -719,6 +834,18 @@ impl EngineCore {
             at: now,
             event: event.clone(),
         })?;
+        // Shape BEFORE the append it describes — but only when a
+        // maximum actually moved. Persisting unconditionally would add a
+        // create-in-root to every commit: an already-open log can append
+        // under a root that no longer grants create (the dir-mode fault
+        // test), so the steady state must cost nothing here.
+        let r = self.journal_record_version_max.max(ENVELOPE_VERSION);
+        let w = self.journal_max_ws.max(ws);
+        if r != self.journal_record_version_max || w != self.journal_max_ws {
+            self.journal_record_version_max = r;
+            self.journal_max_ws = w;
+            self.persist_shape()?;
+        }
         match &mut self.log {
             // durable BEFORE applied below
             Log::Direct(j) => {
@@ -729,7 +856,6 @@ impl EngineCore {
             // durable.
             Log::Piped(p) => p.enqueue(payload)?,
         }
-        self.journal_record_version_max = self.journal_record_version_max.max(ENVELOPE_VERSION);
         self.apply_committed(ws, run, event, now)
     }
 
@@ -806,7 +932,12 @@ impl EngineCore {
         let mut due: Vec<(Millis, RunId, StepIndex, u32)> = self
             .runs
             .iter()
+            // Runs of any workspace ≠ 0 are parked on this binary: it can
+            // replay their records but must never call a handler for them
+            // (the handler registry is name-keyed, workspace-blind — D-056
+            // floor safety, S2 review).
             .filter_map(|(id, r)| match &r.state {
+                _ if r.ws != 0 => None,
                 RunState::Queued { next_run_at } if *next_run_at <= now => {
                     Some((*next_run_at, *id, StepIndex(0), 1))
                 }
@@ -940,6 +1071,13 @@ impl EngineCore {
             stale_generations,
             discarded_tail_bytes: self.discarded_tail.map_or(0, |t| t.bytes),
             journal_record_version_max: self.journal_record_version_max,
+            journal_snapshot_version_max: self.snapshot_version_max,
+            journal_max_ws: self.journal_max_ws,
+            parked_runs: self
+                .runs
+                .values()
+                .filter(|r| r.ws != 0 && !r.state.is_terminal())
+                .count() as u64,
         }
     }
 
@@ -972,11 +1110,14 @@ impl EngineCore {
     }
 
     /// Attempts whose deadline passed at `now` — each is a lost reply until
-    /// a reconciler proves otherwise.
+    /// a reconciler proves otherwise. Parked (ws ≠ 0) runs never expire
+    /// into a reconcile either: probing would call a workspace-blind
+    /// handler for a tenant's step.
     pub fn expired_attempts(&self, now: Millis) -> Vec<(RunId, StepIndex)> {
         self.runs
             .iter()
             .filter_map(|(id, r)| match &r.state {
+                _ if r.ws != 0 => None,
                 RunState::Running { step, deadline, .. } if *deadline < now => Some((*id, *step)),
                 _ => None,
             })
@@ -1044,6 +1185,112 @@ mod tests {
         let d = tempfile::tempdir().unwrap_or_else(|e| panic!("{e}"));
         let e = EngineCore::open(d.path()).unwrap_or_else(|e| panic!("{e}"));
         (d, e)
+    }
+
+    #[test]
+    fn the_shape_sidecar_tracks_the_journal() {
+        // Fresh open publishes the baseline (D-056's server-down scan).
+        let (d, mut e) = open();
+        let s = durable_journal::read_shape(d.path())
+            .unwrap_or_else(|e| panic!("{e}"))
+            .unwrap_or_else(|| panic!("no journal.shape"));
+        assert_eq!(
+            s,
+            durable_journal::Shape {
+                records: 1,
+                snapshots: 1,
+                max_ws: 0,
+            }
+        );
+
+        // The first ws ≠ 0 record writes the sidecar BEFORE its journal
+        // record — the file is what a downed server leaves the guard.
+        e.submit_at(7, OperationKey("t".into()), spec(), 0, 0)
+            .unwrap_or_else(|e| panic!("{e}"));
+        let s = durable_journal::read_shape(d.path())
+            .unwrap_or_else(|e| panic!("{e}"))
+            .unwrap_or_else(|| panic!("no journal.shape"));
+        assert_eq!(s.max_ws, 7);
+        assert_eq!(s.records, ENVELOPE_VERSION);
+        // Diagnostics and the sidecar describe the same journal — the
+        // live commit moved journal_max_ws, not only replay (S2 review).
+        assert_eq!(e.diagnostics().journal_max_ws, 7);
+    }
+
+    /// A1 (S1 re-review): a sidecar seeded ahead of the journal's own
+    /// records — exactly what a restore or upgrade can leave — must not
+    /// be lowered by a commit whose maxima are smaller. Only the
+    /// read-merge inside `write_shape` keeps the claim monotonic.
+    #[test]
+    fn a_seeded_higher_sidecar_survives_a_lower_ws_commit() {
+        let d = tempfile::tempdir().unwrap_or_else(|e| panic!("{e}"));
+        durable_journal::write_shape(
+            d.path(),
+            durable_journal::Shape {
+                records: ENVELOPE_VERSION,
+                snapshots: 1,
+                max_ws: 9,
+            },
+        )
+        .unwrap_or_else(|e| panic!("{e}"));
+        let mut e = EngineCore::open(d.path()).unwrap_or_else(|e| panic!("{e}"));
+        // A ws=3 commit asks the sidecar for max_ws 3; the file must
+        // still read the seeded 9 — under-reporting is the open failure.
+        e.submit_at(3, OperationKey("t".into()), spec(), 0, 0)
+            .unwrap_or_else(|e| panic!("{e}"));
+        let s = durable_journal::read_shape(d.path())
+            .unwrap_or_else(|e| panic!("{e}"))
+            .unwrap_or_else(|| panic!("no journal.shape"));
+        assert_eq!(
+            s.max_ws, 9,
+            "a ws=3 commit lowered a sidecar seeded at ws=9"
+        );
+    }
+
+    #[test]
+    fn compaction_moves_tenant_runs_into_the_snapshot_and_the_sidecar_knows() {
+        let (d, mut e) = open();
+        // A parked tenant run: it survives compaction inside snapshot.bin,
+        // where a grep of journal.log can no longer find its ws (S2
+        // review: the down-server hole).
+        let run = e
+            .submit_at(9, OperationKey("t".into()), spec(), 0, 0)
+            .unwrap_or_else(|e| panic!("{e}"));
+        e.compact(1).unwrap_or_else(|e| panic!("{e}"));
+        let s = durable_journal::read_shape(d.path())
+            .unwrap_or_else(|e| panic!("{e}"))
+            .unwrap_or_else(|| panic!("no journal.shape"));
+        assert_eq!(s.snapshots, snapshot::VERSION);
+        assert_eq!(s.max_ws, 9);
+        // The pruned journal.log really is silent about the tenant now.
+        let gen = d
+            .path()
+            .join(format!("gen-{:06}", e.diagnostics().generation));
+        let log =
+            std::fs::read_to_string(gen.join("journal.log")).unwrap_or_else(|e| panic!("{e}"));
+        assert!(!log.contains("\"ws\":9"), "{log}");
+        assert_eq!(
+            e.diagnostics().journal_snapshot_version_max,
+            snapshot::VERSION
+        );
+        // Reopen still parks it — the snapshot carried the ws.
+        drop(e);
+        let e2 = EngineCore::open(d.path()).unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(e2.diagnostics().journal_max_ws, 9);
+        assert!(e2.run(run).is_some());
+    }
+
+    #[test]
+    fn a_malformed_sidecar_heals_at_open_but_the_guard_refuses() {
+        let (d, e) = open();
+        drop(e);
+        std::fs::write(d.path().join("journal.shape"), "records=zzz\n")
+            .unwrap_or_else(|e| panic!("{e}"));
+        assert!(durable_journal::read_shape(d.path()).is_err());
+        let _e2 = EngineCore::open(d.path()).unwrap_or_else(|e| panic!("{e}"));
+        assert!(durable_journal::read_shape(d.path())
+            .unwrap_or_else(|e| panic!("{e}"))
+            .is_some());
     }
 
     #[test]
@@ -1333,6 +1580,76 @@ mod tests {
             .err()
             .unwrap_or_else(|| panic!("opened"));
         assert!(matches!(err, EngineError::Serde(_)), "{err}");
+    }
+
+    // --- v1.0.2: ws ≠ 0 runs are parked, never dispatched -----------------
+    //
+    // This binary's registry is name-keyed and workspace-blind. Running a
+    // replayed tenant run would POST the tenant's input and idempotency
+    // key to workspace 0's same-named handler — the S2-review rollback
+    // finding. Parked means: replayed faithfully, surfaced in
+    // diagnostics, and never scheduled, expired, or probed.
+
+    /// A queued tenant run never leaves `due` — only workspace-0 work is
+    /// scheduled — and diagnostics expose it as parked, not lost.
+    #[test]
+    fn tenant_runs_are_parked_not_dispatched() {
+        let d = tempfile::tempdir().unwrap_or_else(|e| panic!("{e}"));
+        commit_v3(d.path(), 1, 7, &v3_accepted("tenant"));
+        commit_v3(d.path(), 2, 0, &v3_accepted("ops"));
+        let e = EngineCore::open(d.path()).unwrap_or_else(|e| panic!("{e}"));
+        let due: Vec<RunId> = e.due(u64::MAX).into_iter().map(|(r, ..)| r).collect();
+        assert_eq!(due, vec![RunId(2)], "the tenant run must never be due");
+        let diag = e.diagnostics();
+        assert_eq!(diag.journal_max_ws, 7);
+        assert_eq!(diag.parked_runs, 1);
+    }
+
+    /// A tenant attempt journaled Running past its deadline stays parked:
+    /// expiring it would start a probe — a handler call with the same
+    /// exposure the park exists to prevent.
+    #[test]
+    fn a_parked_attempt_never_expires_into_a_probe() {
+        let d = tempfile::tempdir().unwrap_or_else(|e| panic!("{e}"));
+        commit_v3(d.path(), 1, 7, &v3_accepted("tenant"));
+        commit_v3(
+            d.path(),
+            1,
+            7,
+            "{\"StepDispatched\":{\"step\":0,\"attempt\":1,\"deadline\":1000}}",
+        );
+        commit_v3(d.path(), 2, 0, &v3_accepted("ops"));
+        commit_v3(
+            d.path(),
+            2,
+            0,
+            "{\"StepDispatched\":{\"step\":0,\"attempt\":1,\"deadline\":1000}}",
+        );
+        let e = EngineCore::open(d.path()).unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(
+            e.expired_attempts(2000),
+            vec![(RunId(2), StepIndex(0))],
+            "only the workspace-0 attempt may expire into a reconcile"
+        );
+    }
+
+    /// A snapshot that already carries tenant runs parks them too — the
+    /// park is not a journal-tail property only.
+    #[test]
+    fn tenant_runs_stay_parked_through_a_snapshot() {
+        let d = tempfile::tempdir().unwrap_or_else(|e| panic!("{e}"));
+        commit_v3(d.path(), 1, 7, &v3_accepted("tenant"));
+        {
+            let mut e = EngineCore::open(d.path()).unwrap_or_else(|e| panic!("{e}"));
+            e.compact(0).unwrap_or_else(|e| panic!("{e}"));
+        }
+        let e = EngineCore::open(d.path()).unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(e.run(RunId(1)).unwrap_or_else(|| panic!("run")).ws, 7);
+        assert!(e.due(u64::MAX).is_empty());
+        let diag = e.diagnostics();
+        assert_eq!(diag.parked_runs, 1);
+        assert_eq!(diag.journal_snapshot_version_max, snapshot::VERSION);
+        assert_eq!(diag.journal_max_ws, 7);
     }
 
     /// Compaction and its snapshot carry runs that arrived under either
@@ -1796,7 +2113,7 @@ mod tests {
         let mut bytes = Vec::new();
         snapshot::encode(&plan.view, &mut bytes).unwrap_or_else(|e| panic!("{e}"));
         assert_eq!(bytes.len() as u64, plan.bytes);
-        let (_, runs) = snapshot::decode(&bytes).unwrap_or_else(|e| panic!("{e}"));
+        let (_, _, runs) = snapshot::decode(&bytes).unwrap_or_else(|e| panic!("{e}"));
         assert!(matches!(
             runs.get(&run).map(|r| &r.state),
             Some(RunState::Queued { .. })
