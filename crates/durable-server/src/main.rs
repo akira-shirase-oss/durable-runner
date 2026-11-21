@@ -753,6 +753,30 @@ fn registry_writer(
     }
 }
 
+/// Per-workspace serialization of registry mutations against reconcile
+/// passes (S2 review finding 4). A mutation holds its workspace's stripe
+/// across the store write + engine update + file send, and a reconcile
+/// holds the same stripe across `list_handlers` + `set_workspace_handlers`
+/// — a DELETE can never land between a pass's read of a row and its
+/// re-arm, which is what let a deleted handler resurrect in the engine
+/// and in `handlers.json`. The epoch stays as the writer's third layer;
+/// the lock closes the check-then-act window it could not see. Striped
+/// rather than keyed: ws N and ws N+64 share a stripe, which at most
+/// serializes two unrelated tenants, never one workspace's own flow.
+pub struct RegistryLocks([tokio::sync::Mutex<()>; 64]);
+
+impl RegistryLocks {
+    fn stripe(&self, ws: u64) -> &tokio::sync::Mutex<()> {
+        &self.0[(ws % self.0.len() as u64) as usize]
+    }
+}
+
+impl Default for RegistryLocks {
+    fn default() -> Self {
+        Self(std::array::from_fn(|_| tokio::sync::Mutex::new(())))
+    }
+}
+
 /// Spawn the registry writer thread; the sender goes in `App`.
 fn spawn_registry_writer(
     path: Arc<Path>,
@@ -777,6 +801,7 @@ async fn registry_sync(
     flags: &[(String, Arc<dyn StepHandler>)],
     tx: &std::sync::mpsc::SyncSender<RegistryWrite>,
     epoch: &std::sync::atomic::AtomicU64,
+    locks: &RegistryLocks,
 ) -> Result<(), AccountError> {
     // A mutation anywhere in the pass's read window makes its applies
     // stale — bail out; the mutation applied itself and the next pass
@@ -805,6 +830,12 @@ async fn registry_sync(
     let mut preserve_ws = Vec::new();
     let mut refused = 0u64;
     for ws in &workspaces {
+        // Finding 4: the read and the apply are one critical section
+        // per workspace — a mutation of this workspace cannot land
+        // between them, so a pass never re-arms a row that was deleted
+        // underneath it. One stripe per iteration; unrelated workspaces
+        // still run in parallel.
+        let _ws_guard = locks.stripe(ws.id).lock().await;
         // Per-workspace error isolation (S2 review #6): one bad row or
         // engine refusal must not abort the pass for every later
         // workspace — the engine keeps that workspace's last-armed set,
@@ -912,9 +943,10 @@ fn spawn_registry_reconcile(
     let flags = Arc::clone(&app.flag_handlers);
     let tx = app.registry_tx.clone();
     let epoch = Arc::clone(&app.registry_epoch);
+    let locks = Arc::clone(&app.registry_locks);
     tokio::spawn(async move {
         loop {
-            match registry_sync(&store, &engine, &factory, &flags, &tx, &epoch).await {
+            match registry_sync(&store, &engine, &factory, &flags, &tx, &epoch, &locks).await {
                 Ok(()) => stale.store(false, std::sync::atomic::Ordering::Relaxed),
                 Err(e) => {
                     stale.store(true, std::sync::atomic::Ordering::Relaxed);
@@ -1169,6 +1201,9 @@ struct App {
     /// always sees the epoch move. The writer re-checks it under its
     /// own serialization before a snapshot may land (S3).
     registry_epoch: Arc<std::sync::atomic::AtomicU64>,
+    /// Per-workspace stripes serializing route mutations against the
+    /// reconciler's read+apply of the same workspace (finding 4).
+    registry_locks: Arc<RegistryLocks>,
     /// Opaque public run ids (S2 #7): every run id crosses the API
     /// through this keyed permutation, so no response reveals the
     /// global sequence or another workspace's volume.
@@ -1209,6 +1244,7 @@ fn test_app(
         registry_file: Arc::from(journal_dir.join("handlers.json").as_path()),
         registry_tx,
         registry_epoch,
+        registry_locks: Arc::new(RegistryLocks::default()),
         pubid,
     }
 }
@@ -2178,6 +2214,10 @@ async fn put_handler(
         ));
     }
     let url = valid_handler_url(body.url.trim(), app.handler_factory.allow_local)?;
+    // Finding 4: the bound check, the store write, the engine update and
+    // the snapshot send are one critical section per workspace — a
+    // reconcile's list+apply cannot interleave between them.
+    let _ws_guard = app.registry_locks.stripe(auth.ws).lock().await;
     // The 256 bound lives in the engine, but the store must never hold a
     // row the engine refuses: one over-limit row would poison every
     // later reconcile of this workspace's set. Check before writing —
@@ -2252,6 +2292,9 @@ async fn rotate_handler_secret(
     // Bump before the store write — same epoch ordering as PUT (S3).
     app.registry_epoch
         .fetch_add(1, std::sync::atomic::Ordering::Release);
+    // Finding 4: rotate + re-arm + snapshot under the ws stripe, same
+    // section as PUT/DELETE and the reconciler's list+apply.
+    let _ws_guard = app.registry_locks.stripe(auth.ws).lock().await;
     let Some(secret) = store
         .rotate_handler_secret(auth.ws)
         .await
@@ -2299,6 +2342,9 @@ async fn delete_handler(
     // Bump before the store write — same epoch ordering as PUT (S3).
     app.registry_epoch
         .fetch_add(1, std::sync::atomic::Ordering::Release);
+    // Finding 4: the delete holds the ws stripe across store + engine +
+    // file, so a reconcile pass can never be mid-list for this row.
+    let _ws_guard = app.registry_locks.stripe(auth.ws).lock().await;
     let existed = store
         .delete_handler(auth.ws, &name)
         .await
@@ -2772,6 +2818,7 @@ async fn main() -> Result<()> {
         registry_file,
         registry_tx,
         registry_epoch,
+        registry_locks: Arc::new(RegistryLocks::default()),
         pubid,
     };
     if let Some(store) = &store {
@@ -4591,6 +4638,7 @@ mod tests {
             &h.app.flag_handlers,
             &h.app.registry_tx,
             &h.app.registry_epoch,
+            &h.app.registry_locks,
         )
         .await
         .unwrap_or_else(|e| panic!("{e}"));
@@ -4616,6 +4664,7 @@ mod tests {
                 &h.app.flag_handlers,
                 &h.app.registry_tx,
                 &h.app.registry_epoch,
+                &h.app.registry_locks,
             )
             .await
             .is_err(),
@@ -4635,6 +4684,293 @@ mod tests {
         let (status, v) = call(&h.router, "GET", "/admin/diagnostics", Some(KEY), None).await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(v["registry_stale"], json!(true), "{v}");
+    }
+
+    /// A one-shot tripwire + release latch that cannot miss a signal:
+    /// the wire is an atomic flag re-checked *after* the notify is
+    /// armed, so a release before the trip still ends the park.
+    struct Gate {
+        tripped: std::sync::atomic::AtomicBool,
+        trip_n: tokio::sync::Notify,
+        released: std::sync::atomic::AtomicBool,
+        release_n: tokio::sync::Notify,
+    }
+
+    impl Gate {
+        fn new() -> Self {
+            Self {
+                tripped: std::sync::atomic::AtomicBool::new(false),
+                trip_n: tokio::sync::Notify::new(),
+                released: std::sync::atomic::AtomicBool::new(false),
+                release_n: tokio::sync::Notify::new(),
+            }
+        }
+
+        /// Fire the wire, then park until `release` is called.
+        async fn trip(&self) {
+            self.tripped
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+            self.trip_n.notify_waiters();
+            loop {
+                let n = self.release_n.notified();
+                tokio::pin!(n);
+                n.as_mut().enable();
+                if self.released.load(std::sync::atomic::Ordering::SeqCst) {
+                    break;
+                }
+                n.await;
+            }
+        }
+
+        /// Wait for the wire to fire.
+        async fn wait(&self) {
+            loop {
+                let n = self.trip_n.notified();
+                tokio::pin!(n);
+                n.as_mut().enable();
+                if self.tripped.load(std::sync::atomic::Ordering::SeqCst) {
+                    break;
+                }
+                n.await;
+            }
+        }
+
+        fn release(&self) {
+            self.released
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+            self.release_n.notify_waiters();
+        }
+    }
+
+    /// A `Memory` store whose `list_handlers`/`delete_handler` for `ws`
+    /// park mid-call — `listed` fires with the stale result already
+    /// computed, `deleting` fires inside the delete before the row is
+    /// removed: the "listed before the commit" window finding 4 names.
+    struct GateStore {
+        inner: Arc<durable_accounts::Memory>,
+        ws: u64,
+        listed: Gate,
+        deleting: Gate,
+    }
+
+    use durable_accounts::{ApiKeyInfo, HandlerRegistration, KeyGrant, Workspace};
+
+    #[async_trait::async_trait]
+    impl AccountStore for GateStore {
+        async fn verify_key(&self, h: &[u8; 32]) -> Result<Option<KeyGrant>, AccountError> {
+            self.inner.verify_key(h).await
+        }
+        async fn workspace_by_id(&self, id: u64) -> Result<Option<Workspace>, AccountError> {
+            self.inner.workspace_by_id(id).await
+        }
+        async fn workspace_by_public_id(
+            &self,
+            public_id: uuid::Uuid,
+        ) -> Result<Option<Workspace>, AccountError> {
+            self.inner.workspace_by_public_id(public_id).await
+        }
+        async fn create_workspace(&self, name: &str) -> Result<Workspace, AccountError> {
+            self.inner.create_workspace(name).await
+        }
+        async fn list_workspaces(
+            &self,
+            limit: u32,
+            after: Option<u64>,
+        ) -> Result<Vec<Workspace>, AccountError> {
+            self.inner.list_workspaces(limit, after).await
+        }
+        async fn create_key(
+            &self,
+            workspace: u64,
+            name: &str,
+            permission: Permission,
+            key_hash: &[u8; 32],
+            prefix: &str,
+        ) -> Result<ApiKeyInfo, AccountError> {
+            self.inner
+                .create_key(workspace, name, permission, key_hash, prefix)
+                .await
+        }
+        async fn revoke_key(
+            &self,
+            workspace: u64,
+            key_id: u64,
+        ) -> Result<Option<[u8; 32]>, AccountError> {
+            self.inner.revoke_key(workspace, key_id).await
+        }
+        async fn list_keys(&self, workspace: u64) -> Result<Vec<ApiKeyInfo>, AccountError> {
+            self.inner.list_keys(workspace).await
+        }
+        async fn list_handlers(
+            &self,
+            workspace: u64,
+        ) -> Result<Vec<HandlerRegistration>, AccountError> {
+            let r = self.inner.list_handlers(workspace).await;
+            if workspace == self.ws && r.is_ok() {
+                self.listed.trip().await;
+            }
+            r
+        }
+        async fn put_handler(
+            &self,
+            workspace: u64,
+            name: &str,
+            url: &str,
+        ) -> Result<(), AccountError> {
+            self.inner.put_handler(workspace, name, url).await
+        }
+        async fn delete_handler(&self, workspace: u64, name: &str) -> Result<bool, AccountError> {
+            if workspace == self.ws {
+                self.deleting.trip().await;
+            }
+            self.inner.delete_handler(workspace, name).await
+        }
+        async fn rotate_handler_secret(
+            &self,
+            workspace: u64,
+        ) -> Result<Option<[u8; 32]>, AccountError> {
+            self.inner.rotate_handler_secret(workspace).await
+        }
+    }
+
+    /// Finding 4 (S2): the epoch bumps *before* the store write, so a
+    /// pass that read the new epoch could still list the pre-commit row
+    /// — its apply then re-armed a deleted handler in the engine and
+    /// its snapshot put the row back in `handlers.json`. A DELETE and
+    /// a pass's list+apply of the same workspace are each one critical
+    /// section now: whichever runs second sees the other's result, so
+    /// the row can never come back.
+    ///
+    /// The gate store makes the interleave deterministic: the delete is
+    /// parked inside `store.delete_handler` while a pass is started —
+    /// under the fix that pass cannot reach its own `list_handlers`
+    /// until the delete releases the workspace's stripe.
+    #[tokio::test]
+    async fn a_deleted_handler_stays_deleted_through_a_reconcile_window() {
+        use durable_accounts::Memory;
+        let inner = Arc::new(Memory::new());
+        let a = inner
+            .create_workspace("a")
+            .await
+            .unwrap_or_else(|e| panic!("{e}"));
+        let key_a = "dr_cccccccccccccccccccccccccccccccccccccccccccccccc";
+        inner
+            .create_key(
+                a.id,
+                "k",
+                Permission::Admin,
+                &sha256(key_a.as_bytes()),
+                "dr_c",
+            )
+            .await
+            .unwrap_or_else(|e| panic!("{e}"));
+        inner
+            .put_handler(a.id, "h", "http://127.0.0.1:9/h")
+            .await
+            .unwrap_or_else(|e| panic!("{e}"));
+        let store = Arc::new(GateStore {
+            inner,
+            ws: a.id,
+            listed: Gate::new(),
+            deleting: Gate::new(),
+        });
+        let dyn_store: Arc<dyn AccountStore> = store.clone();
+        let h = harness_store(true, None, Some(dyn_store.clone()));
+        // The pre-delete state: `h` armed in the engine and present in
+        // the snapshot file — what a restart would see.
+        h.app
+            .engine
+            .put_handler(a.id, "h", Arc::new(Echo))
+            .await
+            .unwrap_or_else(|e| panic!("{e}"));
+        registry_file_upsert(
+            &h.app,
+            RegistryEntry {
+                ws: a.id,
+                name: "h".into(),
+                url: "http://127.0.0.1:9/h".into(),
+                secret: None,
+            },
+        )
+        .await;
+
+        // The DELETE through its real route: bump → stripe → store →
+        // engine → file. `deleting` trips inside the store write.
+        let del = {
+            let router = h.router.clone();
+            tokio::spawn(
+                async move { call(&router, "DELETE", "/handlers/h", Some(key_a), None).await },
+            )
+        };
+        store.deleting.wait().await;
+
+        // The property under test: while a mutation of this workspace
+        // is in flight, its stripe is held — an unfixed tree lets a
+        // reconcile read through right here.
+        let held = h.app.registry_locks.stripe(a.id).try_lock().is_err();
+
+        let pass = {
+            let engine = h.app.engine.clone();
+            let factory = Arc::clone(&h.app.handler_factory);
+            let flags = Arc::clone(&h.app.flag_handlers);
+            let tx = h.app.registry_tx.clone();
+            let epoch = Arc::clone(&h.app.registry_epoch);
+            let locks = Arc::clone(&h.app.registry_locks);
+            tokio::spawn(async move {
+                registry_sync(&dyn_store, &engine, &factory, &flags, &tx, &epoch, &locks).await
+            })
+        };
+        if held {
+            // Serialized: finish the delete first — the pass waits on
+            // the stripe, then lists the post-delete truth.
+            store.deleting.release();
+            let (status, v) = del.await.unwrap_or_else(|e| panic!("{e}"));
+            assert_eq!(status, StatusCode::OK, "{v}");
+            store.listed.wait().await;
+            store.listed.release();
+            pass.await
+                .unwrap_or_else(|e| panic!("{e}"))
+                .unwrap_or_else(|e| panic!("{e}"));
+        } else {
+            // Unfixed behaviour, driven deterministically: the pass
+            // lists the pre-delete row and parks; the delete commits
+            // beneath it; the stale apply re-arms `h` and the stale
+            // snapshot rewrites the row.
+            store.listed.wait().await;
+            store.deleting.release();
+            let (status, v) = del.await.unwrap_or_else(|e| panic!("{e}"));
+            assert_eq!(status, StatusCode::OK, "{v}");
+            store.listed.release();
+            pass.await
+                .unwrap_or_else(|e| panic!("{e}"))
+                .unwrap_or_else(|e| panic!("{e}"));
+        }
+
+        // Store truth and file mirror are identical under both
+        // orderings — what must never diverge is the engine: a deleted
+        // handler must not re-admit work.
+        assert!(
+            store
+                .inner
+                .list_handlers(a.id)
+                .await
+                .unwrap_or_else(|e| panic!("{e}"))
+                .is_empty(),
+            "the store row is gone"
+        );
+        let rows = load_registry_file(&h.app.registry_file);
+        assert!(
+            !rows.iter().any(|e| e.ws == a.id && e.name == "h"),
+            "handlers.json resurrected the deleted row: {rows:?}"
+        );
+        let spec = json!({"op_key": "after", "spec": {"version": 1,
+            "steps": [{"name": "s", "handler": "h"}], "input_b64": "aGk="}});
+        let (status, v) = call(&h.router, "POST", "/jobs", Some(key_a), Some(spec)).await;
+        assert_eq!(
+            (status, v["code"].as_str()),
+            (StatusCode::CONFLICT, Some("unregistered_handler")),
+            "the deleted handler admitted work again: {v}"
+        );
     }
 
     /// S2-5, the packet assertion: a handler URL whose *name* resolves
