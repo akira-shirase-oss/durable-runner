@@ -1279,7 +1279,16 @@ async fn actor(
                     pipe.answer(core.last_index(), reply, r);
                 }
                 Some(Cmd::Cancel { run, reply }) => {
+                    // The run may hold scheduler memory: a parked entry
+                    // (handler dead past grace) or a dead_since marker
+                    // (in grace). Drop both now — a cancelled run's entry
+                    // must not wait on its dead handler's return (S2
+                    // re-review N2).
+                    let ws = core.run(run).map(|r| r.ws);
                     let r = core.cancel(run, wall_ms()).map(|_| ());
+                    if let Some(w) = ws {
+                        exec!().untrack(w, run);
+                    }
                     if let Err(e) = &r {
                         mon.returned(e);
                     }
@@ -1306,14 +1315,14 @@ async fn actor(
                 }
                 Some(Cmd::PutHandler { ws, name, handler, reply }) => {
                     pipe.answer(core.last_index(), reply, registry.put(ws, &name, handler));
-                    exec!().unpark(ws); // a handler's return revives parked runs
+                    exec!().unpark(&core, ws); // a handler's return revives parked runs
                 }
                 Some(Cmd::DeleteHandler { ws, name }) => {
                     registry.remove(ws, &name);
                 }
                 Some(Cmd::SetWorkspaceHandlers { ws, handlers, reply }) => {
                     pipe.answer(core.last_index(), reply, registry.set_ws(ws, handlers));
-                    exec!().unpark(ws);
+                    exec!().unpark(&core, ws);
                 }
                 None => {
                     pipe.shutdown().await;
@@ -1786,17 +1795,44 @@ impl Exec<'_> {
         self.spawned.insert(handle.id(), (run, step));
     }
 
+    /// Drop every scheduler entry a run holds — an in-grace `dead_since`
+    /// marker and a parked entry (S2 re-review N2). Called when the run
+    /// leaves waiting for a reason no queue pass will see: a cancel.
+    fn untrack(&mut self, ws: u64, run: RunId) {
+        self.dead_since.remove(&run);
+        if let Some(v) = self.parked.get_mut(&ws) {
+            v.retain(|p| p.0 != run);
+            if v.is_empty() {
+                self.parked.remove(&ws);
+            }
+        }
+    }
+
     /// A registry change on `ws` may bring a parked run's handler back:
     /// re-queue every parked entry whose name resolves again, still
-    /// longest-waiting-first at the queue's head. A run that left its
-    /// waiting state while parked re-queues stale and refuses its
-    /// dispatch like any other skipped entry.
-    fn unpark(&mut self, ws: u64) {
+    /// longest-waiting-first at the queue's head. Entries whose run left
+    /// waiting while parked (a cancel lands nowhere else) are pruned
+    /// here — the map is the only other place they could die.
+    fn unpark(&mut self, core: &EngineCore, ws: u64) {
         let Some(mut entries) = self.parked.remove(&ws) else {
             return;
         };
         let mut i = 0;
         while i < entries.len() {
+            // A run that left waiting while parked (cancelled, expired)
+            // drops out here — parked entries must not outlive the run's
+            // interest in dispatch (S2 re-review N2).
+            let run = entries[i].0;
+            let waiting = core.run(run).is_some_and(|r| {
+                matches!(
+                    r.state,
+                    RunState::Queued { .. } | RunState::RetryWaiting { .. }
+                )
+            });
+            if !waiting {
+                entries.swap_remove(i);
+                continue;
+            }
             if self.registry.contains(ws, &entries[i].3) {
                 let (run, step, attempt, _) = entries.swap_remove(i);
                 // Absent-or-empty queue ⇔ the workspace is not in the
@@ -1852,10 +1888,22 @@ fn tick(core: &mut EngineCore, exec: &mut Exec<'_>) {
         if let Some(call) = exec.live.remove(&(run, step)) {
             call.abort(); // frees its permit; the remote effect is reconciled
         }
-        let effects = exec
-            .mon
-            .effects(core.step_finished(run, step, None, None, now));
-        run_effects(core, exec, effects, run, None, None);
+        match core.step_finished(run, step, None, None, now) {
+            Ok(effects) => run_effects(core, exec, effects, run, None, None),
+            Err(e) => {
+                let stale = matches!(e, EngineError::Refused(_));
+                exec.mon.handled(&e);
+                if stale {
+                    continue; // the run moved on without the popped entry
+                }
+                // A real commit error (NoSpace, a failed group commit):
+                // the attempt still owes its lost-reply record — put the
+                // deadline back and stop the sweep; every step_finished
+                // behind it fails the same way (S2 re-review N1).
+                core.requeue_deadline(run);
+                break;
+            }
+        }
     }
     // Probes that found no permit or workspace share when their run
     // started reconciling. Each entry gets ONE try per tick, bounded by
@@ -1941,9 +1989,11 @@ fn tick(core: &mut EngineCore, exec: &mut Exec<'_>) {
                         )
                     })
                 }) else {
+                    exec.dead_since.remove(&run); // the run is gone entirely
                     continue; // stale queue entry — spec/step the run lost
                 };
                 if !waiting {
+                    exec.dead_since.remove(&run); // in-grace marker dies with the wait
                     continue; // cancelled or already dispatched — stale
                 }
                 if !exec.registry.contains(ws, &name) {
@@ -1979,8 +2029,20 @@ fn tick(core: &mut EngineCore, exec: &mut Exec<'_>) {
                 // whole pool in a single tick.
                 let slot = WsSlot::take(exec.inflight, ws);
                 if let Err(e) = core.dispatch(run, step, attempt, now) {
-                    exec.mon.handled(&e); // stale claim; permit + slot return
-                    continue;
+                    let stale = matches!(e, EngineError::Refused(_));
+                    exec.mon.handled(&e);
+                    if stale {
+                        continue; // stale claim; permit + slot return
+                    }
+                    // A real commit error (NoSpace, a failed group
+                    // commit): the entry is live work, not a stale claim
+                    // — put it back and end the tick; every dispatch
+                    // behind it fails the same way (S2 re-review N1:
+                    // dropping it left runs queued-with-no-index-entry
+                    // until a restart's recount).
+                    queue.push_front((run, step, attempt));
+                    starved = true;
+                    break;
                 }
                 exec.fire(core, run, step, permit, slot);
                 budget -= 1;
@@ -3161,6 +3223,61 @@ mod tests {
         assert_eq!(sched.attempts.len(), 3);
     }
 
+    /// S2 re-review N1: a dispatch whose commit fails for a real reason
+    /// (NoSpace) keeps its queue entry — it is live work, not a stale
+    /// claim — and the run dispatches on a later tick once space is back,
+    /// with no restart. The unfixed code dropped every queued entry on
+    /// the error, leaving runs queued-but-unindexed until a recount.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_failed_dispatch_keeps_its_queue_entry() {
+        let d = tempfile::tempdir().unwrap_or_else(|e| panic!("{e}"));
+        let free = Arc::new(std::sync::atomic::AtomicU64::new(u64::MAX));
+        let probe_free = free.clone();
+        let mut core = EngineCore::open_with(
+            d.path(),
+            JournalOptions {
+                space: durable_journal::SpaceProbe::new(move |_| {
+                    Ok(probe_free.load(std::sync::atomic::Ordering::SeqCst))
+                }),
+                ..JournalOptions::default()
+            },
+        )
+        .unwrap_or_else(|e| panic!("{e}"));
+        core.submit(OperationKey("k".into()), spec1("hang"), wall_ms())
+            .unwrap_or_else(|e| panic!("{e}"));
+        let mut reg = Registry::default();
+        reg.register("hang", Arc::new(HangAlways));
+        let mut sched = Sched::new(8);
+        // Space at exactly the reserve: `space_ok` still admits the tick
+        // but the commit is refused NoSpace — the entry must survive,
+        // queued again, not dropped.
+        free.store(
+            durable_journal::DEFAULT_RESERVE_BYTES,
+            std::sync::atomic::Ordering::SeqCst,
+        );
+        {
+            let mut ex = sched.exec(&reg, 64, 0, 8);
+            tick(&mut core, &mut ex);
+        }
+        assert_eq!(
+            sched.due_by_ws.get(&0).map(VecDeque::len),
+            Some(1),
+            "the NoSpace-dropped entry left the queue"
+        );
+        assert_eq!(sched.attempts.len(), 0, "nothing dispatched while full");
+        // Space back: the queued entry dispatches on the next tick.
+        free.store(u64::MAX, std::sync::atomic::Ordering::SeqCst);
+        {
+            let mut ex = sched.exec(&reg, 64, 0, 8);
+            tick(&mut core, &mut ex);
+        }
+        assert_eq!(sched.attempts.len(), 1, "the run never dispatched");
+        assert!(
+            sched.due_by_ws.get(&0).is_none_or(VecDeque::is_empty),
+            "the entry was not consumed by dispatch"
+        );
+    }
+
     /// A workspace at its in-flight share is skipped whole — its queued
     /// entries are not examined at all (finding 5). The O(1) skip is the
     /// evidence: a second tick over a full workspace's forty-deep queue
@@ -3257,7 +3374,7 @@ mod tests {
         reg.put(0, "ghost", Arc::new(h.clone()))
             .unwrap_or_else(|e| panic!("{e}"));
         let mut ex = sched.exec(&reg, 64, 0, 8);
-        ex.unpark(0);
+        ex.unpark(&core, 0);
         tick(&mut core, &mut ex);
         assert_eq!(
             ex.examined, 1,
@@ -3281,6 +3398,69 @@ mod tests {
                 .unwrap_or(0),
             1,
             "the parked run's handler was finally called"
+        );
+    }
+
+    /// S2 re-review N2: a cancelled run drops its scheduler entries —
+    /// the parked slot and the in-grace dead_since marker — at cancel
+    /// time, not whenever its dead handler happens to return. Without
+    /// the drop, a register/submit/delete/cancel cycle accumulates an
+    /// entry per cancelled run forever.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_cancelled_dead_handler_run_leaves_no_scheduler_entry() {
+        let d = tempfile::tempdir().unwrap_or_else(|e| panic!("{e}"));
+        let mut core = EngineCore::open(d.path()).unwrap_or_else(|e| panic!("{e}"));
+        let parked_run = core
+            .submit(OperationKey("parked".into()), spec1("ghost"), wall_ms())
+            .unwrap_or_else(|e| panic!("{e}"));
+        let grace_run = core
+            .submit(OperationKey("grace".into()), spec1("ghost"), wall_ms())
+            .unwrap_or_else(|e| panic!("{e}"));
+        let reg = Registry::default(); // "ghost" never registered
+        let mut sched = Sched::new(8);
+        // Park the first run (grace 0) — the second is parked directly
+        // for the unpark-prune check below.
+        {
+            let mut ex = sched.exec(&reg, 64, 0, 8);
+            tick(&mut core, &mut ex);
+        }
+        assert_eq!(sched.parked.get(&0).map(Vec::len), Some(2));
+        sched.dead_since.insert(grace_run, wall_ms()); // an in-grace marker survives
+                                                       // The cancel path drops both collections' entries for the run.
+        core.cancel(parked_run, wall_ms())
+            .unwrap_or_else(|e| panic!("{e}"));
+        core.cancel(grace_run, wall_ms())
+            .unwrap_or_else(|e| panic!("{e}"));
+        {
+            let mut ex = sched.exec(&reg, 64, 0, 8);
+            ex.untrack(0, parked_run);
+            ex.untrack(0, grace_run);
+        }
+        assert!(
+            sched.parked.get(&0).is_none_or(Vec::is_empty),
+            "a cancelled run's parked entry survived"
+        );
+        assert!(
+            sched.dead_since.is_empty(),
+            "a cancelled run's in-grace marker survived"
+        );
+        // And the reconcile-time sweep prunes a cancelled parked run
+        // even when nothing tracked the cancel (belt for the same leak).
+        let stale = core
+            .submit(OperationKey("stale".into()), spec1("ghost"), wall_ms())
+            .unwrap_or_else(|e| panic!("{e}"));
+        {
+            let mut ex = sched.exec(&reg, 64, 0, 8);
+            tick(&mut core, &mut ex);
+        }
+        assert_eq!(sched.parked.get(&0).map(Vec::len), Some(1));
+        core.cancel(stale, wall_ms())
+            .unwrap_or_else(|e| panic!("{e}"));
+        let mut ex = sched.exec(&reg, 64, 0, 8);
+        ex.unpark(&core, 0);
+        assert!(
+            sched.parked.get(&0).is_none_or(Vec::is_empty),
+            "unpark kept a cancelled run's entry"
         );
     }
 

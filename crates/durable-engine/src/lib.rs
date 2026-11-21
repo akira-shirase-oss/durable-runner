@@ -1394,6 +1394,20 @@ impl EngineCore {
         out
     }
 
+    /// Put a popped deadline back: the sweep's commit failed for a reason
+    /// other than a refusal (NoSpace, a poisoned writer), so the attempt
+    /// still owes its lost-reply record — the entry re-derives from the
+    /// run's own state, and a run that moved on queues nothing (S2
+    /// re-review N1: dropping it left Running runs unindexed until the
+    /// next restart's recount).
+    pub fn requeue_deadline(&mut self, run: RunId) {
+        if let Some(r) = self.runs.get(&run) {
+            if let Some((d, step)) = deadline_entry(&r.state) {
+                self.deadline_index.insert((d, run), step);
+            }
+        }
+    }
+
     /// One page newest first for one workspace: up to `limit` runs with
     /// id < `before` (all when `None`), ids descending, plus the cursor
     /// for the next page. See `page` for the scan note.
