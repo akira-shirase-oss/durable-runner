@@ -266,6 +266,15 @@ pub const MAX_PAGE: usize = 1000;
 /// `min(first + grace, now + this)` still parks on the exact deadline.
 const DEAD_RECHECK_MS: u64 = 1_000;
 
+/// While a batch rides the writer pipeline, outbound accumulates until
+/// at least this many records are queued — fsyncs then carry real groups
+/// and the writer's own gather merges what is already in its channel.
+/// The moment the pipeline is idle, whatever has accumulated ships. The
+/// strict one-batch gate serialized every fsync through the actor's wake
+/// latency (~tens of ms under a saturated offer), capping durable
+/// throughput near one tiny batch per cycle.
+const MIN_SHIP_RECORDS: usize = 256;
+
 /// Which end a list page starts from, with its cursor.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Order {
@@ -863,11 +872,15 @@ impl Pipeline {
         }
     }
 
-    /// Hand queued messages to the writer, but only once everything sent
-    /// before is durable: one batch is in flight while the next one
-    /// accumulates (that is the group commit). False if the writer is gone.
+    /// Hand queued messages to the writer the moment it is idle, and
+    /// while it is busy once at least `MIN_SHIP_RECORDS` have accumulated:
+    /// several batches ride the fsync pipeline so the writer never waits
+    /// on the actor's wake latency between fsyncs (that is the group
+    /// commit). False if the writer is gone.
     fn flush(&mut self) -> bool {
-        if self.sent_upto > self.durable || self.outbound.is_empty() {
+        if self.outbound.is_empty()
+            || (self.sent_upto > self.durable && self.outbound_records < MIN_SHIP_RECORDS)
+        {
             return true;
         }
         let Some(tx) = &self.tx else { return true };
@@ -3443,6 +3456,63 @@ mod tests {
             Some(1),
             "the flap restarted the grace clock — the entry did not park"
         );
+    }
+
+    fn pipe(
+        sent_upto: u64,
+        durable: u64,
+        records: usize,
+    ) -> (Pipeline, std::sync::mpsc::Receiver<WriterMsg>) {
+        let (tx, rx) = std::sync::mpsc::sync_channel(8);
+        let mut p = Pipeline::new(Some((tx, std::thread::spawn(|| ()))), 1024, 4 << 20);
+        p.sent_upto = sent_upto;
+        p.durable = durable;
+        if records > 0 {
+            let bytes = 8 * records;
+            p.outbound.push_back(WriterMsg::Append {
+                records: vec![vec![0u8; 8]; records],
+                bytes,
+                upto: sent_upto + records as u64,
+            });
+            p.outbound_records = records;
+            p.outbound_bytes = bytes;
+        }
+        (p, rx)
+    }
+
+    #[test]
+    fn a_busy_writer_pipeline_still_gets_fed() {
+        // Regression for the one-batch-in-flight gate: it withheld every
+        // later batch until the previous fsync reported durable, so each
+        // fsync paid a full actor wake round trip (~tens of ms under a
+        // saturated offer — the 1M battery's submit-latency collapse).
+        // A busy pipeline must ship once MIN_SHIP_RECORDS accumulate.
+        let (mut p, rx) = pipe(1, 0, MIN_SHIP_RECORDS + 44);
+        assert!(p.flush());
+        let shipped: usize = rx.try_iter().map(|m| m.records()).sum();
+        assert_eq!(
+            shipped,
+            MIN_SHIP_RECORDS + 44,
+            "a busy pipeline shipped {shipped} records"
+        );
+    }
+
+    #[test]
+    fn a_busy_writer_pipeline_coalesces_small_accumulations() {
+        // The other half of the gate: below MIN_SHIP_RECORDS, keep
+        // accumulating so fsyncs carry real groups (the
+        // queued_commits_share_one_fsync property), then ship the moment
+        // the pipeline drains.
+        let (mut p, rx) = pipe(1, 0, MIN_SHIP_RECORDS - 156);
+        assert!(p.flush());
+        assert_eq!(
+            rx.try_iter().count(),
+            0,
+            "small accumulations shipped early"
+        );
+        p.durable = p.sent_upto;
+        assert!(p.flush());
+        assert_eq!(rx.try_iter().count(), 1, "an idle pipeline did not ship");
     }
 
     /// A workspace at its in-flight share is skipped whole — its queued

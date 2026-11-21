@@ -371,6 +371,11 @@ async function startServer(journalDir, extra = []) {
 let submit503s = 0;
 let submitRetries = 0;
 let submitTcpRefusals = 0;
+// Refusals by errno — ECONNREFUSED is the server's accept queue pacing
+// us; EADDRNOTAVAIL/EPROTO are the HARNESS out of ephemeral ports or
+// sockets, a different diagnosis entirely (the 1M battery miss at
+// 44881585860 lumped them together as "tcp refusals").
+const submitTcpByCode = {};
 // One op, retried against honest backpressure until `until` (absolute ms;
 // default +90 s). Within the budget a 503 or a kernel refusal is pacing —
 // the op keeps retrying; the old fixed 90 s cap abandoned it mid-run and
@@ -415,6 +420,7 @@ async function submit(opKey, steps = 1, auth = AUTH, until = performance.now() +
       const code = e.name === 'AbortError' ? 'hung' : (e.cause?.code ?? e.code ?? 'error');
       if (performance.now() < until) {
         submitTcpRefusals++;
+        submitTcpByCode[code] = (submitTcpByCode[code] ?? 0) + 1;
         submitRetries += Math.max(0, attempts - 1);
         await sleep(150);
         continue;
@@ -636,7 +642,7 @@ async function runSustained() {
   const h = startHandler('ok'); const s = await startServer(`${dir}/journal`);
   const hst = new LatHist(); const acceptHst = new LatHist(); const codes = {};
   let sent = 0, accepted = 0;
-  const MAX_PENDING = 4096;
+  const MAX_PENDING = +(process.env.DR_LOAD_MAX_PENDING || 384); // below the server's default --max-connections 512: deeper offers pile sockets into the kernel accept queue and the run measures TCP refusal storms, not the engine
   const pending = new Set();
   const t0 = now();
   const phaseEnd = t0 + submitBudgetMs;
@@ -684,7 +690,7 @@ async function runSustained() {
       submit_budget_ms: submitBudgetMs, drain_budget_ms: drainBudgetMs, smoke: SMOKE,
     },
     sent, accepted, done_after_drain: done, http_codes: codes,
-    backpressure: { at_capacity_503s: submit503s, tcp_refusals: submitTcpRefusals, retries: submitRetries },
+    backpressure: { at_capacity_503s: submit503s, tcp_refusals: submitTcpRefusals, tcp_refusals_by_code: { ...submitTcpByCode }, retries: submitRetries },
     wall_clock_s: Math.round((now() - t0) / 1000),
     submit_phase_s: Math.round(submitSecs),
     accept_rate_per_s: submitSecs > 0 ? Math.round(accepted / submitSecs) : accepted,
@@ -769,7 +775,7 @@ async function runWorkspaces() {
   // connection and buffers, one leak per op for the whole run.
   let churnDone = false; let churnOps = 0, churnErrors = 0;
   const churn = (async () => {
-    while (!churnDone) {
+    while (!churnDone && !process.env.DR_LOAD_NO_CHURN) {
       try {
         const put = await fetch(`${API}/handlers/churn`, {
           method: 'PUT', headers: { 'content-type': 'application/json', ...keys[0].auth },
@@ -797,7 +803,7 @@ async function runWorkspaces() {
   const submitBudgetMs = Number(args.submit_budget_ms ?? Math.round((per * n / 50) * 1000));
   const hst = new LatHist(); const acceptHst = new LatHist(); const codes = {};
   let sent = 0, accepted = 0;
-  const MAX_PENDING = 4096;
+  const MAX_PENDING = +(process.env.DR_LOAD_MAX_PENDING || 384); // below the server's default --max-connections 512: deeper offers pile sockets into the kernel accept queue and the run measures TCP refusal storms, not the engine
   const pending = new Set();
   const t0 = now();
   const phaseEnd = t0 + submitBudgetMs;
@@ -815,7 +821,9 @@ async function runWorkspaces() {
       pending.add(p);
     }
     if (pending.size >= MAX_PENDING) await waitSettle();
-    if (i % 100 === 0) await sleep(50);
+    // DR_LOAD_NO_PACE drops the 50 ms cadence — used to find the
+    // server's knee when the paced offer sits below it.
+    if (i % 100 === 0 && !process.env.DR_LOAD_NO_PACE) await sleep(50);
     if (i > 0 && i % 25_000 === 0) {
       console.log(`${sent} sent, ${accepted} accepted @${((now() - t0) / 1000).toFixed(0)}s`);
     }
@@ -928,7 +936,7 @@ async function runWorkspaces() {
       submit_budget_ms: submitBudgetMs, drain_budget_ms: drainBudgetMs, smoke: SMOKE,
     },
     sent, accepted, http_codes: codes,
-    backpressure: { at_capacity_503s: submit503s, tcp_refusals: submitTcpRefusals, retries: submitRetries },
+    backpressure: { at_capacity_503s: submit503s, tcp_refusals: submitTcpRefusals, tcp_refusals_by_code: { ...submitTcpByCode }, retries: submitRetries },
     per_workspace: pageCounts, churn_registrations: churnOps, churn_errors: churnErrors,
     done_after_drain: done, drain_seconds: Math.round(drainSecs),
     drain_runs_per_s: drainSecs > 0 ? Math.round(done / drainSecs) : done,

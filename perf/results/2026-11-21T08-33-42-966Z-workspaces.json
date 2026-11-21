@@ -1,0 +1,95 @@
+{
+  "machine": {
+    "host": "maintainer-laptop",
+    "platform": "darwin/arm64",
+    "cpu": "Apple M2 Pro",
+    "cores": 12,
+    "mem_gb": 32,
+    "date": "2026-11-21T08:33:42.966Z",
+    "commit": "93797f7"
+  },
+  "scenario": "workspaces",
+  "peak_heap_mb": 125,
+  "params": {
+    "workspaces": 4,
+    "submits_per_workspace": 25000,
+    "account_backend": "memory",
+    "submit_budget_ms": 2000000,
+    "drain_budget_ms": 1800000,
+    "smoke": false
+  },
+  "sent": 100000,
+  "accepted": 100000,
+  "http_codes": {
+    "200": 100000
+  },
+  "backpressure": {
+    "at_capacity_503s": 0,
+    "tcp_refusals": 257,
+    "tcp_refusals_by_code": {
+      "ECONNRESET": 257
+    },
+    "retries": 257
+  },
+  "per_workspace": {
+    "01a1fd3c-f286-7224-b0ee-876d74fb4db5": {
+      "runs": 25000,
+      "pages": 25
+    },
+    "01a1fd3c-f28c-737e-9da9-4559695b4a0a": {
+      "runs": 25000,
+      "pages": 25
+    },
+    "01a1fd3c-f28f-75a8-b762-7f6e7088ce2a": {
+      "runs": 25000,
+      "pages": 25
+    },
+    "01a1fd3c-f292-7743-a9e5-e7b3350df598": {
+      "runs": 25000,
+      "pages": 25
+    }
+  },
+  "churn_registrations": 378,
+  "churn_errors": 1,
+  "done_after_drain": 100000,
+  "drain_seconds": 6,
+  "drain_runs_per_s": 16636,
+  "submit_phase_s": 19,
+  "accept_rate_per_s": 5178,
+  "handler_calls": {
+    "signed": 100000,
+    "unsigned": 0,
+    "signedProbes": 2,
+    "unsignedProbes": 0
+  },
+  "identity": {
+    "suspects_cross": 0,
+    "suspects_self": 0,
+    "suspect_overflow": false,
+    "shared_verified": [],
+    "dupes_verified": [],
+    "sample_leaks": []
+  },
+  "latency_ms": {
+    "p50": 27,
+    "p99": 104,
+    "max": 5919.613,
+    "note": "bucket upper edges: 1 ms to 2 s, x2 to ~4.4 min (true pXX <= value)"
+  },
+  "accept_latency_ms": {
+    "p50": 27,
+    "p99": 110,
+    "max": 5919.613,
+    "note": "bucket upper edges: 1 ms to 2 s, x2 to ~4.4 min (true pXX <= value)"
+  },
+  "thresholds": {
+    "accepted": "every offered op admitted within the submit budget",
+    "sized": "25000 runs per workspace, no id listed twice",
+    "disjoint": "no run id shared across workspaces (bloom + exact checks)",
+    "oracle": "foreign run id → 404",
+    "done": "every accepted run within 1800s drain",
+    "signed": "every handler call signed",
+    "p99_ms": "<2000 per-attempt response"
+  },
+  "verdict": "pass"
+}
