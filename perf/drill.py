@@ -68,6 +68,10 @@ def heavy_lock():
         held = os.fstat(9)
         lock = os.stat(HEAVY_LOCK)
         if (held.st_dev, held.st_ino) == (lock.st_dev, lock.st_ino):
+            # The fd is the proof, and the proof is the LOCK: a relock
+            # on our inherited description never contends; an fd merely
+            # open on a contended lock would fail here (N5).
+            fcntl.flock(9, fcntl.LOCK_EX | fcntl.LOCK_NB)
             return None
     except OSError:
         pass

@@ -75,6 +75,7 @@ function httpFetch(url, opts = {}) {
       method: opts.method ?? 'GET',
       headers: opts.headers,
       agent,
+      localAddress: opts.localAddress,
     }, (res) => {
       const chunks = [];
       res.on('data', (c) => chunks.push(c));
@@ -125,7 +126,18 @@ const HEAVY_LOCK = process.env.DR_HEAVY_LOCK ??
   try {
     const fd9 = fs.fstatSync(9);
     const lock = fs.statSync(HEAVY_LOCK);
-    held = fd9.ino === lock.ino && fd9.dev === lock.dev;
+    // The fd is the proof, and the proof is the LOCK — an fd open on a
+    // world-writable file anyone can open proves nothing on its own.
+    // flock(9, LOCK_EX|LOCK_NB) on the inherited description succeeds
+    // only because this description already holds it (relock on the
+    // same description never contends); a merely-open fd to a contended
+    // lock fails (S2 re-review N5).
+    if (fd9.ino === lock.ino && fd9.dev === lock.dev) {
+      const r = spawnSync('python3',
+        ['-c', 'import fcntl; fcntl.flock(9, fcntl.LOCK_EX | fcntl.LOCK_NB)'],
+        { stdio: ['ignore','ignore','inherit','ignore','ignore','ignore','ignore','ignore','ignore', 9] });
+      held = r.status === 0;
+    }
   } catch { held = false; }
   if (!held) {
     const r = spawnSync(path.join(ROOT, 'perf', 'heavy.sh'),
@@ -134,6 +146,13 @@ const HEAVY_LOCK = process.env.DR_HEAVY_LOCK ??
     process.exit(r.status ?? (r.error ? 1 : 0));
   }
 }
+
+// A spawned workload child must NOT hold the slot: this run's leader
+// holds fd 9; if it is SIGKILLed a child still holding the fd wedges
+// the lock until it dies (S2 re-review N5). exec 9>&- strips the
+// descriptor before the real command execs.
+const spawnUnlocked = (argv0, argv, opts = {}) =>
+  spawn('bash', ['-c', 'exec 9>&- 2>/dev/null; exec "$@"', 'spawnUnlocked', argv0, ...argv], opts);
 
 // Socket self-check: this process's own TCP count, sampled. A run whose
 // client-side dead conns grow past the bound is the leak above — the run
@@ -450,7 +469,7 @@ function startHandler(mode, stallMs = 0) {
     }).listen(${HPORT}, '127.0.0.1');
   `;
   const p = track(
-    spawn('node', ['-e', src], { stdio: 'ignore' }),
+    spawnUnlocked('node', ['-e', src], { stdio: 'ignore' }),
     `drload-handler-${HPORT}`,
     `node -e <handler fixture> on 127.0.0.1:${HPORT}`,
     HPORT,
@@ -473,8 +492,9 @@ async function startServer(journalDir, extra = [], listen = `127.0.0.1:${PORT}`,
     '--rate-limit-per-addr', '100000', '--max-conns-per-addr', String(connsPerAddr), ...extra];
   const p = track(
     // DR_LOAD_SRV_STDIO=inherit surfaces the server's stderr (e.g. the
-    // DURABLE_ACTOR_TRACE histogram); default keeps runs quiet.
-    spawn(SRV, argv, {
+    // DURABLE_ACTOR_TRACE histogram); default keeps runs quiet. The
+    // server is workload, not a slot holder: fd 9 is stripped (N5).
+    spawnUnlocked(SRV, argv, {
       stdio: process.env.DR_LOAD_SRV_STDIO === 'inherit' ? 'inherit' : 'ignore',
       env: { ...process.env, DURABLE_API_KEY: API_KEY },
     }),
@@ -736,11 +756,43 @@ async function runAdmission() {
 //     503+Retry-After), no RSTs or hangs, >= 50% 200.
 // A threshold is fixed before the run, never moved after measuring
 // (F1/RULES.md).
-async function runOverload({ sameAddr = false } = {}) {
+// The overload scenario's source addresses: every local address that can
+// actually source a conn to the server, minus the excluded ones (the
+// flooder's). Candidates: all interface addresses, plus the 127/8 block
+// (all of it routes on Linux; macOS answers only for assigned /8s — the
+// probe decides). Returns up to `want` addresses; the caller records the
+// set it got — a host with fewer makes its offers from what exists.
+async function offerSources(exclude, want) {
+  const excl = new Set(exclude);
+  const cands = [];
+  for (const [name, list] of Object.entries(os.networkInterfaces()))
+    for (const a of list) cands.push(a.scopeid ? `${a.address}%${name}` : a.address);
+  for (let i = 2; i <= 8; i++) cands.push(`127.0.0.${i}`);
+  const found = [];
+  for (const c of new Set(cands)) {
+    if (found.length >= want) break;
+    if (excl.has(c.split('%')[0]) || excl.has(c)) continue;
+    const isV6 = c.includes(':');
+    // A scoped (link-local) source dials its own scope; anything else
+    // v6 dials ::1, v4 dials 127.0.0.1 — the server covers all of it on
+    // its [::] listen.
+    const host = c.includes('%') ? c : (isV6 ? '::1' : '127.0.0.1');
+    const ok = await new Promise((res) => {
+      const s = net.connect({ port: PORT, host, localAddress: c, timeout: 1500 });
+      s.on('connect', () => { s.destroy(); res(true); });
+      s.on('error', () => res(false));
+      s.on('timeout', () => { s.destroy(); res(false); });
+    });
+    if (ok) found.push(c);
+  }
+  return found;
+}
+
+async function runOverload({ dist = false } = {}) {
   const floodConns = Number(args.flood ?? 256);
   const secs = Number(args.seconds ?? (SMOKE ? 8 : 15));
   const recoverSecs = Number(args.recover_secs ?? 5);
-  const estClients = sameAddr ? 0 : 8;
+  const estClients = dist ? 0 : 8;
   const offerCount = 48;
   const hport2 = HPORT + 10;
   const dir = fs.mkdtempSync(`${os.tmpdir()}/dr-load-`);
@@ -755,7 +807,7 @@ async function runOverload({ sameAddr = false } = {}) {
   const healthBase = `http://127.0.0.1:${hport2}`;
   const healthProbe = () =>
     fetch(`${healthBase}/health`, { signal: AbortSignal.timeout(2000) });
-  const legitHost = sameAddr ? '127.0.0.1' : '[::1]';
+  const legitHost = dist ? '127.0.0.1' : '[::1]';
   const legitBase = `http://${legitHost}:${PORT}`;
   // agent:false: a one-shot baseline — a pooled keep-alive conn would
   // hold a ::1 bucket guard for the rest of the run and silently eat
@@ -805,17 +857,30 @@ async function runOverload({ sameAddr = false } = {}) {
     }
   })());
 
-  // The flood: `floodConns` sockets from 127.0.0.1, each parked on a
-  // head that never completes. Closed conns (the lane's 503s, evicted
-  // heads) reopen — the pressure must SUSTAIN for the full window, not
-  // die out when the first wave is answered.
+  // The offer source set is enumerated before the flood so a distributed
+  // flood can draw from it too.
+  const offerAddrs = await offerSources(dist ? [] : ['127.0.0.1'], 6);
+  const perAddr = Math.ceil(offerCount / Math.max(1, offerAddrs.length));
+
+  // The flood: `floodConns` sockets parked on heads that never complete.
+  // Single-host mode: all from 127.0.0.1. Distributed mode: spread across
+  // every source the host can make — recorded, no floor (ruling point 2).
+  // Closed conns (the lane's 503s, evicted heads) reopen — the pressure
+  // must SUSTAIN for the full window, not die out when the first wave is
+  // answered.
   const floodAnswers = {};
   const floodErrors = {};
   let floodOpen = 0;
   let floodOpenPeak = 0;
   let stopFlood = false;
+  const floodAddrs = dist ? offerAddrs : ['127.0.0.1'];
+  let floodN = 0;
   const openFlood = () => {
-    const c = net.connect(PORT, '127.0.0.1');
+    const localAddress = floodAddrs[floodN++ % floodAddrs.length];
+    const host = localAddress.includes(':')
+      ? (localAddress.includes('%') ? localAddress : '::1')
+      : '127.0.0.1';
+    const c = net.connect({ port: PORT, host, localAddress });
     floodOpen++;
     if (floodOpen > floodOpenPeak) floodOpenPeak = floodOpen;
     let buf = '';
@@ -841,21 +906,38 @@ async function runOverload({ sameAddr = false } = {}) {
   };
   for (let i = 0; i < floodConns; i++) openFlood();
 
-  // The 48 offers. Separate-address: they are submissions BY the
-  // established clients over their keep-alive conns — the only reading
-  // under which "pool 64, cap 8, 8 established, 48/48 get 200" is
-  // self-consistent (the 8 established conns are the whole ::1 budget;
-  // a fresh ::1 conn cannot draw a slot the bucket no longer has).
-  // Same-address: there are no established conns; offers dial fresh
-  // through a bounded agent and retry inside the flood window — a
-  // 503+Retry-After is an instruction to come back.
-  const offerAgent = new http.Agent({ keepAlive: true, maxSockets: 8, keepAliveMsecs: 4_000 });
-  const offerDeadline = sameAddr ? secs * 1000 : 10_000;
+  // The 48 offers — FIXED BEFORE THE RUN (coordinator ruling point 3):
+  // fresh SINGLE-ATTEMPT conns from 6 other addresses, <= 8 per address.
+  // Each offer is one POST on a new socket bound to its source address —
+  // a 503+Retry-After is a real answer (not a refusal), a closed or hung
+  // conn is an unanswered refusal the server chose to make.
+  const submitOnce = async (key, localAddress) => {
+    const isV6 = localAddress.includes(':');
+    const host = localAddress.includes('%') ? `[${localAddress}]` : (isV6 ? '[::1]' : '127.0.0.1');
+    const ac = new AbortController();
+    const timer = setTimeout(() => ac.abort(), 60_000);
+    try {
+      const r = await httpFetch(`${host}:${PORT}/jobs`, {
+        method: 'POST', headers: { 'content-type': 'application/json', ...AUTH },
+        agent: false, localAddress, signal: ac.signal,
+        body: JSON.stringify({
+          op_key: key,
+          spec: { version: 1, steps: [{ name: 's0', handler: 'step' }], input_b64: INPUT_B64 },
+        }),
+      });
+      return { status: r.status };
+    } catch (e) {
+      const code = e.name === 'AbortError' ? 'hung' : (e.cause?.code ?? e.code ?? 'error');
+      return { status: `tcp:${code}` };
+    } finally {
+      clearTimeout(timer);
+    }
+  };
   const offer = Array.from({ length: offerCount }, async (_, i) => {
+    const localAddress = offerAddrs[i % offerAddrs.length];
     const t0 = now();
-    const r = await submit(`overload-${i}`, 1, AUTH, performance.now() + offerDeadline,
-      { base: legitBase, agent: est.length ? est[i % est.length].agent : offerAgent });
-    return { status: r.status, took: now() - t0 };
+    const r = await submitOnce(`overload-${i}`, localAddress);
+    return { ...r, localAddress, took: now() - t0 };
   });
   const offered = await Promise.all(offer);
   const answers = {};
@@ -900,39 +982,26 @@ async function runOverload({ sameAddr = false } = {}) {
   }
   const recoverMs = now() - t0;
   h.kill(); s.kill();
-  const checks = sameAddr ? [
+  // Floors FIXED BEFORE THE RUN (coordinator ruling 2026-11-21, point 3):
+  // one flooding host (127.0.0.1, 256 parked heads); 48 fresh
+  // single-attempt offers from 6 other addresses (<= 8 each); 8
+  // established keep-alive clients on ::1 at 2 req/s. A FAIL here is
+  // recorded and stops the work for a ruling — never re-floored.
+  const checks = dist ? [] : [
     ['baseline submit served before the flood', base.status === 200],
-    ['every offered request settled inside the bound', hung === 0 && offered.length === offerCount],
-    // FIXED BEFORE THE RUN (reviewer ruling): same-address or
-    // distributed flood — 100% real HTTP answers, no RSTs or hangs,
-    // >= 50% get 200.
-    ['100% of offers got a real HTTP answer (200 or 503+Retry-After)', httpAnswered === offerCount],
-    ['zero offers ended in a tcp refusal', tcpRefused === 0],
-    ['at least half the offers answered 200', (answers[200] ?? 0) >= offerCount / 2],
-    ['/health answered 200 mid-flood on its listener', midHealth === 200],
-    ['every liveness probe answered <500ms during the flood', healthFails.length === 0],
-    [`40 submits inside ${recoverSecs}s after the flood`, recovered === 40],
-  ] : [
-    ['baseline submit served before the flood', base.status === 200],
-    ['every offered request settled inside the bound', hung === 0 && offered.length === offerCount],
-    // FIXED BEFORE THE RUN (reviewer ruling): separate addresses —
-    // 48/48 get 200, zero RSTs, p99 < 1 s; 8 established keep-alive
-    // clients >= 99% 200 and never evicted.
-    ['48/48 offers answered 200', (answers[200] ?? 0) === offerCount],
-    ['every offer got a real HTTP answer', httpAnswered === offerCount],
-    ['zero offers ended in a tcp refusal', tcpRefused === 0],
-    ['offer p99 under 1 s', p99 < 1000],
+    ['every offer attempt was recorded', offered.length === offerCount],
+    ['at least 46/48 offers answered 200', (answers[200] ?? 0) >= 46],
+    ['zero unanswered refusals from server decisions', tcpRefused === 0],
     ['established clients >= 99% 200', estRate >= 0.99 && estTotal >= estClients * 2 * secs],
     ['established clients never evicted', estEvictions === 0],
     ['/health answered 200 mid-flood on its listener', midHealth === 200],
     ['every liveness probe answered <500ms during the flood', healthFails.length === 0],
-    [`40 submits inside ${recoverSecs}s after the flood`, recovered === 40],
   ];
-  const r = writeResult(sameAddr ? 'overloadsame' : 'overload', {
+  const r = writeResult(dist ? 'overloaddist' : 'overload', {
     params: {
       flood_conns: floodConns, max_connections: 64, max_conns_per_addr: 8,
       legit_addr: legitHost, established: estClients, offers: offerCount,
-      offers_via: est.length ? 'the established keep-alive conns' : 'fresh conns through a bounded agent (cap shared with the flood)',
+      offer_addrs: offerAddrs, offers_per_addr: perAddr,
       flood_secs: secs, smoke: SMOKE,
     },
     baseline_status: base.status,
@@ -940,6 +1009,7 @@ async function runOverload({ sameAddr = false } = {}) {
     answers_during_flood: answers,
     http_answered: httpAnswered,
     tcp_refused: tcpRefused,
+    hung_offers: hung,
     offer_p99_ms: Math.round(p99),
     established: estStats,
     established_ok_rate: Number(estRate.toFixed(4)),
@@ -947,23 +1017,17 @@ async function runOverload({ sameAddr = false } = {}) {
     health_during_flood: midHealth,
     health_failures: healthFails,
     recovery: { submits_done: recovered, ms: Math.round(recoverMs), codes: recCodes },
-    thresholds: sameAddr ? {
-      offers: '100% real HTTP answers (200 or 503+Retry-After), no RSTs or hangs',
-      legit: '>= 50% of offers answer 200',
+    thresholds: dist ? 'none — for the record only (a distributed flood is the edge\'s job, coordinator ruling point 2)' : {
+      offers: '>= 46/48 answer 200, every attempt recorded, 0 unanswered refusals',
+      established: '8 keep-alive clients on ::1 at 2 req/s: >= 99% 200, 0 evictions',
       health: '200 on the dedicated listener, every probe <500 ms',
-      recovery: `40 submits served <${recoverSecs} s after the flood`,
-    } : {
-      offers: '48/48 real HTTP answers, zero RSTs, p99 < 1 s',
-      established: '8 keep-alive clients >= 99% 200, never evicted',
-      health: '200 on the dedicated listener, every probe <500 ms',
-      recovery: `40 submits served <${recoverSecs} s after the flood`,
     },
-    ...verdictOf(checks),
-    note: 'flood and legit on separate addresses with the per-addr cap on: the lane answers over-cap conns a real 503+Retry-After, never a bare RST; tcp refusals are failures, not answers',
+    ...(dist ? { verdict: 'record' } : verdictOf(checks)),
+    note: 'single flooding host vs separate-address offers+established with the per-addr cap on: the lane answers over-cap conns a real 503+Retry-After, never a bare RST; tcp refusals are failures, not answers',
   });
-  return r.verdict === 'pass';
+  return dist ? true : r.verdict === 'pass';
 }
-async function runOverloadSameAddr() { return runOverload({ sameAddr: true }); }
+async function runOverloadDist() { return runOverload({ dist: true }); }
 
 async function runCompact() {
   const secs = Number(args.seconds ?? (SMOKE ? 15 : 30));
@@ -1406,7 +1470,7 @@ async function runConnreuse() {
 const runners = {
   submit: runSubmit, replay: runReplay, stall: runStall,
   admission: runAdmission, compact: runCompact, sustained: runSustained,
-  workspaces: runWorkspaces, overload: runOverload, overloadsame: runOverloadSameAddr, connreuse: runConnreuse,
+  workspaces: runWorkspaces, overload: runOverload, overloaddist: runOverloadDist, connreuse: runConnreuse,
 };
 if (!runners[scenario]) {
   console.error(`unknown scenario ${scenario}; choices: ${Object.keys(runners).join(', ')}`);

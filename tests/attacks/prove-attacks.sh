@@ -45,6 +45,10 @@ mutations=(
   "body-deadline|crates/durable-server/src/main.rs|bodies|a_dribbled_body_is_cut_at_its_deadline|limits\.body_deadline~~>Duration::from_secs(3600)"
   "head-timeout|crates/durable-server/src/main.rs|bodies|a_partial_head_is_cut|limits\.header_timeout~~>Duration::from_secs(3600)"
   "submit-dedup|crates/durable-engine/src/lib.rs|replay|a_replayed_submit_returns_the_same_run|self\.by_op\.get\(&\(ws, key\.clone\(\)\)\)~~>Option::<&RunId>::None"
+  "deadline-drop|crates/durable-engine/src/shell.rs|unit:durable-engine|the_sweep_requeues_every_popped_deadline_on_commit_error|core\.requeue_deadline\(rest\)~~>let _ = &rest"
+  "liveness-flood|crates/durable-server/src/main.rs|unit:durable-server|health_survives_a_pinned_connection_pool|ready_pool\\.max\\(1\\)~~>ready_pool.min(0)"
+  "slot-camp|crates/durable-server/src/main.rs|unit:durable-server|a_fresh_head_gets_a_one_second_grace_then_dies_under_pressure|served_n == 0~~>false"
+  "overload-lane|crates/durable-server/src/main.rs|unit:durable-server|the_overload_lane_answers_conns_from_four_buckets|lane_answer\([^)]*\)~~>{ let _ = (lane_guard, lane_permit); drop(stream); }"
 )
 
 # Every marker in the source has exactly one mutation, and every mutation
@@ -98,9 +102,25 @@ for row in "${mutations[@]}"; do
     output="the mutated source no longer builds:\n$(tail -15 <<<"$build_out")"
     status=99
   else
-    output="$(cd "$here" && DURABLE_SERVER_BIN="$CARGO_TARGET_DIR/debug/durable-server" \
-        cargo test -p durable-attacks --locked --test "$target" -- --exact "$test" 2>&1)"
-    status=$?
+    case "$target" in
+      unit:*)
+        # A unit test lives inside the mutated crate: the mutated code
+        # IS the test binary, so it compiles and runs in the scratch
+        # tree — a red result there is the proof.
+        pkg="${target#unit:}"
+        unit_flag="--bin $pkg"
+        [ "$pkg" = "durable-engine" ] && unit_flag="--lib"
+        output="$(cd "$work" && cargo test -p "$pkg" $unit_flag --locked -- "$test" 2>&1)"
+        status=$?
+        ;;
+      *)
+        # An attacks-suite test drives the mutated binary, which is the
+        # scratch build DURABLE_SERVER_BIN points at.
+        output="$(cd "$here" && DURABLE_SERVER_BIN="$CARGO_TARGET_DIR/debug/durable-server" \
+            cargo test -p durable-attacks --locked --test "$target" -- --exact "$test" 2>&1)"
+        status=$?
+        ;;
+    esac
   fi
   set -e
   seconds=$(( $(date +%s) - started ))

@@ -1986,12 +1986,13 @@ fn tick_at(core: &mut EngineCore, exec: &mut Exec<'_>, now: Millis) {
                 // the attempt still owes its lost-reply record — put the
                 // deadline back and stop the sweep; every step_finished
                 // behind it fails the same way (S2 re-review N1).
-                // ATTACK(deadline-drop): pop_expired already removed the
-                // whole batch from the index — re-index every remaining
-                // entry, not just the failure, or crash-surviving Running
-                // runs strand here until a restart's recount (R1).
+                // pop_expired already removed the whole batch from the
+                // index — re-index every remaining entry, not just the
+                // failure, or crash-surviving Running runs strand here
+                // until a restart's recount (R1).
                 core.requeue_deadline(run);
                 for (rest, _step) in popped.by_ref() {
+                    // ATTACK(deadline-drop): without it the popped batch strands until restart.
                     core.requeue_deadline(rest);
                 }
                 break;

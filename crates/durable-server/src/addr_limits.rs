@@ -310,22 +310,46 @@ fn bucket_addr(addr: IpAddr, v6_prefix: u8) -> IpAddr {
     }
 }
 
-/// Per-peer open connections, counted by address bucket (v6 peers share
-/// the prefix bucket above). Over the cap the socket is refused at
-/// accept; the guard releases the slot when the connection ends. A peer
-/// inside the trusted-proxy ranges gets the larger `cap_trusted`: the
-/// peer is the proxy's edge, and one edge legitimately holds many real
-/// clients' connections (D-052). The global connection cap still bounds
-/// everything. The counts are kept even with no cap configured — the
-/// fair-share pressure yield reads them to evict only conns whose
-/// bucket holds more than its share of the pool.
+/// The bucket an address's fair share is counted under: a v4 address
+/// stands alone; a real v6 address's share is its /48 aggregate, so a
+/// host that owns a /48 cannot mint 65,536 share buckets (or escape the
+/// aggregate cap below) by spraying its /64s (S2 re-review N3, same
+/// convention as the rate limiter's /48 aggregate).
+fn share_bucket_addr(addr: IpAddr) -> IpAddr {
+    match addr {
+        IpAddr::V4(_) => addr,
+        IpAddr::V6(a) => match a.to_ipv4_mapped() {
+            Some(v4) => IpAddr::V4(v4),
+            None => IpAddr::V6(Ipv6Addr::from_bits(a.to_bits() & (!0u128 << (128 - 48)))),
+        },
+    }
+}
+
+/// The aggregate cap multiplier over a /48 — the rate limiter's
+/// convention, applied to connection counts (S2 re-review N3).
+const AGGREGATE_CAP_MULT: usize = 10;
+
+/// Per-peer open connections, counted under two keys: the configured
+/// prefix bucket for the per-address cap, and the /48 share bucket for
+/// the fair-share count and — for real v6 peers — an aggregate cap at
+/// `AGGREGATE_CAP_MULT` times the per-bucket cap. Over a cap the socket
+/// is refused at accept; the guard releases both slots when the
+/// connection ends. A peer inside the trusted-proxy ranges gets the
+/// larger `cap_trusted`: the peer is the proxy's edge, and one edge
+/// legitimately holds many real clients' connections (D-052). The
+/// global connection cap still bounds everything. The counts are kept
+/// even with no cap configured — fair-share accounting and the starved
+/// -accept eviction read them (S2 re-review F3 + N3).
 #[derive(Debug, Clone)]
 pub struct ConnLimit {
     cap_untrusted: usize,
     cap_trusted: usize,
     v6_prefix: u8,
-    counts: std::sync::Arc<std::sync::Mutex<HashMap<IpAddr, usize>>>,
+    counts: Counts,
 }
+
+// The dual counters: configured-prefix caps first, /48 share buckets second.
+type Counts = std::sync::Arc<std::sync::Mutex<(HashMap<IpAddr, usize>, HashMap<IpAddr, usize>)>>;
 
 impl ConnLimit {
     pub fn new(cap_untrusted: usize, cap_trusted: usize, v6_prefix: u8) -> Self {
@@ -333,7 +357,7 @@ impl ConnLimit {
             cap_untrusted,
             cap_trusted,
             v6_prefix: v6_prefix.min(128),
-            counts: std::sync::Arc::new(std::sync::Mutex::new(HashMap::new())),
+            counts: std::sync::Arc::new(std::sync::Mutex::new((HashMap::new(), HashMap::new()))),
         }
     }
 
@@ -343,49 +367,84 @@ impl ConnLimit {
         } else {
             self.cap_untrusted
         };
-        let bucket = bucket_addr(addr, self.v6_prefix);
+        let cap_bucket = bucket_addr(addr, self.v6_prefix);
+        let share_bucket = share_bucket_addr(addr);
         let mut counts = self.counts.lock().unwrap_or_else(|p| p.into_inner());
-        let n = counts.entry(bucket).or_insert(0);
-        if cap > 0 && *n >= cap {
-            return None;
+        let (cap_counts, share_counts) = &mut *counts;
+        if cap > 0 {
+            if cap_counts.get(&cap_bucket).copied().unwrap_or(0) >= cap {
+                return None;
+            }
+            // The /48 aggregate bounds a real-v6 tenant to 10x one
+            // bucket's conns — subnet-hopping inside its /48 cannot mint
+            // an unlimited connection budget (S2 re-review N3).
+            if share_bucket.is_ipv6()
+                && share_counts.get(&share_bucket).copied().unwrap_or(0)
+                    >= cap.saturating_mul(AGGREGATE_CAP_MULT)
+            {
+                return None;
+            }
         }
-        *n += 1;
+        *cap_counts.entry(cap_bucket).or_insert(0) += 1;
+        *share_counts.entry(share_bucket).or_insert(0) += 1;
         Some(ConnGuard {
-            bucket,
+            cap_bucket,
+            share_bucket,
             counts: self.counts.clone(),
         })
     }
 
-    /// Conns held under `addr`'s bucket — the fair-share numerator.
+    /// Conns held under `addr`'s share bucket — the fair-share
+    /// numerator (v6 answers for its whole /48).
     pub fn held(&self, addr: IpAddr) -> usize {
-        *self
-            .counts
+        let share = share_bucket_addr(addr);
+        self.counts
             .lock()
             .unwrap_or_else(|p| p.into_inner())
-            .get(&bucket_addr(addr, self.v6_prefix))
-            .unwrap_or(&0)
+            .1
+            .get(&share)
+            .copied()
+            .unwrap_or(0)
     }
 
-    /// Distinct buckets currently holding conns — the fair-share
+    /// Distinct share buckets currently holding conns — the fair-share
     /// denominator.
     pub fn buckets(&self) -> usize {
-        self.counts.lock().unwrap_or_else(|p| p.into_inner()).len()
+        self.counts
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .1
+            .len()
     }
 }
 
 #[derive(Debug)]
 pub struct ConnGuard {
-    bucket: IpAddr,
-    counts: std::sync::Arc<std::sync::Mutex<HashMap<IpAddr, usize>>>,
+    cap_bucket: IpAddr,
+    share_bucket: IpAddr,
+    counts: Counts,
+}
+
+impl ConnGuard {
+    /// The conn's fair-share bucket — the victim ordering keys on it.
+    pub fn share_bucket(&self) -> IpAddr {
+        self.share_bucket
+    }
 }
 
 impl Drop for ConnGuard {
     fn drop(&mut self) {
         let mut counts = self.counts.lock().unwrap_or_else(|p| p.into_inner());
-        match counts.get_mut(&self.bucket) {
-            Some(n) if *n > 1 => *n -= 1,
-            _ => {
-                counts.remove(&self.bucket);
+        let (cap_counts, share_counts) = &mut *counts;
+        for (map, bucket) in [
+            (&mut *cap_counts, self.cap_bucket),
+            (&mut *share_counts, self.share_bucket),
+        ] {
+            match map.get_mut(&bucket) {
+                Some(n) if *n > 1 => *n -= 1,
+                _ => {
+                    map.remove(&bucket);
+                }
             }
         }
     }

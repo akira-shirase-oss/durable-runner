@@ -66,6 +66,21 @@ target/release/durable-server \
   such jobs/s on a 2 GB host; more needs a bigger host. Without scheduled
   compaction the records never leave, and `503 at_capacity` comes once
   about `max_index_bytes ÷ 230 B` jobs have run.
+
+- **Overload scope — the claim is deliberately narrow.** Under a flood
+  from ONE host the server holds three things: per-address/prefix
+  fairness (a flooding bucket can hold at most its share of work slots,
+  reserve slots, and lane slots — legitimate buckets keep getting
+  served); a readable `503 overloaded` + `Retry-After` for EVERY refusal
+  the server chooses to make (never a silent drop the client cannot tell
+  from a crash); and `/health` answering throughout (the liveness reserve
+  is bounded per address, so the flood cannot take it). What is NOT
+  claimed: resistance to a DISTRIBUTED flood — many source addresses at
+  once is the edge's job, not this process's. The SaaS puts Cloudflare in
+  front (the deploy package already does); a self-hosted install needs a
+  CDN/reverse-proxy layer or firewall conntrack limits for the same
+  reason — the single-host fairness above is for a neighbour who
+  misbehaves, not for a botnet.
 - **Retention.** Compaction runs only when asked (`durable compact`) unless
   you pass `--compact-every-secs N` (default 0 = off; see D-018 for why it
   is opt-in). Each compaction removes the dedup records of runs that
@@ -347,8 +362,11 @@ it):
   and limits each client address's request rate and each peer's
   connection count (D-052: IPv6 is keyed by /64 with a shared /48
   aggregate, so a spray of distinct /48s can still push a new real
-  client into the overflow bucket). It still has no TLS: put Cloudflare
-  (or a reverse proxy that does TLS) in front, and pass its ranges as
+  client into the overflow bucket). The overload claim covers a SINGLE
+  flooding host — a distributed flood overwhelms the per-address design
+  itself and is the edge's job (see "Overload scope" above). It still
+  has no TLS: put Cloudflare (or a reverse proxy that does TLS) in
+  front, and pass its ranges as
   `--trusted-proxy` so the per-address limits count real clients — the
   trusted edges then get `--max-conns-per-proxy` (4096) instead of the
   untrusted `--max-conns-per-addr` (64). Never combine a proxy with
