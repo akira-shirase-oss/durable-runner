@@ -1383,12 +1383,12 @@ impl Journal {
                 File::open(&gd)?.sync_data()?;
             }
         }
-        // The flat sidecars travel too — a restored journal must keep
-        // the same claims about versions and workspace scope for the
-        // format-guard (D-056), and the server's public-id key so ids a
-        // client holds still decode on the restored instance (the
-        // permutation key lives beside the journal; without it every
-        // public id orphans to a 404). Neither is a journal file, but
+        // The flat sidecars travel too (D-058 — S2 writes both):
+        // `journal.shape` preserves claims a replay alone cannot
+        // reconstruct (a ws scope claim survives the compaction that
+        // deleted its records), and `public_id.key` is install identity —
+        // without it every opaque public id a client holds orphans to a
+        // 404 on the restored instance. Neither is a journal file, but
         // both are journal-dir state a faithful backup must carry.
         for flat in ["journal.shape", "public_id.key"] {
             let src = self.root.join(flat);
@@ -3496,44 +3496,13 @@ mod tests {
         );
     }
 
-    /// The sidecar stays OUT of backup.json: a v1.0.1 restore tool refuses
-    /// any path outside a generation, so carrying it would brick
-    /// cross-version restores. A restored journal rebuilds it from replayed
-    /// maxima at open.
-    #[test]
-    fn the_sidecar_stays_out_of_the_backup() {
-        let d = tempfile::tempdir().unwrap_or_else(|e| panic!("{e}"));
-        let src = d.path().join("src");
-        {
-            let mut j = Journal::open(&src).unwrap_or_else(|e| panic!("{e}"));
-            j.append(&record(0)).unwrap_or_else(|e| panic!("{e}"));
-            // Force a sidecar the backup must NOT carry.
-            write_shape(&src, SHAPE).unwrap_or_else(|e| panic!("{e}"));
-            assert!(shape_path(&src).exists());
-        }
-        let dest = d.path().join("backup");
-        {
-            let j = Journal::open(&src).unwrap_or_else(|e| panic!("{e}"));
-            j.backup_to(&dest).unwrap_or_else(|e| panic!("{e}"));
-        }
-        assert!(
-            !dest.join("journal.shape").exists(),
-            "sidecar leaked into the backup"
-        );
-        let to = d.path().join("to");
-        restore_backup(&dest, &to).unwrap_or_else(|e| panic!("{e}"));
-        assert!(!shape_path(&to).exists(), "restore materialized a sidecar");
-        let j = Journal::open(&to).unwrap_or_else(|e| panic!("{e}"));
-        assert_eq!(j.records_written(), 1);
-    }
-
-    /// The agreed backup set (S2 re-review finding 7): an S2 backup lists
-    /// the journal-dir flats `journal.shape` and `public_id.key` beside
-    /// the generations. This build never writes them into a backup — the
-    /// sidecar is derivable at open and v1.0.1's restore admits only
-    /// generation paths — but restore must ACCEPT them: an S2 backup of
-    /// a still-v2 journal is a legitimate rollback target, and the key
-    /// must land intact or every public id the install issued orphans.
+    /// The agreed backup set (S2 re-review finding 7, D-058): an S2
+    /// backup lists the journal-dir flats `journal.shape` and
+    /// `public_id.key` beside the generations — this build writes them
+    /// (`the_flat_sidecars_ride_the_backup`), and restore must ACCEPT
+    /// them: an S2 backup of a still-v2 journal is a legitimate rollback
+    /// target, and the key must land intact or every public id the
+    /// install issued orphans.
     #[test]
     fn restore_accepts_the_s2_backup_set() {
         let d = tempfile::tempdir().unwrap_or_else(|e| panic!("{e}"));

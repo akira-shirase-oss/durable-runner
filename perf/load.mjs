@@ -28,6 +28,7 @@
 // died at ~4 GB Mark-Compact because the old one retained per-op state).
 // peak_heap_mb in every result is the measured proof.
 import { spawn, spawnSync, execFileSync } from 'node:child_process';
+import { Agent, setGlobalDispatcher } from 'undici';
 import fs from 'node:fs';
 import net from 'node:net';
 import os from 'node:os';
@@ -45,6 +46,67 @@ const SRV = `${ROOT}/target/release/durable-server`;
 const PORT = Number(args.port ?? 53340); // not 58400: that is Service Monitor's default port, and a harness must never collide with a running monitor
 const HPORT = Number(args.hport ?? 53341);
 const API = `http://127.0.0.1:${PORT}`;
+
+// The client's own sockets are a bounded resource: an earlier churn-flood
+// let undici keep-alive churn pile ~12k CLOSE_WAIT + ~12k FIN_WAIT_2 and
+// exhaust the machine's ephemeral port range, taking every session's
+// outbound TCP with it. One pool, bounded connections, short keep-alive —
+// dead ends evict in seconds instead of camping for the socket lifetime.
+const pool = new Agent({
+  connections: Number(process.env.DR_LOAD_POOL_CONNS ?? 128),
+  keepAliveTimeout: 4_000,
+  keepAliveMaxTimeout: 30_000,
+});
+// DR_LOAD_NO_POOL runs the unbounded default dispatcher — the regression
+// switch that proves the connreuse socket bound goes red without the fix.
+if (!process.env.DR_LOAD_NO_POOL) setGlobalDispatcher(pool);
+
+// One load run per machine at a time (the heavy slot): a second run races
+// the first for ports, fds and the measurement — refuse it, don't queue.
+const LOCK = path.join(ROOT, 'perf', '.heavy.lock');
+try {
+  const fd = fs.openSync(LOCK, 'wx');
+  fs.writeFileSync(fd, `${process.pid} ${process.argv.slice(2).join(' ')}\n`);
+  fs.closeSync(fd);
+} catch {
+  console.error(`another load run holds ${LOCK} — serialize under perf/heavy.sh`);
+  process.exit(3);
+}
+const unlock = () => { try { fs.unlinkSync(LOCK); } catch { /* already gone */ } };
+process.on('exit', unlock);
+for (const sig of ['SIGINT', 'SIGTERM']) process.on(sig, () => { unlock(); process.exit(130); });
+
+// Socket self-check: this process's own TCP count, sampled. A run whose
+// client-side dead conns grow past the bound is the leak above — the run
+// fails and its result is kept, not rerun to green.
+const SOCKET_BOUND = Number(process.env.DR_LOAD_SOCKET_BOUND ?? 1024);
+let socketPeak = 0, closeWaitPeak = 0, socketOverBound = 0;
+const countOwnSockets = () => {
+  // lsof exits 1 when it lists nothing — parse stdout either way.
+  const out = spawnSync('lsof', ['-nP', '-a', '-p', String(process.pid), '-iTCP'], { encoding: 'utf8' });
+  if (out.error) return { total: -1, cw: -1 };
+  let total = 0, cw = 0;
+  if (process.env.DR_LOAD_SOCK_DEBUG) {
+    const tcplines = String(out.stdout ?? '').split('\n').filter((l) => l.includes('TCP'));
+    console.error(`sockdbg status=${out.status} tcp=${tcplines.length} :: ${tcplines.slice(0, 2).join(' | ')}`);
+  }
+  for (const line of String(out.stdout ?? '').split('\n')) {
+    if (!line.includes('TCP')) continue;
+    total++;
+    if (line.includes('CLOSE_WAIT')) cw++;
+  }
+  socketPeak = Math.max(socketPeak, total);
+  closeWaitPeak = Math.max(closeWaitPeak, cw);
+  if (cw > SOCKET_BOUND) {
+    socketOverBound++;
+    console.error(`socket self-check: ${cw} CLOSE_WAIT > bound ${SOCKET_BOUND} (total ${total})`);
+  }
+  return { total, cw };
+};
+// 1 s cadence: a dead-conn pile lives ~4 s (keep-alive evict) — a slower
+// sampler misses it entirely and the self-check goes blind.
+const sockTimer = setInterval(countOwnSockets, 1_000);
+sockTimer.unref();
 const INPUT_B64 = Buffer.from('load').toString('base64');
 // Mutating and admin routes need the API key; the spawned server reads it
 // from DURABLE_API_KEY, so one random key per harness run serves both.
@@ -177,9 +239,12 @@ function writeResult(name, data) {
   const stamp = new Date().toISOString().replace(/[:.]/g, '-');
   fs.mkdirSync(RESULTS_DIR, { recursive: true });
   const file = `${RESULTS_DIR}/${stamp}-${name}.json`;
+  countOwnSockets();
   fs.writeFileSync(file, JSON.stringify({
     machine: machine(), scenario: name,
     peak_heap_mb: Math.round(memPeak / 2 ** 20),
+    socket_peak: socketPeak, close_wait_peak: closeWaitPeak,
+    socket_bound: SOCKET_BOUND,
     ...(undiciTosRaces ? { undici_tos_races: undiciTosRaces } : {}),
     ...data,
   }, null, 2));
@@ -1081,14 +1146,65 @@ async function runWorkspaces() {
   return r.verdict === 'pass';
 }
 
+// The socket-bound regression test: a server that closes EVERY response
+// (--max-requests-per-connection 1) forces the client to open a fresh conn
+// per op — the exact churn shape that piled 12k CLOSE_WAIT before the
+// bounded pool. The run passes only if the client's own socket count stays
+// under the bound — with the unbounded default dispatcher the pile is
+// per-op and this fails.
+async function runConnreuse() {
+  const n = Number(args.ops ?? 400);
+  const dir = fs.mkdtempSync(`${os.tmpdir()}/dr-load-`);
+  const h = startHandler('ok');
+  const s = await startServer(`${dir}/journal`, ['--max-requests-per-connection', '1']);
+  const t0 = now();
+  let sent = 0, ok200 = 0;
+  const codes = {};
+  const pending = new Set(); const MAXP = 64;
+  const settle = () => new Promise((res) => {
+    const w = () => pending.size < MAXP ? res() : setImmediate(w);
+    w();
+  });
+  for (let i = 0; i < n; i++) {
+    sent++;
+    const p = submit(`connreuse-${i}`, 1, AUTH, performance.now() + 20_000).then((r) => {
+      pending.delete(p); codes[r.status] = (codes[r.status] ?? 0) + 1;
+      if (r.status === 200) ok200++;
+    });
+    pending.add(p);
+    if (pending.size >= MAXP) await settle();
+  }
+  await Promise.all(pending);
+  // Let dead ends drain through the pool's keep-alive window, then count.
+  await sleep(4_500);
+  const final = countOwnSockets();
+  const r = writeResult('connreuse', {
+    ops: n, ms: Math.round(now() - t0), codes,
+    close_wait_after_drain: final.cw, total_sockets_after_drain: final.total,
+    ...verdictOf([
+      ['every op answered 200', ok200 === sent],
+      [`sockets bounded (<=${SOCKET_BOUND})`, socketPeak <= SOCKET_BOUND],
+      [`CLOSE_WAIT drains under bound (<=${SOCKET_BOUND / 4})`, closeWaitPeak <= SOCKET_BOUND / 4 && final.cw <= SOCKET_BOUND / 4],
+      ['client never over the bound', socketOverBound === 0],
+    ]),
+  });
+  return r.verdict === 'pass';
+}
+
 const runners = {
   submit: runSubmit, replay: runReplay, stall: runStall,
   admission: runAdmission, compact: runCompact, sustained: runSustained,
-  workspaces: runWorkspaces, overload: runOverload,
+  workspaces: runWorkspaces, overload: runOverload, connreuse: runConnreuse,
 };
 if (!runners[scenario]) {
   console.error(`unknown scenario ${scenario}; choices: ${Object.keys(runners).join(', ')}`);
   process.exit(2);
 }
 const ok = await runners[scenario]();
+// A run whose client-side sockets crossed the bound fails even when its
+// scenario checks passed — the leak is the thing being measured.
+if (socketOverBound > 0) {
+  console.error(`socket self-check tripped ${socketOverBound}x — run fails`);
+  process.exit(1);
+}
 process.exit(ok === false ? 1 : 0);

@@ -3310,19 +3310,37 @@ async fn serve_http(
             .serve_connection(io, handler);
         let mut closing = closing.clone();
         let lifetime = limits.max_lifetime;
+        let pool_pressure = permits.clone();
         conns.spawn(async move {
             let _permit = permit;
             let _conn_guard = conn_guard;
             let mut conn = std::pin::pin!(conn);
+            // Under slot pressure, an idle keep-alive would still camp on
+            // its permit for up to max_lifetime — the S2 wedge shape, where
+            // one client's conn storm starved every other tenant's accept.
+            // While the pool is dry, drain this conn's in-flight request
+            // (bounded by the deadlines above) and close it, rotating the
+            // slot to the kernel backlog's next conn.
+            let pressured = async {
+                let mut poll = tokio::time::interval(Duration::from_millis(250));
+                poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+                loop {
+                    poll.tick().await;
+                    if pool_pressure.available_permits() == 0 {
+                        break;
+                    }
+                }
+            };
             // A connection error (a reset, a timed-out head, a stalled
             // write) ends only that connection.
             tokio::select! {
                 _ = conn.as_mut() => return,
                 _ = closing.wait_for(|c| *c) => {}
                 () = tokio::time::sleep(lifetime) => {}
+                _ = pressured => {}
             }
-            // Shutting down, or the connection is old: answer the request
-            // in flight (bounded by the deadlines above), then close.
+            // Shutting down, pressured, or the connection is old: answer
+            // the request in flight, then close.
             conn.as_mut().graceful_shutdown();
             let _ = conn.await;
         });
@@ -6501,6 +6519,71 @@ mod tests {
             "{}",
             String::from_utf8_lossy(&reply)
         );
+    }
+
+    /// The residual S2 wedge: a keep-alive conn that completed a request
+    /// while the pool still had room camps on its permit for the whole
+    /// connection lifetime — under a conn storm the pool converges to
+    /// campers plus one rotating slot, and every tenant's accept crawls.
+    /// Under pressure an idle conn must drain and yield its slot: the
+    /// camper below is closed proactively, so the probe draws a real work
+    /// permit (401) instead of the liveness reserve (503).
+    #[tokio::test]
+    async fn an_idle_keep_alive_yields_its_slot_under_pressure() {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+        let limits = HttpLimits {
+            max_connections: 3,
+            // Long enough that the parked heads below outlive the probe's
+            // deadline — they yield only at their own timeout, never
+            // proactively, so only the camper's yield can free a slot.
+            header_timeout: Duration::from_secs(60),
+            ..lifted_limits()
+        };
+        let (addr, _stop, _h) = serving(limits).await;
+        // Camp one slot: the request is served while the pool still has
+        // room (no Connection: close), then the conn goes keep-alive idle.
+        let mut camper = tokio::net::TcpStream::connect(addr)
+            .await
+            .unwrap_or_else(|e| panic!("{e}"));
+        camper
+            .write_all(b"GET /health HTTP/1.1\r\nhost: x\r\n\r\n")
+            .await
+            .unwrap_or_else(|e| panic!("{e}"));
+        // Drain the whole first response so the yield check below sees
+        // only the server's FIN, not leftover body bytes. EOF here means
+        // the conn never camped at all — a broken test, not a pass.
+        let mut buf = [0u8; 512];
+        loop {
+            match tokio::time::timeout(Duration::from_millis(400), camper.read(&mut buf)).await {
+                Ok(Ok(0)) => panic!("the conn closed instead of camping keep-alive"),
+                Ok(Ok(_)) => continue,
+                Ok(Err(e)) => panic!("{e}"),
+                Err(_) => break, // quiet socket: response fully consumed
+            }
+        }
+        // Pin the remaining two slots with heads that never complete.
+        // The pool is now dry and stays dry: only the camper can yield
+        // proactively — the parked heads hold out until their own
+        // 60 s deadline, far past this test's bound.
+        let mut held = Vec::new();
+        for _ in 0..2 {
+            let mut s = tokio::net::TcpStream::connect(addr)
+                .await
+                .unwrap_or_else(|e| panic!("{e}"));
+            s.write_all(b"GET /health HTTP/1.1\r\n")
+                .await
+                .unwrap_or_else(|e| panic!("{e}"));
+            held.push(s);
+        }
+        // The camping conn must be closed proactively (server FIN): its
+        // permit rotates to the backlog's next conn. Without the
+        // pressure-yield it stays open for the whole 600 s lifetime and
+        // this read times out.
+        let n = tokio::time::timeout(Duration::from_secs(5), camper.read(&mut buf))
+            .await
+            .unwrap_or_else(|_| panic!("idle keep-alive camped on its slot under pressure"))
+            .unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(n, 0, "camper did not yield its slot to the dry pool");
     }
 
     /// D-052: one flooding address is refused 429 `rate_limited` with a
