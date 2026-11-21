@@ -1021,5 +1021,12 @@ The agreed contract, decided for both branches:
   without it the minted ids orphan to 404.
 - Whether a restored journal can then RUN under the binary is a
   separate, unchanged gate: record/snapshot/ws versions and the
-  D-056 format guard, never the file list. An S2 backup restores
-  under v1.0.2 exactly when the journal is still record-v2.
+  D-056 format guard, never the file list. v1.0.2's reader is
+  record-3, so an S2 journal that already wrote v3 records still
+  restores and opens — every workspace-tagged run parks instead of
+  executing (and keeps surviving compaction inside snapshot.bin)
+  until an S2 binary picks the journal up again. And one asymmetry
+  an operator must know: a v1.0.2 backup of a directory that holds
+  `public_id.key` lists that key, and a backup listing it is refused
+  by v1.0.1's restore, which admits generation paths only — the
+  rollback floor for a key-holding backup is this release.

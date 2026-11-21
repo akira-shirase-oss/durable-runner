@@ -52,13 +52,17 @@ found two ways v1.0.1 was an unsafe rollback floor, both fixed here.
   backup may carry is one contract across versions: generation files,
   plus the journal-dir flats `journal.shape` and `public_id.key` that
   newer releases write. v1.0.2 still writes generation files only,
-  but it now restores all of them — an S2 backup of a journal that is
-  still record-v2 is a legitimate rollback target, and its
-  `public_id.key` keeps issued public ids decodable instead of
-  orphaning to 404. A backup taken on a key-holding directory carries
-  the key forward. Whether the restored journal can then run under
-  this binary is the unchanged D-056 gate (record/snapshot/ws
-  versions), never the file list.
+  but it now restores all of them — an S2 backup whose journal this
+  binary still reads (record ≤ 3, DRIX ≤ 2) is a legitimate rollback
+  target. v1.0.2 issues no public ids; a restored `public_id.key` is
+  carried forward so a later S2 boot does not orphan the ids it
+  issued — and its presence means that backup no longer restores
+  under v1.0.1, whose file list admits generation paths only: the
+  floor for a key-holding backup becomes this release. A backup
+  taken on a key-holding directory carries the key forward. Whether
+  the restored journal can then run under this binary is the
+  unchanged D-056 gate (record/snapshot/ws versions), never the file
+  list.
 - **format-guard always scans the files** and takes the max of files
   and `/admin/diagnostics` — a running server's numbers were open-time
   facts that live commits could leave behind. A DRIX ≥ 2 snapshot with

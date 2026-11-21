@@ -231,10 +231,16 @@ The file set a backup may list is one agreed contract across versions
 `journal.shape` and `public_id.key`. This build writes generation
 files only (the sidecar is rebuilt at open, and listing it would
 break restore under v1.0.1), but it accepts all of them on restore —
-so an S2 backup of a still-record-v2 journal restores here, and the
-public-id key it carries keeps issued ids decodable. Newer file sets
-are never the blocker; the record/snapshot/ws versions and the D-056
-format guard decide what the binary can run.
+so an S2 backup whose journal this reader still opens (record ≤ 3,
+DRIX ≤ 2) restores here; a v3 journal's workspace-tagged runs park
+until an S2 binary picks it up. v1.0.2 issues no public ids, so a
+restored `public_id.key` only travels forward — to a later S2 boot,
+not into anything this release decodes — and a backup of a
+key-holding directory carries it, which makes that backup unrestorable
+under v1.0.1 (its file list admits generation paths only): the
+rollback floor there is this release. Newer file sets are never the
+blocker; the record/snapshot/ws versions and the D-056 format guard
+decide what the binary can run.
 
 ## What "honest" looks like in the output
 
