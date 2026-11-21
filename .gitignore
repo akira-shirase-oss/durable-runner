@@ -17,3 +17,4 @@ apps/*/.svelte-kit/
 
 # coordinator/worker scratch (never committed)
 .coord/
+perf/.heavy.slot/

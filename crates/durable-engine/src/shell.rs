@@ -1260,10 +1260,10 @@ async fn actor(
         }
     }
 
-    // DURABLE_ACTOR_TRACE: per-branch latency histogram for wedge hunts.
-    let trace = std::env::var_os("DURABLE_ACTOR_TRACE").is_some();
+    // DURABLE_ACTOR_TRACE: per-branch latency for wedge hunts — the env
+    // is read once and only a slow arm or slow tick phase is logged.
+    let trace = actor_trace();
     let mut arm_ms: std::collections::BTreeMap<&'static str, (u64, u128)> = Default::default();
-    let mut last_dump = std::time::Instant::now();
 
     loop {
         if core.is_poisoned() || writer_lost {
@@ -1523,7 +1523,9 @@ async fn actor(
             let e = arm_ms.entry(arm).or_default();
             e.0 += 1;
             e.1 += us;
-            if us > 20_000 || last_dump.elapsed() > Duration::from_secs(4) {
+            // Only a slow arm is worth the log line — normal work is
+            // silent even under the flag.
+            if us > 20_000 {
                 eprintln!(
                     "actor-trace arm={arm} us={us} held={} backlog={backlog_records}B{backlog_bytes} [{}]",
                     pipe.held.len(),
@@ -1533,7 +1535,6 @@ async fn actor(
                         .collect::<Vec<_>>()
                         .join(" ")
                 );
-                last_dump = std::time::Instant::now();
             }
         }
     }
@@ -1932,10 +1933,18 @@ fn tick(core: &mut EngineCore, exec: &mut Exec<'_>) {
     tick_at(core, exec, wall_ms());
 }
 
+/// DURABLE_ACTOR_TRACE, resolved once for the process — the actor loop
+/// and tick_at share the same answer instead of re-reading the env per
+/// iteration.
+fn actor_trace() -> bool {
+    static TRACE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *TRACE.get_or_init(|| std::env::var_os("DURABLE_ACTOR_TRACE").is_some())
+}
+
 /// The scheduler's pass at an explicit `now` — production calls it via
 /// `tick`; tests drive the re-check/grace clocks deterministically.
 fn tick_at(core: &mut EngineCore, exec: &mut Exec<'_>, now: Millis) {
-    let trace = std::env::var_os("DURABLE_ACTOR_TRACE").is_some();
+    let trace = actor_trace();
     let mut ph = [0u128; 4];
     let mut tp = std::time::Instant::now();
     let mut mark = |i: usize| {
@@ -1956,7 +1965,12 @@ fn tick_at(core: &mut EngineCore, exec: &mut Exec<'_>, now: Millis) {
     // it reconciles, never silently repeats. `live` only tracks attempts
     // this process fired; a run orphaned by a restart has no entry, and
     // gating on it would strand every crash-surviving Running run.
-    for (run, step) in core.pop_expired(now, exec.per_tick) {
+    // The batch is popped before it is processed: on an early exit the
+    // remainder was already de-indexed, so every entry the sweep never
+    // reached loses its deadline until the next restart's recount (R1:
+    // a run that broke the sweep requeued itself but dropped the rest).
+    let mut popped = core.pop_expired(now, exec.per_tick).into_iter().peekable();
+    while let Some((run, step)) = popped.next() {
         if let Some(call) = exec.live.remove(&(run, step)) {
             call.abort(); // frees its permit; the remote effect is reconciled
         }
@@ -1972,7 +1986,14 @@ fn tick_at(core: &mut EngineCore, exec: &mut Exec<'_>, now: Millis) {
                 // the attempt still owes its lost-reply record — put the
                 // deadline back and stop the sweep; every step_finished
                 // behind it fails the same way (S2 re-review N1).
+                // ATTACK(deadline-drop): pop_expired already removed the
+                // whole batch from the index — re-index every remaining
+                // entry, not just the failure, or crash-surviving Running
+                // runs strand here until a restart's recount (R1).
                 core.requeue_deadline(run);
+                for (rest, _step) in popped.by_ref() {
+                    core.requeue_deadline(rest);
+                }
                 break;
             }
         }
@@ -2166,7 +2187,9 @@ fn tick_at(core: &mut EngineCore, exec: &mut Exec<'_>, now: Millis) {
         }
     }
     mark(3);
-    if trace {
+    // Only a slow phase earns the log line: a tick whose parts all fit
+    // inside the arm-level bound stays silent under the flag.
+    if trace && (ph.iter().sum::<u128>() > 20_000 || ph.iter().any(|p| *p > 5_000)) {
         eprintln!(
             "tick-phase sweep={}us probes={}us pour={}us rotate={}us dueq={}",
             ph[0],
@@ -3452,6 +3475,51 @@ mod tests {
         assert!(sched.dead_since.is_empty(), "the marker outlived parking");
     }
 
+    /// S3 re-review N7, the reconcile arm itself: a handler that returns
+    /// DURING the grace window must see its waiters come off `dead_retry`
+    /// at the re-check and dispatch — not wait out the whole grace and
+    /// park with their handler already present. Without the pour back
+    /// into the rotation the run strands until a restart's recount.
+    #[tokio::test(flavor = "current_thread")]
+    async fn an_in_grace_entry_dispatches_when_its_handler_returns() {
+        let d = tempfile::tempdir().unwrap_or_else(|e| panic!("{e}"));
+        let mut core = EngineCore::open(d.path()).unwrap_or_else(|e| panic!("{e}"));
+        let t0 = wall_ms();
+        core.submit_at(0, OperationKey("revive".into()), spec1("gone"), t0, t0)
+            .unwrap_or_else(|e| panic!("{e}"));
+        let mut reg = Registry::default(); // absent at the first sighting
+        let mut sched = Sched::new(8);
+        {
+            let mut ex = sched.exec(&reg, 64, 10_000, 8);
+            tick_at(&mut core, &mut ex, t0); // marker = t0, due back t0+1000
+        }
+        assert_eq!(sched.dead_retry.len(), 1, "the entry waits on the heap");
+        // The handler returns mid-grace; at the next re-check tick the
+        // entry must re-enter the rotation and dispatch.
+        let h = NamedCalls::default();
+        reg.put(0, "gone", Arc::new(h.clone()))
+            .unwrap_or_else(|e| panic!("{e}"));
+        {
+            let mut ex = sched.exec(&reg, 64, 10_000, 8);
+            tick_at(&mut core, &mut ex, t0 + 1_000);
+        }
+        assert_eq!(sched.attempts.len(), 1, "the revived run dispatched");
+        assert!(
+            sched.dead_retry.is_empty(),
+            "the re-check tuple stayed on the heap"
+        );
+        let (r, _, outcome, _permit, _slot) = sched
+            .attempts
+            .join_next()
+            .await
+            .unwrap_or_else(|| panic!("no attempt join"))
+            .unwrap_or_else(|e| panic!("attempt join: {e}"));
+        assert!(
+            matches!(outcome, Outcome::Checkpoint(_)),
+            "{r:?} {outcome:?}"
+        );
+    }
+
     /// S3 re-review N7: a PUT/DELETE flap must not restart the
     /// dead-handler grace clock. The old code dropped `dead_since` the
     /// moment a present handler was *seen* — even when the run stayed
@@ -3712,7 +3780,12 @@ mod tests {
         }
         assert_eq!(sched.parked.get(&0).map(Vec::len), Some(2));
         sched.dead_since.insert(grace_run, wall_ms()); // an in-grace marker survives
-                                                       // The cancel path drops both collections' entries for the run.
+        sched
+            .dead_retry
+            .push(Reverse((wall_ms() + 1_000, grace_run.0, 0, 1))); // and its re-check tuple rides the heap
+                                                                    // The cancel path drops every collection's entries for the run —
+                                                                    // the heap's too (N2: dropping only the marker left the tuple to
+                                                                    // re-queue the run at its re-check).
         core.cancel(parked_run, wall_ms())
             .unwrap_or_else(|e| panic!("{e}"));
         core.cancel(grace_run, wall_ms())
@@ -3729,6 +3802,10 @@ mod tests {
         assert!(
             sched.dead_since.is_empty(),
             "a cancelled run's in-grace marker survived"
+        );
+        assert!(
+            sched.dead_retry.is_empty(),
+            "a cancelled run's re-check tuple survived on the heap"
         );
         // And the reconcile-time sweep prunes a cancelled parked run
         // even when nothing tracked the cancel (belt for the same leak).
@@ -3919,6 +3996,61 @@ mod tests {
         }
         assert!(matches!(state, Some(RunState::Done)), "{state:?}");
         assert!(eng.readiness().ready);
+    }
+
+    /// R1: the deadline sweep pops a batch, then processes it — on a real
+    /// commit error it stopped after re-indexing only the entry that
+    /// failed, dropping every other popped deadline until the next
+    /// restart's recount. Two expired attempts at exactly the reserve:
+    /// the first's lost-reply commit fails NoSpace, and BOTH entries must
+    /// survive to re-fire once space returns.
+    #[tokio::test(flavor = "current_thread")]
+    async fn the_sweep_requeues_every_popped_deadline_on_commit_error() {
+        use std::sync::atomic::{AtomicU64, Ordering::SeqCst};
+        let d = tempfile::tempdir().unwrap_or_else(|e| panic!("{e}"));
+        let free = Arc::new(AtomicU64::new(1 << 20));
+        let gate = Arc::new(Semaphore::new(0));
+        let mut reg = Registry::default();
+        reg.register("gated", Arc::new(GateThenFound(gate.clone())));
+        let probe_free = free.clone();
+        let reserve = 4096u64;
+        let cfg = ShellConfig {
+            tick_ms: 5,
+            limits: Limits {
+                // Expired fast: both attempts are out before the sweep.
+                max_step_deadline_ms: 60,
+                ..Limits::default()
+            },
+            journal: JournalOptions {
+                reserve_bytes: reserve,
+                space: durable_journal::SpaceProbe::new(move |_| Ok(probe_free.load(SeqCst))),
+                ..JournalOptions::default()
+            },
+            ..Default::default()
+        };
+        let eng = spawn(d.path(), reg, cfg).unwrap_or_else(|e| panic!("{e}"));
+        let a = eng
+            .submit(OperationKey("sweep-a".into()), spec1("gated"))
+            .await
+            .unwrap_or_else(|e| panic!("{e}"));
+        let b = eng
+            .submit(OperationKey("sweep-b".into()), spec1("gated"))
+            .await
+            .unwrap_or_else(|e| panic!("{e}"));
+        wait_state(&eng, a, "running").await;
+        wait_state(&eng, b, "running").await;
+        // Exactly at the reserve: the sweep's space gate still passes but
+        // the lost-reply record's commit refuses NoSpace — the break path.
+        free.store(reserve + 1, SeqCst);
+        // Both deadlines fire under the failed commit; give the sweep a
+        // few ticks to pop the batch and take the break.
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        free.store(1 << 20, SeqCst);
+        // With every popped entry re-indexed, both runs re-fire and
+        // reconcile (the probe finds the effect); with the bug the second
+        // run's deadline is lost and it strands Running until restart.
+        assert!(matches!(until_done(&eng, a).await, RunState::Done));
+        assert!(matches!(until_done(&eng, b).await, RunState::Done));
     }
 
     // ---- group commit (D-014 rules, D-015) --------------------------------

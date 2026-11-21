@@ -3046,6 +3046,10 @@ impl Default for HttpLimits {
 ///
 /// Liveness connections held in reserve: a flood that fills every
 /// general slot cannot take these — they answer /health and /ready only.
+// ATTACK(liveness-flood): a conn storm that fills every work permit must
+// not starve liveness — the readiness listener and this reserve answer
+// /health + /ready even while the work pool is dry (S2 wedge: a flood
+// once reset every probe at the kernel backlog).
 const READY_CONNECTIONS: usize = 8;
 
 /// Which pool a freshly-accepted connection drew its permit from.
@@ -3238,19 +3242,22 @@ async fn serve_http(
         // The connection's `max_requests`-th answer says `Connection:
         // close`, so pipelining cannot keep one connection busy for ever.
         let svc = service.clone();
-        let served = std::sync::atomic::AtomicUsize::new(0);
+        // Per-connection eligibility for pressure-yield: it may drain and
+        // close only after it has served at least one request and while
+        // none is in flight — a fresh conn (unread, or a head still
+        // parsing) is never evicted (S2 re-review R2).
+        let served = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let in_flight = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let max_requests = limits.max_requests.max(1);
-        let per_conn = Arc::new((svc, served));
+        let per_conn = Arc::new((svc, served.clone(), in_flight.clone()));
         let peer_ip = peer.ip();
         let rate_limiter = rate_limiter.clone();
         let trusted = trusted.clone();
-        let pool = permits.clone();
         let handler =
             hyper::service::service_fn(move |req: hyper::Request<hyper::body::Incoming>| {
                 let per_conn = per_conn.clone();
                 let rate_limiter = rate_limiter.clone();
                 let trusted = trusted.clone();
-                let pool = pool.clone();
                 async move {
                     // The per-address request rate. Refused before auth:
                     // a flood without a key is still a flood, and the
@@ -3285,16 +3292,15 @@ async fn serve_http(
                             return Ok(res);
                         }
                     }
-                    let (svc, served) = &*per_conn;
+                    let (svc, served, in_flight) = &*per_conn;
+                    let _flight = FlightGuard::enter(in_flight);
                     let n = served.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
                     let mut res = tower::ServiceExt::oneshot(svc.clone(), req).await?;
-                    // `Connection: close` at the request cap — and under
-                    // slot pressure: while every work permit is held, a
-                    // keep-alive conn would still sit on its slot through
-                    // the idle window, which is how one tenant's conn
-                    // storm starved every tenant's next accept (S2 wedge).
-                    // Closing rotates the slot to the backlog's next conn.
-                    if n >= max_requests || pool.available_permits() == 0 {
+                    // `Connection: close` at the request cap so
+                    // pipelining cannot keep one connection busy for
+                    // ever. (Idle-conn eviction under slot pressure is
+                    // the yield arm's job, not the response's.)
+                    if n >= max_requests {
                         res.headers_mut().insert(
                             header::CONNECTION,
                             header::HeaderValue::from_static("close"),
@@ -3311,22 +3317,34 @@ async fn serve_http(
         let mut closing = closing.clone();
         let lifetime = limits.max_lifetime;
         let pool_pressure = permits.clone();
+        let yield_state = (served, in_flight);
         conns.spawn(async move {
             let _permit = permit;
             let _conn_guard = conn_guard;
+            let (served, in_flight) = yield_state;
             let mut conn = std::pin::pin!(conn);
-            // Under slot pressure, an idle keep-alive would still camp on
-            // its permit for up to max_lifetime — the S2 wedge shape, where
-            // one client's conn storm starved every other tenant's accept.
-            // While the pool is dry, drain this conn's in-flight request
-            // (bounded by the deadlines above) and close it, rotating the
-            // slot to the kernel backlog's next conn.
+            // ATTACK(slot-camp): under slot pressure an idle keep-alive
+            // would still camp on its permit for up to max_lifetime — the
+            // S2 wedge shape, where one client's conn storm starved every
+            // other tenant's accept. Eligibility is narrow (R2): a conn
+            // yields only after it has served at least one request and
+            // while none is in flight — a fresh conn, whether unread or
+            // with a head still parsing, is never evicted into the
+            // flooded backlog it would have to fight for a slot. The
+            // first check lands a grace window after the conn opened, so
+            // pressure during a conn's first moments cannot close it.
             let pressured = async {
-                let mut poll = tokio::time::interval(Duration::from_millis(250));
+                let mut poll = tokio::time::interval_at(
+                    tokio::time::Instant::now() + Duration::from_millis(250),
+                    Duration::from_millis(250),
+                );
                 poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
                 loop {
                     poll.tick().await;
-                    if pool_pressure.available_permits() == 0 {
+                    if pool_pressure.available_permits() == 0
+                        && served.load(std::sync::atomic::Ordering::Relaxed) >= 1
+                        && in_flight.load(std::sync::atomic::Ordering::Relaxed) == 0
+                    {
                         break;
                     }
                 }
@@ -3353,6 +3371,24 @@ async fn serve_http(
         }
     }
     Ok(())
+}
+
+/// Increments a connection's in-flight count on entry and decrements it
+/// when the request future completes, however it completes — the
+/// pressure-yield arm's "none in flight" witness.
+struct FlightGuard(Arc<std::sync::atomic::AtomicUsize>);
+
+impl FlightGuard {
+    fn enter(c: &Arc<std::sync::atomic::AtomicUsize>) -> Self {
+        c.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        Self(c.clone())
+    }
+}
+
+impl Drop for FlightGuard {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+    }
 }
 
 /// A connection's stream whose writes fail with `TimedOut` once they have
@@ -6584,6 +6620,63 @@ mod tests {
             .unwrap_or_else(|_| panic!("idle keep-alive camped on its slot under pressure"))
             .unwrap_or_else(|e| panic!("{e}"));
         assert_eq!(n, 0, "camper did not yield its slot to the dry pool");
+    }
+
+    /// The yield is narrow (S2 re-review R2): a conn that has never been
+    /// served is never evicted — closing it unread would push a legitimate
+    /// client back into the flooded backlog, worse than letting it wait.
+    /// Two parked heads dry the pool; a third conn sends nothing and must
+    /// still be alive and usable once it does ask.
+    #[tokio::test]
+    async fn an_unserved_connection_is_not_evicted_under_pressure() {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+        let limits = HttpLimits {
+            max_connections: 3,
+            header_timeout: Duration::from_secs(60),
+            ..lifted_limits()
+        };
+        let (addr, _stop, _h) = serving(limits).await;
+        let mut held = Vec::new();
+        for _ in 0..2 {
+            let mut s = tokio::net::TcpStream::connect(addr)
+                .await
+                .unwrap_or_else(|e| panic!("{e}"));
+            s.write_all(b"GET /health HTTP/1.1\r\n")
+                .await
+                .unwrap_or_else(|e| panic!("{e}"));
+            held.push(s);
+        }
+        // The last slot goes to a conn that has sent nothing — it is
+        // waiting for service, not camping.
+        let mut fresh = tokio::net::TcpStream::connect(addr)
+            .await
+            .unwrap_or_else(|e| panic!("{e}"));
+        // Past several pressure ticks the conn must still be open: if it
+        // had been yielded, the server's FIN reads as EOF here.
+        let mut buf = [0u8; 64];
+        for _ in 0..12 {
+            match tokio::time::timeout(Duration::from_millis(100), fresh.read(&mut buf)).await {
+                Ok(Ok(0)) => panic!("a conn that never served was evicted under pressure"),
+                Ok(Ok(_)) => panic!("unsolicited bytes on an idle conn"),
+                Ok(Err(e)) => panic!("{e}"),
+                Err(_) => {}
+            }
+        }
+        // And it can still be served: a real request gets a real answer.
+        fresh
+            .write_all(b"GET /health HTTP/1.1\r\nhost: x\r\n\r\n")
+            .await
+            .unwrap_or_else(|e| panic!("{e}"));
+        let n = tokio::time::timeout(Duration::from_secs(5), fresh.read(&mut buf))
+            .await
+            .unwrap_or_else(|_| panic!("the never-served conn was left unusable"))
+            .unwrap_or_else(|e| panic!("{e}"));
+        assert!(n > 0, "expected an HTTP answer on the held conn");
+        assert!(
+            buf[..n].starts_with(b"HTTP/1.1 200"),
+            "expected 200, got {:?}",
+            String::from_utf8_lossy(&buf[..n])
+        );
     }
 
     /// D-052: one flooding address is refused 429 `rate_limited` with a

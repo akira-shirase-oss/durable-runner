@@ -18,6 +18,13 @@
 # 53341); PERF_HOST_LABEL names the machine in results (never a hostname).
 set -u
 cd "$(dirname "$0")/.."
+# The heavy slot is machine-wide: a battery is one heavy run, and a second
+# heavy run anywhere on the box refuses rather than races it. Re-exec under
+# heavy.sh so every leg (each a load.mjs child) inherits DR_HEAVY_HELD and
+# skips its own acquire.
+if [ -z "${DR_HEAVY_HELD:-}" ]; then
+  exec perf/heavy.sh "$0" "$@"
+fi
 MODE=${1:-smoke}
 GROUP=${2:-all}
 PORT=${PORT:-53340}

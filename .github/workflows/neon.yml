@@ -61,4 +61,5 @@ jobs:
       - name: Workspace battery against Neon (visible skip without the secret)
         env:
           DATABASE_URL: ${{ secrets.NEON_TEST_DATABASE_URL }}
-        run: node perf/load.mjs workspaces --smoke --workspaces=2 --per=50
+        # Every load entry point goes through the machine-wide heavy slot.
+        run: perf/heavy.sh node perf/load.mjs workspaces --smoke --workspaces=2 --per=50

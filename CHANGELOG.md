@@ -147,9 +147,13 @@ contract + reference verifier ship in `docs/HANDLERS.md`.
   `public_id.key`), checksummed and owner-only (D-058): a restore
   keeps the sidecar's forward claims and decodes every public id the
   install issued — without the key they all orphaned to 404. The file
-  set is one agreed contract across versions, so v1.0.2's restore
-  accepts this build's backup whenever its journal is still
-  record-v2 — the upgrade-then-rollback-before-traffic floor.
+  set is one agreed contract across versions — v1.0.2's restore
+  accepts this build's backup *files* — while the journal inside must
+  still be record-v2 to open there: a backup taken before the first
+  v3 write rolls back cleanly (the upgrade-then-rollback-before-
+  traffic floor), one taken after is refused by the format guard.
+  Fixture: `restore_accepts_the_s2_backup_set` in durable-journal
+  restores this build's backup under v1.0.2's reader.
 
 ### Security
 

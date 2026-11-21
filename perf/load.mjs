@@ -63,45 +63,86 @@ if (!process.env.DR_LOAD_NO_POOL) setGlobalDispatcher(pool);
 
 // One load run per machine at a time (the heavy slot): a second run races
 // the first for ports, fds and the measurement — refuse it, don't queue.
-const LOCK = path.join(ROOT, 'perf', '.heavy.lock');
-try {
-  const fd = fs.openSync(LOCK, 'wx');
-  fs.writeFileSync(fd, `${process.pid} ${process.argv.slice(2).join(' ')}\n`);
-  fs.closeSync(fd);
-} catch {
-  console.error(`another load run holds ${LOCK} — serialize under perf/heavy.sh`);
-  process.exit(3);
+// The slot is MACHINE-wide (one shared path under tmpdir, not inside any
+// checkout — two worktrees must resolve to the same slot) and it names its
+// holder pid: a stale slot whose pid is dead gets reclaimed, a live one
+// refuses. heavy.sh/battery.sh hold the same slot for their children via
+// DR_HEAVY_HELD; a bare `node load.mjs` still self-guards.
+const LOCK = path.join(os.tmpdir(), 'durable-runner-heavy.slot');
+const unlock = () => { try { fs.rmSync(LOCK, { recursive: true, force: true }); } catch { /* already gone */ } };
+if (!process.env.DR_HEAVY_HELD) {
+  for (let attempt = 0; attempt < 4; attempt++) {
+    try {
+      fs.mkdirSync(LOCK);
+      fs.writeFileSync(path.join(LOCK, 'holder'), `${process.pid} ${process.argv.slice(1).join(' ')}\n`);
+      process.on('exit', unlock);
+      for (const sig of ['SIGINT', 'SIGTERM']) {
+        process.on(sig, () => { unlock(); process.exit(130); });
+      }
+      break;
+    } catch (e) {
+      if (e.code !== 'EEXIST') throw e;
+      // Contended. Liveness decides: a dead holder's slot is stale and gets
+      // swept; a live one (or an unanswerable one) refuses the run. kill(0)
+      // answers ESRCH for dead, EPERM for alive-but-not-ours — both are
+      // "alive" for our purpose, so only ESRCH permits the sweep.
+      let alive = true;
+      try {
+        const holder = fs.readFileSync(path.join(LOCK, 'holder'), 'utf8');
+        const pid = Number(holder.split(' ')[0]);
+        if (Number.isFinite(pid) && pid > 0) {
+          try { process.kill(pid, 0); } catch (ke) { alive = ke.code !== 'ESRCH'; }
+        }
+      } catch {
+        // No holder file yet — a slot that young is being written, not stale.
+        try { alive = Date.now() - fs.statSync(LOCK).mtimeMs < 30_000; } catch { alive = false; }
+      }
+      if (alive) {
+        let holder = 'unknown';
+        try { holder = fs.readFileSync(path.join(LOCK, 'holder'), 'utf8').trim(); } catch {}
+        console.error(`another load run holds ${LOCK} (${holder}) — one heavy run per machine`);
+        process.exit(3);
+      }
+      unlock(); // stale: the recorded pid is dead — reclaim and retry
+    }
+  }
+  process.env.DR_HEAVY_HELD = String(process.pid);
 }
-const unlock = () => { try { fs.unlinkSync(LOCK); } catch { /* already gone */ } };
-process.on('exit', unlock);
-for (const sig of ['SIGINT', 'SIGTERM']) process.on(sig, () => { unlock(); process.exit(130); });
 
 // Socket self-check: this process's own TCP count, sampled. A run whose
 // client-side dead conns grow past the bound is the leak above — the run
-// fails and its result is kept, not rerun to green.
+// fails and its result is kept, not rerun to green. CLOSE_WAIT and
+// FIN_WAIT_2 are bounded separately — they pile on different sides of a
+// half-close and each is independently sufficient to exhaust the box.
+// An lsof that cannot answer fails the run too: blind is not "clean".
 const SOCKET_BOUND = Number(process.env.DR_LOAD_SOCKET_BOUND ?? 1024);
-let socketPeak = 0, closeWaitPeak = 0, socketOverBound = 0;
+let socketPeak = 0, closeWaitPeak = 0, finWait2Peak = 0, socketOverBound = 0, lsofBlind = 0;
 const countOwnSockets = () => {
-  // lsof exits 1 when it lists nothing — parse stdout either way.
+  // lsof exits 1 when it lists nothing — parse stdout either way; but a
+  // spawn failure or a nonzero exit with empty output means we cannot see.
   const out = spawnSync('lsof', ['-nP', '-a', '-p', String(process.pid), '-iTCP'], { encoding: 'utf8' });
-  if (out.error) return { total: -1, cw: -1 };
-  let total = 0, cw = 0;
-  if (process.env.DR_LOAD_SOCK_DEBUG) {
-    const tcplines = String(out.stdout ?? '').split('\n').filter((l) => l.includes('TCP'));
-    console.error(`sockdbg status=${out.status} tcp=${tcplines.length} :: ${tcplines.slice(0, 2).join(' | ')}`);
+  if (out.error || (out.status !== 0 && !String(out.stdout ?? '').includes('TCP'))) {
+    if (out.error || out.status > 1) {
+      lsofBlind++;
+      console.error(`socket self-check: lsof cannot answer (error=${out.error} status=${out.status})`);
+      return { total: -1, cw: -1, fw2: -1 };
+    }
   }
+  let total = 0, cw = 0, fw2 = 0;
   for (const line of String(out.stdout ?? '').split('\n')) {
     if (!line.includes('TCP')) continue;
     total++;
     if (line.includes('CLOSE_WAIT')) cw++;
+    if (line.includes('FIN_WAIT_2')) fw2++;
   }
   socketPeak = Math.max(socketPeak, total);
   closeWaitPeak = Math.max(closeWaitPeak, cw);
-  if (cw > SOCKET_BOUND) {
+  finWait2Peak = Math.max(finWait2Peak, fw2);
+  if (cw > SOCKET_BOUND || fw2 > SOCKET_BOUND) {
     socketOverBound++;
-    console.error(`socket self-check: ${cw} CLOSE_WAIT > bound ${SOCKET_BOUND} (total ${total})`);
+    console.error(`socket self-check: ${cw} CLOSE_WAIT / ${fw2} FIN_WAIT_2 > bound ${SOCKET_BOUND} (total ${total})`);
   }
-  return { total, cw };
+  return { total, cw, fw2 };
 };
 // 1 s cadence: a dead-conn pile lives ~4 s (keep-alive evict) — a slower
 // sampler misses it entirely and the self-check goes blind.
@@ -242,9 +283,12 @@ function writeResult(name, data) {
   countOwnSockets();
   fs.writeFileSync(file, JSON.stringify({
     machine: machine(), scenario: name,
+    loadavg: os.loadavg().map((v) => Math.round(v * 100) / 100),
     peak_heap_mb: Math.round(memPeak / 2 ** 20),
     socket_peak: socketPeak, close_wait_peak: closeWaitPeak,
+    fin_wait2_peak: finWait2Peak,
     socket_bound: SOCKET_BOUND,
+    ...(lsofBlind ? { lsof_blind_samples: lsofBlind } : {}),
     ...(undiciTosRaces ? { undici_tos_races: undiciTosRaces } : {}),
     ...data,
   }, null, 2));
@@ -713,12 +757,18 @@ async function runOverload() {
   const offered = await Promise.all(offer);
   const answers = {};
   let hung = 0;
+  let httpAnswered = 0;
+  let tcpRefused = 0;
   for (const r of offered) {
     answers[r.status] = (answers[r.status] ?? 0) + 1;
     // A conn parked in the full kernel backlog waits out the flood
     // before its refusal/service — the wedge is "never answered",
     // not "answered late" (queued backpressure is the honest one).
     if (r.took > secs * 1000 + 15_000) hung++;
+    // Only a real HTTP answer counts — a tcp reset is a FAILURE for the
+    // offer (the AGENTS.md EOF-as-success rule), not an "answered".
+    if (typeof r.status === 'number') httpAnswered++;
+    else tcpRefused++;
   }
   const midHealth = await healthProbe().then((r) => r.status).catch((e) => `ERR:${e.cause?.code || e.name}`);
   await sleep(secs * 1000);
@@ -739,22 +789,29 @@ async function runOverload() {
     params: { flood_conns: pool, max_connections: 64, header_timeout_ms: 'default (10 s)', smoke: SMOKE },
     baseline_status: base.status,
     answers_during_flood: answers,
+    http_answered: httpAnswered,
+    tcp_refused: tcpRefused,
     health_during_flood: midHealth,
     health_failures: healthFails,
     recovery: { submits_done: recovered, ms: Math.round(recoverMs), codes: recCodes },
     thresholds: {
-      offers: 'each answered inside flood+15 s (200/503/tcp-refusal — no hang)',
+      offers: 'every offer settles inside flood+15 s; only real HTTP answers count — a tcp reset is a failure',
+      legit_floor: 'at least half the offers get a real HTTP answer during the flood, and at least 4 are 200',
       health: '200 on the dedicated listener, every probe <500 ms',
       recovery: `40 submits served <${recoverSecs} s after the flood`,
     },
     ...verdictOf([
       ['baseline submit served before the flood', base.status === 200],
-      ['every offered request answered inside the bound', hung === 0 && offered.length === 48],
+      ['every offered request settled inside the bound', hung === 0 && offered.length === 48],
+      // Legitimate keep-alive clients must still get real HTTP answers
+      // under the flood — not merely a kernel RST (S2 re-review R2).
+      ['at least half the offers got a real HTTP answer', httpAnswered >= 24],
+      ['at least 4 offers answered 200 during the flood', (answers[200] ?? 0) >= 4],
       ['/health answered 200 mid-flood on its listener', midHealth === 200],
       ['every liveness probe answered <500ms during the flood', healthFails.length === 0],
       [`40 submits inside ${recoverSecs}s after the flood`, recovered === 40],
     ]),
-    note: 'a conn hoard must not wedge work or liveness: reserve + slot rotation',
+    note: 'a conn hoard must not wedge work or liveness: reserve + slot rotation; tcp refusals are failures, not answers',
   });
   return r.verdict === 'pass';
 }
@@ -1202,9 +1259,14 @@ if (!runners[scenario]) {
 }
 const ok = await runners[scenario]();
 // A run whose client-side sockets crossed the bound fails even when its
-// scenario checks passed — the leak is the thing being measured.
+// scenario checks passed — the leak is the thing being measured. So does
+// a run that could not measure: a blind lsof is not a clean one.
 if (socketOverBound > 0) {
   console.error(`socket self-check tripped ${socketOverBound}x — run fails`);
+  process.exit(1);
+}
+if (lsofBlind > 0) {
+  console.error(`lsof could not answer ${lsofBlind}x — the socket bound was unobserved, run fails`);
   process.exit(1);
 }
 process.exit(ok === false ? 1 : 0);

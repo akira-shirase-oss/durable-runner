@@ -246,8 +246,10 @@ Headers added alongside the existing D-050 set:
 - `x-durable-signature` — hex `HMAC_SHA256(secret,
   "ts\nmethod\nauthority\npath\nrun\nstep\nattempt\nidem_key\nSHA256(body)")` —
   newline-joined (dot-joined fields re-split under an `idem_key` carrying
-  `.`); `authority` is the `Host` header verbatim so a sig minted for one
-  handler's URL verifies nowhere else; `run` is the opaque public id.
+  `.`); `authority` is the registered handler URL's authority — never
+  the request's `Host` header, which the caller chooses (a Host-verified
+  signature minted for `a/step` replays at `b/step` with `Host: a`
+  forged; HANDLERS.md); `run` is the opaque public id.
   Probe requests sign the same canonical with an empty body digest.
 
 Handler-side contract (documented in `docs/HANDLERS.md`, S2-6): recompute
