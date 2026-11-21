@@ -83,6 +83,9 @@ jobs:
         with:
           node-version: "22"
 
+      - name: Clean-checkout import gate (no node_modules — 44894875049 died to a bare specifier)
+        run: perf/check-clean-imports.sh
+
       - name: Build the release server the harness spawns
         run: cargo build --release --locked -p durable-server
 

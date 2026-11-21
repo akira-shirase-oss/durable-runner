@@ -28,8 +28,9 @@
 // died at ~4 GB Mark-Compact because the old one retained per-op state).
 // peak_heap_mb in every result is the measured proof.
 import { spawn, spawnSync, execFileSync } from 'node:child_process';
-import { Agent, setGlobalDispatcher } from 'undici';
 import fs from 'node:fs';
+import http from 'node:http';
+import https from 'node:https';
 import net from 'node:net';
 import os from 'node:os';
 import path from 'node:path';
@@ -48,18 +49,60 @@ const HPORT = Number(args.hport ?? 53341);
 const API = `http://127.0.0.1:${PORT}`;
 
 // The client's own sockets are a bounded resource: an earlier churn-flood
-// let undici keep-alive churn pile ~12k CLOSE_WAIT + ~12k FIN_WAIT_2 and
-// exhaust the machine's ephemeral port range, taking every session's
-// outbound TCP with it. One pool, bounded connections, short keep-alive —
-// dead ends evict in seconds instead of camping for the socket lifetime.
-const pool = new Agent({
-  connections: Number(process.env.DR_LOAD_POOL_CONNS ?? 128),
-  keepAliveTimeout: 4_000,
-  keepAliveMaxTimeout: 30_000,
-});
-// DR_LOAD_NO_POOL runs the unbounded default dispatcher — the regression
-// switch that proves the connreuse socket bound goes red without the fix.
-if (!process.env.DR_LOAD_NO_POOL) setGlobalDispatcher(pool);
+// let keep-alive churn pile ~12k CLOSE_WAIT + ~12k FIN_WAIT_2 and exhaust
+// the machine's ephemeral port range, taking every session's outbound TCP
+// with it. Bounded keep-alive agents — node:http/node:https builtins, no
+// third-party dep (undici-as-import broke CI on a clean checkout) — dead
+// ends evict in seconds instead of camping for the socket lifetime.
+const POOL_CONNS = Number(process.env.DR_LOAD_POOL_CONNS ?? 128);
+const httpPool = new http.Agent({ keepAlive: true, maxSockets: POOL_CONNS, keepAliveMsecs: 4_000, scheduling: 'lifo' });
+const httpsPool = new https.Agent({ keepAlive: true, maxSockets: POOL_CONNS, keepAliveMsecs: 4_000, scheduling: 'lifo' });
+
+// A fetch-shaped helper over node:http — the harness's only HTTP client.
+// Every response body is consumed (an unread body pins its conn), errors
+// carry their kernel .code (a tcp refusal is a refusal, not an answer),
+// and AbortSignal destroys the request's socket.
+function httpFetch(url, opts = {}) {
+  const u = new URL(url);
+  const mod = u.protocol === 'https:' ? https : http;
+  const pooled = !process.env.DR_LOAD_NO_POOL;
+  const agent = pooled ? (u.protocol === 'https:' ? httpsPool : httpPool) : false;
+  return new Promise((resolve, reject) => {
+    const req = mod.request(u, {
+      method: opts.method ?? 'GET',
+      headers: opts.headers,
+      agent,
+    }, (res) => {
+      const chunks = [];
+      res.on('data', (c) => chunks.push(c));
+      res.on('end', () => {
+        const body = Buffer.concat(chunks);
+        resolve({
+          status: res.statusCode,
+          ok: res.statusCode >= 200 && res.statusCode < 300,
+          headers: res.headers,
+          text: async () => body.toString('utf8'),
+          arrayBuffer: async () => body.buffer.slice(body.byteOffset, body.byteOffset + body.byteLength),
+          json: async () => JSON.parse(body.toString('utf8')),
+        });
+      });
+      res.on('error', reject);
+    });
+    if (opts.signal) {
+      if (opts.signal.aborted) {
+        req.destroy(Object.assign(new Error('aborted'), { name: 'AbortError' }));
+        return;
+      }
+      opts.signal.addEventListener('abort', () => {
+        req.destroy(Object.assign(new Error('aborted'), { name: 'AbortError' }));
+      }, { once: true });
+    }
+    req.on('error', reject);
+    if (opts.body) req.write(opts.body);
+    req.end();
+  });
+}
+const fetch = httpFetch;
 
 // One load run per machine at a time (the heavy slot): a second run races
 // the first for ports, fds and the measurement — refuse it, don't queue.
@@ -234,22 +277,9 @@ let wakeWaiter = null;
 const wake = () => { const w = wakeWaiter; wakeWaiter = null; if (w) w(); };
 const waitSettle = () => new Promise((r) => { wakeWaiter = r; });
 
-// Node 24/undici on macOS: writeH1 calls setTypeOfService on a socket that
-// the server may be closing at the same instant (the server bounds
-// connection lifetime and requests-per-connection, so churn is real). The
-// EINVAL escapes as uncaughtException from a socket callback — a platform
-// defect in the harness, not the system under test. The attempt's own
-// socket already errored, so the op's normal tcp-refusal retry absorbs it;
-// count the races into the result for transparency. Anything else is
-// fatal as before.
-let undiciTosRaces = 0;
-process.on('uncaughtException', (e) => {
-  if (e?.code === 'EINVAL' && e?.syscall === 'setTypeOfService') {
-    undiciTosRaces++;
-    return;
-  }
-  throw e;
-});
+// node:http's client has no setTypeOfService path, so the former
+// undici/macOS EINVAL race is gone with the dependency; any
+// uncaughtException is fatal again.
 
 // Heap-peak sampler: every result carries peak_heap_mb, so the harness's
 // own bound is measured evidence — the O(1) claim is checked, not asserted.
@@ -289,7 +319,6 @@ function writeResult(name, data) {
     fin_wait2_peak: finWait2Peak,
     socket_bound: SOCKET_BOUND,
     ...(lsofBlind ? { lsof_blind_samples: lsofBlind } : {}),
-    ...(undiciTosRaces ? { undici_tos_races: undiciTosRaces } : {}),
     ...data,
   }, null, 2));
   console.log(`result -> ${file}`);
@@ -498,7 +527,7 @@ const submitTcpByCode = {};
 // a kernel-level refusal never reached the server and contributes no
 // sample, so the bound measures server speed, not box congestion. `ms` is
 // time to the final answer (pacing included); `attempts` counts tries.
-// Every response body is consumed — an unread undici body pins its
+// Every response body is consumed — an unread body pins its
 // connection and buffers for the run.
 async function submit(opKey, steps = 1, auth = AUTH, until = performance.now() + 90_000) {
   const t0 = performance.now();
@@ -1006,7 +1035,7 @@ async function runWorkspaces() {
   // submit burst runs — the registry is rebuilt per workspace, never
   // blocked. Kernel refusals count as churn_errors, not a harness crash;
   // a persistent outage stops churning rather than spin on a dead port.
-  // Every response body is consumed — an unread undici body pins its
+  // Every response body is consumed — an unread body pins its
   // connection and buffers, one leak per op for the whole run.
   let churnDone = false; let churnOps = 0, churnErrors = 0;
   const churn = (async () => {
@@ -1210,8 +1239,11 @@ async function runWorkspaces() {
 // (--max-requests-per-connection 1) forces the client to open a fresh conn
 // per op — the exact churn shape that piled 12k CLOSE_WAIT before the
 // bounded pool. The run passes only if the client's own socket count stays
-// under the bound — with the unbounded default dispatcher the pile is
-// per-op and this fails.
+// under the bound. Measured under node:http's agents (undici removed):
+// pooled and unpooled both pile at the in-flight window (~MAXP) since the
+// pile is server-driven, not client-retention — DR_LOAD_NO_POOL remains
+// the regression switch but the discriminator here is the absolute bound
+// plus the drain check, tripped 13x at bound 50 in the red proof.
 async function runConnreuse() {
   const n = Number(args.ops ?? 400);
   const dir = fs.mkdtempSync(`${os.tmpdir()}/dr-load-`);
@@ -1232,6 +1264,9 @@ async function runConnreuse() {
       if (r.status === 200) ok200++;
     });
     pending.add(p);
+    // A sub-second run never trips the 1 s sampler — count at op
+    // cadence too so a churn pile cannot slip between ticks.
+    if (i % 64 === 0) countOwnSockets();
     if (pending.size >= MAXP) await settle();
   }
   await Promise.all(pending);
