@@ -895,8 +895,8 @@ impl Journal {
         tighten(&manifest_path_of(dir), FILE_MODE);
         tighten(&shape_path(dir), FILE_MODE);
         tighten(&dir.join("public_id.key"), FILE_MODE); // the server's id key
-        // A crash can orphan the sidecar's temp file; it is not journal
-        // content and the next write_shape recreates it anyway.
+                                                        // A crash can orphan the sidecar's temp file; it is not journal
+                                                        // content and the next write_shape recreates it anyway.
         let _ = fs::remove_file(dir.join("journal.shape.tmp"));
 
         // Manifest: keep the last valid one. First open creates generation
