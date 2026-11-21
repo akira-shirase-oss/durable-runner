@@ -4484,8 +4484,9 @@ mod tests {
         }
     }
 
-    /// A real OS error BEFORE the swap point — here an unwritable root
-    /// fails the journal.shape write — is an ordinary compaction error:
+    /// A real OS error BEFORE the swap point — a journal root the process
+    /// can write into but not open for reading fails the sidecar's
+    /// directory fsync (EACCES) — is an ordinary compaction error:
     /// the engine serves on, nothing is poisoned. (A post-rename fault
     /// still stops it; `compaction_error_at_any_step` covers step 3, and
     /// a permissions trick cannot reach past the sidecar write anymore.)

@@ -264,7 +264,11 @@ writes both flats — the sidecar preserves forward claims a replay
 cannot reconstruct, and the key keeps every issued public id
 decodable on the restored instance. v1.0.x writes generation files
 only but accepts all of them on restore, so this build's backup of a
-still-record-v2 journal is a legitimate rollback target there.
+still-record-v2 journal is a legitimate rollback target there. One
+asymmetry an operator must know: a v1.0.2 backup of a directory that
+holds `public_id.key` lists that key, and a backup listing it is
+refused by v1.0.1's restore (its file list admits generation paths
+only) — the rollback floor for a key-holding backup is v1.0.2.
 Whether the restored journal can then run is the unchanged D-056
 gate (record/snapshot/ws versions), never the file list.
 

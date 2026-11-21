@@ -976,9 +976,10 @@ format bump would make the service refuse to start. The rules:
   three maxima — including ws ≠ 0 runs that survive only inside
   `snapshot.bin` after `prune_superseded` deleted their records, which
   no grep can find. Server-down the guard reads the sidecar plus a
-  full scan; a DRIX ≥ 2 journal with no sidecar is ambiguous (a
-  ws-capable writer may have compacted before sidecars existed) and
-  refuses unless the records prove a pre-workspace writer.
+  full scan; a DRIX ≥ 2 journal with no sidecar is ambiguous — every
+  workspace-aware writer (v1.0.1+) stamps `"ws"` on each record, so no
+  record set can prove such a journal is pre-workspace — and refuses
+  every non-parking binary.
   `durable-server --journal-format` prints them from the binary's side:
   `<max record version> <max DRIX version> <parks ws ≠ 0>` since
   v1.0.2 (a lone integer before it means records only, snapshot
@@ -1050,5 +1051,12 @@ decided for both branches:
   without it the minted ids orphan to 404.
 - Whether a restored journal can then RUN under the binary is a
   separate, unchanged gate: record/snapshot/ws versions and the
-  D-056 format guard, never the file list. An S2 backup restores
-  under v1.0.2 exactly when the journal is still record-v2.
+  D-056 format guard, never the file list. v1.0.2's reader is
+  record-3, so an S2 journal that already wrote v3 records still
+  restores and opens — every workspace-tagged run parks instead of
+  executing (and keeps surviving compaction inside snapshot.bin)
+  until an S2 binary picks the journal up again. And one asymmetry
+  an operator must know: a v1.0.2 backup of a directory that holds
+  `public_id.key` lists that key, and a backup listing it is refused
+  by v1.0.1's restore, which admits generation paths only — the
+  rollback floor for a key-holding backup is this release.

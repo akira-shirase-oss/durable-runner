@@ -79,8 +79,10 @@ install -d "$work/jlogdir/gen-000001/journal.log"; run 1 jlogdir reads-v2  # jou
 # passed the guard and then refused startup.
 mkjournal snap2 2; mksnap "$work/jsnap2" 2
 run 1 jsnap2 reads-v2          # v1.0.0-class reader on a DRIX-2 journal
-run 0 jsnap2 reads-v3          # v1.0.1 floor: reader 3 implies DRIX 2
-run 0 jsnap2 reads-v3-2-1      # the explicit three-number answer
+# A sidecar-less DRIX-2 journal can never prove a pre-workspace writer
+# (v1.0.1+ stamps "ws" on every record) — refused even for reads-v3.
+run 1 jsnap2 reads-v3          # ambiguous: cannot park, refused
+run 0 jsnap2 reads-v3-2-1      # the parking three-number answer
 
 # A snapshot from the future refuses even a three-number binary.
 mkjournal snap9 2; mksnap "$work/jsnap9" 9
@@ -158,6 +160,15 @@ mkjournal ambmt 2; mksnap "$work/jambmt" 2
 : >"$work/jambmt/gen-000001/journal.log"
 run 1 jambmt reads-v3
 
+# Hardest case: v2 records WITHOUT ws fields + a DRIX ≥ 2 snapshot and
+# no sidecar — the only combination the old guard admitted. But every
+# ws-aware writer (v1.0.1+) stamps "ws" on each record, so ws-free
+# records can't prove the compactor was pre-workspace: refuse.
+mkjournal ambold 2; mksnap "$work/jambold" 2
+printf '{"v":2,"run":1}\n' >"$work/jambold/gen-000001/journal.log"
+run 1 jambold reads-v3
+run 0 jambold reads-v3-2-1
+
 # Multi-generation: the scan walks every gen dir.
 mkjournal multi 3; install -d "$work/jmulti/gen-000002"
 printf '{"v":3,"ws":4,"run":1}\n' >"$work/jmulti/gen-000002/journal.log"
@@ -204,6 +215,111 @@ for stub, want in [("reads-v3", 1), ("reads-v3-2-1", 0)]:
         print(r.stderr.decode(), file=sys.stderr); sys.exit(1)
 PY
 pypid=$!
+# A diagnostics answer that carries a non-numeric ws field refuses —
+# the workspace scope can never be guessed at (line: `jws =~ ^[0-9]+$`).
+python3 - "$work" <<'PY' &
+import http.server, json, sys, threading
+work = sys.argv[1]
+class H(http.server.BaseHTTPRequestHandler):
+    def do_GET(self):
+        b = json.dumps({"journal_record_version_max": 2,
+                        "journal_snapshot_version_max": 1,
+                        "journal_max_ws": "nine"}).encode()
+        self.send_response(200)
+        self.send_header("content-type", "application/json")
+        self.send_header("content-length", str(len(b)))
+        self.end_headers(); self.wfile.write(b)
+    def log_message(self, *a): pass
+s = http.server.HTTPServer(("127.0.0.1", 58402), H)
+threading.Thread(target=s.serve_forever, daemon=True).start()
+import os, subprocess, time
+time.sleep(0.4)
+env = dict(os.environ, FORMAT_GUARD_LISTEN="127.0.0.1:58402",
+           FORMAT_GUARD_KEY_FILE=f"{work}/keyfile",
+           FORMAT_GUARD_JOURNAL_ROOT=f"{work}/jsc0")
+r = subprocess.run(["deploy/format-guard.sh", f"{work}/reads-v3-2-1"],
+                   env=env, capture_output=True)
+print(f"server-up nonnumeric-ws: exit {r.returncode} (want 1)", file=sys.stderr)
+if r.returncode != 1:
+    print(r.stderr.decode(), file=sys.stderr); sys.exit(1)
+PY
+pypid2=$!
 wait $pypid || { echo "FAIL: server-up merge wrong"; fails=1; }
+wait $pypid2 || { echo "FAIL: nonnumeric-ws refusal wrong"; fails=1; }
+
+# --- v1.0.2 (S1 review): the freed port is hostile --------------------
+# rollback.sh/upgrade.sh stop the server BEFORE the guard runs, so any
+# local user can bind 58300 first: a squatter would receive the admin
+# key in the Authorization header and could answer arithmetic-injection
+# JSON (bash `(( x > y[$(cmd)0] ))` runs cmd). The guard must run
+# files-only for them, and never arithmetic-evaluate an unvalidated
+# value even when the diagnostics path does run.
+install -d "$work/jok/gen-000001"
+printf '{"v":1,"ws":0,"run":1}\n' >"$work/jok/gen-000001/journal.log"
+printf 'records=1\nsnapshots=1\nws=0\n' >"$work/jok/journal.shape"
+printf 'sekrit-admin-key' >"$work/keyfile2"
+python3 - "$work" <<'PY' &
+import http.server, json, socket, sys, threading, time
+work = sys.argv[1]
+class H(http.server.BaseHTTPRequestHandler):
+    def do_GET(self):
+        with open(f"{work}/stub-hit", "a") as f:
+            f.write(self.headers.get("authorization", "-") + "\n")
+        pwn = f"BASH_VERSINFO[$(touch {work}/pwned)0]"
+        b = json.dumps({"journal_record_version_max": pwn,
+                        "journal_snapshot_version_max": pwn,
+                        "journal_max_ws": pwn}).encode()
+        self.send_response(200)
+        self.send_header("content-type", "application/json")
+        self.send_header("content-length", str(len(b)))
+        self.end_headers(); self.wfile.write(b)
+    def log_message(self, *a): pass
+s = http.server.HTTPServer(("127.0.0.1", 58403), H)
+threading.Thread(target=s.serve_forever, daemon=True).start()
+# The socket already listens (constructor bound it); a bare connect
+# cannot reach do_GET, so this probe never logs a stub-hit.
+for _ in range(200):
+    try:
+        socket.create_connection(("127.0.0.1", 58403), 0.1).close(); break
+    except OSError:
+        time.sleep(0.05)
+import os, subprocess
+base = dict(os.environ, FORMAT_GUARD_LISTEN="127.0.0.1:58403",
+            FORMAT_GUARD_KEY_FILE=f"{work}/keyfile2",
+            FORMAT_GUARD_JOURNAL_ROOT=f"{work}/jok")
+
+# 1. Files-only (how the scripts must run it): the squatter is never
+#    contacted — the key cannot leak and no payload arrives at all.
+env = dict(base, FORMAT_GUARD_FILES_ONLY="1")
+r = subprocess.run(["deploy/format-guard.sh", f"{work}/reads-v3-2-1"],
+                   env=env, capture_output=True)
+print(f"files-only: exit {r.returncode} (want 0)", file=sys.stderr)
+if r.returncode != 0:
+    print(r.stderr.decode(), file=sys.stderr); sys.exit(1)
+if os.path.exists(f"{work}/stub-hit"):
+    print("files-only still curled the squatter — the key leaked",
+          file=sys.stderr); sys.exit(1)
+
+# 2. Even with the diagnostics path live, a hostile value must be
+#    refused BEFORE any arithmetic sees it: exit non-zero and the
+#    injection marker must not exist.
+env = dict(base)
+r = subprocess.run(["deploy/format-guard.sh", f"{work}/reads-v3-2-1"],
+                   env=env, capture_output=True)
+print(f"hostile diagnostics: exit {r.returncode} (want non-zero)",
+      file=sys.stderr)
+if r.returncode == 0:
+    print("hostile diagnostics accepted", file=sys.stderr); sys.exit(1)
+if os.path.exists(f"{work}/pwned"):
+    print("COMMAND INJECTION: the guard evaluated the payload",
+          file=sys.stderr); sys.exit(1)
+PY
+pypid3=$!
+wait $pypid3 || { echo "FAIL: freed-port squatter not blocked"; fails=1; }
+
+# The scripts themselves must run the guard in files-only mode — after
+# their stop, whatever answers the port is a squatter by definition.
+grep -q 'FORMAT_GUARD_FILES_ONLY' deploy/rollback.sh deploy/upgrade.sh \
+  || { echo "FAIL: upgrade/rollback let the guard curl the freed port"; fails=1; }
 
 (( fails == 0 )) && echo "format-guard tests: all pass" || exit 1
