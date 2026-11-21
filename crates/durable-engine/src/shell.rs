@@ -13,7 +13,8 @@ use durable_domain::{
     Effect, JobSpec, Limits, Millis, OperationKey, Run, RunId, RunState, StepIndex, StepSpec,
 };
 use durable_journal::{JournalError, JournalOptions};
-use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+use std::cmp::Reverse;
+use std::collections::{BTreeMap, BinaryHeap, HashMap, HashSet, VecDeque};
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{SyncSender, TrySendError};
@@ -258,6 +259,12 @@ struct Health {
 
 /// The most runs one list call returns, whatever the caller asks for.
 pub const MAX_PAGE: usize = 1000;
+
+/// How long an in-grace dead-handler entry waits on `dead_retry`
+/// between presence re-checks (S3 re-review N7): a 30 s grace costs ~30
+/// examinations per entry instead of one per tick, and the heap's
+/// `min(first + grace, now + this)` still parks on the exact deadline.
+const DEAD_RECHECK_MS: u64 = 1_000;
 
 /// Which end a list page starts from, with its cursor.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1173,6 +1180,11 @@ async fn actor(
     let mut due_order: VecDeque<u64> = VecDeque::new();
     let mut parked: HashMap<u64, Vec<Parked>> = HashMap::new();
     let mut dead_since: HashMap<RunId, Millis> = HashMap::new();
+    // In-grace dead-handler entries sit HERE between re-checks, not in
+    // the dispatch queues: `(next_check, run, step, attempt)` pops back
+    // into `due_by_ws` when due, so a dead entry costs one examination
+    // per re-check interval instead of one per tick (S3 re-review N7).
+    let mut dead_retry: BinaryHeap<Reverse<(u64, u64, u32, u32)>> = BinaryHeap::new();
     let mut spawned: HashMap<tokio::task::Id, (RunId, StepIndex)> = HashMap::new();
     let sem = Arc::new(Semaphore::new(cfg.max_in_flight));
     let mut status = writer.status;
@@ -1207,6 +1219,7 @@ async fn actor(
                 due_order: &mut due_order,
                 parked: &mut parked,
                 dead_since: &mut dead_since,
+                dead_retry: &mut dead_retry,
                 dead_grace_ms: cfg.dead_handler_grace_ms,
                 per_tick: cfg.max_dispatch_per_tick,
                 #[cfg(test)]
@@ -1626,6 +1639,10 @@ struct Exec<'a> {
     due_order: &'a mut VecDeque<u64>,
     parked: &'a mut HashMap<u64, Vec<Parked>>,
     dead_since: &'a mut HashMap<RunId, Millis>,
+    /// `(next_check, run, step, attempt)` — in-grace dead entries
+    /// between re-checks; the field types are raw ints so the heap
+    /// orders without `Ord` on the domain ids.
+    dead_retry: &'a mut BinaryHeap<Reverse<(u64, u64, u32, u32)>>,
     dead_grace_ms: u64,
     per_tick: usize,
     /// Queue entries this tick examined — the test counter proving the
@@ -1796,10 +1813,12 @@ impl Exec<'_> {
     }
 
     /// Drop every scheduler entry a run holds — an in-grace `dead_since`
-    /// marker and a parked entry (S2 re-review N2). Called when the run
-    /// leaves waiting for a reason no queue pass will see: a cancel.
+    /// marker, its `dead_retry` tuple, and a parked entry (S2 re-review
+    /// N2). Called when the run leaves waiting for a reason no queue
+    /// pass will see: a cancel.
     fn untrack(&mut self, ws: u64, run: RunId) {
         self.dead_since.remove(&run);
+        self.dead_retry.retain(|Reverse((_, r, ..))| *r != run.0);
         if let Some(v) = self.parked.get_mut(&ws) {
             v.retain(|p| p.0 != run);
             if v.is_empty() {
@@ -1871,7 +1890,12 @@ impl Exec<'_> {
 /// A permit is taken **before** `StepDispatched` is journaled: with none
 /// free the run stays queued (nothing happened, nothing is recorded).
 fn tick(core: &mut EngineCore, exec: &mut Exec<'_>) {
-    let now = wall_ms();
+    tick_at(core, exec, wall_ms());
+}
+
+/// The scheduler's pass at an explicit `now` — production calls it via
+/// `tick`; tests drive the re-check/grace clocks deterministically.
+fn tick_at(core: &mut EngineCore, exec: &mut Exec<'_>, now: Millis) {
     // Below the reserve nothing new can be journaled: no expiry, no
     // dispatch (a call whose outcome cannot be recorded is not started).
     // In-flight work waits; readiness reports `no_space`.
@@ -1936,6 +1960,30 @@ fn tick(core: &mut EngineCore, exec: &mut Exec<'_>) {
             .or_default()
             .push_back((run, step, attempt));
     }
+    // In-grace dead entries whose re-check is due come back through the
+    // same rotation — a handler that returned dispatches this visit, a
+    // still-absent one goes back to the heap once (S3 re-review N7: they
+    // used to re-examine on every tick of their grace window).
+    while exec
+        .dead_retry
+        .peek()
+        .is_some_and(|Reverse((due, ..))| *due <= now)
+    {
+        let Some(Reverse((_, run, step, attempt))) = exec.dead_retry.pop() else {
+            break;
+        };
+        let Some(ws) = core.run(RunId(run)).map(|r| r.ws) else {
+            exec.dead_since.remove(&RunId(run)); // the run is gone entirely
+            continue;
+        };
+        if !exec.due_by_ws.contains_key(&ws) {
+            exec.due_order.push_back(ws);
+        }
+        exec.due_by_ws
+            .entry(ws)
+            .or_default()
+            .push_back((RunId(run), StepIndex(step), attempt));
+    }
     // The per-tick budget counts only dispatch that actually happens
     // (S2 re-review N2): an entry that cannot dispatch — its handler left
     // the registry, its workspace is at share — is skipped for free, so
@@ -1999,10 +2047,11 @@ fn tick(core: &mut EngineCore, exec: &mut Exec<'_>) {
                 if !exec.registry.contains(ws, &name) {
                     // The handler left the registry after this run was
                     // accepted: it stays queued — registry repair or a
-                    // cancel resolves it. Within grace it re-queues past
-                    // this visit's bound; past grace it parks out of the
-                    // rotation until the handler returns, so a dead-handler
-                    // backlog never re-scans every tick (finding 5).
+                    // cancel resolves it. Within grace it waits out the
+                    // re-check interval on the `dead_retry` heap — not
+                    // in this queue, so a dead backlog is not re-scanned
+                    // every tick; past grace it parks out of the
+                    // rotation until the handler returns (findings 5/N7).
                     let first = *exec.dead_since.entry(run).or_insert(now);
                     if now.saturating_sub(first) >= exec.dead_grace_ms {
                         exec.dead_since.remove(&run);
@@ -2011,11 +2060,14 @@ fn tick(core: &mut EngineCore, exec: &mut Exec<'_>) {
                             .or_default()
                             .push((run, step, attempt, name.into()));
                     } else {
-                        queue.push_back((run, step, attempt));
+                        let next = first
+                            .saturating_add(exec.dead_grace_ms)
+                            .min(now.saturating_add(DEAD_RECHECK_MS));
+                        exec.dead_retry
+                            .push(Reverse((next, run.0, step.0, attempt)));
                     }
                     continue;
                 }
-                exec.dead_since.remove(&run);
                 let Ok(permit) = exec.sem.clone().try_acquire_owned() else {
                     // At capacity: the entry stays next-due for a later tick.
                     queue.push_front((run, step, attempt));
@@ -2045,6 +2097,12 @@ fn tick(core: &mut EngineCore, exec: &mut Exec<'_>) {
                     break;
                 }
                 exec.fire(core, run, step, permit, slot);
+                // The run left the wait — its in-grace marker dies here,
+                // AFTER the dispatch took. Dropping it earlier let a
+                // PUT/DELETE flap restart the grace clock every time the
+                // handler was seen present but the run stayed queued
+                // (starved permit, full workspace share) — N7.
+                exec.dead_since.remove(&run);
                 budget -= 1;
                 dispatched = true;
                 break; // one dispatch per visit — the rotation stays fair
@@ -2949,6 +3007,7 @@ mod tests {
         let (mut live, mut waiting) = (HashMap::new(), ProbeQueue::default());
         let (mut due_by_ws, mut due_order) = (BTreeMap::new(), VecDeque::new());
         let (mut parked, mut dead_since) = (HashMap::new(), HashMap::new());
+        let mut dead_retry = BinaryHeap::new();
         let inflight = WsInflight::default();
         let mut spawned = HashMap::new();
         let mut mon = Monitor {
@@ -2972,6 +3031,7 @@ mod tests {
                     due_order: &mut due_order,
                     parked: &mut parked,
                     dead_since: &mut dead_since,
+                    dead_retry: &mut dead_retry,
                     dead_grace_ms: 0,
                     per_tick: 8,
                     examined: 0,
@@ -3070,6 +3130,7 @@ mod tests {
         let (mut live, mut waiting) = (HashMap::new(), ProbeQueue::default());
         let (mut due_by_ws, mut due_order) = (BTreeMap::new(), VecDeque::new());
         let (mut parked, mut dead_since) = (HashMap::new(), HashMap::new());
+        let mut dead_retry = BinaryHeap::new();
         let inflight = WsInflight::default();
         let mut spawned = HashMap::new();
         let mut mon = Monitor {
@@ -3092,6 +3153,7 @@ mod tests {
             due_order: &mut due_order,
             parked: &mut parked,
             dead_since: &mut dead_since,
+            dead_retry: &mut dead_retry,
             dead_grace_ms: 0,
             per_tick: 3,
             examined: 0,
@@ -3129,6 +3191,7 @@ mod tests {
         due_order: VecDeque<u64>,
         parked: HashMap<u64, Vec<Parked>>,
         dead_since: HashMap<RunId, Millis>,
+        dead_retry: BinaryHeap<Reverse<(u64, u64, u32, u32)>>,
         mon: Monitor,
         pipe: Pipeline,
     }
@@ -3146,6 +3209,7 @@ mod tests {
                 due_order: VecDeque::new(),
                 parked: HashMap::new(),
                 dead_since: HashMap::new(),
+                dead_retry: BinaryHeap::new(),
                 mon: Monitor {
                     health: Arc::default(),
                     errors: BTreeMap::new(),
@@ -3174,6 +3238,7 @@ mod tests {
                 due_order: &mut self.due_order,
                 parked: &mut self.parked,
                 dead_since: &mut self.dead_since,
+                dead_retry: &mut self.dead_retry,
                 dead_grace_ms,
                 per_tick,
                 examined: 0,
@@ -3275,6 +3340,108 @@ mod tests {
         assert!(
             sched.due_by_ws.get(&0).is_none_or(VecDeque::is_empty),
             "the entry was not consumed by dispatch"
+        );
+    }
+
+    /// S3 re-review N7: an in-grace dead-handler entry re-checks on the
+    /// cadence, not every tick. Ticks inside the re-check interval
+    /// examine nothing — the entry waits on `dead_retry` — and it still
+    /// parks at the exact grace deadline.
+    #[tokio::test(flavor = "current_thread")]
+    async fn an_in_grace_dead_entry_rechecks_on_a_cadence() {
+        let d = tempfile::tempdir().unwrap_or_else(|e| panic!("{e}"));
+        let mut core = EngineCore::open(d.path()).unwrap_or_else(|e| panic!("{e}"));
+        let t0 = wall_ms();
+        core.submit_at(0, OperationKey("dead".into()), spec1("gone"), t0, t0)
+            .unwrap_or_else(|e| panic!("{e}"));
+        let reg = Registry::default(); // "gone" never resolves
+        let mut sched = Sched::new(8);
+        {
+            let mut ex = sched.exec(&reg, 64, 10_000, 8);
+            tick_at(&mut core, &mut ex, t0);
+            assert_eq!(ex.examined, 1, "the first sighting marked it");
+        }
+        // Ticks inside the re-check interval re-examine nothing.
+        for i in 1..=4u64 {
+            let mut ex = sched.exec(&reg, 64, 10_000, 8);
+            tick_at(&mut core, &mut ex, t0 + i * 100);
+            assert_eq!(
+                ex.examined, 0,
+                "tick {i} re-examined an in-grace dead entry"
+            );
+        }
+        assert_eq!(
+            sched.dead_retry.len(),
+            1,
+            "the in-grace entry waits on the heap"
+        );
+        // At the re-check boundary it is examined exactly once more…
+        {
+            let mut ex = sched.exec(&reg, 64, 10_000, 8);
+            tick_at(&mut core, &mut ex, t0 + 1_000);
+            assert_eq!(ex.examined, 1, "the re-check did not happen");
+        }
+        // …and it parks on the grace deadline, not a tick early or late.
+        {
+            let mut ex = sched.exec(&reg, 64, 10_000, 8);
+            tick_at(&mut core, &mut ex, t0 + 10_000);
+        }
+        assert_eq!(sched.parked.get(&0).map(Vec::len), Some(1));
+        assert!(sched.dead_since.is_empty(), "the marker outlived parking");
+    }
+
+    /// S3 re-review N7: a PUT/DELETE flap must not restart the
+    /// dead-handler grace clock. The old code dropped `dead_since` the
+    /// moment a present handler was *seen* — even when the run stayed
+    /// queued (here, a starved permit) — so a DELETE before the next
+    /// absence check minted a fresh grace window and the entry never
+    /// parked. The marker now dies only when the run leaves the wait.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_delete_put_flap_does_not_restart_the_dead_grace() {
+        let d = tempfile::tempdir().unwrap_or_else(|e| panic!("{e}"));
+        let mut core = EngineCore::open(d.path()).unwrap_or_else(|e| panic!("{e}"));
+        let t0 = wall_ms();
+        core.submit_at(0, OperationKey("flap".into()), spec1("h"), t0, t0)
+            .unwrap_or_else(|e| panic!("{e}"));
+        let mut reg = Registry::default(); // absent at the first sighting
+        let mut sched = Sched::new(0); // zero permits: present-but-starved
+        {
+            let mut ex = sched.exec(&reg, 64, 2_000, 8);
+            tick_at(&mut core, &mut ex, t0); // marker = t0; due back t0+1000
+        }
+        assert_eq!(
+            sched.dead_since.values().copied().collect::<Vec<_>>(),
+            vec![t0],
+            "the marker did not record the first absence"
+        );
+        // PUT: present at the re-check, but the run cannot dispatch.
+        reg.put(0, "h", Arc::new(HangAlways))
+            .unwrap_or_else(|e| panic!("{e}"));
+        {
+            let mut ex = sched.exec(&reg, 64, 2_000, 8);
+            tick_at(&mut core, &mut ex, t0 + 1_000);
+        }
+        assert_eq!(sched.attempts.len(), 0, "nothing may dispatch on 0 permits");
+        assert_eq!(
+            sched.dead_since.values().copied().collect::<Vec<_>>(),
+            vec![t0],
+            "a present sighting must not erase the marker while the run waits"
+        );
+        // DELETE again — the flap. Under the old marker policy this
+        // minted a fresh grace at t0+1500.
+        reg.remove(0, "h");
+        {
+            let mut ex = sched.exec(&reg, 64, 2_000, 8);
+            tick_at(&mut core, &mut ex, t0 + 1_500);
+        }
+        {
+            let mut ex = sched.exec(&reg, 64, 2_000, 8);
+            tick_at(&mut core, &mut ex, t0 + 2_000);
+        }
+        assert_eq!(
+            sched.parked.get(&0).map(Vec::len),
+            Some(1),
+            "the flap restarted the grace clock — the entry did not park"
         );
     }
 
