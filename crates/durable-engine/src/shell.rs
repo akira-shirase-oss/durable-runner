@@ -743,11 +743,13 @@ impl Monitor {
     }
 }
 
-/// An attempt's result comes back with the permit it ran under, so a
-/// chained step (the checkpoint that moves the run to its next step) can
-/// inherit it instead of racing other runs for capacity.
-type AttemptJoin = (RunId, StepIndex, Outcome, OwnedSemaphorePermit);
-type ProbeJoin = (RunId, StepIndex, bool, OwnedSemaphorePermit);
+/// An attempt's result comes back with the permit AND the workspace
+/// slot it ran under, so a chained step (the checkpoint that moves the
+/// run to its next step) inherits both instead of racing other runs for
+/// capacity — a freed slot could otherwise be handed to a backlog run
+/// before the finished call's effects ran (S1).
+type AttemptJoin = (RunId, StepIndex, Outcome, OwnedSemaphorePermit, WsSlot);
+type ProbeJoin = (RunId, StepIndex, bool, OwnedSemaphorePermit, WsSlot);
 
 /// Sends a held answer: `None` once durable, `Some(err)` if the commit failed.
 type HeldReply = Box<dyn FnOnce(Option<&Arc<JournalError>>) + Send>;
@@ -1316,7 +1318,7 @@ async fn actor(
                 }
             },
             Some(res) = attempts.join_next() => match res {
-                Ok((run, step, outcome, permit)) => {
+                Ok((run, step, outcome, permit, slot)) => {
                     live.remove(&(run, step));
                     spawned.retain(|_, k| *k != (run, step));
                     let (out, fail) = match outcome {
@@ -1328,7 +1330,7 @@ async fn actor(
                     // Not journaled (e.g. NoSpace): counted; the run stays
                     // Running and its deadline sweep reconciles the effect.
                     let effects = ex.mon.effects(core.step_finished(run, step, out, fail, wall_ms()));
-                    run_effects(&mut core, &mut ex, effects, run, Some(permit));
+                    run_effects(&mut core, &mut ex, effects, run, Some(permit), Some(slot));
                 }
                 // A panicked or aborted attempt: the WsSlot already
                 // returned the workspace's share on drop. The call's
@@ -1346,16 +1348,16 @@ async fn actor(
                             None,
                             wall_ms(),
                         ));
-                        run_effects(&mut core, &mut ex, effects, run, None);
+                        run_effects(&mut core, &mut ex, effects, run, None, None);
                     }
                 }
             },
             Some(res) = probes.join_next() => match res {
-                Ok((run, step, found, permit)) => {
+                Ok((run, step, found, permit, slot)) => {
                     spawned.retain(|_, k| *k != (run, step));
                     let mut ex = exec!();
                     let effects = ex.mon.effects(core.reconciled(run, step, found, wall_ms()));
-                    run_effects(&mut core, &mut ex, effects, run, Some(permit));
+                    run_effects(&mut core, &mut ex, effects, run, Some(permit), Some(slot));
                 }
                 // Same release rule for a dead probe; its verdict is
                 // unknown, so it reconciles as not-found — at-least-once
@@ -1366,7 +1368,7 @@ async fn actor(
                         let mut ex = exec!();
                         let effects =
                             ex.mon.effects(core.reconciled(run, step, false, wall_ms()));
-                        run_effects(&mut core, &mut ex, effects, run, None);
+                        run_effects(&mut core, &mut ex, effects, run, None, None);
                     }
                 }
             },
@@ -1640,8 +1642,11 @@ impl Exec<'_> {
         let call = Call { run, step, attempt };
         let handle = self.attempts.spawn(async move {
             let outcome = handler.execute_call(call, &sspec, &input, &idem).await;
-            drop(slot); // the slot returns at task end — panic and abort included
-            (run, step, outcome, permit)
+            // The slot returns WITH the outcome so the run's next step
+            // can inherit it like the permit: dropping it here freed the
+            // share to a backlog run before the effect pass, and the
+            // journaled-Running next step was never called (S1).
+            (run, step, outcome, permit, slot)
         });
         self.spawned.insert(handle.id(), (run, step));
         self.live.insert((run, step), handle);
@@ -1652,7 +1657,7 @@ impl Exec<'_> {
         let effects =
             self.mon
                 .effects(core.step_finished(run, step, None, Some(why.to_string()), wall_ms()));
-        run_effects(core, self, effects, run, None);
+        run_effects(core, self, effects, run, None, None);
     }
 
     /// Probe for a reconciling step; the verdict returns through the loop.
@@ -1723,15 +1728,17 @@ impl Exec<'_> {
             let effects = self
                 .mon
                 .effects(core.reconciled(run, step, false, wall_ms()));
-            run_effects(core, self, effects, run, Some(permit));
+            run_effects(core, self, effects, run, Some(permit), Some(slot));
             return;
         };
         let idem = idem_key(&r.key, step);
         let call = Call { run, step, attempt };
         let handle = self.probes.spawn(async move {
             let found = handler.probe_call(call, &sspec, &idem).await;
-            drop(slot); // the slot returns at task end — panic and abort included
-            (run, step, found, permit)
+            // Same rule as an attempt: the slot rides home with the
+            // verdict so a DispatchStep the reconcile produces keeps
+            // the share the probe was run under.
+            (run, step, found, permit, slot)
         });
         self.spawned.insert(handle.id(), (run, step));
     }
@@ -1762,7 +1769,7 @@ fn tick(core: &mut EngineCore, exec: &mut Exec<'_>) {
         let effects = exec
             .mon
             .effects(core.step_finished(run, step, None, None, now));
-        run_effects(core, exec, effects, run, None);
+        run_effects(core, exec, effects, run, None, None);
     }
     // Probes that found no permit or workspace share when their run
     // started reconciling. Each entry gets ONE try per tick, bounded by
@@ -1829,15 +1836,20 @@ fn tick(core: &mut EngineCore, exec: &mut Exec<'_>) {
     }
 }
 
-/// Carry out the reducer's effects. `permit` is the capacity the event
-/// arrived with (a finished attempt or probe); a `DispatchStep` effect —
-/// the run already journaled Running on its next step — inherits it.
+/// Carry out the reducer's effects. `permit` and `slot` are the
+/// capacity the event arrived with (a finished attempt or probe); a
+/// `DispatchStep` effect — the run already journaled Running on its
+/// next step — inherits both. The slot MUST ride with the event: the
+/// share count still includes it, so checking the cap against it would
+/// see the run's own predecessor as a rival (S1: the next step stayed
+/// journaled Running and was never called).
 fn run_effects(
     core: &mut EngineCore,
     exec: &mut Exec<'_>,
     effects: Vec<Effect>,
     run: RunId,
     mut permit: Option<OwnedSemaphorePermit>,
+    mut slot: Option<WsSlot>,
 ) {
     for eff in effects {
         match eff {
@@ -1857,30 +1869,38 @@ fn run_effects(
                     exec.fail(core, run, step, "unregistered handler");
                     continue;
                 }
-                // The workspace share rule is the tick's (S2 N3): at cap
-                // the run stays journaled Running and the deadline sweep
-                // reconciles it — it is never silently skipped, and it
-                // never crowds another workspace out of its share.
-                if exec.inflight.count(ws) >= exec.ws_cap {
-                    continue;
-                }
+                // The inherited slot already owns its share — the cap
+                // check is only for a DispatchStep that arrives with
+                // none (a restart's effect, a sweep): then the fresh
+                // slot must fit, else the run stays journaled Running
+                // and the deadline sweep reconciles it (S2 N3).
+                let slot = match slot.take() {
+                    Some(s) => Some(s),
+                    None if exec.inflight.count(ws) < exec.ws_cap => {
+                        Some(WsSlot::take(exec.inflight, ws))
+                    }
+                    None => None,
+                };
                 // Every DispatchStep comes from an event carrying a permit,
                 // so this always fires; if it ever cannot, the run stays
                 // journaled Running and the deadline sweep reconciles it —
                 // it is never silently skipped.
-                if let Some(p) = permit
-                    .take()
-                    .or_else(|| exec.sem.clone().try_acquire_owned().ok())
-                {
-                    let slot = WsSlot::take(exec.inflight, ws);
-                    exec.fire(core, run, step, p, slot);
+                if let (Some(p), Some(s)) = (
+                    permit
+                        .take()
+                        .or_else(|| exec.sem.clone().try_acquire_owned().ok()),
+                    slot,
+                ) {
+                    exec.fire(core, run, step, p, s);
                 }
             }
             Effect::Reconcile { step } => {
-                // The finishing call's permit is spent on its verdict, so
-                // the probe re-enters the normal path — it queues if the
-                // workspace is at share or the pool is empty (S2 N1/N3).
+                // The finishing call's permit and slot are spent on its
+                // verdict, so the probe re-enters the normal path — it
+                // queues if the workspace is at share or the pool is
+                // empty (S2 N1/N3).
                 drop(permit.take());
+                drop(slot.take());
                 exec.probe(core, run, step);
             }
             // Wakes are covered by the ticker; checkpoints are already in
@@ -2628,6 +2648,166 @@ mod tests {
         }
         assert_eq!(h.calls.load(SeqCst), 6, "each step called exactly once");
         assert!(h.peak.load(SeqCst) <= 2);
+    }
+
+    /// Calls by step name — lets a test tell step 2's call from the
+    /// backlog run's, where a global count would conflate them.
+    #[derive(Clone, Default)]
+    struct NamedCalls {
+        calls: Arc<std::sync::Mutex<HashMap<String, usize>>>,
+    }
+    #[async_trait::async_trait]
+    impl StepHandler for NamedCalls {
+        async fn execute(&self, s: &StepSpec, _i: &[u8], _k: &str) -> Outcome {
+            *self
+                .calls
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .entry(s.name.clone())
+                .or_default() += 1;
+            Outcome::Checkpoint(b"ok".to_vec())
+        }
+    }
+
+    fn spec2(handler: &str) -> JobSpec {
+        JobSpec {
+            version: 1,
+            input: b"payload".to_vec(),
+            steps: vec![
+                StepSpec {
+                    name: "one".into(),
+                    handler: handler.into(),
+                },
+                StepSpec {
+                    name: "two".into(),
+                    handler: handler.into(),
+                },
+            ],
+        }
+    }
+
+    /// S1 re-review (B, finding 1): a finishing call must hand its
+    /// workspace slot to the run's next step — the journaled-Running
+    /// claim for step n+1 was paid for by the call that just ended.
+    /// Before the fix the task dropped its `WsSlot` before the join was
+    /// processed; a tick could give the freed share to a backlog run,
+    /// the `DispatchStep` then saw the workspace at cap and skipped —
+    /// the step sat `Running` until its deadline and burned an attempt
+    /// without ever being called.
+    ///
+    /// Drives `Exec`/`tick` directly (like `dispatch_per_tick_is_capped`):
+    /// the interposition is exact — the tick runs between the finished
+    /// call's join and its effect pass, which is the race window.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_finished_steps_workspace_slot_flows_to_the_next_step() {
+        let d = tempfile::tempdir().unwrap_or_else(|e| panic!("{e}"));
+        let mut core = EngineCore::open(d.path()).unwrap_or_else(|e| panic!("{e}"));
+        // One workspace, cap 1: run A needs two steps, run B is the
+        // backlog that would steal the freed share.
+        let a = core
+            .submit(OperationKey("a".into()), spec2("gated"), 0)
+            .unwrap_or_else(|e| panic!("{e}"));
+        let b = core
+            .submit(OperationKey("b".into()), spec1("gated"), 0)
+            .unwrap_or_else(|e| panic!("{e}"));
+        let h = NamedCalls::default();
+        let mut reg = Registry::default();
+        reg.register("gated", Arc::new(h.clone()));
+        let sem = Arc::new(Semaphore::new(8));
+        let (mut attempts, mut probes) = (JoinSet::new(), JoinSet::new());
+        let (mut live, mut waiting) = (HashMap::new(), ProbeQueue::default());
+        let inflight = WsInflight::default();
+        let mut spawned = HashMap::new();
+        let mut mon = Monitor {
+            health: Arc::default(),
+            errors: BTreeMap::new(),
+        };
+        let mut pipe = Pipeline::new(None, 1024, usize::MAX);
+        macro_rules! ex {
+            () => {
+                Exec {
+                    registry: &reg,
+                    sem: sem.clone(),
+                    attempts: &mut attempts,
+                    probes: &mut probes,
+                    live: &mut live,
+                    inflight: &inflight,
+                    spawned: &mut spawned,
+                    ws_cap: 1,
+                    waiting_probes: &mut waiting,
+                    per_tick: 8,
+                    mon: &mut mon,
+                    pipe: &mut pipe,
+                }
+            };
+        }
+        // The single slot dispatches A's step 1; B stays queued.
+        {
+            let mut ex = ex!();
+            tick(&mut core, &mut ex);
+        }
+        assert_eq!(inflight.count(0), 1);
+        assert_eq!(attempts.len(), 1);
+        let calls = |h: &NamedCalls, name: &str| {
+            h.calls
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .get(name)
+                .copied()
+                .unwrap_or(0)
+        };
+        // Take the finished call's result: its slot must still be held —
+        // the count may not dip before the effect pass runs.
+        let (run, step, outcome, permit, slot) = attempts
+            .join_next()
+            .await
+            .unwrap_or_else(|| panic!("no attempt join"))
+            .unwrap_or_else(|e| panic!("attempt join: {e}"));
+        assert_eq!(run, a);
+        assert_eq!(
+            inflight.count(0),
+            1,
+            "the finished call returned its slot before its effects ran"
+        );
+        let (out, fail) = match outcome {
+            Outcome::Checkpoint(o) => (Some(o), None),
+            _ => panic!("step 1 did not checkpoint"),
+        };
+        let effects = mon.effects(core.step_finished(run, step, out, fail, wall_ms()));
+        {
+            let mut ex = ex!();
+            // The race window: a tick between the call's end and its
+            // effect pass must NOT give the slot to B — A still holds it.
+            tick(&mut core, &mut ex);
+            assert_eq!(
+                calls(&h, "only"),
+                0,
+                "the backlog run stole the finished call's workspace slot"
+            );
+            assert!(!matches!(
+                core.run(b).map(|r| &r.state),
+                Some(RunState::Running { .. })
+            ));
+            // The effect pass: step 2's DispatchStep inherits the slot
+            // and fires — it must not stop at the share check with a
+            // count that still includes its own predecessor.
+            run_effects(&mut core, &mut ex, effects, run, Some(permit), Some(slot));
+        }
+        assert_eq!(
+            attempts.len(),
+            1,
+            "step 2 was journaled Running but never called"
+        );
+        assert_eq!(calls(&h, "one"), 1);
+        // Step 2 completes; its returned permit+slot go back here.
+        let (_, _, _, permit, slot) = attempts
+            .join_next()
+            .await
+            .unwrap_or_else(|| panic!("no attempt join"))
+            .unwrap_or_else(|e| panic!("attempt join: {e}"));
+        drop((permit, slot));
+        assert_eq!(calls(&h, "two"), 1, "step 2 was never called");
+        assert_eq!(calls(&h, "only"), 0);
     }
 
     /// One tick dispatches at most `max_dispatch_per_tick` runs, oldest
