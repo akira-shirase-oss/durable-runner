@@ -354,6 +354,19 @@ pub struct EngineCore {
     /// Non-terminal runs with `ws != 0` — `workspace_scoped_live_runs`
     /// in diagnostics without a full scan.
     scoped_live: u64,
+    /// Runs waiting on time — `Queued` and `RetryWaiting` — keyed by
+    /// `(next_run_at, run)` with the dispatch tuple `(ws, step, attempt)`
+    /// `due()` used to compute per scan. A tick pops the elapsed prefix
+    /// in O(newly due), never O(retained runs) (S2 re-review finding 5).
+    /// Maintained exactly with `runs` in `apply_committed`/`recount`.
+    due_index: BTreeMap<(Millis, RunId), (u64, StepIndex, u32)>,
+    /// `Running` attempts keyed by `(deadline, run)` — the expiry sweep
+    /// pops only what lapsed instead of scanning every retained run.
+    deadline_index: BTreeMap<(Millis, RunId), StepIndex>,
+    /// Entries the query paths examined — the test-only counter that
+    /// proves a tick's cost is its due prefix, not the retained set.
+    #[cfg(test)]
+    pub(crate) examined: std::cell::Cell<u64>,
     /// The torn tail the journal discarded when this core opened it.
     discarded_tail: Option<durable_journal::TornTail>,
     /// Highest record `v` present in the journal: bumped by replay and by
@@ -379,6 +392,29 @@ pub struct EngineCore {
 /// the compaction that expires them also deletes the superseded generations
 /// that held their records.
 const TERMINAL_EXPIRY_MS: u64 = 7 * 24 * 60 * 60 * 1000;
+
+/// The `(next_run_at, step, attempt)` a waiting state contributes to the
+/// due index: `Queued` dispatches step 0 attempt 1; `RetryWaiting` the
+/// failed step's next attempt.
+fn waiting_entry(state: &RunState) -> Option<(Millis, StepIndex, u32)> {
+    match state {
+        RunState::Queued { next_run_at } => Some((*next_run_at, StepIndex(0), 1)),
+        RunState::RetryWaiting {
+            step,
+            attempt,
+            next_run_at,
+        } => Some((*next_run_at, *step, attempt + 1)),
+        _ => None,
+    }
+}
+
+/// The `(deadline, step)` a `Running` state contributes to the deadline index.
+fn deadline_entry(state: &RunState) -> Option<(Millis, StepIndex)> {
+    match state {
+        RunState::Running { step, deadline, .. } => Some((*deadline, *step)),
+        _ => None,
+    }
+}
 
 impl EngineCore {
     /// Open the journal at `dir` and rebuild every run: snapshot first if
@@ -407,6 +443,10 @@ impl EngineCore {
             index_bytes: 0,
             ws_index_bytes: HashMap::new(),
             state_counts: std::collections::BTreeMap::new(),
+            due_index: BTreeMap::new(),
+            deadline_index: BTreeMap::new(),
+            #[cfg(test)]
+            examined: std::cell::Cell::new(0),
             scoped_live: 0,
             discarded_tail,
             journal_record_version_max: 1,
@@ -789,6 +829,8 @@ impl EngineCore {
         self.ws_index.clear();
         self.ws_index_bytes.clear();
         self.state_counts.clear();
+        self.due_index.clear();
+        self.deadline_index.clear();
         self.scoped_live = 0;
         self.index_bytes = 0;
         for r in self.runs.values() {
@@ -797,6 +839,12 @@ impl EngineCore {
             let bytes = Limits::run_bytes(&r.key, &r.spec);
             self.index_bytes += bytes;
             *self.ws_index_bytes.entry(r.ws).or_default() += bytes;
+            if let Some((at, step, attempt)) = waiting_entry(&r.state) {
+                self.due_index.insert((at, r.id), (r.ws, step, attempt));
+            }
+            if let Some((d, step)) = deadline_entry(&r.state) {
+                self.deadline_index.insert((d, r.id), step);
+            }
             if !r.state.is_terminal() {
                 *self.ws_live.entry(r.ws).or_default() += 1;
                 if r.ws != 0 {
@@ -880,6 +928,9 @@ impl EngineCore {
             *self.ws_index_bytes.entry(ws).or_default() += bytes;
             let run = Arc::new(Run::accepted(run_id, ws, key, spec, not_before));
             *self.state_counts.entry(run.state.kind()).or_default() += 1;
+            if let Some((at, step, attempt)) = waiting_entry(&run.state) {
+                self.due_index.insert((at, run_id), (ws, step, attempt));
+            }
             self.runs.insert(run_id, run);
             return Ok(vec![]);
         }
@@ -922,6 +973,18 @@ impl EngineCore {
                 *n = n.saturating_sub(1);
             }
             *self.state_counts.entry(state.kind()).or_default() += 1;
+        }
+        if let Some((at, ..)) = waiting_entry(&run.state) {
+            self.due_index.remove(&(at, run_id));
+        }
+        if let Some((d, ..)) = deadline_entry(&run.state) {
+            self.deadline_index.remove(&(d, run_id));
+        }
+        if let Some((at, step, attempt)) = waiting_entry(&state) {
+            self.due_index.insert((at, run_id), (run.ws, step, attempt));
+        }
+        if let Some((d, step)) = deadline_entry(&state) {
+            self.deadline_index.insert((d, run_id), step);
         }
         run.state = state;
         Ok(effects)
@@ -1052,27 +1115,27 @@ impl EngineCore {
         Ok(run)
     }
 
-    /// Every run whose wait has expired at `now` — the dispatch candidates
-    /// as (run, step, next attempt), longest-waiting first so a per-tick
-    /// dispatch cap cannot starve anyone.
-    pub fn due(&self, now: Millis) -> Vec<(RunId, StepIndex, u32)> {
-        let mut due: Vec<(Millis, RunId, StepIndex, u32)> = self
-            .runs
-            .iter()
-            .filter_map(|(id, r)| match &r.state {
-                RunState::Queued { next_run_at } if *next_run_at <= now => {
-                    Some((*next_run_at, *id, StepIndex(0), 1))
-                }
-                RunState::RetryWaiting {
-                    step,
-                    attempt,
-                    next_run_at,
-                } if *next_run_at <= now => Some((*next_run_at, *id, *step, *attempt + 1)),
-                _ => None,
-            })
-            .collect();
-        due.sort_unstable_by_key(|(at, id, ..)| (*at, id.0));
-        due.into_iter().map(|(_, id, s, a)| (id, s, a)).collect()
+    /// Pop every run whose wait expired at `now` as
+    /// `(ws, run, step, next attempt)`, longest-waiting first. The tick
+    /// moves the prefix into its per-workspace queues: popped entries are
+    /// the scheduler's until they dispatch, so a tick's read cost is the
+    /// newly-due count, never the retained set (S2 re-review finding 5).
+    /// A run that leaves its waiting state before its queued entry is
+    /// examined simply refuses the dispatch — a stale queue entry, never
+    /// a wrong one.
+    pub fn pop_due(&mut self, now: Millis) -> Vec<(u64, RunId, StepIndex, u32)> {
+        // The prefix is every key below (now+1, 0); at now = u64::MAX the
+        // whole map is due.
+        let rest = match now.checked_add(1) {
+            Some(next) => self.due_index.split_off(&(next, RunId(0))),
+            None => BTreeMap::new(),
+        };
+        let due = std::mem::replace(&mut self.due_index, rest);
+        #[cfg(test)]
+        self.examined.set(self.examined.get() + due.len() as u64);
+        due.into_iter()
+            .map(|((_, run), (ws, step, attempt))| (ws, run, step, attempt))
+            .collect()
     }
 
     /// Commit a dispatch: record StepDispatched, then the caller may invoke
@@ -1260,16 +1323,25 @@ impl EngineCore {
         (page, next)
     }
 
-    /// Attempts whose deadline passed at `now` — each is a lost reply until
-    /// a reconciler proves otherwise.
-    pub fn expired_attempts(&self, now: Millis) -> Vec<(RunId, StepIndex)> {
-        self.runs
-            .iter()
-            .filter_map(|(id, r)| match &r.state {
-                RunState::Running { step, deadline, .. } if *deadline < now => Some((*id, *step)),
-                _ => None,
-            })
-            .collect()
+    /// Pop up to `limit` attempts whose deadline passed at `now` — each a
+    /// lost reply until a reconciler proves otherwise. Popping (rather
+    /// than scanning) bounds the sweep by what it processes; the rest
+    /// stay indexed for later ticks.
+    pub fn pop_expired(&mut self, now: Millis, limit: usize) -> Vec<(RunId, StepIndex)> {
+        let mut out = Vec::new();
+        while out.len() < limit {
+            let Some(((deadline, run), step)) = self.deadline_index.pop_first() else {
+                break;
+            };
+            if deadline >= now {
+                self.deadline_index.insert((deadline, run), step);
+                break;
+            }
+            out.push((run, step));
+        }
+        #[cfg(test)]
+        self.examined.set(self.examined.get() + out.len() as u64);
+        out
     }
 
     /// One page newest first for one workspace: up to `limit` runs with
@@ -1295,17 +1367,10 @@ impl EngineCore {
         (page, next)
     }
 
-    /// Millisecond clock values the dispatcher should re-arm for.
+    /// Millisecond clock values the dispatcher should re-arm for — the
+    /// head of the due index, O(1).
     pub fn next_wake(&self) -> Option<Millis> {
-        self.runs
-            .values()
-            .filter_map(|r| match &r.state {
-                RunState::Queued { next_run_at } | RunState::RetryWaiting { next_run_at, .. } => {
-                    Some(*next_run_at)
-                }
-                _ => None,
-            })
-            .min()
+        self.due_index.keys().next().map(|(at, _)| *at)
     }
 }
 
@@ -1872,8 +1937,12 @@ mod tests {
         let d = tempfile::tempdir().unwrap_or_else(|e| panic!("{e}"));
         commit_v3(d.path(), 1, 7, &v3_accepted("tenant"));
         commit_v3(d.path(), 2, 0, &v3_accepted("ops"));
-        let e = EngineCore::open(d.path()).unwrap_or_else(|e| panic!("{e}"));
-        let due: Vec<RunId> = e.due(u64::MAX).into_iter().map(|(r, ..)| r).collect();
+        let mut e = EngineCore::open(d.path()).unwrap_or_else(|e| panic!("{e}"));
+        let due: Vec<RunId> = e
+            .pop_due(u64::MAX)
+            .into_iter()
+            .map(|(_, r, ..)| r)
+            .collect();
         assert_eq!(due, vec![RunId(1), RunId(2)]);
         let diag = e.diagnostics();
         assert_eq!(diag.journal_max_ws, 7);
@@ -1899,9 +1968,9 @@ mod tests {
             0,
             "{\"StepDispatched\":{\"step\":0,\"attempt\":1,\"deadline\":1000}}",
         );
-        let e = EngineCore::open(d.path()).unwrap_or_else(|e| panic!("{e}"));
+        let mut e = EngineCore::open(d.path()).unwrap_or_else(|e| panic!("{e}"));
         assert_eq!(
-            e.expired_attempts(2000),
+            e.pop_expired(2000, usize::MAX),
             vec![(RunId(1), StepIndex(0)), (RunId(2), StepIndex(0))]
         );
     }
@@ -1980,7 +2049,7 @@ mod tests {
             .submit(OperationKey("k".into()), spec(), 0)
             .unwrap_or_else(|e| panic!("{e}"));
         let (step0, _) = {
-            let (id, s, a) = e.due(0)[0];
+            let (_, id, s, a) = e.pop_due(0)[0];
             assert_eq!(id, run);
             (s, a)
         };

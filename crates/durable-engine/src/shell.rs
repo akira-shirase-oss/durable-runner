@@ -569,6 +569,12 @@ pub struct ShellConfig {
     pub max_dispatch_per_tick: usize,
     /// Scheduler/deadline-sweep cadence.
     pub tick_ms: u64,
+    /// How long a run whose handler left the registry stays in the due
+    /// rotation before it parks (S2 re-review finding 5): within grace a
+    /// registration blip costs the run nothing; past grace it leaves the
+    /// rotation until the handler returns, instead of being re-examined
+    /// every tick forever.
+    pub dead_handler_grace_ms: u64,
     /// Command channel capacity (submit back-pressure bound).
     pub cmd_capacity: usize,
     /// Read channel capacity (inspect/list/diagnostics), separate so reads
@@ -610,6 +616,7 @@ impl Default for ShellConfig {
             max_in_flight_per_ws: 64,
             max_dispatch_per_tick: 512,
             tick_ms: 50,
+            dead_handler_grace_ms: 30_000,
             cmd_capacity: 1024,
             read_capacity: 256,
             limits: Limits::default(),
@@ -1154,6 +1161,17 @@ async fn actor(
     let mut live: HashMap<(RunId, StepIndex), AbortHandle> = HashMap::new();
     let mut waiting_probes = ProbeQueue::default();
     let inflight = WsInflight::default();
+    // The scheduler's per-workspace due queues: `pop_due` drains the
+    // time-ordered index into these once, `due_order` rotates the
+    // workspaces so a tick round-robins fairly, and a workspace at its
+    // in-flight share is skipped whole — its queue is never examined
+    // (S2 re-review finding 5). A run whose handler left the registry
+    // parks out of the queues after `dead_handler_grace_ms`; the handler
+    // re-registering re-queues it.
+    let mut due_by_ws: BTreeMap<u64, VecDeque<(RunId, StepIndex, u32)>> = BTreeMap::new();
+    let mut due_order: VecDeque<u64> = VecDeque::new();
+    let mut parked: HashMap<u64, Vec<Parked>> = HashMap::new();
+    let mut dead_since: HashMap<RunId, Millis> = HashMap::new();
     let mut spawned: HashMap<tokio::task::Id, (RunId, StepIndex)> = HashMap::new();
     let sem = Arc::new(Semaphore::new(cfg.max_in_flight));
     let mut status = writer.status;
@@ -1184,7 +1202,14 @@ async fn actor(
                 spawned: &mut spawned,
                 ws_cap: cfg.max_in_flight_per_ws as u32,
                 waiting_probes: &mut waiting_probes,
+                due_by_ws: &mut due_by_ws,
+                due_order: &mut due_order,
+                parked: &mut parked,
+                dead_since: &mut dead_since,
+                dead_grace_ms: cfg.dead_handler_grace_ms,
                 per_tick: cfg.max_dispatch_per_tick,
+                #[cfg(test)]
+                examined: 0,
                 mon: &mut mon,
                 pipe: &mut pipe,
             }
@@ -1280,12 +1305,14 @@ async fn actor(
                 }
                 Some(Cmd::PutHandler { ws, name, handler, reply }) => {
                     pipe.answer(core.last_index(), reply, registry.put(ws, &name, handler));
+                    exec!().unpark(ws); // a handler's return revives parked runs
                 }
                 Some(Cmd::DeleteHandler { ws, name }) => {
                     registry.remove(ws, &name);
                 }
                 Some(Cmd::SetWorkspaceHandlers { ws, handlers, reply }) => {
                     pipe.answer(core.last_index(), reply, registry.set_ws(ws, handlers));
+                    exec!().unpark(ws);
                 }
                 None => {
                     pipe.shutdown().await;
@@ -1479,6 +1506,10 @@ fn release(core: &mut EngineCore, ex: &mut Exec<'_>) {
     }
 }
 
+/// A parked dead-handler wait: the queued dispatch tuple plus the
+/// handler name whose return revives it.
+type Parked = (RunId, StepIndex, u32, Arc<str>);
+
 /// Reconcile probes waiting for a permit, oldest first, each run once.
 /// Bounded by the live index: a run is queued at most once.
 #[derive(Default)]
@@ -1579,7 +1610,18 @@ struct Exec<'a> {
     spawned: &'a mut HashMap<tokio::task::Id, (RunId, StepIndex)>,
     ws_cap: u32,
     waiting_probes: &'a mut ProbeQueue,
+    /// Per-workspace dispatch queues + rotation — see the declarations
+    /// the `exec!` macro wires these to.
+    due_by_ws: &'a mut BTreeMap<u64, VecDeque<(RunId, StepIndex, u32)>>,
+    due_order: &'a mut VecDeque<u64>,
+    parked: &'a mut HashMap<u64, Vec<Parked>>,
+    dead_since: &'a mut HashMap<RunId, Millis>,
+    dead_grace_ms: u64,
     per_tick: usize,
+    /// Queue entries this tick examined — the test counter proving the
+    /// rotation skips a full workspace's queue without touching it.
+    #[cfg(test)]
+    examined: usize,
     mon: &'a mut Monitor,
     pipe: &'a mut Pipeline,
 }
@@ -1742,6 +1784,49 @@ impl Exec<'_> {
         });
         self.spawned.insert(handle.id(), (run, step));
     }
+
+    /// A registry change on `ws` may bring a parked run's handler back:
+    /// re-queue every parked entry whose name resolves again, still
+    /// longest-waiting-first at the queue's head. A run that left its
+    /// waiting state while parked re-queues stale and refuses its
+    /// dispatch like any other skipped entry.
+    fn unpark(&mut self, ws: u64) {
+        let Some(mut entries) = self.parked.remove(&ws) else {
+            return;
+        };
+        let mut i = 0;
+        while i < entries.len() {
+            if self.registry.contains(ws, &entries[i].3) {
+                let (run, step, attempt, _) = entries.swap_remove(i);
+                // Absent-or-empty queue ⇔ the workspace is not in the
+                // rotation (the invariant `requeue_ws` maintains).
+                if self.due_by_ws.get(&ws).is_none_or(|q| q.is_empty()) {
+                    self.due_order.push_back(ws);
+                }
+                self.due_by_ws
+                    .entry(ws)
+                    .or_default()
+                    .push_front((run, step, attempt));
+            } else {
+                i += 1;
+            }
+        }
+        if !entries.is_empty() {
+            self.parked.insert(ws, entries);
+        }
+    }
+
+    /// `ws` re-enters the due rotation iff its queue still holds entries —
+    /// the invariant `due_order holds ws ⇔ due_by_ws[ws] is non-empty`,
+    /// which is what makes the at-share skip O(1) and keeps drained
+    /// workspaces out of the rotation entirely.
+    fn requeue_ws(&mut self, ws: u64) {
+        if self.due_by_ws.get(&ws).is_some_and(|q| !q.is_empty()) {
+            self.due_order.push_back(ws);
+        } else {
+            self.due_by_ws.remove(&ws);
+        }
+    }
 }
 
 /// The periodic pass: sweep expired attempts, start waiting probes, then
@@ -1762,7 +1847,7 @@ fn tick(core: &mut EngineCore, exec: &mut Exec<'_>) {
     // it reconciles, never silently repeats. `live` only tracks attempts
     // this process fired; a run orphaned by a restart has no entry, and
     // gating on it would strand every crash-surviving Running run.
-    for (run, step) in core.expired_attempts(now).into_iter().take(exec.per_tick) {
+    for (run, step) in core.pop_expired(now, exec.per_tick) {
         if let Some(call) = exec.live.remove(&(run, step)) {
             call.abort(); // frees its permit; the remote effect is reconciled
         }
@@ -1789,50 +1874,124 @@ fn tick(core: &mut EngineCore, exec: &mut Exec<'_>) {
     // commit and the call can only lose a journaled fact, and no commit
     // is ever made for a call that capacity would not allow.
     //
+    // Newly-due work leaves the time-ordered index for the per-workspace
+    // queues once (S2 re-review finding 5): a tick's scan cost is the
+    // newly-due count, never the retained set, and entries already queued
+    // are re-examined only while their workspace can still take work.
+    for (ws, run, step, attempt) in core.pop_due(now) {
+        if !exec.due_by_ws.contains_key(&ws) {
+            exec.due_order.push_back(ws);
+        }
+        exec.due_by_ws
+            .entry(ws)
+            .or_default()
+            .push_back((run, step, attempt));
+    }
     // The per-tick budget counts only dispatch that actually happens
     // (S2 re-review N2): an entry that cannot dispatch — its handler left
     // the registry, its workspace is at share — is skipped for free, so
     // a tenant whose queue heads the due order can never starve the runs
-    // behind it.
+    // behind it. Workspaces rotate: each live queue loses at most one
+    // head entry per round, and a queue at share is passed over whole.
     let mut budget = exec.per_tick;
-    for (run, step, attempt) in core.due(now) {
-        if budget == 0 {
+    // Workspace visits since the last dispatch: when every workspace in
+    // the rotation was visited once with nothing dispatchable — full,
+    // dead-handler-only, stale — a further pass can only repeat that,
+    // so the tick ends without draining the budget.
+    let mut idle = 0usize;
+    while budget > 0 && idle < exec.due_order.len() {
+        let Some(ws) = exec.due_order.pop_front() else {
             break;
-        }
-        let Some((ws, name)) = core.run(run).and_then(|r| {
-            r.spec
-                .steps
-                .get(step.0 as usize)
-                .map(|s| (r.ws, s.handler.clone()))
-        }) else {
-            continue;
         };
-        if !exec.registry.contains(ws, &name) {
-            // The handler left the registry after this run was accepted:
-            // it stays queued — registry repair or a cancel resolves it.
-            // Refusing an event here would be noise; there is nothing to
-            // journal because nothing happened.
-            continue;
-        }
-        // Fairness (S2 review #6): a workspace at its in-flight share is
-        // skipped — its runs stay queued while others dispatch.
         if exec.inflight.count(ws) >= exec.ws_cap {
+            idle += 1;
+            exec.due_order.push_back(ws); // full: skipped whole, queue untouched
             continue;
         }
-        let Ok(permit) = exec.sem.clone().try_acquire_owned() else {
-            break; // at capacity: the rest stay queued for a later tick
-        };
-        // The workspace share is charged AT the dispatch (S2 re-review
-        // N3): the slot rides the held-fire through the fsync wait, so a
-        // run waiting undurable already owns its place — charging at
-        // spawn let one workspace take the whole pool in a single tick.
-        let slot = WsSlot::take(exec.inflight, ws);
-        if let Err(e) = core.dispatch(run, step, attempt, now) {
-            exec.mon.handled(&e); // stale claim or no space; permit + slot return
-            continue;
+        // This visit examines each queued entry at most once (`pass` is
+        // the queue's length at entry): a dead-handler or stale head
+        // cannot hide the live work behind it, and a skipped entry that
+        // re-queues waits for the workspace's next turn.
+        let mut dispatched = false;
+        let mut starved = false;
+        {
+            let Some(queue) = exec.due_by_ws.get_mut(&ws) else {
+                idle += 1;
+                continue; // emptied between rotations — leaves the rotation
+            };
+            let mut pass = queue.len();
+            while pass > 0 {
+                pass -= 1;
+                let Some((run, step, attempt)) = queue.pop_front() else {
+                    break;
+                };
+                #[cfg(test)]
+                {
+                    exec.examined += 1;
+                }
+                let Some((name, waiting)) = core.run(run).and_then(|r| {
+                    r.spec.steps.get(step.0 as usize).map(|s| {
+                        (
+                            s.handler.clone(),
+                            matches!(
+                                r.state,
+                                RunState::Queued { .. } | RunState::RetryWaiting { .. }
+                            ),
+                        )
+                    })
+                }) else {
+                    continue; // stale queue entry — spec/step the run lost
+                };
+                if !waiting {
+                    continue; // cancelled or already dispatched — stale
+                }
+                if !exec.registry.contains(ws, &name) {
+                    // The handler left the registry after this run was
+                    // accepted: it stays queued — registry repair or a
+                    // cancel resolves it. Within grace it re-queues past
+                    // this visit's bound; past grace it parks out of the
+                    // rotation until the handler returns, so a dead-handler
+                    // backlog never re-scans every tick (finding 5).
+                    let first = *exec.dead_since.entry(run).or_insert(now);
+                    if now.saturating_sub(first) >= exec.dead_grace_ms {
+                        exec.dead_since.remove(&run);
+                        exec.parked
+                            .entry(ws)
+                            .or_default()
+                            .push((run, step, attempt, name.into()));
+                    } else {
+                        queue.push_back((run, step, attempt));
+                    }
+                    continue;
+                }
+                exec.dead_since.remove(&run);
+                let Ok(permit) = exec.sem.clone().try_acquire_owned() else {
+                    // At capacity: the entry stays next-due for a later tick.
+                    queue.push_front((run, step, attempt));
+                    starved = true;
+                    break;
+                };
+                // The workspace share is charged AT the dispatch (S2
+                // re-review N3): the slot rides the held-fire through the
+                // fsync wait, so a run waiting undurable already owns its
+                // place — charging at spawn let one workspace take the
+                // whole pool in a single tick.
+                let slot = WsSlot::take(exec.inflight, ws);
+                if let Err(e) = core.dispatch(run, step, attempt, now) {
+                    exec.mon.handled(&e); // stale claim; permit + slot return
+                    continue;
+                }
+                exec.fire(core, run, step, permit, slot);
+                budget -= 1;
+                dispatched = true;
+                break; // one dispatch per visit — the rotation stays fair
+            }
         }
-        exec.fire(core, run, step, permit, slot);
-        budget -= 1;
+        idle = if dispatched { 0 } else { idle + 1 };
+        exec.requeue_ws(ws);
+        if starved {
+            break; // global capacity — every later workspace starves too
+        }
     }
 }
 
@@ -2716,6 +2875,8 @@ mod tests {
         let sem = Arc::new(Semaphore::new(8));
         let (mut attempts, mut probes) = (JoinSet::new(), JoinSet::new());
         let (mut live, mut waiting) = (HashMap::new(), ProbeQueue::default());
+        let (mut due_by_ws, mut due_order) = (BTreeMap::new(), VecDeque::new());
+        let (mut parked, mut dead_since) = (HashMap::new(), HashMap::new());
         let inflight = WsInflight::default();
         let mut spawned = HashMap::new();
         let mut mon = Monitor {
@@ -2735,7 +2896,13 @@ mod tests {
                     spawned: &mut spawned,
                     ws_cap: 1,
                     waiting_probes: &mut waiting,
+                    due_by_ws: &mut due_by_ws,
+                    due_order: &mut due_order,
+                    parked: &mut parked,
+                    dead_since: &mut dead_since,
+                    dead_grace_ms: 0,
                     per_tick: 8,
+                    examined: 0,
                     mon: &mut mon,
                     pipe: &mut pipe,
                 }
@@ -2829,6 +2996,8 @@ mod tests {
         let sem = Arc::new(Semaphore::new(10));
         let (mut attempts, mut probes) = (JoinSet::new(), JoinSet::new());
         let (mut live, mut waiting) = (HashMap::new(), ProbeQueue::default());
+        let (mut due_by_ws, mut due_order) = (BTreeMap::new(), VecDeque::new());
+        let (mut parked, mut dead_since) = (HashMap::new(), HashMap::new());
         let inflight = WsInflight::default();
         let mut spawned = HashMap::new();
         let mut mon = Monitor {
@@ -2847,7 +3016,13 @@ mod tests {
             spawned: &mut spawned,
             ws_cap: 64,
             waiting_probes: &mut waiting,
+            due_by_ws: &mut due_by_ws,
+            due_order: &mut due_order,
+            parked: &mut parked,
+            dead_since: &mut dead_since,
+            dead_grace_ms: 0,
             per_tick: 3,
+            examined: 0,
             mon: &mut mon,
             pipe: &mut pipe,
         };
@@ -2866,6 +3041,237 @@ mod tests {
         ));
         tick(&mut core, &mut ex);
         assert_eq!(running(&core), 6);
+    }
+
+    /// The scheduler state a `tick` test needs — the same fields the
+    /// actor loop owns and lends to `Exec`.
+    struct Sched {
+        sem: Arc<Semaphore>,
+        attempts: JoinSet<AttemptJoin>,
+        probes: JoinSet<ProbeJoin>,
+        live: HashMap<(RunId, StepIndex), AbortHandle>,
+        inflight: WsInflight,
+        spawned: HashMap<tokio::task::Id, (RunId, StepIndex)>,
+        waiting: ProbeQueue,
+        due_by_ws: BTreeMap<u64, VecDeque<(RunId, StepIndex, u32)>>,
+        due_order: VecDeque<u64>,
+        parked: HashMap<u64, Vec<Parked>>,
+        dead_since: HashMap<RunId, Millis>,
+        mon: Monitor,
+        pipe: Pipeline,
+    }
+    impl Sched {
+        fn new(sem_permits: usize) -> Self {
+            Self {
+                sem: Arc::new(Semaphore::new(sem_permits)),
+                attempts: JoinSet::new(),
+                probes: JoinSet::new(),
+                live: HashMap::new(),
+                inflight: WsInflight::default(),
+                spawned: HashMap::new(),
+                waiting: ProbeQueue::default(),
+                due_by_ws: BTreeMap::new(),
+                due_order: VecDeque::new(),
+                parked: HashMap::new(),
+                dead_since: HashMap::new(),
+                mon: Monitor {
+                    health: Arc::default(),
+                    errors: BTreeMap::new(),
+                },
+                pipe: Pipeline::new(None, 1024, usize::MAX),
+            }
+        }
+        fn exec<'a>(
+            &'a mut self,
+            registry: &'a Registry,
+            ws_cap: u32,
+            dead_grace_ms: u64,
+            per_tick: usize,
+        ) -> Exec<'a> {
+            Exec {
+                registry,
+                sem: self.sem.clone(),
+                attempts: &mut self.attempts,
+                probes: &mut self.probes,
+                live: &mut self.live,
+                inflight: &self.inflight,
+                spawned: &mut self.spawned,
+                ws_cap,
+                waiting_probes: &mut self.waiting,
+                due_by_ws: &mut self.due_by_ws,
+                due_order: &mut self.due_order,
+                parked: &mut self.parked,
+                dead_since: &mut self.dead_since,
+                dead_grace_ms,
+                per_tick,
+                examined: 0,
+                mon: &mut self.mon,
+                pipe: &mut self.pipe,
+            }
+        }
+    }
+
+    /// A tick's index read is the due prefix, never the retained set
+    /// (S2 re-review finding 5): forty not-yet-due runs behind three due
+    /// ones cost three examinations, not forty-three.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_tick_examines_only_the_due_prefix() {
+        let d = tempfile::tempdir().unwrap_or_else(|e| panic!("{e}"));
+        let mut core = EngineCore::open(d.path()).unwrap_or_else(|e| panic!("{e}"));
+        let far = wall_ms() + 3_600_000;
+        for i in 0..40 {
+            core.submit_at(
+                0,
+                OperationKey(format!("later-{i}")),
+                spec1("gated"),
+                far,
+                wall_ms(),
+            )
+            .unwrap_or_else(|e| panic!("{e}"));
+        }
+        for i in 0..3 {
+            core.submit(OperationKey(format!("now-{i}")), spec1("gated"), wall_ms())
+                .unwrap_or_else(|e| panic!("{e}"));
+        }
+        let mut reg = Registry::default();
+        reg.register("gated", Arc::new(HangAlways));
+        let mut sched = Sched::new(8);
+        core.examined.set(0);
+        {
+            let mut ex = sched.exec(&reg, 64, 0, 8);
+            tick(&mut core, &mut ex);
+            assert_eq!(ex.examined, 3, "queue examinations beyond the due work");
+        }
+        assert_eq!(
+            core.examined.get(),
+            3,
+            "the tick scanned runs that were not due"
+        );
+        assert!(!sched.due_by_ws.contains_key(&0), "all due work dispatched");
+        assert_eq!(sched.attempts.len(), 3);
+    }
+
+    /// A workspace at its in-flight share is skipped whole — its queued
+    /// entries are not examined at all (finding 5). The O(1) skip is the
+    /// evidence: a second tick over a full workspace's forty-deep queue
+    /// examines zero entries.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_full_workspace_skips_its_whole_queue() {
+        let d = tempfile::tempdir().unwrap_or_else(|e| panic!("{e}"));
+        let mut core = EngineCore::open(d.path()).unwrap_or_else(|e| panic!("{e}"));
+        for i in 0..41 {
+            core.submit_at(
+                1,
+                OperationKey(format!("w1-{i}")),
+                spec1("gated"),
+                0,
+                wall_ms(),
+            )
+            .unwrap_or_else(|e| panic!("{e}"));
+        }
+        core.submit_at(2, OperationKey("w2".into()), spec1("gated"), 0, wall_ms())
+            .unwrap_or_else(|e| panic!("{e}"));
+        let mut reg = Registry::default();
+        reg.put(1, "gated", Arc::new(HangAlways))
+            .unwrap_or_else(|e| panic!("{e}"));
+        reg.put(2, "gated", Arc::new(HangAlways))
+            .unwrap_or_else(|e| panic!("{e}"));
+        let mut sched = Sched::new(8);
+        // ws_cap 1: tick 1 dispatches ws 1's first run (which hangs,
+        // holding the share) and ws 2's run.
+        {
+            let mut ex = sched.exec(&reg, 1, 0, 8);
+            tick(&mut core, &mut ex);
+        }
+        assert_eq!(sched.attempts.len(), 2);
+        assert_eq!(sched.inflight.count(1), 1, "ws 1's share is held");
+        assert_eq!(sched.due_by_ws[&1].len(), 40, "ws 1's backlog stays queued");
+        // Tick 2: ws 1 is at share — its forty-entry queue must cost
+        // zero examinations while it sits out the rotation.
+        let mut ex = sched.exec(&reg, 1, 0, 8);
+        tick(&mut core, &mut ex);
+        assert_eq!(
+            ex.examined, 0,
+            "a full workspace's queue was examined entry by entry"
+        );
+        assert_eq!(sched.due_by_ws[&1].len(), 40, "skipped entries stay queued");
+        assert_eq!(sched.attempts.len(), 2, "nothing else dispatched");
+    }
+
+    /// A run whose handler left the registry parks after the grace
+    /// period — it leaves the due rotation entirely instead of being
+    /// re-examined every tick — and re-dispatches when the handler
+    /// returns (finding 5: dead-handler runs never leave the due set).
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_dead_handler_run_parks_until_its_handler_returns() {
+        let d = tempfile::tempdir().unwrap_or_else(|e| panic!("{e}"));
+        let mut core = EngineCore::open(d.path()).unwrap_or_else(|e| panic!("{e}"));
+        let run = core
+            .submit(OperationKey("orphaned".into()), spec1("ghost"), wall_ms())
+            .unwrap_or_else(|e| panic!("{e}"));
+        let mut reg = Registry::default(); // "ghost" is never registered — yet
+        let mut sched = Sched::new(8);
+        // Grace 0: the first examination parks it.
+        {
+            let mut ex = sched.exec(&reg, 64, 0, 8);
+            tick(&mut core, &mut ex);
+            assert_eq!(ex.examined, 1);
+        }
+        assert!(
+            sched.parked[&0].iter().any(|(r, ..)| *r == run),
+            "the dead-handler run did not park"
+        );
+        assert!(
+            matches!(
+                core.run(run).map(|r| &r.state),
+                Some(RunState::Queued { .. })
+            ),
+            "a parked run stays queued — it was never called"
+        );
+        assert!(
+            !sched.due_by_ws.contains_key(&0),
+            "parked left the rotation"
+        );
+        // The next tick examines nothing: the parked run is out of the
+        // rotation, not re-scanned on every pass.
+        {
+            let mut ex = sched.exec(&reg, 64, 0, 8);
+            tick(&mut core, &mut ex);
+            assert_eq!(
+                ex.examined, 0,
+                "the parked run was re-examined — it never left the due set"
+            );
+        }
+        // The handler returning revives it: it re-queues and dispatches.
+        let h = NamedCalls::default();
+        reg.put(0, "ghost", Arc::new(h.clone()))
+            .unwrap_or_else(|e| panic!("{e}"));
+        let mut ex = sched.exec(&reg, 64, 0, 8);
+        ex.unpark(0);
+        tick(&mut core, &mut ex);
+        assert_eq!(
+            ex.examined, 1,
+            "the revived run should be the only examination"
+        );
+        assert_eq!(sched.attempts.len(), 1, "the revived run dispatched");
+        let (r, _, outcome, _permit, _slot) = sched
+            .attempts
+            .join_next()
+            .await
+            .unwrap_or_else(|| panic!("no attempt join"))
+            .unwrap_or_else(|e| panic!("attempt join: {e}"));
+        assert_eq!(r, run);
+        assert!(matches!(outcome, Outcome::Checkpoint(_)));
+        assert_eq!(
+            h.calls
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .get("only")
+                .copied()
+                .unwrap_or(0),
+            1,
+            "the parked run's handler was finally called"
+        );
     }
 
     /// Never answers; its probe reports the effect landed.
