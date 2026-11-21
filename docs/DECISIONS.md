@@ -993,3 +993,33 @@ format bump would make the service refuse to start. The rules:
   wrote DRIX 2 while the guard compared records only); workspace scope
   is part of it because a binary that cannot park ws ≠ 0 runs would
   execute tenant work on workspace 0's name-keyed handlers.
+
+## D-057: the backup set is one agreed contract across versions
+
+The S2 re-review found the branches disagreeing: v1.0.2's file list
+admitted generation paths only while the workspace branch listed
+`journal.shape` and `public_id.key` beside them — so an S2 backup
+could never restore under v1.0.2, breaking the rollback floor for a
+backup taken after upgrade but before the first new-format commit.
+The agreed contract, decided for both branches:
+
+- **A backup MAY list**: `gen-NNNNNN/{journal.log, snapshot.bin,
+  snapshot.json}`, plus the journal-dir flats `journal.shape` and
+  `public_id.key`. Every version's restore accepts the whole set —
+  a listed flat is copied, sized and checksummed like any file.
+- **v1.0.x WRITES generation files only.** `journal.shape` is rebuilt
+  from replayed maxima at open, and a backup listing it could never
+  restore under v1.0.1 (its list admits generation paths only) — so
+  carrying it buys nothing and costs the current rollback floor.
+  `public_id.key` does not exist under v1.0.x; when the directory
+  holds one anyway (restored from an S2 backup), it travels — the
+  permutation key is install identity a backup cannot regenerate.
+- **S2 WRITES both flats.** `journal.shape` preserves forward claims
+  a replay alone cannot reconstruct (a ws scope claim survives the
+  compaction that deleted its records); `public_id.key` keeps every
+  public id a client holds decodable on the restored instance —
+  without it the minted ids orphan to 404.
+- Whether a restored journal can then RUN under the binary is a
+  separate, unchanged gate: record/snapshot/ws versions and the
+  D-056 format guard, never the file list. An S2 backup restores
+  under v1.0.2 exactly when the journal is still record-v2.

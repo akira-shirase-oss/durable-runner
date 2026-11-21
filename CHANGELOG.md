@@ -44,9 +44,21 @@ found two ways v1.0.1 was an unsafe rollback floor, both fixed here.
   swap it describes and only ever upward — so after `prune_superseded`
   deletes the generations that held ws ≠ 0 records, the down-server
   guard can still see tenant runs living inside `snapshot.bin`. The
-  sidecar stays OUT of backups: open rebuilds it from the replayed
-  maxima, and a backup listing it would refuse under the v1.0.1
-  restore tool (its file list admits generation paths only).
+  sidecar stays OUT of backups this build writes: open rebuilds it
+  from the replayed maxima, and a backup listing it would refuse
+  under the v1.0.1 restore tool (its file list admits generation
+  paths only).
+- **Restore accepts the agreed backup set (D-057).** The file list a
+  backup may carry is one contract across versions: generation files,
+  plus the journal-dir flats `journal.shape` and `public_id.key` that
+  newer releases write. v1.0.2 still writes generation files only,
+  but it now restores all of them — an S2 backup of a journal that is
+  still record-v2 is a legitimate rollback target, and its
+  `public_id.key` keeps issued public ids decodable instead of
+  orphaning to 404. A backup taken on a key-holding directory carries
+  the key forward. Whether the restored journal can then run under
+  this binary is the unchanged D-056 gate (record/snapshot/ws
+  versions), never the file list.
 - **format-guard always scans the files** and takes the max of files
   and `/admin/diagnostics` — a running server's numbers were open-time
   facts that live commits could leave behind. A DRIX ≥ 2 snapshot with

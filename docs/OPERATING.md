@@ -226,6 +226,16 @@ copies only the backup's own regular files, refusing symlinks. An
 interrupted restore leaves generations without a manifest; a server
 refuses to start there, so remove the directory and restore again.
 
+The file set a backup may list is one agreed contract across versions
+(D-057): the generation files, plus the journal-dir flats
+`journal.shape` and `public_id.key`. This build writes generation
+files only (the sidecar is rebuilt at open, and listing it would
+break restore under v1.0.1), but it accepts all of them on restore —
+so an S2 backup of a still-record-v2 journal restores here, and the
+public-id key it carries keeps issued ids decodable. Newer file sets
+are never the blocker; the record/snapshot/ws versions and the D-056
+format guard decide what the binary can run.
+
 ## What "honest" looks like in the output
 
 - `queued` / `retry_waiting:*` — scheduled, not yet attempted.

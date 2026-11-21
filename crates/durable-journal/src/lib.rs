@@ -1385,7 +1385,19 @@ impl Journal {
         // journal.shape stays OUT of the backup (S2 re-review): the open
         // path rebuilds it from the replayed maxima, and a backup listing
         // it would no longer restore under the v1.0.1 CLI (its file list
-        // admits generation paths only).
+        // admits generation paths only). public_id.key travels when the
+        // directory holds one — only an S2-restored dir does, and the
+        // permutation key is the one piece of install identity a backup
+        // cannot regenerate: dropping it orphans every public id.
+        let key = self.root.join("public_id.key");
+        if key.exists() {
+            let (bytes, crc32) = copy_file_durably(&key, &partial.join("public_id.key"))?;
+            list.files.push(BackupFile {
+                path: "public_id.key".into(),
+                bytes,
+                crc32: Some(crc32),
+            });
+        }
         // What restore verifies against (D-044): every file, its size and
         // checksum, and the generation the manifest names.
         write_private(
@@ -1418,9 +1430,12 @@ impl Journal {
 
 impl Journal {
     /// Bytes a backup copies: every generation's log and snapshot plus the
-    /// manifest.
+    /// manifest, and `public_id.key` when the directory holds one.
     fn backup_bytes(&self) -> Result<u64, JournalError> {
         let mut total = fs::metadata(self.root.join("manifest.json"))?.len();
+        if let Ok(m) = fs::metadata(self.root.join("public_id.key")) {
+            total += m.len();
+        }
         for entry in fs::read_dir(&self.root)? {
             let entry = entry?;
             let is_gen = entry
@@ -1524,7 +1539,11 @@ fn restore_with(from: &Path, to: &Path, step: &dyn Fn(RestoreStep)) -> Result<()
     for entry in fs::read_dir(to)? {
         let name = entry?.file_name();
         let n = name.to_string_lossy();
-        if n == "manifest.json" || n.starts_with("gen-") || n.starts_with("journal.shape") {
+        if n == "manifest.json"
+            || n.starts_with("gen-")
+            || n.starts_with("journal.shape")
+            || n.starts_with("public_id.key")
+        {
             return Err(JournalError::RestoreTargetNotEmpty);
         }
     }
@@ -1532,10 +1551,12 @@ fn restore_with(from: &Path, to: &Path, step: &dyn Fn(RestoreStep)) -> Result<()
     step(RestoreStep::Copied);
     if let Err(e) = copied {
         // Nothing was published: take back what was copied, so the target
-        // holds no generation a later restore or open would trip on.
+        // holds no generation or flat a later restore or open trips on.
         for f in &list.files {
             if let Some((g, _)) = f.path.split_once('/') {
                 let _ = fs::remove_dir_all(to.join(g));
+            } else {
+                let _ = fs::remove_file(to.join(&f.path));
             }
         }
         return Err(e);
@@ -1682,10 +1703,17 @@ fn backup_list(from: &Path, generation: u32) -> Result<BackupList, JournalError>
         if !seen.insert(f.path.as_str()) {
             return Err(bad(format!("{BACKUP_LIST} lists {} twice", f.path)));
         }
-        let ok = f
-            .path
-            .split_once('/')
-            .is_some_and(|(g, file)| canonical_gen(g).is_some() && SNAPSHOT_FILES.contains(&file));
+        // The agreed set (S2 re-review finding 7): generation files, plus
+        // the journal-dir flats an S2 writer carries. This build never
+        // lists them in a backup it writes (the sidecar is derivable at
+        // open and v1.0.1's restore admits generation paths only), but a
+        // restore must accept them so an S2 backup of a still-v2 journal
+        // stays a legitimate rollback target.
+        let ok = f.path == "journal.shape"
+            || f.path == "public_id.key"
+            || f.path.split_once('/').is_some_and(|(g, file)| {
+                canonical_gen(g).is_some() && SNAPSHOT_FILES.contains(&file)
+            });
         if !ok {
             return Err(bad(format!("{BACKUP_LIST} lists {:?}", f.path)));
         }
@@ -3431,6 +3459,84 @@ mod tests {
         assert!(!shape_path(&to).exists(), "restore materialized a sidecar");
         let j = Journal::open(&to).unwrap_or_else(|e| panic!("{e}"));
         assert_eq!(j.records_written(), 1);
+    }
+
+    /// The agreed backup set (S2 re-review finding 7): an S2 backup lists
+    /// the journal-dir flats `journal.shape` and `public_id.key` beside
+    /// the generations. This build never writes them into a backup — the
+    /// sidecar is derivable at open and v1.0.1's restore admits only
+    /// generation paths — but restore must ACCEPT them: an S2 backup of
+    /// a still-v2 journal is a legitimate rollback target, and the key
+    /// must land intact or every public id the install issued orphans.
+    #[test]
+    fn restore_accepts_the_s2_backup_set() {
+        let d = tempfile::tempdir().unwrap_or_else(|e| panic!("{e}"));
+        let backup = backup_of_three(d.path());
+        // Give the backup the two flat entries an S2 writer lists: real
+        // files, real checksums, added to backup.json.
+        let key = [7u8; 32];
+        fs::write(backup.join("public_id.key"), key).unwrap_or_else(|e| panic!("{e}"));
+        write_shape(&backup, SHAPE).unwrap_or_else(|e| panic!("{e}"));
+        let list_path = backup.join(BACKUP_LIST);
+        let mut list: serde_json::Value =
+            serde_json::from_slice(&fs::read(&list_path).unwrap_or_else(|e| panic!("{e}")))
+                .unwrap_or_else(|e| panic!("{e}"));
+        for name in ["journal.shape", "public_id.key"] {
+            let bytes = fs::read(backup.join(name)).unwrap_or_else(|e| panic!("{e}"));
+            let mut h = crc32fast::Hasher::new();
+            h.update(&bytes);
+            list["files"]
+                .as_array_mut()
+                .unwrap_or_else(|| panic!("files"))
+                .push(serde_json::json!({
+                    "path": name,
+                    "bytes": bytes.len() as u64,
+                    "crc32": h.finalize(),
+                }));
+        }
+        fs::write(
+            &list_path,
+            serde_json::to_vec(&list).unwrap_or_else(|e| panic!("{e}")),
+        )
+        .unwrap_or_else(|e| panic!("{e}"));
+        let to = d.path().join("to");
+        restore_backup(&backup, &to).unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(
+            fs::read(to.join("public_id.key")).unwrap_or_else(|e| panic!("{e}")),
+            key,
+            "the restored key differs — every public id would rename"
+        );
+        assert!(to.join("journal.shape").exists());
+        let j = Journal::open(&to).unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(j.records_written(), 3);
+        // A target already holding a stale key is refused — the old key
+        // must never silently survive a restore that carries another.
+        let stale = d.path().join("stale");
+        fs::create_dir(&stale).unwrap_or_else(|e| panic!("{e}"));
+        fs::write(stale.join("public_id.key"), [9u8; 32]).unwrap_or_else(|e| panic!("{e}"));
+        assert!(
+            restore_backup(&backup, &stale).is_err(),
+            "restored onto a stale public_id.key"
+        );
+        // And a backup taken on the restored dir carries the key forward:
+        // an install that once held it must never let a later restore
+        // orphan the ids it was issued under.
+        drop(j);
+        let backup2 = d.path().join("backup2");
+        Journal::open(&to)
+            .unwrap_or_else(|e| panic!("{e}"))
+            .backup_to(&backup2)
+            .unwrap_or_else(|e| panic!("{e}"));
+        assert!(
+            backup2.join("public_id.key").exists(),
+            "a backup of a key-holding dir dropped the key"
+        );
+        let to2 = d.path().join("to2");
+        restore_backup(&backup2, &to2).unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(
+            fs::read(to2.join("public_id.key")).unwrap_or_else(|e| panic!("{e}")),
+            key
+        );
     }
 
     /// A1 (S1 re-review): the read-merge inside `write_shape` is the only
