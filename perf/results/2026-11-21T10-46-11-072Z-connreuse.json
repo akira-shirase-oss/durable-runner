@@ -1,0 +1,35 @@
+{
+  "machine": {
+    "host": "maintainer-laptop",
+    "platform": "darwin/arm64",
+    "cpu": "Apple M2 Pro",
+    "cores": 12,
+    "mem_gb": 32,
+    "date": "2026-11-21T10:46:11.116Z",
+    "commit": "ba87a26"
+  },
+  "scenario": "connreuse",
+  "loadavg": [
+    80.57,
+    49.36,
+    35.3
+  ],
+  "peak_heap_mb": 16,
+  "socket_peak": 64,
+  "close_wait_peak": 63,
+  "fin_wait2_peak": 0,
+  "socket_bound": 50,
+  "ops": 800,
+  "ms": 5949,
+  "codes": {
+    "200": 800
+  },
+  "close_wait_after_drain": 0,
+  "total_sockets_after_drain": 0,
+  "verdict": "FAIL",
+  "failures": [
+    "sockets bounded (<=50)",
+    "CLOSE_WAIT drains under bound (<=12.5)",
+    "client never over the bound"
+  ]
+}
