@@ -12,8 +12,10 @@
 //! mode-0600 on first boot and reused after. Losing it orphans every
 //! public id (the runs themselves are untouched); rotating it renames
 //! every run, so it is generated once and never rewritten — a journal
-//! that already holds runs but no key fails loudly rather than mint a
-//! second identity for them.
+//! carrying evidence a public-id binary already ran there but no key
+//! fails loudly rather than mint a second identity. A v1.0.x journal
+//! has runs but never had the feature: upgrading mints the key once,
+//! then the new binary keeps it.
 
 use base64::Engine as _;
 use durable_domain::RunId;
@@ -41,9 +43,11 @@ impl PubId {
     /// journal record changes shape. The journal dir may not exist yet
     /// (first boot): create it owner-only, the mode the journal uses.
     ///
-    /// A journal that already holds committed content but no key refuses:
+    /// A journal that is already public-id era but has no key refuses:
     /// silently generating a fresh key would rename every run id a client
     /// ever saw — the missing key is data loss to surface, not to hide.
+    /// A v1.0.x journal holds runs yet is pre-pubid: its ids were never
+    /// public, so minting here is the upgrade path, not a rename.
     pub fn load_or_generate(journal_dir: &Path) -> io::Result<Self> {
         let mut d = std::fs::DirBuilder::new();
         d.recursive(true);
@@ -70,11 +74,11 @@ impl PubId {
                 ));
             }
             Err(e) if e.kind() == io::ErrorKind::NotFound => {
-                if journal_has_content(journal_dir)? {
+                if journal_is_pubid_era(journal_dir)? {
                     return Err(io::Error::new(
                         io::ErrorKind::InvalidData,
                         format!(
-                            "{}: journal has committed runs but no public-id key — \
+                            "{}: journal is public-id era but has no public-id key — \
                              restore the key from backup; generating one would rename every run",
                             path.display()
                         ),
@@ -139,22 +143,44 @@ impl PubId {
     }
 }
 
-/// True when the journal already holds committed content — any non-empty
-/// file inside a `gen-*` directory (a records tail or a snapshot). A
-/// journal this fresh has no manifest to consult; presence of bytes is
-/// the conservative signal.
-fn journal_has_content(dir: &Path) -> io::Result<bool> {
+/// True when the journal carries evidence a public-id binary has already
+/// run here — a `journal.shape` claiming record format ≥ 3 (the sidecar's
+/// monotonic max, which covers v3 records compaction pruned into a
+/// snapshot) or any generation's `journal.log` holding a `"v":3`
+/// envelope, which no v1.0.x binary ever wrote.
+///
+/// Any other journal — empty, v1/v2 records, no sidecar — is pre-pubid:
+/// the upgrade path mints the key there (S1: refusing to mint made every
+/// v1.0.x install crash-loop on the S2 binary). A malformed sidecar
+/// decides nothing — the record evidence does.
+fn journal_is_pubid_era(dir: &Path) -> io::Result<bool> {
+    match std::fs::read_to_string(dir.join("journal.shape")) {
+        Ok(text) => {
+            for line in text.lines() {
+                if let Some(v) = line.strip_prefix("records=") {
+                    if v.trim().parse::<u64>().unwrap_or(0) >= 3 {
+                        return Ok(true);
+                    }
+                }
+            }
+        }
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e),
+    }
     for entry in std::fs::read_dir(dir)? {
         let entry = entry?;
         let name = entry.file_name();
         if !name.to_string_lossy().starts_with("gen-") || !entry.file_type()?.is_dir() {
             continue;
         }
-        for inner in std::fs::read_dir(entry.path())? {
-            let inner = inner?;
-            if inner.file_type()?.is_file() && inner.metadata()?.len() > 0 {
-                return Ok(true);
+        match std::fs::read(entry.path().join("journal.log")) {
+            Ok(bytes) => {
+                if bytes.windows(5).any(|w| w == *br#""v":3"#) {
+                    return Ok(true);
+                }
             }
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e),
         }
     }
     Ok(false)
@@ -317,18 +343,28 @@ mod tests {
         );
     }
 
-    /// S3/N6: a journal holding runs but no key refuses to mint one —
-    /// generation would rename every run id already issued.
-    #[test]
-    fn a_journal_with_runs_refuses_to_mint_a_second_key() {
-        let d = tempfile::tempdir().unwrap_or_else(|e| panic!("{e}"));
-        let gen = d.path().join("gen-00000001");
+    /// Drop a `journal.log` holding `line` under `gen-000001` — the
+    /// bytes the era check reads, no framing needed for it.
+    fn journal_log_with(dir: &Path, line: &str) {
+        let gen = dir.join("gen-000001");
         std::fs::create_dir(&gen).unwrap_or_else(|e| panic!("{e}"));
-        std::fs::write(gen.join("records"), b"one committed record")
-            .unwrap_or_else(|e| panic!("{e}"));
+        std::fs::write(gen.join("journal.log"), line).unwrap_or_else(|e| panic!("{e}"));
+    }
+
+    /// S3/N6: a journal a public-id binary already wrote to (a `"v":3`
+    /// envelope is unmistakable — v1.0.x writers top out at `v:2`) but
+    /// that lost its key refuses to mint one — generation would rename
+    /// every run id already issued.
+    #[test]
+    fn a_pubid_era_journal_refuses_to_mint_a_second_key() {
+        let d = tempfile::tempdir().unwrap_or_else(|e| panic!("{e}"));
+        journal_log_with(
+            d.path(),
+            r#"{"v":3,"ws":0,"run":1,"at":1,"event":{"Done":{}}}"#,
+        );
         let e = match PubId::load_or_generate(d.path()) {
             Err(e) => e,
-            Ok(_) => panic!("a non-empty journal must refuse a fresh key"),
+            Ok(_) => panic!("a public-id-era journal must refuse a fresh key"),
         };
         assert_eq!(e.kind(), io::ErrorKind::InvalidData);
         assert!(
@@ -336,5 +372,71 @@ mod tests {
             "the refusal says what to do: {e}"
         );
         assert!(!d.path().join(KEY_FILE).exists(), "no key was generated");
+    }
+
+    /// S1 (finding 2): a v1.0.x journal holds runs but never had public
+    /// ids — `load_or_generate` ran before the engine on upgrade and
+    /// refused every non-empty journal, so S2 could never start on an
+    /// existing install. With no era marker, the key is minted here.
+    #[test]
+    fn a_v1_journal_mints_the_key_on_upgrade() {
+        let d = tempfile::tempdir().unwrap_or_else(|e| panic!("{e}"));
+        journal_log_with(
+            d.path(),
+            r#"{"v":2,"run":1,"at":1,"event":{"Accepted":{"key":"k"}}}"#,
+        );
+        let p = PubId::load_or_generate(d.path()).unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(
+            std::fs::read(d.path().join(KEY_FILE))
+                .unwrap_or_else(|e| panic!("{e}"))
+                .len(),
+            32
+        );
+        assert_eq!(p.decode(&p.encode(RunId(1))), Some(1));
+    }
+
+    /// The sidecar's `records` is the max record version — `3` means the
+    /// pubid-era writer ran even when compaction pruned the v3 records
+    /// into a snapshot, so a missing key still refuses. `records=2` (a
+    /// v1.0.2 journal, sidecar era but not pubid era) mints.
+    #[test]
+    fn the_sidecar_records_field_decides_the_era() {
+        let d = tempfile::tempdir().unwrap_or_else(|e| panic!("{e}"));
+        journal_log_with(d.path(), r#"{"v":2,"run":1,"at":1,"event":{"Done":{}}}"#);
+        std::fs::write(
+            d.path().join("journal.shape"),
+            "records=3\nsnapshots=1\nws=0\n",
+        )
+        .unwrap_or_else(|e| panic!("{e}"));
+        let e = match PubId::load_or_generate(d.path()) {
+            Err(e) => e,
+            Ok(_) => panic!("records=3 means the pubid writer ran — refuse"),
+        };
+        assert!(
+            e.to_string().contains("no public-id key"),
+            "the refusal says what to do: {e}"
+        );
+
+        let d2 = tempfile::tempdir().unwrap_or_else(|e| panic!("{e}"));
+        journal_log_with(d2.path(), r#"{"v":2,"run":1,"at":1,"event":{"Done":{}}}"#);
+        std::fs::write(
+            d2.path().join("journal.shape"),
+            "records=2\nsnapshots=1\nws=3\n",
+        )
+        .unwrap_or_else(|e| panic!("{e}"));
+        PubId::load_or_generate(d2.path()).unwrap_or_else(|e| panic!("{e}"));
+        assert!(d2.path().join(KEY_FILE).exists(), "records=2 is pre-pubid");
+    }
+
+    /// A malformed sidecar decides nothing — the record evidence does —
+    /// and a v1/v2 log under a damaged shape is still pre-pubid.
+    #[test]
+    fn a_malformed_sidecar_falls_back_to_record_evidence() {
+        let d = tempfile::tempdir().unwrap_or_else(|e| panic!("{e}"));
+        journal_log_with(d.path(), r#"{"v":2,"run":1,"at":1,"event":{"Done":{}}}"#);
+        std::fs::write(d.path().join("journal.shape"), "junk\n")
+            .unwrap_or_else(|e| panic!("{e}"));
+        PubId::load_or_generate(d.path()).unwrap_or_else(|e| panic!("{e}"));
+        assert!(d.path().join(KEY_FILE).exists());
     }
 }

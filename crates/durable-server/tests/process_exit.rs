@@ -68,6 +68,19 @@ async fn wait_healthy(c: &reqwest::Client, base: &str) {
     panic!("server never became healthy");
 }
 
+/// The readiness signal a deployment probes: 200, not just a listener.
+async fn wait_ready(c: &reqwest::Client, base: &str) {
+    for _ in 0..200 {
+        if let Ok(r) = c.get(format!("{base}/ready")).send().await {
+            if r.status().is_success() {
+                return;
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    panic!("server never became ready");
+}
+
 /// Submit a delayed job; its run id if acknowledged.
 async fn submit(c: &reqwest::Client, base: &str, key: &str) -> Option<String> {
     let body = serde_json::json!({
@@ -402,6 +415,115 @@ async fn a_missing_or_short_key_refuses_startup() {
         "must differ",
     )
     .await;
+}
+
+/// Finding 2 (S1): a v1.0.x journal has committed runs but no public-id
+/// key — no v1.0.x binary ever wrote one. The S2 server must mint the
+/// key and come up on it: before the era check, every existing install
+/// crash-looped on upgrade (the key loader refused any non-empty
+/// journal). The same server must still refuse a pubid-era journal that
+/// lost its key — that refusal is the rename guard, kept by the unit
+/// test next to `load_or_generate`.
+#[tokio::test]
+async fn a_v1_journal_boots_and_reaches_ready() {
+    let d = tempfile::tempdir().unwrap_or_else(|e| panic!("{e}"));
+    let journal = d.path().join("journal");
+    // A journal exactly as v1.0.1 leaves it: manifest, writer lock and
+    // gen-000001 holding v2-envelope records — no journal.shape (that
+    // sidecar is v1.0.2) and never a public_id.key.
+    {
+        let mut j = durable_journal::Journal::open(&journal).unwrap_or_else(|e| panic!("{e}"));
+        j.append(
+            br#"{"v":2,"run":1,"at":1000,"event":{"Accepted":{"key":"legacy","spec":{"version":1,"steps":[{"name":"a","handler":"step"}],"input":"aGk="},"not_before":9999999999999}}}"#,
+        )
+        .unwrap_or_else(|e| panic!("{e}"));
+    }
+    assert!(
+        !journal.join("journal.shape").exists(),
+        "the fixture claims v1.0.1 — no sidecar"
+    );
+    assert!(
+        !journal.join("public_id.key").exists(),
+        "the fixture claims v1.0.1 — no key"
+    );
+
+    let port = free_port();
+    let base = format!("http://127.0.0.1:{port}");
+    let c = reqwest::Client::new();
+    let mut server = start(&journal, port);
+    wait_ready(&c, &base).await;
+
+    // The key was minted at boot, owner-only, and the upgrade mint is
+    // stable: the run the v1.0.1 writer committed can be read back by
+    // its S2-era public id.
+    assert_eq!(
+        std::fs::read(journal.join("public_id.key"))
+            .unwrap_or_else(|e| panic!("{e}"))
+            .len(),
+        32,
+        "upgrade minted the key"
+    );
+    let listed = c
+        .get(format!("{base}/jobs"))
+        .bearer_auth(KEY)
+        .timeout(Duration::from_secs(5))
+        .send()
+        .await
+        .unwrap_or_else(|e| panic!("{e}"));
+    assert_eq!(listed.status().as_u16(), 200);
+    let ids = listed
+        .json::<serde_json::Value>()
+        .await
+        .unwrap_or_else(|e| panic!("{e}"));
+    let run = &ids["runs"][0];
+    let id = run["id"].as_str().unwrap_or_else(|| panic!("{ids}")).to_string();
+    assert_eq!(
+        run["key"].as_str(),
+        Some("legacy"),
+        "the replayed run is listed under a public id: {ids}"
+    );
+    assert_run_survives(&c, &base, &id, "after the v1.0.x upgrade").await;
+    let _ = server.kill();
+    let _ = server.wait();
+}
+
+/// The other half of finding 2's contract at process level: a journal
+/// the S2 binary already wrote (v3 envelopes prove the era) that lost
+/// its public_id.key must refuse startup — minting would rename every
+/// public id clients hold.
+#[tokio::test]
+async fn a_pubid_era_journal_missing_its_key_refuses_to_start() {
+    let d = tempfile::tempdir().unwrap_or_else(|e| panic!("{e}"));
+    let journal = d.path().join("journal");
+    {
+        let mut j = durable_journal::Journal::open(&journal).unwrap_or_else(|e| panic!("{e}"));
+        j.append(
+            br#"{"v":3,"ws":0,"run":1,"at":1000,"event":{"Accepted":{"key":"era","spec":{"version":1,"steps":[{"name":"a","handler":"step"}],"input":[104,105]},"not_before":9999999999999}}}"#,
+        )
+        .unwrap_or_else(|e| panic!("{e}"));
+    }
+    let port = free_port();
+    let mut cmd = server_cmd(&journal, port);
+    cmd.args(["--handler", "step=http://127.0.0.1:9/unused"])
+        .stderr(Stdio::piped());
+    let mut server = cmd.spawn().unwrap_or_else(|e| panic!("{e}"));
+    let status = match exit_within(&mut server, Duration::from_secs(10)).await {
+        Some(s) => s,
+        None => {
+            let _ = server.kill();
+            let _ = server.wait();
+            panic!("a key-less pubid-era journal let the server start");
+        }
+    };
+    let mut err = String::new();
+    if let Some(mut e) = server.stderr.take() {
+        let _ = std::io::Read::read_to_string(&mut e, &mut err);
+    }
+    assert!(!status.success(), "exit {status}");
+    assert!(
+        err.contains("no public-id key"),
+        "stderr names the missing key: {err}"
+    );
 }
 
 /// Checklist P0: unauthenticated reads only on a loopback listener.
