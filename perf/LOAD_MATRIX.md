@@ -12,9 +12,12 @@ exits non-zero on a FAIL. `--smoke` picks the small local sizes.
 
 Batteries: `perf/battery.sh` runs every scenario at smoke sizes (~2 min);
 `perf/battery.sh --full` is the gate battery — `.github/workflows/load.yml`
-runs it on hosted CI (workflow_dispatch, `ubuntu-24.04`) and uploads
-`perf/results/` as an artifact (a FAIL uploads too); the coordinator
-commits them through a reviewed branch.
+runs it on hosted CI (workflow_dispatch, `ubuntu-24.04`) as four matrix
+legs — `sustained`, `workspaces-memory`, `workspaces-postgres`, `rest`
+(`perf/battery.sh --full GROUP` runs one leg; `--full` alone runs all of
+them locally) — each with its own timeout and its own `perf/results/`
+artifact (a FAIL uploads too); the coordinator commits them through a
+reviewed branch.
 
 The server under test is spawned with `--rate-limit-per-addr 100000
 --max-conns-per-addr 0`: the battery measures the engine's bounds, not
