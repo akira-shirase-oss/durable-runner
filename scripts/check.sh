@@ -18,6 +18,19 @@ fi
 
 step() { printf '\n== %s\n' "$1"; }
 
+step "no mutation markers in committed source"
+# A mutation marker in a tracked file means a mutation under test was
+# never reverted — it shipped. Mutations happen only on the scratch copy
+# in tests/attacks/prove-attacks.sh, so no marker may ever appear in a
+# tracked file. (The pattern is built by concatenation so this script
+# does not match itself.)
+marker='MUT''ANT\|MUT''ATION-MARK\|MUT''ATE-HERE'
+if git grep -nE "$marker" -- . >"${TMPDIR:-/tmp}/durable-mutants.$$"; then
+  cat "${TMPDIR:-/tmp}/durable-mutants.$$"
+  echo "a mutation marker is committed — revert it before committing" >&2
+  exit 1
+fi
+
 step "toolchain"
 cargo --version
 rustc --version

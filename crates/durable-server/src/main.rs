@@ -3239,8 +3239,7 @@ async fn serve_http(
             // is read, not raced by a reset; the read side drains briefly
             // because closing with unread request bytes is what turns
             // into an RST (S2 re-review design item 1).
-            drop(stream);
-            let _ = lane_permit; // MUTANT: lane takes the permit but never answers
+            conns.spawn(overload_answer(stream, lane_permit, lane_response.clone()));
             continue;
         }
         if let Slot::Ready(ready_permit) = slot {
