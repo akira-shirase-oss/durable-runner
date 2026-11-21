@@ -589,6 +589,7 @@ fn valid_handler_url(url: &str, allow_local: bool) -> Result<String, ApiError> {
             format!("handler URL {url:?} must be http:// or https:// with a host"),
         ));
     }
+    // ATTACK(ssrf-register)
     ssrf::check_url(&parsed, allow_local).map_err(|why| {
         ApiError::new(
             StatusCode::UNPROCESSABLE_ENTITY,
@@ -1254,6 +1255,7 @@ impl FromRequestParts<App> for Authorized {
         let Some(key) = bearer(parts) else {
             return Err(unauthorized());
         };
+        // ATTACK(auth)
         match app.keyring.verify(key).await {
             Verified::Granted(auth) if auth.permission == Permission::Admin => Ok(Authorized(auth)),
             Verified::Granted(_) => Err(ApiError::new(
@@ -1287,6 +1289,7 @@ impl FromRequestParts<App> for ReadAuthorized {
             }));
         }
         match bearer(parts) {
+            // ATTACK(auth)
             Some(key) => match app.keyring.verify(key).await {
                 Verified::Granted(auth) => Ok(ReadAuthorized(auth)),
                 Verified::Denied => Err(unauthorized()),
@@ -1601,6 +1604,7 @@ fn decode_id(app: &App, ws: u64, s: &str) -> Result<u64, ApiError> {
 /// (S2-2's no-oracle rule).
 async fn scoped_run(app: &App, auth: &Auth, id: u64) -> Result<durable_domain::Run, ApiError> {
     match app.engine.inspect(RunId(id)).await? {
+        // ATTACK(tenant-scope)
         Some(run) if run.ws == auth.ws => Ok(run),
         _ => Err(not_found()),
     }
@@ -1768,6 +1772,7 @@ async fn diagnostics(
 /// key (the env key, or a store key scoped to ws 0). Tenant self-service
 /// is the S3 slice's member/role surface.
 fn ops_admin(auth: &Auth) -> Result<(), ApiError> {
+    // ATTACK(ops-scope)
     if auth.ws != 0 || auth.permission != Permission::Admin {
         return Err(ApiError::new(
             StatusCode::FORBIDDEN,
@@ -2426,6 +2431,7 @@ fn router(app: App, ui_dir: Option<&Path>) -> Router {
         )
         // A submit is at most 64 KiB of input (base64: ~88 KiB) plus its
         // spec; nothing legitimate comes near this.
+        // ATTACK(body-limit)
         .layer(DefaultBodyLimit::max(MAX_REQUEST_BYTES))
         .with_state(app);
     if let Some(ui) = ui_dir {
@@ -2907,6 +2913,7 @@ async fn serve_http(
     use hyper_util::rt::{TokioIo, TokioTimer};
     let permits = Arc::new(tokio::sync::Semaphore::new(limits.max_connections.max(1)));
     let (closing_tx, closing) = tokio::sync::watch::channel(false);
+    // ATTACK(body-deadline)
     let service = tower_http::timeout::RequestBodyDeadline::new(router, limits.body_deadline);
     let mut conns = tokio::task::JoinSet::new();
     let mut accept_failing = false;
@@ -2914,6 +2921,7 @@ async fn serve_http(
     // client address in a bounded map; the connection count is per TCP
     // peer (at accept time no request — and so no trusted-proxy header —
     // has been read yet).
+    // ATTACK(rate-limit)
     let rate_limiter = (limits.rate_per_addr > 0.0).then(|| {
         Arc::new(std::sync::Mutex::new(RateLimit::new(
             limits.rate_per_addr,
@@ -3044,6 +3052,7 @@ async fn serve_http(
             });
         let conn = hyper::server::conn::http1::Builder::new()
             .timer(TokioTimer::new())
+            // ATTACK(head-timeout)
             .header_read_timeout(limits.header_timeout)
             .serve_connection(io, handler);
         let mut closing = closing.clone();

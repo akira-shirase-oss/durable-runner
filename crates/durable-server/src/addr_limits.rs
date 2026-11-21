@@ -116,6 +116,7 @@ pub fn client_addr(
     trusted: &TrustedProxies,
     cf_connecting_ip: Option<&str>,
 ) -> IpAddr {
+    // ATTACK(cf-header)
     if trusted.trusts(peer) {
         if let Some(ip) = cf_connecting_ip.and_then(|v| v.trim().parse::<IpAddr>().ok()) {
             return ip;

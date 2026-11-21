@@ -1014,6 +1014,7 @@ impl EngineCore {
     ) -> Result<RunId, EngineError> {
         // Dedup first: a run accepted under an older (larger) key bound
         // must still return itself. The bound refuses new keys only.
+        // ATTACK(submit-dedup)
         if let Some(existing) = self.by_op.get(&(ws, key.clone())) {
             return Ok(*existing); // duplicate: hand back the original run
         }

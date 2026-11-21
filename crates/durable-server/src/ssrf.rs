@@ -85,6 +85,7 @@ fn validate_addrs(
     if allow_local {
         return Ok(());
     }
+    // ATTACK(ssrf-resolve)
     if addrs.into_iter().any(is_local) {
         return Err(ResolvedLocal);
     }
