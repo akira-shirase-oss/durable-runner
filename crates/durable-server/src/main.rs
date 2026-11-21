@@ -619,17 +619,15 @@ struct RegistryEntry {
 /// startup so a restart during an account-store outage dispatches from
 /// the snapshot instead of losing every registered handler. Rebuildable
 /// from the store — it is a cache, never an authority.
-fn load_registry_file(path: &Path) -> Vec<RegistryEntry> {
+fn load_registry_file(path: &Path) -> Result<Vec<RegistryEntry>> {
     match std::fs::read(path) {
-        Ok(b) => serde_json::from_slice(&b).unwrap_or_else(|e| {
-            eprintln!("durable-server: {path:?} is corrupt ({e}); ignoring it");
-            Vec::new()
+        Ok(b) => serde_json::from_slice(&b).map_err(|e| {
+            anyhow::anyhow!(
+                "{path:?} is corrupt ({e}); refusing to treat last-known-good rows as empty"
+            )
         }),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Vec::new(),
-        Err(e) => {
-            eprintln!("durable-server: cannot read {path:?}: {e}; ignoring it");
-            Vec::new()
-        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
+        Err(e) => Err(anyhow::anyhow!("cannot read {path:?}: {e}")),
     }
 }
 
@@ -673,19 +671,19 @@ enum RegistryWrite {
     /// Replace the `(ws, name)` row with `entry`.
     Upsert {
         entry: RegistryEntry,
-        ack: tokio::sync::oneshot::Sender<()>,
+        ack: tokio::sync::oneshot::Sender<Result<()>>,
     },
     /// Drop the `(ws, name)` row.
     Remove {
         ws: u64,
         name: String,
-        ack: tokio::sync::oneshot::Sender<()>,
+        ack: tokio::sync::oneshot::Sender<Result<()>>,
     },
     /// Replace one workspace's whole set (a secret rotation).
     ReplaceWs {
         ws: u64,
         entries: Vec<RegistryEntry>,
-        ack: tokio::sync::oneshot::Sender<()>,
+        ack: tokio::sync::oneshot::Sender<Result<()>>,
     },
     /// A reconcile pass's whole-file snapshot, taken at `epoch_seen`.
     /// `preserve_ws` holds workspaces the pass saw but could not arm —
@@ -697,7 +695,7 @@ enum RegistryWrite {
         epoch_seen: u64,
         /// The pass is settled when the writer has decided — applied or
         /// discarded as stale, either way the sender hears about it.
-        ack: tokio::sync::oneshot::Sender<()>,
+        ack: tokio::sync::oneshot::Sender<Result<()>>,
     },
 }
 
@@ -711,7 +709,24 @@ fn registry_writer(
     rx: std::sync::mpsc::Receiver<RegistryWrite>,
 ) {
     while let Ok(op) = rx.recv() {
-        let mut all = load_registry_file(&path);
+        let mut all = match load_registry_file(&path) {
+            Ok(v) => v,
+            Err(e) => {
+                // Unreadable or corrupt last-known-good: never merge
+                // onto an empty view — the write would erase every
+                // workspace's rows. Report it; the caller's 503 is the
+                // honest answer (re-review #8).
+                eprintln!("durable-server: {e}");
+                let ack = match op {
+                    RegistryWrite::Upsert { ack, .. }
+                    | RegistryWrite::Remove { ack, .. }
+                    | RegistryWrite::ReplaceWs { ack, .. }
+                    | RegistryWrite::Snapshot { ack, .. } => ack,
+                };
+                let _ = ack.send(Err(e));
+                continue;
+            }
+        };
         let ack = match op {
             RegistryWrite::Upsert { entry, ack } => {
                 all.retain(|e| !(e.ws == entry.ws && e.name == entry.name));
@@ -733,25 +748,27 @@ fn registry_writer(
                 epoch_seen,
                 ack,
             } => {
-                if epoch.load(std::sync::atomic::Ordering::Acquire) == epoch_seen {
+                let r = if epoch.load(std::sync::atomic::Ordering::Acquire) == epoch_seen {
                     all.retain(|e| preserve_ws.contains(&e.ws));
                     all.extend(entries);
-                    if let Err(e) = save_registry_file(&path, &all) {
-                        eprintln!("durable-server: cannot write {path:?}: {e}");
-                    }
+                    save_registry_file(&path, &all)
+                        .map_err(|e| anyhow::anyhow!("cannot write {path:?}: {e}"))
                 } else {
                     eprintln!(
                         "durable-server: registry reconcile discarded a pass overtaken by a mutation"
                     );
-                }
-                let _ = ack.send(());
+                    Ok(())
+                };
+                let _ = ack.send(r);
                 continue;
             }
         };
-        if let Err(e) = save_registry_file(&path, &all) {
-            eprintln!("durable-server: cannot write {path:?}: {e}");
+        let r = save_registry_file(&path, &all)
+            .map_err(|e| anyhow::anyhow!("cannot write {path:?}: {e}"));
+        if let Err(e) = &r {
+            eprintln!("durable-server: {e}");
         }
-        let _ = ack.send(());
+        let _ = ack.send(r);
     }
 }
 
@@ -921,7 +938,13 @@ async fn registry_sync(
     // The pass is settled when the writer decides — applied or dropped
     // as stale, either way a bounded wait hears about it.
     match tokio::time::timeout(std::time::Duration::from_secs(10), ack_rx).await {
-        Ok(Ok(())) => Ok(()),
+        Ok(Ok(Ok(()))) => Ok(()),
+        Ok(Ok(Err(e))) => {
+            eprintln!("durable-server: registry writer could not persist a reconcile pass: {e}");
+            Err(AccountError::Unavailable(
+                "registry writer could not persist the pass".into(),
+            ))
+        }
         _ => {
             eprintln!("durable-server: registry writer did not settle a reconcile pass");
             Err(AccountError::Unavailable(
@@ -2169,40 +2192,60 @@ struct PutHandlerReq {
     url: String,
 }
 
-/// Rewrite the snapshot after a route mutation — the actual
-/// load/merge/fsync runs on the registry writer thread; the route waits
-/// for its ack (bounded) so the response still means "the snapshot has
-/// it" (S3: no synchronous fsync on an async worker).
+/// Queue the write and wait for the writer's verdict — the actual
+/// load/merge/fsync runs on the writer thread; the route waits for its
+/// ack (bounded, no synchronous fsync on an async worker). Anything but
+/// a durably-applied write is a retryable 503 — a mutation the file
+/// never held would resurrect on restart while the client believed it
+/// landed (re-review #8: the old code logged and returned 200).
 async fn registry_write(
     app: &App,
-    op: impl FnOnce(tokio::sync::oneshot::Sender<()>) -> RegistryWrite,
-) {
+    op: impl FnOnce(tokio::sync::oneshot::Sender<Result<()>>) -> RegistryWrite,
+) -> Result<(), ApiError> {
     let (ack, rx) = tokio::sync::oneshot::channel();
     if app.registry_tx.try_send(op(ack)).is_err() {
         eprintln!(
             "durable-server: registry writer queue full; {:?} converges at the next reconcile",
             app.registry_file
         );
-        return;
+        return Err(ApiError::new(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "busy",
+            "the registry writer's queue is full; retry",
+        ));
     }
-    if tokio::time::timeout(Duration::from_secs(10), rx)
-        .await
-        .is_err()
-    {
-        eprintln!("durable-server: registry writer did not ack within 10 s");
+    match tokio::time::timeout(Duration::from_secs(10), rx).await {
+        Ok(Ok(Ok(()))) => Ok(()),
+        Ok(Ok(Err(_))) => Err(ApiError::new(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "registry_write_failed",
+            "the registry snapshot write failed; retry",
+        )),
+        _ => {
+            eprintln!("durable-server: registry writer did not ack within 10 s");
+            Err(ApiError::new(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "busy",
+                "the registry writer did not settle in 10 s; retry",
+            ))
+        }
     }
 }
 
-async fn registry_file_upsert(app: &App, entry: RegistryEntry) {
+async fn registry_file_upsert(app: &App, entry: RegistryEntry) -> Result<(), ApiError> {
     registry_write(app, |ack| RegistryWrite::Upsert { entry, ack }).await
 }
 
-async fn registry_file_remove(app: &App, ws: u64, name: &str) {
+async fn registry_file_remove(app: &App, ws: u64, name: &str) -> Result<(), ApiError> {
     let name = name.to_string();
     registry_write(app, |ack| RegistryWrite::Remove { ws, name, ack }).await
 }
 
-async fn registry_file_replace_ws(app: &App, ws: u64, entries: Vec<RegistryEntry>) {
+async fn registry_file_replace_ws(
+    app: &App,
+    ws: u64,
+    entries: Vec<RegistryEntry>,
+) -> Result<(), ApiError> {
     registry_write(app, |ack| RegistryWrite::ReplaceWs { ws, entries, ack }).await
 }
 
@@ -2283,7 +2326,7 @@ async fn put_handler(
             secret: secret.as_deref().map(|s| hex(s)),
         },
     )
-    .await;
+    .await?;
     Ok(Json(serde_json::json!({ "name": name, "url": url })))
 }
 
@@ -2337,7 +2380,7 @@ async fn rotate_handler_secret(
         });
     }
     app.engine.set_workspace_handlers(auth.ws, set).await?;
-    registry_file_replace_ws(&app, auth.ws, entries).await;
+    registry_file_replace_ws(&app, auth.ws, entries).await?;
     Ok(Json(serde_json::json!({ "secret": hex(&secret) })))
 }
 
@@ -2365,7 +2408,7 @@ async fn delete_handler(
         ));
     }
     app.engine.delete_handler(auth.ws, &name)?;
-    registry_file_remove(&app, auth.ws, &name).await;
+    registry_file_remove(&app, auth.ws, &name).await?;
     Ok(Json(serde_json::json!({ "deleted": name })))
 }
 
@@ -2790,7 +2833,9 @@ async fn main() -> Result<()> {
         }
     }
     if store.is_some() {
-        for entry in load_registry_file(&registry_file) {
+        for entry in load_registry_file(&registry_file)
+            .with_context(|| format!("loading {registry_file:?}"))?
+        {
             // Re-check the snapshot URL: the file may have been written
             // under --allow-local-handlers or edited offline — a literal
             // local target never enters the registry.
@@ -4476,7 +4521,7 @@ mod tests {
         assert_eq!(status, StatusCode::OK, "{v}");
 
         // The snapshot on disk carries the entry…
-        let entries = load_registry_file(&h.app.registry_file);
+        let entries = load_registry_file(&h.app.registry_file).unwrap_or_else(|e| panic!("{e}"));
         assert_eq!(
             entries,
             vec![RegistryEntry {
@@ -4666,7 +4711,12 @@ mod tests {
         )
         .await
         .unwrap_or_else(|e| panic!("{e}"));
-        assert_eq!(load_registry_file(&h.app.registry_file).len(), 1);
+        assert_eq!(
+            load_registry_file(&h.app.registry_file)
+                .unwrap_or_else(|e| panic!("{e}"))
+                .len(),
+            1
+        );
 
         // Cache key_a's verification — a *cached* key keeps working
         // through the outage; an unknown bearer would fail closed.
@@ -4916,7 +4966,8 @@ mod tests {
                 secret: None,
             },
         )
-        .await;
+        .await
+        .unwrap_or_else(|e| panic!("{e:?}"));
 
         // The DELETE through its real route: bump → stripe → store →
         // engine → file. `deleting` trips inside the store write.
@@ -4982,7 +5033,7 @@ mod tests {
                 .is_empty(),
             "the store row is gone"
         );
-        let rows = load_registry_file(&h.app.registry_file);
+        let rows = load_registry_file(&h.app.registry_file).unwrap_or_else(|e| panic!("{e}"));
         assert!(
             !rows.iter().any(|e| e.ws == a.id && e.name == "h"),
             "handlers.json resurrected the deleted row: {rows:?}"
@@ -4994,6 +5045,96 @@ mod tests {
             (status, v["code"].as_str()),
             (StatusCode::CONFLICT, Some("unregistered_handler")),
             "the deleted handler admitted work again: {v}"
+        );
+    }
+
+    /// Re-review #8: a mutation the registry writer could not durably
+    /// apply to handlers.json must not answer 200 — the row would
+    /// resurrect on restart while the client believed it gone. The
+    /// answer is a retryable 503 with a code.
+    #[tokio::test]
+    async fn a_registry_write_the_file_refused_is_503_not_200() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let h = harness_store(true, None, Some(Arc::new(durable_accounts::Memory::new())));
+        let store = h.keyring.store.clone().unwrap_or_else(|| panic!("store"));
+        let ws = store
+            .create_workspace("t")
+            .await
+            .unwrap_or_else(|e| panic!("{e}"));
+        let key = "dr_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        store
+            .create_key(
+                ws.id,
+                "k",
+                Permission::Admin,
+                &sha256(key.as_bytes()),
+                "dr_a",
+            )
+            .await
+            .unwrap_or_else(|e| panic!("{e}"));
+        store
+            .put_handler(ws.id, "h", "http://127.0.0.1:9/h")
+            .await
+            .unwrap_or_else(|e| panic!("{e}"));
+        assert!(
+            store
+                .verify_key(&sha256(key.as_bytes()))
+                .await
+                .unwrap_or_else(|e| panic!("{e}"))
+                .is_some(),
+            "probe: the store does not see the seeded key"
+        );
+        // The writer cannot persist: the file's directory refuses writes.
+        let dir = h
+            .app
+            .registry_file
+            .parent()
+            .unwrap_or_else(|| panic!("parent"))
+            .to_path_buf();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o500))
+            .unwrap_or_else(|e| panic!("{e}"));
+        let (status, v) = call(&h.router, "DELETE", "/handlers/h", Some(key), None).await;
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))
+            .unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(
+            (status, v["code"].as_str()),
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Some("registry_write_failed")
+            ),
+            "a write the file refused answered {status}: {v}"
+        );
+    }
+
+    /// The companion failure: an unreadable or corrupt handlers.json is
+    /// an error, never an empty registry — the next write would erase
+    /// every workspace's last-known-good rows.
+    #[test]
+    fn an_unreadable_or_corrupt_registry_file_is_an_error() {
+        let d = tempfile::tempdir().unwrap_or_else(|e| panic!("{e}"));
+        let p = d.path().join("handlers.json");
+        std::fs::write(&p, b"not json{").unwrap_or_else(|e| panic!("{e}"));
+        assert!(
+            load_registry_file(&p).is_err(),
+            "a corrupt file loaded as an empty registry"
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o000))
+                .unwrap_or_else(|e| panic!("{e}"));
+            assert!(
+                load_registry_file(&p).is_err(),
+                "an unreadable file loaded as an empty registry"
+            );
+            std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o600))
+                .unwrap_or_else(|e| panic!("{e}"));
+        }
+        assert!(
+            load_registry_file(&d.path().join("absent.json"))
+                .unwrap_or_else(|e| panic!("{e}"))
+                .is_empty(),
+            "a missing file is a fresh registry, not an error"
         );
     }
 
@@ -7807,7 +7948,7 @@ mod tests {
             let d = tempfile::tempdir().unwrap_or_else(|e| panic!("{e}"));
             let p = d.path().join("handlers.json");
             std::fs::write(&p, bytes).unwrap_or_else(|e| panic!("{e}"));
-            let _ = load_registry_file(&p);
+            let _ = load_registry_file(&p); // returns Result now — ignored deliberately
         }
 
         #[test]

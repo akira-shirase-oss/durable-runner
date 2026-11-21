@@ -149,8 +149,12 @@ impl Drop for Restore<'_> {
     }
 }
 
+/// A *pre-swap* compaction failure (the journal.shape write refused by an
+/// unwritable root) is an ordinary error, not a poison: the engine keeps
+/// serving, nothing is lost, and SIGTERM still drains to exit 0. The old
+/// name claimed the process exited — it asserted the opposite (re-review #8).
 #[tokio::test]
-async fn failed_manifest_swap_exits_the_process_and_loses_nothing() {
+async fn a_preswap_compaction_error_keeps_the_engine_and_loses_nothing() {
     let d = tempfile::tempdir().unwrap_or_else(|e| panic!("{e}"));
     let journal = d.path().join("journal");
     let port = free_port();
