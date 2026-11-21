@@ -1260,6 +1260,11 @@ async fn actor(
         }
     }
 
+    // DURABLE_ACTOR_TRACE: per-branch latency histogram for wedge hunts.
+    let trace = std::env::var_os("DURABLE_ACTOR_TRACE").is_some();
+    let mut arm_ms: std::collections::BTreeMap<&'static str, (u64, u128)> = Default::default();
+    let mut last_dump = std::time::Instant::now();
+
     loop {
         if core.is_poisoned() || writer_lost {
             // A write or fsync failed (never retried) or the writer died:
@@ -1283,8 +1288,10 @@ async fn actor(
         let (backlog_records, backlog_bytes) = pipe.backlog(&core);
         let accepting =
             backlog_records < cfg.max_outbox_records && backlog_bytes < cfg.max_outbox_bytes;
+        let t_iter = trace.then(std::time::Instant::now);
+        let mut arm = "idle";
         tokio::select! {
-            cmd = rx.recv(), if accepting => match cmd {
+            cmd = rx.recv(), if accepting => { arm = "cmd"; match cmd {
                 Some(Cmd::Submit { ws, key, spec, not_before, reply }) => {
                     let now = wall_ms();
                     // Admission is where the allowlist bites: a step naming a
@@ -1354,8 +1361,8 @@ async fn actor(
                     pipe.shutdown().await;
                     return StopReason::Dropped;
                 }
-            },
-            read = read_rx.recv() => match read {
+            }},
+            read = read_rx.recv() => { arm = "read"; match read {
                 Some(Read::Inspect { run, reply }) => {
                     pipe.answer_read(core.last_index(), reply, core.run(run).cloned());
                 }
@@ -1379,8 +1386,8 @@ async fn actor(
                     pipe.shutdown().await;
                     return StopReason::Dropped;
                 }
-            },
-            Some(res) = attempts.join_next() => match res {
+            }},
+            Some(res) = attempts.join_next() => { arm = "attempt"; match res {
                 Ok((run, step, outcome, permit, slot)) => {
                     live.remove(&(run, step));
                     spawned.retain(|_, k| *k != (run, step));
@@ -1414,8 +1421,8 @@ async fn actor(
                         run_effects(&mut core, &mut ex, effects, run, None, None);
                     }
                 }
-            },
-            Some(res) = probes.join_next() => match res {
+            }},
+            Some(res) = probes.join_next() => { arm = "probe"; match res {
                 Ok((run, step, found, permit, slot)) => {
                     spawned.retain(|_, k| *k != (run, step));
                     let mut ex = exec!();
@@ -1434,8 +1441,8 @@ async fn actor(
                         run_effects(&mut core, &mut ex, effects, run, None, None);
                     }
                 }
-            },
-            r = compaction_done(&mut pending_compaction) => {
+            }},
+            r = compaction_done(&mut pending_compaction) => { arm = "compact_done";
                 if let Some(c) = pending_compaction.take() {
                     let answer = match r {
                         Ok(Ok(generation)) => {
@@ -1461,7 +1468,7 @@ async fn actor(
                     }
                 }
             }
-            changed = status.changed() => match changed {
+            changed = status.changed() => { arm = "status"; match changed {
                 Ok(()) => {
                     let st = status.borrow_and_update().clone();
                     core.observe(&st);
@@ -1470,8 +1477,9 @@ async fn actor(
                     release(&mut core, &mut ex);
                 }
                 Err(_) => writer_lost = true,
-            },
+            }},
             _ = ticker.tick() => {
+                arm = "tick";
                 let mut ex = exec!();
                 tick(&mut core, &mut ex);
             }
@@ -1509,6 +1517,24 @@ async fn actor(
         pipe.collect(&mut core);
         if !pipe.flush() {
             writer_lost = true;
+        }
+        if let Some(t) = t_iter {
+            let us = t.elapsed().as_micros();
+            let e = arm_ms.entry(arm).or_default();
+            e.0 += 1;
+            e.1 += us;
+            if us > 20_000 || last_dump.elapsed() > Duration::from_secs(4) {
+                eprintln!(
+                    "actor-trace arm={arm} us={us} held={} backlog={backlog_records}B{backlog_bytes} [{}]",
+                    pipe.held.len(),
+                    arm_ms
+                        .iter()
+                        .map(|(k, (n, t))| format!("{k}:{n}x{:.0}us", t / (*n).max(1) as u128))
+                        .collect::<Vec<_>>()
+                        .join(" ")
+                );
+                last_dump = std::time::Instant::now();
+            }
         }
     }
 }
@@ -1909,6 +1935,15 @@ fn tick(core: &mut EngineCore, exec: &mut Exec<'_>) {
 /// The scheduler's pass at an explicit `now` — production calls it via
 /// `tick`; tests drive the re-check/grace clocks deterministically.
 fn tick_at(core: &mut EngineCore, exec: &mut Exec<'_>, now: Millis) {
+    let trace = std::env::var_os("DURABLE_ACTOR_TRACE").is_some();
+    let mut ph = [0u128; 4];
+    let mut tp = std::time::Instant::now();
+    let mut mark = |i: usize| {
+        if trace {
+            ph[i] = tp.elapsed().as_micros();
+            tp = std::time::Instant::now();
+        }
+    };
     // Below the reserve nothing new can be journaled: no expiry, no
     // dispatch (a call whose outcome cannot be recorded is not started).
     // In-flight work waits; readiness reports `no_space`.
@@ -1947,6 +1982,7 @@ fn tick_at(core: &mut EngineCore, exec: &mut Exec<'_>, now: Millis) {
     // the queue's length at entry (S2 re-review N1): a queue full of
     // over-share workspaces used to spin this loop forever — submits,
     // dispatch and the shutdown drain all starved behind it.
+    mark(0);
     let mut probes_left = exec.waiting_probes.len();
     while probes_left > 0 {
         probes_left -= 1;
@@ -1955,6 +1991,7 @@ fn tick_at(core: &mut EngineCore, exec: &mut Exec<'_>, now: Millis) {
         };
         exec.probe(core, run, step);
     }
+    mark(1);
     // Dispatch: permit and workspace slot first, then the journal commits
     // StepDispatched, then the handler is invoked — a crash between the
     // commit and the call can only lose a journaled fact, and no commit
@@ -1997,6 +2034,7 @@ fn tick_at(core: &mut EngineCore, exec: &mut Exec<'_>, now: Millis) {
             .or_default()
             .push_back((RunId(run), StepIndex(step), attempt));
     }
+    mark(2);
     // The per-tick budget counts only dispatch that actually happens
     // (S2 re-review N2): an entry that cannot dispatch — its handler left
     // the registry, its workspace is at share — is skipped for free, so
@@ -2126,6 +2164,17 @@ fn tick_at(core: &mut EngineCore, exec: &mut Exec<'_>, now: Millis) {
         if starved {
             break; // global capacity — every later workspace starves too
         }
+    }
+    mark(3);
+    if trace {
+        eprintln!(
+            "tick-phase sweep={}us probes={}us pour={}us rotate={}us dueq={}",
+            ph[0],
+            ph[1],
+            ph[2],
+            ph[3],
+            exec.due_by_ws.values().map(|q| q.len()).sum::<usize>()
+        );
     }
 }
 

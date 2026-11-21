@@ -43,6 +43,12 @@ struct Args {
     /// Listen address.
     #[arg(long, default_value = "127.0.0.1:58300")]
     listen: String,
+    /// Dedicated liveness listener: /health and /ready on their own
+    /// socket and backlog, so a connection flood on the main port cannot
+    /// starve probes (S2 wedge: keep-alive hoarding RST'd /health at the
+    /// accept queue). Point readiness/liveness checks here.
+    #[arg(long)]
+    health_listen: Option<String>,
     /// HTTP handler registrations: name=URL (repeatable).
     #[arg(long = "handler", value_parser = parse_handler)]
     handlers: Vec<(String, String)>,
@@ -2893,7 +2899,7 @@ async fn main() -> Result<()> {
     if let Some(store) = &store {
         spawn_registry_reconcile(store.clone(), &app, registry_stale);
     }
-    let router = router(app, args.ui_dir.as_deref());
+    let router = router(app.clone(), args.ui_dir.as_deref());
     let listener = tokio::net::TcpListener::bind(&args.listen)
         .await
         .with_context(|| format!("bind {}", args.listen))?;
@@ -2906,6 +2912,24 @@ async fn main() -> Result<()> {
     }
     eprintln!("durable-server listening on {}", args.listen);
     let (stop_http, http_stopped) = tokio::sync::oneshot::channel::<()>();
+    let health_serve = match &args.health_listen {
+        Some(addr) => {
+            let l = tokio::net::TcpListener::bind(addr)
+                .await
+                .with_context(|| format!("bind health listener {addr}"))?;
+            let r = Router::new()
+                .route("/health", get(health))
+                .route("/ready", get(ready))
+                .with_state(app.clone());
+            let (hs_stop, hs_rx) = tokio::sync::oneshot::channel::<()>();
+            eprintln!("durable-server liveness listening on {addr}");
+            Some((
+                hs_stop,
+                tokio::spawn(serve_http(l, r, health_limits(), hs_rx)),
+            ))
+        }
+        None => None,
+    };
     let limits = HttpLimits {
         max_connections: args.max_connections.max(1),
         header_timeout: Duration::from_millis(args.header_timeout_ms.max(1)),
@@ -2938,6 +2962,10 @@ async fn main() -> Result<()> {
     eprintln!("durable-server: terminating: draining");
     let limit = Duration::from_secs(args.drain_timeout_secs.max(1));
     let _ = stop_http.send(());
+    if let Some((hs_stop, hs_task)) = health_serve {
+        let _ = hs_stop.send(());
+        let _ = hs_task.await;
+    }
     let cut = match tokio::time::timeout(limit, &mut serve).await {
         Ok(r) => {
             r.context("serve")?;
@@ -3013,7 +3041,40 @@ impl Default for HttpLimits {
 }
 
 /// Serve `router` on `listener` until `stop` fires, then let the requests
-/// in flight finish (D-045, D-049). Every connection holds one of
+/// in flight finish (D-045, D-049). Every connection holds one of the
+/// `max_connections` permits, or one of the reserve below.
+///
+/// Liveness connections held in reserve: a flood that fills every
+/// general slot cannot take these — they answer /health and /ready only.
+const READY_CONNECTIONS: usize = 8;
+
+/// Which pool a freshly-accepted connection drew its permit from.
+enum Slot {
+    /// Full service; the permit is the bounded-work cap.
+    Work(tokio::sync::OwnedSemaphorePermit),
+    /// Liveness-only service from the reserve (S2: /health must answer
+    /// while a tenant's connection storm fills every work slot).
+    Ready(tokio::sync::OwnedSemaphorePermit),
+}
+
+/// The dedicated liveness listener's bounds: a small conn pool, no rate
+/// table (probes are bursts by design), the same deadline posture.
+fn health_limits() -> HttpLimits {
+    HttpLimits {
+        max_connections: 32,
+        header_timeout: Duration::from_secs(10),
+        body_deadline: Duration::from_secs(30),
+        write_stall: Duration::from_secs(10),
+        max_lifetime: Duration::from_secs(300),
+        max_requests: 100,
+        rate_per_addr: 0.0,
+        v6_prefix: 64,
+        max_conns_per_addr: 32,
+        max_conns_per_proxy: 0,
+        trusted_proxies: TrustedProxies::default(),
+    }
+}
+
 /// `max_connections` permits (the rest wait in the kernel's accept queue);
 /// a request head (and an idle keep-alive connection waiting for one) must
 /// arrive within `header_timeout`; a request body within `body_deadline`;
@@ -3028,6 +3089,11 @@ async fn serve_http(
 ) -> std::io::Result<()> {
     use hyper_util::rt::{TokioIo, TokioTimer};
     let permits = Arc::new(tokio::sync::Semaphore::new(limits.max_connections.max(1)));
+    // Readiness keeps a reserved slice: a flood that fills every general
+    // slot still leaves `READY_CONNECTIONS` conns that answer /health and
+    // /ready — a tenant's connection storm can starve work, never probes
+    // (S2 wedge: keep-alive hoarding froze /health behind a full pool).
+    let ready_permits = Arc::new(tokio::sync::Semaphore::new(READY_CONNECTIONS));
     let (closing_tx, closing) = tokio::sync::watch::channel(false);
     // ATTACK(body-deadline)
     let service = tower_http::timeout::RequestBodyDeadline::new(router, limits.body_deadline);
@@ -3050,10 +3116,19 @@ async fn serve_http(
     let trusted = limits.trusted_proxies.clone();
     let mut conn_cap_refused = false;
     loop {
-        let permit = tokio::select! {
+        // `biased`: general slots are preferred; a ready slot is spent
+        // only while the general pool is empty — reserved capacity must
+        // not drain during normal load (N7-re: a saturated pool is the
+        // only moment /health would otherwise lose).
+        let slot = tokio::select! {
+            biased;
             p = permits.clone().acquire_owned() => match p {
-                Ok(p) => p,
+                Ok(p) => Slot::Work(p),
                 Err(_) => break, // the semaphore is never closed
+            },
+            p = ready_permits.clone().acquire_owned() => match p {
+                Ok(p) => Slot::Ready(p),
+                Err(_) => break,
             },
             _ = &mut stop => break,
             Some(done) = conns.join_next(), if !conns.is_empty() => {
@@ -3082,6 +3157,60 @@ async fn serve_http(
                 }
             },
             _ = &mut stop => break,
+        };
+        if let Slot::Ready(ready_permit) = slot {
+            // Reserved capacity: liveness paths only, never keep-alive —
+            // a conn answers one probe then closes, so the slice cannot
+            // be camped. Per-address caps do not apply: they exist to
+            // keep one client from spending general slots, and these
+            // slots are not spendable on work.
+            let io = TokioIo::new(StallGuard::new(stream, limits.write_stall));
+            let svc = service.clone();
+            let handler =
+                hyper::service::service_fn(move |req: hyper::Request<hyper::body::Incoming>| {
+                    let svc = svc.clone();
+                    async move {
+                        let allowed = req.method() == hyper::Method::GET
+                            && matches!(req.uri().path(), "/health" | "/ready");
+                        let mut res = if allowed {
+                            tower::ServiceExt::oneshot(svc, req).await?
+                        } else {
+                            Response::builder()
+                                .status(StatusCode::SERVICE_UNAVAILABLE)
+                                .header(header::CONTENT_TYPE, "application/json")
+                                .body(axum::body::Body::from(
+                                    r#"{"error":"reserved for liveness","code":"reserved"}"#,
+                                ))
+                                .unwrap_or_else(|_| Response::new(axum::body::Body::empty()))
+                        };
+                        res.headers_mut().insert(
+                            header::CONNECTION,
+                            header::HeaderValue::from_static("close"),
+                        );
+                        Ok::<_, std::convert::Infallible>(res)
+                    }
+                });
+            let conn = hyper::server::conn::http1::Builder::new()
+                .timer(TokioTimer::new())
+                .header_read_timeout(limits.header_timeout)
+                .serve_connection(io, handler);
+            let mut closing = closing.clone();
+            let lifetime = limits.max_lifetime;
+            conns.spawn(async move {
+                let _permit = ready_permit;
+                let mut conn = std::pin::pin!(conn);
+                tokio::select! {
+                    _ = conn.as_mut() => return,
+                    _ = closing.wait_for(|c| *c) => {}
+                    () = tokio::time::sleep(lifetime) => {}
+                }
+                conn.as_mut().graceful_shutdown();
+                let _ = conn.await;
+            });
+            continue;
+        }
+        let Slot::Work(permit) = slot else {
+            unreachable!("slots are only Work or Ready")
         };
         // The per-peer connection cap: past it the socket is dropped at
         // accept — the client sees a refused connection, not a queue slot
@@ -3115,11 +3244,13 @@ async fn serve_http(
         let peer_ip = peer.ip();
         let rate_limiter = rate_limiter.clone();
         let trusted = trusted.clone();
+        let pool = permits.clone();
         let handler =
             hyper::service::service_fn(move |req: hyper::Request<hyper::body::Incoming>| {
                 let per_conn = per_conn.clone();
                 let rate_limiter = rate_limiter.clone();
                 let trusted = trusted.clone();
+                let pool = pool.clone();
                 async move {
                     // The per-address request rate. Refused before auth:
                     // a flood without a key is still a flood, and the
@@ -3157,7 +3288,13 @@ async fn serve_http(
                     let (svc, served) = &*per_conn;
                     let n = served.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
                     let mut res = tower::ServiceExt::oneshot(svc.clone(), req).await?;
-                    if n >= max_requests {
+                    // `Connection: close` at the request cap — and under
+                    // slot pressure: while every work permit is held, a
+                    // keep-alive conn would still sit on its slot through
+                    // the idle window, which is how one tenant's conn
+                    // storm starved every tenant's next accept (S2 wedge).
+                    // Closing rotates the slot to the backlog's next conn.
+                    if n >= max_requests || pool.available_permits() == 0 {
                         res.headers_mut().insert(
                             header::CONNECTION,
                             header::HeaderValue::from_static("close"),
@@ -6296,6 +6433,71 @@ mod tests {
             .unwrap_or_else(|e| panic!("{e}"));
         assert!(
             reply.starts_with(b"HTTP/1.1 200"),
+            "{}",
+            String::from_utf8_lossy(&reply)
+        );
+    }
+
+    /// S2 wedge: a conn's permit outlived its request for the whole
+    /// keep-alive life, so `max_connections` parked sockets starved every
+    /// later accept — /health included. Liveness keeps a reserved slice.
+    #[tokio::test]
+    async fn health_survives_a_pinned_connection_pool() {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+        let limits = HttpLimits {
+            max_connections: 4,
+            // Long enough that an idle keep-alive still holds its slot
+            // when the probe arrives.
+            header_timeout: Duration::from_secs(60),
+            ..lifted_limits()
+        };
+        let (addr, _stop, _h) = serving(limits).await;
+        // Park every work slot on an unfinished request head: no response
+        // is ever served, so the pressure-close rotation cannot free one
+        // — any probe served at all came through the reserve.
+        let mut held = Vec::new();
+        for _ in 0..4 {
+            let mut s = tokio::net::TcpStream::connect(addr)
+                .await
+                .unwrap_or_else(|e| panic!("{e}"));
+            s.write_all(b"GET /health HTTP/1.1\r\n")
+                .await
+                .unwrap_or_else(|e| panic!("{e}"));
+            held.push(s);
+        }
+        // Every work slot is pinned: /health answers on the reserve.
+        let mut probe = tokio::net::TcpStream::connect(addr)
+            .await
+            .unwrap_or_else(|e| panic!("{e}"));
+        probe
+            .write_all(b"GET /health HTTP/1.1\r\nhost: x\r\nconnection: close\r\n\r\n")
+            .await
+            .unwrap_or_else(|e| panic!("{e}"));
+        let mut reply = Vec::new();
+        tokio::time::timeout(Duration::from_secs(5), probe.read_to_end(&mut reply))
+            .await
+            .unwrap_or_else(|_| panic!("/health starved behind a pinned connection pool"))
+            .unwrap_or_else(|e| panic!("{e}"));
+        assert!(
+            reply.starts_with(b"HTTP/1.1 200"),
+            "{}",
+            String::from_utf8_lossy(&reply)
+        );
+        // The reserve serves liveness only: work gets a fast 503.
+        let mut probe = tokio::net::TcpStream::connect(addr)
+            .await
+            .unwrap_or_else(|e| panic!("{e}"));
+        probe
+            .write_all(b"GET /jobs HTTP/1.1\r\nhost: x\r\nconnection: close\r\n\r\n")
+            .await
+            .unwrap_or_else(|e| panic!("{e}"));
+        let mut reply = Vec::new();
+        tokio::time::timeout(Duration::from_secs(5), probe.read_to_end(&mut reply))
+            .await
+            .unwrap_or_else(|_| panic!("the reserve must refuse non-liveness work fast"))
+            .unwrap_or_else(|e| panic!("{e}"));
+        assert!(
+            reply.starts_with(b"HTTP/1.1 503"),
             "{}",
             String::from_utf8_lossy(&reply)
         );

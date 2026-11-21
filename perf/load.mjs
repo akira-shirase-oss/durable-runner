@@ -349,7 +349,12 @@ async function startServer(journalDir, extra = []) {
     '--allow-local-handlers',
     '--rate-limit-per-addr', '100000', '--max-conns-per-addr', '0', ...extra];
   const p = track(
-    spawn(SRV, argv, { stdio: 'ignore', env: { ...process.env, DURABLE_API_KEY: API_KEY } }),
+    // DR_LOAD_SRV_STDIO=inherit surfaces the server's stderr (e.g. the
+    // DURABLE_ACTOR_TRACE histogram); default keeps runs quiet.
+    spawn(SRV, argv, {
+      stdio: process.env.DR_LOAD_SRV_STDIO === 'inherit' ? 'inherit' : 'ignore',
+      env: { ...process.env, DURABLE_API_KEY: API_KEY },
+    }),
     journalDir, // unique per run (mkdtemp): matches only a child that serves this journal
     [SRV, ...argv].join(' '),
     PORT,
@@ -580,6 +585,111 @@ async function runAdmission() {
       ['the flood hit a bound (503s or tcp refusals)', (codes[503] ?? 0) + tcp > 0],
     ]),
     note: 'over-capacity must refuse (503 reserve / 409), never queue silently',
+  });
+  return r.verdict === 'pass';
+}
+
+// Offer far above --max-connections with connections that PARK a slot
+// (a request head that never completes) — the churn-conn hoard shape
+// that wedged /health behind a full accept queue. Asserts: liveness
+// answers on its dedicated listener the whole flood, offered work gets
+// a fast honest answer (200/503/tcp-refusal — never a hang past the
+// bound), and full throughput returns within N seconds of the flood
+// stopping (S2 wedge regression, made explicit).
+async function runOverload() {
+  const pool = Number(args.flood ?? 256);
+  const secs = Number(args.seconds ?? (SMOKE ? 8 : 15));
+  const recoverSecs = Number(args.recover_secs ?? 5);
+  const hport2 = HPORT + 10;
+  const dir = fs.mkdtempSync(`${os.tmpdir()}/dr-load-`);
+  const h = startHandler('ok');
+  const s = await startServer(`${dir}/journal`, [
+    '--max-connections', '64',
+    '--health-listen', `127.0.0.1:${hport2}`,
+  ]);
+  const healthBase = `http://127.0.0.1:${hport2}`;
+  const healthProbe = () =>
+    fetch(`${healthBase}/health`, { signal: AbortSignal.timeout(2000) });
+  const base = await submit('overload-base', 1, AUTH, performance.now() + 10_000);
+  const healthFails = [];
+  let stopProbes = false;
+  const probeLoop = (async () => {
+    while (!stopProbes) {
+      const t0 = now();
+      try {
+        const r = await healthProbe();
+        if (r.status !== 200) healthFails.push(`status:${r.status}`);
+      } catch (e) {
+        healthFails.push(e.cause?.code || e.name);
+      }
+      const took = now() - t0;
+      if (took > 500) healthFails.push(`slow:${Math.round(took)}ms`);
+      await sleep(120);
+    }
+  })();
+  // 4× the conn cap; each socket parks a slot on a head that never
+  // completes. Past the cap the extras wait in the kernel backlog —
+  // the honest refusal path (RST) when it too fills.
+  const conns = [];
+  for (let i = 0; i < pool; i++) {
+    const c = net.connect(PORT, '127.0.0.1');
+    c.on('error', () => {});
+    c.write('POST /jobs HTTP/1.1\r\nhost: x\r\n');
+    conns.push(c);
+  }
+  // Single attempt per offer (until=now): the measured answer is the
+  // honest one — a served 200, a bound 503, or a tcp refusal — not the
+  // retry loop's masked outcome (the admission scenario does the same).
+  const offer = Array.from({ length: 48 }, async (_, i) => {
+    const t0 = now();
+    const r = await submit(`overload-${i}`, 1, AUTH, performance.now());
+    return { status: r.status, took: now() - t0 };
+  });
+  const offered = await Promise.all(offer);
+  const answers = {};
+  let hung = 0;
+  for (const r of offered) {
+    answers[r.status] = (answers[r.status] ?? 0) + 1;
+    // A conn parked in the full kernel backlog waits out the flood
+    // before its refusal/service — the wedge is "never answered",
+    // not "answered late" (queued backpressure is the honest one).
+    if (r.took > secs * 1000 + 15_000) hung++;
+  }
+  const midHealth = await healthProbe().then((r) => r.status).catch((e) => `ERR:${e.cause?.code || e.name}`);
+  await sleep(secs * 1000);
+  for (const c of conns) c.destroy(); // the flood stops
+  const t0 = now();
+  let recovered = 0;
+  const recCodes = {};
+  while (recovered < 40 && now() - t0 < recoverSecs * 1000) {
+    const r = await submit(`recover-${recovered}`, 1, AUTH, performance.now() + 10_000);
+    recCodes[r.status] = (recCodes[r.status] ?? 0) + 1;
+    if (r.status === 200) recovered++;
+  }
+  const recoverMs = now() - t0;
+  stopProbes = true;
+  await probeLoop;
+  h.kill(); s.kill();
+  const r = writeResult('overload', {
+    params: { flood_conns: pool, max_connections: 64, header_timeout_ms: 'default (10 s)', smoke: SMOKE },
+    baseline_status: base.status,
+    answers_during_flood: answers,
+    health_during_flood: midHealth,
+    health_failures: healthFails,
+    recovery: { submits_done: recovered, ms: Math.round(recoverMs), codes: recCodes },
+    thresholds: {
+      offers: 'each answered inside flood+15 s (200/503/tcp-refusal — no hang)',
+      health: '200 on the dedicated listener, every probe <500 ms',
+      recovery: `40 submits served <${recoverSecs} s after the flood`,
+    },
+    ...verdictOf([
+      ['baseline submit served before the flood', base.status === 200],
+      ['every offered request answered inside the bound', hung === 0 && offered.length === 48],
+      ['/health answered 200 mid-flood on its listener', midHealth === 200],
+      ['every liveness probe answered <500ms during the flood', healthFails.length === 0],
+      [`40 submits inside ${recoverSecs}s after the flood`, recovered === 40],
+    ]),
+    note: 'a conn hoard must not wedge work or liveness: reserve + slot rotation',
   });
   return r.verdict === 'pass';
 }
@@ -974,7 +1084,7 @@ async function runWorkspaces() {
 const runners = {
   submit: runSubmit, replay: runReplay, stall: runStall,
   admission: runAdmission, compact: runCompact, sustained: runSustained,
-  workspaces: runWorkspaces,
+  workspaces: runWorkspaces, overload: runOverload,
 };
 if (!runners[scenario]) {
   console.error(`unknown scenario ${scenario}; choices: ${Object.keys(runners).join(', ')}`);
