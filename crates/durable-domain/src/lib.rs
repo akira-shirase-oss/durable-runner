@@ -261,6 +261,12 @@ pub enum Refusal {
     ReserveExhausted,
     #[error("at capacity: live-run or index-byte bound reached")]
     AtCapacity,
+    /// One workspace hit ITS share of the bounds — a distinct refusal
+    /// from the global `AtCapacity`: the rest of the pool still admits,
+    /// and the answer tells the tenant to free its own runs or raise its
+    /// own share, never to wait for the whole runner (S2 re-review #6).
+    #[error("workspace quota: per-workspace live-run or index-byte share reached")]
+    WorkspaceQuota,
 }
 
 // -------------------------------------------------------------------- limits
@@ -328,6 +334,12 @@ pub struct Limits {
     /// fairness share `max_live_runs_per_ws` gives the live pool, so no
     /// one tenant's bytes can crowd every workspace out of the index.
     pub max_index_bytes_per_ws: u64,
+    /// Compat mode (ws-0 only, no account store): workspace 0 is exempt
+    /// from both per-workspace shares and admits up to the global bounds
+    /// — exactly what v1.0.x did — so an upgrade never starts refusing
+    /// an install that already holds more than a quarter of the index
+    /// (S2 re-review finding 6). Real workspaces always obey shares.
+    pub ws0_share_exempt: bool,
 }
 
 impl Default for Limits {
@@ -351,6 +363,7 @@ impl Default for Limits {
             // A quarter of the global index: four tenants can each burst
             // to their share; no one tenant reaches the global bound.
             max_index_bytes_per_ws: 128 * 1024 * 1024,
+            ws0_share_exempt: false,
         }
     }
 }

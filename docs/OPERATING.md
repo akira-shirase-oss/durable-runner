@@ -34,7 +34,11 @@ target/release/durable-server \
 - **Capacity.** `--max-live-runs` (100,000 non-terminal runs) and
   `--max-index-bytes` (512 MiB of retained runs) bound the index; past them
   a submit is `503 at_capacity` (nothing journaled; retry with the same
-  `op_key`). `--max-in-flight` (256 handler calls) and
+  `op_key`). Each workspace's share is bounded separately —
+  `--max-live-runs-per-ws` (25,000) and `--max-index-bytes-per-ws`
+  (128 MiB, and never more than a quarter of the global index); a tenant
+  over its share is `429 workspace_quota` while other workspaces still
+  admit. `--max-in-flight` (256 handler calls) and
   `--max-dispatch-per-tick` (512 per 50 ms tick) bound execution — sized
   after the S2-7 drain measurement (32/64 held ~640–1,300 runs/s against a
   fast handler; 256/512 reached ~5k/s; the journal itself sustains ~33k/s).
@@ -268,6 +272,12 @@ refuses to start there, so remove the directory and restore again.
   terminal transition, unregistered handler, an existing backup name,
   `compaction_running` when a compaction is requested while one runs).
 - HTTP 401 — no or wrong API key on a mutating/admin route.
+- HTTP 429 `workspace_quota` — this workspace reached ITS share of the
+  bounds (`--max-live-runs-per-ws`, `--max-index-bytes-per-ws`, and never
+  more than a quarter of `--max-index-bytes`); the rest of the pool still
+  admits. Free this workspace's runs or raise its share. Compat mode (no
+  account store) exempts workspace 0 — a ws-0-only install admits up to
+  the global bounds exactly as v1.0.x did.
 - HTTP 503 — the server is bounded and said so instead of queueing
   silently. The `code` says which bound: `busy` (the command queue is
   full — retry with the same `op_key`), `at_capacity` (the live-run or

@@ -1472,6 +1472,14 @@ impl From<EngineError> for ApiError {
                  dedup records leave when a compaction runs after seven days; retry later with \
                  the same op_key",
             ),
+            EngineError::Refused(Refusal::WorkspaceQuota) => Self::new(
+                StatusCode::TOO_MANY_REQUESTS,
+                "workspace_quota",
+                "this workspace's share of the runner's bounds is full \
+                 (--max-live-runs-per-ws, --max-index-bytes-per-ws); other \
+                 workspaces still admit — free this workspace's runs or \
+                 raise its share",
+            ),
             EngineError::Refused(Refusal::OverLimits) => Self::new(
                 StatusCode::CONFLICT,
                 "over_limits",
@@ -2717,6 +2725,10 @@ async fn main() -> Result<()> {
             max_live_runs_per_ws: args.max_live_runs_per_ws,
             max_index_bytes: args.max_index_bytes,
             max_index_bytes_per_ws: args.max_index_bytes_per_ws,
+            // Compat mode (no account store) is a ws-0-only install: it
+            // admits to the global bounds exactly like v1.0.x, never the
+            // tenant share an upgrade would otherwise impose (finding 6).
+            ws0_share_exempt: store.is_none(),
             ..durable_domain::Limits::default()
         },
         ..Default::default()
@@ -6540,6 +6552,20 @@ mod tests {
         assert_eq!(
             (e.status, e.code),
             (StatusCode::SERVICE_UNAVAILABLE, "at_capacity")
+        );
+    }
+
+    /// A tenant over its share is told ITS quota is full — a distinct
+    /// 429, never the retry-the-runner 503 that names --max-live-runs
+    /// (S2 re-review finding 6).
+    #[test]
+    fn workspace_quota_refusal_is_429() {
+        let e = ApiError::from(EngineError::Refused(
+            durable_domain::Refusal::WorkspaceQuota,
+        ));
+        assert_eq!(
+            (e.status, e.code),
+            (StatusCode::TOO_MANY_REQUESTS, "workspace_quota")
         );
     }
 

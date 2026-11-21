@@ -1084,21 +1084,31 @@ impl EngineCore {
         self.limits.admits_key(&key)?;
         self.limits.admits(&spec)?; // limits refuse before anything is written
                                     // Capacity: a bounded index, refused explicitly (contract: "cap
-                                    // memory and disk; reject overload explicitly"). The per-
-                                    // workspace share is bounded the way the live pool is: a tenant
+                                    // memory and disk; reject overload explicitly"). The global
+                                    // bounds refuse `AtCapacity`; the per-workspace share — a tenant
                                     // may use at most `max_index_bytes_per_ws`, and never more than
-                                    // a quarter of the global index (S2 re-review).
+                                    // a quarter of the global index (S2 re-review) — refuses the
+                                    // distinct `WorkspaceQuota`: only this workspace is full.
         let run_bytes = Limits::run_bytes(&key, &spec);
         if self.live >= self.limits.max_live_runs
-            || self.ws_live.get(&ws).copied().unwrap_or(0) >= self.limits.max_live_runs_per_ws
             || self.index_bytes + run_bytes > self.limits.max_index_bytes
-            || self.ws_index_bytes.get(&ws).copied().unwrap_or(0) + run_bytes
-                > self
-                    .limits
-                    .max_index_bytes_per_ws
-                    .min(self.limits.max_index_bytes / 4)
         {
             return Err(Refusal::AtCapacity.into());
+        }
+        // Compat mode exempts workspace 0 from the share bounds entirely
+        // (S2 re-review finding 6): a ws-0-only v1.0.x install that grew
+        // past a quarter of the index must keep admitting — v1.0.x knew
+        // only the global bounds, and "compat behaves as v1.0.x".
+        let exempt = ws == 0 && self.limits.ws0_share_exempt;
+        if !exempt
+            && (self.ws_live.get(&ws).copied().unwrap_or(0) >= self.limits.max_live_runs_per_ws
+                || self.ws_index_bytes.get(&ws).copied().unwrap_or(0) + run_bytes
+                    > self
+                        .limits
+                        .max_index_bytes_per_ws
+                        .min(self.limits.max_index_bytes / 4))
+        {
+            return Err(Refusal::WorkspaceQuota.into());
         }
         let run = RunId(self.next_run);
         self.commit_record(
@@ -2497,6 +2507,37 @@ mod tests {
         ));
     }
 
+    /// S2 re-review finding 6: a ws-0-only v1.0.x install that grew past
+    /// a quarter of the index must keep admitting after upgrade — compat
+    /// mode (`ws0_share_exempt`) bounds ws 0 only by the global bounds,
+    /// exactly as v1.0.x did.
+    #[test]
+    fn a_compat_install_admits_past_the_tenant_share() {
+        let (_d, mut e) = open();
+        e.limits.ws0_share_exempt = true;
+        e.limits.max_live_runs = usize::MAX; // global bound off the table
+        e.limits.max_live_runs_per_ws = 1; // ws 0 ignores the share anyway
+        let job = || {
+            let mut s = spec();
+            s.input = vec![7u8; 4096];
+            s
+        };
+        let job_bytes = Limits::run_bytes(&OperationKey("x".into()), &job());
+        e.limits.max_index_bytes = 4 * job_bytes; // global room for ~3
+        e.limits.max_index_bytes_per_ws = job_bytes; // share = ~1 job
+        for i in 0..3 {
+            e.submit(OperationKey(format!("c-{i}")), job(), 0)
+                .unwrap_or_else(|e| panic!("compat ws 0 admits past the share: {e}"));
+        }
+        // The global bounds still bind ws 0 under compat — set the index
+        // to exactly full and the next submit is `AtCapacity`, not quota.
+        e.limits.max_index_bytes = e.diagnostics().index_bytes;
+        assert!(matches!(
+            e.submit(OperationKey("over".into()), job(), 0),
+            Err(EngineError::Refused(Refusal::AtCapacity))
+        ));
+    }
+
     /// Review S2 #6: one tenant can no longer fill every live slot —
     /// the per-workspace share refuses while other workspaces keep
     /// admitting, and a finished run frees the share again. Replay keeps
@@ -2513,7 +2554,7 @@ mod tests {
         let written = e.diagnostics().records_written;
         assert!(matches!(
             e.submit_at(7, OperationKey("a-4".into()), spec(), 0, 0),
-            Err(EngineError::Refused(Refusal::AtCapacity))
+            Err(EngineError::Refused(Refusal::WorkspaceQuota))
         ));
         assert_eq!(
             e.diagnostics().records_written,
@@ -2523,6 +2564,17 @@ mod tests {
         // A second workspace is unaffected — its own share is empty.
         e.submit_at(8, OperationKey("b-0".into()), spec(), 0, 0)
             .unwrap_or_else(|e| panic!("ws 8 must admit: {e}"));
+        // The share refusal is the distinct `WorkspaceQuota`, never the
+        // global `AtCapacity` — the rest of the pool still admits (S2
+        // re-review finding 6).
+        e.limits.max_live_runs_per_ws = 1;
+        e.submit_at(9, OperationKey("c-0".into()), spec(), 0, 0)
+            .unwrap_or_else(|e| panic!("{e}"));
+        assert!(matches!(
+            e.submit_at(9, OperationKey("c-1".into()), spec(), 0, 0),
+            Err(EngineError::Refused(Refusal::WorkspaceQuota))
+        ));
+        e.limits.max_live_runs_per_ws = 3;
         // A finished run frees ws 7's share.
         let id = e
             .submit_at(8, OperationKey("b-1".into()), spec(), 0, 0)
@@ -2674,7 +2726,7 @@ mod tests {
         e.limits.max_index_bytes_per_ws = ws0_left - 4096 + job_bytes;
         assert!(matches!(
             e.submit(OperationKey("cap-1".into()), job(), 0),
-            Err(EngineError::Refused(Refusal::AtCapacity))
+            Err(EngineError::Refused(Refusal::WorkspaceQuota))
         ));
         e.cancel(first, 1).unwrap_or_else(|e| panic!("{e}"));
         e.submit(OperationKey("cap-1".into()), job(), 2)

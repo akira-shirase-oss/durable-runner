@@ -4838,7 +4838,7 @@ mod tests {
                 .await
             {
                 Ok(_) => {}
-                Err(EngineError::Refused(durable_domain::Refusal::AtCapacity)) => refused += 1,
+                Err(EngineError::Refused(durable_domain::Refusal::WorkspaceQuota)) => refused += 1,
                 Err(e) => panic!("a-{i}: {e}"),
             }
         }
