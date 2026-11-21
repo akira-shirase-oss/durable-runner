@@ -128,6 +128,12 @@ def start(binary, journal, port, handler_port, backups, key, log):
     p = subprocess.Popen(
         [binary, "--journal", journal, "--listen", f"127.0.0.1:{port}",
          "--handler", f"step=http://127.0.0.1:{handler_port}/step",
+         # The fixture handler is loopback — the S2-5 opt-out, same as
+         # the load harness's spawned server.
+         "--allow-local-handlers",
+         # The drill measures crash durability, not admission: resubmit
+         # bursts must not hit the per-address 429 limiter.
+         "--rate-limit-per-addr", "0",
          *(["--backup-root", backups] if backups else [])],
         env=env, stdout=subprocess.DEVNULL, stderr=log)
     deadline = time.time() + 30
