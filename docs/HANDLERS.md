@@ -51,10 +51,15 @@ joined with `\n` (a newline can never appear inside any field —
 where `ts` is the `x-durable-timestamp` value, `method`/`path` are the
 request's method and URL path **only — the query string is excluded**
 (a signature minted for one call replays nowhere else),
-`authority` is the request's **`Host` header value verbatim** —
+`authority` is the authority of the URL the workspace registered —
 brackets on an IPv6 literal, a port only when the URL names a
-non-default one — so a signature minted for `a/step` never verifies at
-`b/step`, even when both handlers share the workspace's secret,
+non-default one. **Verify it against your own configured authority,
+never the request's `Host` header**: the header is the caller's to
+choose, so checking it lets a call minted for `a/step` replay at
+`b/step` with `Host: a` forged. A verifier configured for `b` rejects
+that signature no matter what `Host` arrives — a signature minted for
+`a/step` never verifies at `b/step`, even when both handlers share
+the workspace's secret,
 `run`/`step`/`attempt` are the `x-durable-run-id`/`x-durable-step`/
 `x-durable-attempt` header values *verbatim* — `run` is the opaque
 public id, `step`/`attempt` are integers; any absent header signs as
@@ -66,9 +71,13 @@ body — for a probe (no body) the digest field is empty, so the
 canonical string ends in `\n`.
 
 ```python
-canonical = f"{ts}\n{method}\n{host_header}\n{path}\n{run}\n{step}\n{attempt}\n{idem_key}\n{body_sha256_hex}"
+canonical = f"{ts}\n{method}\n{configured_authority}\n{path}\n{run}\n{step}\n{attempt}\n{idem_key}\n{body_sha256_hex}"
 expected  = hmac_sha256(secret, canonical).hexdigest()
 ```
+
+`configured_authority` is your deployment's value — the authority of
+the URL your workspace registered with the runner (the `url` your
+`PUT /handlers` sent), not anything read from the incoming request.
 
 A verifying handler checks, in order:
 
@@ -77,8 +86,9 @@ A verifying handler checks, in order:
    value your dedupe actually uses — and require the
    `x-idempotency-key` header to equal it. A header/body split is a
    smuggling attempt.
-3. **Signature.** Recompute over the wire fields as received; compare
-   the decoded tag in constant time. Reject on mismatch.
+3. **Signature.** Recompute over the wire fields as received — with
+   `authority` taken from your configuration, not the `Host` header —
+   compare the decoded tag in constant time. Reject on mismatch.
 4. **Replay.** The *signature* must not have been seen before — keyed
    on the signature itself so a re-minted variant cannot masquerade as
    a retry of the same call. A bounded set: entries older than 600 s

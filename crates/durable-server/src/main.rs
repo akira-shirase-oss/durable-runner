@@ -6792,10 +6792,19 @@ mod tests {
     /// over the verbatim wire fields compared in constant time, and a
     /// signature seen at most once. The rejection reason is
     /// inspectable, never 200-with-a-flag.
+    ///
+    /// `expected_authority` is the authority the handler is REGISTERED
+    /// under — the verifier's own configuration, never the request's
+    /// `Host` header: that header is the replayer's to choose, so
+    /// checking it lets a call minted for `a/step` replay at `b/step`
+    /// (S2 re-review #4). The runner signs the registered URL's
+    /// authority; a signature carrying any other value can never match
+    /// a verifier configured for this one.
     #[allow(clippy::too_many_arguments)]
     fn verify_sig(
         secret: &[u8; 32],
         now: u64,
+        expected_authority: &str,
         headers: &axum::http::HeaderMap,
         method: &str,
         path: &str,
@@ -6807,9 +6816,6 @@ mod tests {
         let ts: u64 = get(TS_HEADER)
             .and_then(|v| v.parse().ok())
             .ok_or("missing timestamp")?;
-        // The destination is signed: the `Host` header verbatim, so a
-        // call minted for `a/step` verifies at `a/step` and nowhere else.
-        let authority = get("host").ok_or("missing host header")?;
         if now.abs_diff(ts) > 300 {
             return Err("stale timestamp");
         }
@@ -6831,7 +6837,7 @@ mod tests {
         let expected = {
             let key = ring::hmac::Key::new(ring::hmac::HMAC_SHA256, secret);
             let canonical = format!(
-                "{ts}\n{method}\n{authority}\n{path}\n{r}\n{s}\n{a}\n{idem_key}\n{body_digest}"
+                "{ts}\n{method}\n{expected_authority}\n{path}\n{r}\n{s}\n{a}\n{idem_key}\n{body_digest}"
             );
             ring::hmac::sign(&key, canonical.as_bytes())
         };
@@ -6857,6 +6863,9 @@ mod tests {
     /// the probe endpoint does the same with the query-carried key.
     struct Verifier {
         secret: std::sync::RwLock<[u8; 32]>,
+        /// The authority this handler is registered under — its own
+        /// configuration, verified instead of the request's `Host`.
+        authority: String,
         seen: Mutex<HashSet<String>>,
         rejects: Mutex<Vec<String>>,
         posts: std::sync::atomic::AtomicUsize,
@@ -6902,6 +6911,7 @@ mod tests {
         match verify_sig(
             &secret,
             unix_secs(),
+            &st.authority,
             &headers,
             "POST",
             "/step",
@@ -6928,6 +6938,7 @@ mod tests {
         match verify_sig(
             &secret,
             unix_secs(),
+            &st.authority,
             &headers,
             "GET",
             "/step",
@@ -6941,8 +6952,15 @@ mod tests {
     }
 
     async fn spawn_verifier(secret: [u8; 32]) -> (String, Arc<Verifier>) {
+        // Bound first: the verifier's configured authority is the address
+        // it is registered under — never a header the caller controls.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .unwrap_or_else(|e| panic!("{e}"));
+        let addr = listener.local_addr().unwrap_or_else(|e| panic!("{e}"));
         let st = Arc::new(Verifier {
             secret: std::sync::RwLock::new(secret),
+            authority: addr.to_string(),
             seen: Mutex::new(HashSet::new()),
             rejects: Mutex::new(Vec::new()),
             posts: std::sync::atomic::AtomicUsize::new(0),
@@ -6953,10 +6971,6 @@ mod tests {
                 axum::routing::post(verified_post).get(verified_probe),
             )
             .with_state(st.clone());
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-            .await
-            .unwrap_or_else(|e| panic!("{e}"));
-        let addr = listener.local_addr().unwrap_or_else(|e| panic!("{e}"));
         tokio::spawn(async move {
             axum::serve(listener, app).await.ok();
         });
@@ -7082,29 +7096,64 @@ mod tests {
             "1".parse().unwrap_or_else(|e| panic!("{e}")),
         );
 
+        // The verifier is configured for the authority it is registered
+        // under — the value the runner signed.
+        let home = "h.test:8080";
         // A well-formed call passes…
-        assert!(
-            verify_sig(&secret, now, &headers, "POST", "/step", idem, &digest, &mut seen).is_ok()
-        );
+        assert!(verify_sig(
+            &secret, now, home, &headers, "POST", "/step", idem, &digest, &mut seen
+        )
+        .is_ok());
         // …but its replay does not — the signature is spent.
         assert_eq!(
-            verify_sig(&secret, now, &headers, "POST", "/step", idem, &digest, &mut seen),
+            verify_sig(&secret, now, home, &headers, "POST", "/step", idem, &digest, &mut seen),
             Err("replay")
         );
         // The same sig under a different path or method does not replay.
         assert_eq!(
-            verify_sig(&secret, now, &headers, "GET", "/step", "other", "", &mut seen),
+            verify_sig(&secret, now, home, &headers, "GET", "/step", "other", "", &mut seen),
             Err("signature mismatch")
         );
-        // Nor at a different destination: a sig minted for h.test:8080
-        // never verifies at another host — S3's cross-handler replay.
-        let mut elsewhere = headers.clone();
-        elsewhere.insert(
+        // Nor at a different destination — S3's cross-handler replay.
+        // The captured request is replayed to another verifier with the
+        // ORIGINAL Host header intact: the replayer can send `Host:
+        // h.test:8080` to any target, so only the configured authority —
+        // never the received header — can bind the signature (S2
+        // re-review #4).
+        assert_eq!(
+            verify_sig(
+                &secret,
+                now,
+                "other.test:9",
+                &headers,
+                "POST",
+                "/step",
+                idem,
+                &digest,
+                &mut seen
+            ),
+            Err("signature mismatch")
+        );
+        // The same replay carrying a forged `Host: other.test:9` header
+        // — the destination's real authority — is refused identically:
+        // no value the header carries is consulted.
+        let mut forged = headers.clone();
+        forged.insert(
             "host",
             "other.test:9".parse().unwrap_or_else(|e| panic!("{e}")),
         );
         assert_eq!(
-            verify_sig(&secret, now, &elsewhere, "POST", "/step", idem, &digest, &mut seen),
+            verify_sig(
+                &secret,
+                now,
+                "other.test:9",
+                &forged,
+                "POST",
+                "/step",
+                idem,
+                &digest,
+                &mut seen
+            ),
             Err("signature mismatch")
         );
         // A stale timestamp refuses before the signature is judged.
@@ -7117,7 +7166,7 @@ mod tests {
                 .unwrap_or_else(|e| panic!("{e}")),
         );
         assert_eq!(
-            verify_sig(&secret, now, &stale, "POST", "/step", "other", &digest, &mut seen),
+            verify_sig(&secret, now, home, &stale, "POST", "/step", "other", &digest, &mut seen),
             Err("stale timestamp")
         );
         // A tampered body breaks the digest the signature binds.
@@ -7125,6 +7174,7 @@ mod tests {
             verify_sig(
                 &secret,
                 now,
+                home,
                 &headers,
                 "POST",
                 "/step",
@@ -7143,7 +7193,7 @@ mod tests {
                 .unwrap_or_else(|e| panic!("{e}")),
         );
         assert_eq!(
-            verify_sig(&secret, now, &wrong, "POST", "/step", "other", &digest, &mut seen),
+            verify_sig(&secret, now, home, &wrong, "POST", "/step", "other", &digest, &mut seen),
             Err("signature mismatch")
         );
         // Field smuggling: a non-integer attempt header refuses outright.
@@ -7153,7 +7203,7 @@ mod tests {
             "1.x".parse().unwrap_or_else(|e| panic!("{e}")),
         );
         assert_eq!(
-            verify_sig(&secret, now, &smuggled, "POST", "/step", "other", &digest, &mut seen),
+            verify_sig(&secret, now, home, &smuggled, "POST", "/step", "other", &digest, &mut seen),
             Err("malformed call header")
         );
     }
@@ -7595,7 +7645,6 @@ mod tests {
             for (name, v) in [
                 TS_HEADER,
                 SIG_HEADER,
-                "host",
                 RUN_ID_HEADER,
                 STEP_HEADER,
                 ATTEMPT_HEADER,
@@ -7610,6 +7659,7 @@ mod tests {
             let _ = verify_sig(
                 &secret,
                 1_700_000_000_000,
+                parts.get(2).copied().unwrap_or(""),
                 &h,
                 "POST",
                 "/step",
