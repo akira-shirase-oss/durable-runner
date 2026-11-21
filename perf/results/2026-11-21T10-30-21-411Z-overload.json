@@ -1,0 +1,55 @@
+{
+  "machine": {
+    "host": "maintainer-laptop",
+    "platform": "darwin/arm64",
+    "cpu": "Apple M2 Pro",
+    "cores": 12,
+    "mem_gb": 32,
+    "date": "2026-11-21T10:30:21.446Z",
+    "commit": "98a3e60"
+  },
+  "scenario": "overload",
+  "loadavg": [
+    14.14,
+    19.85,
+    32.25
+  ],
+  "peak_heap_mb": 18,
+  "socket_peak": 199,
+  "close_wait_peak": 3,
+  "fin_wait2_peak": 0,
+  "socket_bound": 1024,
+  "params": {
+    "flood_conns": 256,
+    "max_connections": 64,
+    "header_timeout_ms": "default (10 s)",
+    "smoke": false
+  },
+  "baseline_status": 200,
+  "answers_during_flood": {
+    "200": 7,
+    "tcp:ECONNRESET": 41
+  },
+  "http_answered": 7,
+  "tcp_refused": 41,
+  "health_during_flood": 200,
+  "health_failures": [],
+  "recovery": {
+    "submits_done": 40,
+    "ms": 242,
+    "codes": {
+      "200": 40
+    }
+  },
+  "thresholds": {
+    "offers": "every offer settles inside flood+15 s; only real HTTP answers count — a tcp reset is a failure",
+    "legit_floor": "at least half the offers get a real HTTP answer during the flood, and at least 4 are 200",
+    "health": "200 on the dedicated listener, every probe <500 ms",
+    "recovery": "40 submits served <5 s after the flood"
+  },
+  "verdict": "FAIL",
+  "failures": [
+    "at least half the offers got a real HTTP answer"
+  ],
+  "note": "a conn hoard must not wedge work or liveness: reserve + slot rotation; tcp refusals are failures, not answers"
+}

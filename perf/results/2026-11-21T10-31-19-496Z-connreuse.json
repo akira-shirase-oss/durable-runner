@@ -1,0 +1,30 @@
+{
+  "machine": {
+    "host": "maintainer-laptop",
+    "platform": "darwin/arm64",
+    "cpu": "Apple M2 Pro",
+    "cores": 12,
+    "mem_gb": 32,
+    "date": "2026-11-21T10:31:19.533Z",
+    "commit": "98a3e60"
+  },
+  "scenario": "connreuse",
+  "loadavg": [
+    11.38,
+    17.94,
+    30.68
+  ],
+  "peak_heap_mb": 27,
+  "socket_peak": 0,
+  "close_wait_peak": 0,
+  "fin_wait2_peak": 0,
+  "socket_bound": 1024,
+  "ops": 400,
+  "ms": 4694,
+  "codes": {
+    "200": 400
+  },
+  "close_wait_after_drain": 0,
+  "total_sockets_after_drain": 0,
+  "verdict": "pass"
+}
