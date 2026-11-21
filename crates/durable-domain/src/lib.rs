@@ -353,16 +353,18 @@ impl Default for Limits {
             max_key_bytes: 256,
             max_name_bytes: 128,
             max_live_runs: 100_000,
-            // A quarter of the global pool: four tenants can each burst
-            // to their share; no one tenant reaches the global bound.
-            max_live_runs_per_ws: 25_000,
+            // A fifth of the global pool: four tenants at their share
+            // fill four fifths, so a fifth tenant still admits (S2
+            // re-review N4 — quarter shares would let four fill it all).
+            max_live_runs_per_ws: 20_000,
             // Sized for a 2 GB host (D-031): peak RSS has been measured at
             // up to 1.6 × index bytes, plus up to one snapshot during a
             // compaction, plus ~100 MiB.
             max_index_bytes: 512 * 1024 * 1024,
-            // A quarter of the global index: four tenants can each burst
-            // to their share; no one tenant reaches the global bound.
-            max_index_bytes_per_ws: 128 * 1024 * 1024,
+            // A fifth of the global index: four tenants at their share
+            // fill four fifths, so a fifth tenant still admits — the
+            // admission ceiling itself stays a quarter of the global.
+            max_index_bytes_per_ws: 100 * 1024 * 1024,
             ws0_share_exempt: false,
         }
     }
@@ -989,6 +991,16 @@ mod fuzz {
             let l = Limits::default();
             let _ = l.admits(&spec);
         }
+    }
+
+    /// S2 re-review N4: the shipped per-tenant shares must leave headroom
+    /// — if four tenants each at their share tile a global bound exactly,
+    /// the fifth tenant is refused by capacity it never touched.
+    #[test]
+    fn shipped_shares_leave_the_fifth_tenant_headroom() {
+        let l = Limits::default();
+        assert!(4 * l.max_live_runs_per_ws < l.max_live_runs);
+        assert!(4 * l.max_index_bytes_per_ws < l.max_index_bytes);
     }
 
     proptest! {

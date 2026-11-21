@@ -351,6 +351,12 @@ pub struct EngineCore {
     /// `diagnostics` is O(states), not O(retained runs) (S2 re-review:
     /// a tenant-readable diagnostics route must never stall the actor).
     state_counts: std::collections::BTreeMap<&'static str, u64>,
+    /// The same histogram per workspace — `diagnostics_for` reads it,
+    /// so a tenant's diagnostics call is O(states) on the actor no
+    /// matter how many runs the workspace retains (S2 re-review N5:
+    /// the per-address limit is dodged with many addresses, so the
+    /// walk itself must be bounded).
+    ws_state_counts: HashMap<u64, std::collections::BTreeMap<&'static str, u64>>,
     /// Non-terminal runs with `ws != 0` — `workspace_scoped_live_runs`
     /// in diagnostics without a full scan.
     scoped_live: u64,
@@ -443,6 +449,7 @@ impl EngineCore {
             index_bytes: 0,
             ws_index_bytes: HashMap::new(),
             state_counts: std::collections::BTreeMap::new(),
+            ws_state_counts: HashMap::new(),
             due_index: BTreeMap::new(),
             deadline_index: BTreeMap::new(),
             #[cfg(test)]
@@ -786,6 +793,16 @@ impl EngineCore {
                 if let Some(n) = self.state_counts.get_mut(run.state.kind()) {
                     *n = n.saturating_sub(1);
                 }
+                let ws_bucket_empty = self.ws_state_counts.get_mut(&run.ws).is_some_and(|m| {
+                    if let Some(n) = m.get_mut(run.state.kind()) {
+                        *n = n.saturating_sub(1);
+                    }
+                    m.retain(|_, n| *n > 0);
+                    m.is_empty()
+                });
+                if ws_bucket_empty {
+                    self.ws_state_counts.remove(&run.ws);
+                }
                 // Only terminal runs expire — live counts are untouched;
                 // the per-ws index loses the id either way.
                 if let Some(set) = self.ws_index.get_mut(&run.ws) {
@@ -829,6 +846,7 @@ impl EngineCore {
         self.ws_index.clear();
         self.ws_index_bytes.clear();
         self.state_counts.clear();
+        self.ws_state_counts.clear();
         self.due_index.clear();
         self.deadline_index.clear();
         self.scoped_live = 0;
@@ -836,6 +854,12 @@ impl EngineCore {
         for r in self.runs.values() {
             self.ws_index.entry(r.ws).or_default().insert(r.id);
             *self.state_counts.entry(r.state.kind()).or_default() += 1;
+            *self
+                .ws_state_counts
+                .entry(r.ws)
+                .or_default()
+                .entry(r.state.kind())
+                .or_default() += 1;
             let bytes = Limits::run_bytes(&r.key, &r.spec);
             self.index_bytes += bytes;
             *self.ws_index_bytes.entry(r.ws).or_default() += bytes;
@@ -928,6 +952,12 @@ impl EngineCore {
             *self.ws_index_bytes.entry(ws).or_default() += bytes;
             let run = Arc::new(Run::accepted(run_id, ws, key, spec, not_before));
             *self.state_counts.entry(run.state.kind()).or_default() += 1;
+            *self
+                .ws_state_counts
+                .entry(ws)
+                .or_default()
+                .entry(run.state.kind())
+                .or_default() += 1;
             if let Some((at, step, attempt)) = waiting_entry(&run.state) {
                 self.due_index.insert((at, run_id), (ws, step, attempt));
             }
@@ -973,6 +1003,27 @@ impl EngineCore {
                 *n = n.saturating_sub(1);
             }
             *self.state_counts.entry(state.kind()).or_default() += 1;
+            let empty_bucket = match self.ws_state_counts.get_mut(&run.ws) {
+                Some(m) => {
+                    if let Some(n) = m.get_mut(old_kind) {
+                        *n = n.saturating_sub(1);
+                        if *n == 0 {
+                            m.remove(old_kind);
+                        }
+                    }
+                    m.is_empty()
+                }
+                None => false,
+            };
+            if empty_bucket {
+                self.ws_state_counts.remove(&run.ws);
+            }
+            *self
+                .ws_state_counts
+                .entry(run.ws)
+                .or_default()
+                .entry(state.kind())
+                .or_default() += 1;
         }
         if let Some((at, ..)) = waiting_entry(&run.state) {
             self.due_index.remove(&(at, run_id));
@@ -1272,27 +1323,16 @@ impl EngineCore {
         }
     }
 
-    /// One workspace's diagnostics — the tenant-facing subset, computed
-    /// over that workspace's runs only so nothing cross-tenant leaks and
-    /// the cost is this workspace's set, never everyone's.
+    /// One workspace's diagnostics — the tenant-facing subset, read from
+    /// counters kept current with every transition so the call is
+    /// O(states) on the actor, never O(this workspace's retained runs)
+    /// (S2 re-review N5: an address-limit dodge could repeat the walk
+    /// from as many addresses as the attacker controlled).
     pub fn diagnostics_for(&self, ws: u64) -> WorkspaceDiagnostics {
-        let mut states = std::collections::BTreeMap::new();
-        let mut live_runs = 0u64;
-        let mut active_runs = 0u64;
-        if let Some(ids) = self.ws_index.get(&ws) {
-            for id in ids {
-                let Some(r) = self.runs.get(id) else { continue };
-                *states.entry(r.state.kind()).or_insert(0u64) += 1;
-                live_runs += 1;
-                if !r.state.is_terminal() {
-                    active_runs += 1;
-                }
-            }
-        }
         WorkspaceDiagnostics {
-            live_runs,
-            active_runs,
-            states,
+            live_runs: self.ws_index.get(&ws).map_or(0, |s| s.len() as u64),
+            active_runs: self.ws_live.get(&ws).copied().unwrap_or(0) as u64,
+            states: self.ws_state_counts.get(&ws).cloned().unwrap_or_default(),
         }
     }
 
@@ -2744,6 +2784,62 @@ mod tests {
         let e = EngineCore::open(d.path()).unwrap_or_else(|e| panic!("{e}"));
         assert_eq!(e.diagnostics().index_bytes, bytes);
         assert!(e.run(first).is_some_and(|r| r.spec.input.is_empty()));
+    }
+
+    /// S2 re-review N5: `diagnostics_for` must answer from counters kept
+    /// with every transition — a histogram that forgot a transition
+    /// lies forever, and a walk is what the actor cannot afford. Check
+    /// the answers against a ground-truth recount of the retained index
+    /// across dispatch, finish, cancel and replay.
+    #[test]
+    fn workspace_diagnostics_counts_track_every_transition() {
+        let (d, mut e) = open();
+        let truth = |e: &EngineCore, ws: u64| {
+            let mut states = std::collections::BTreeMap::new();
+            let (mut live, mut active) = (0u64, 0u64);
+            for r in e.runs.values().filter(|r| r.ws == ws) {
+                *states.entry(r.state.kind()).or_insert(0u64) += 1;
+                live += 1;
+                if !r.state.is_terminal() {
+                    active += 1;
+                }
+            }
+            (live, active, states)
+        };
+        let check = |e: &EngineCore, ws: u64| {
+            let (live, active, states) = truth(e, ws);
+            let d = e.diagnostics_for(ws);
+            assert_eq!(
+                (d.live_runs, d.active_runs, d.states),
+                (live, active, states)
+            );
+        };
+        assert_eq!(e.diagnostics_for(7).live_runs, 0);
+        let a = e
+            .submit_at(7, OperationKey("a".into()), spec(), 0, 0)
+            .unwrap_or_else(|e| panic!("{e}"));
+        let b = e
+            .submit_at(7, OperationKey("b".into()), spec(), 0, 0)
+            .unwrap_or_else(|e| panic!("{e}"));
+        e.submit_at(9, OperationKey("other".into()), spec(), 0, 0)
+            .unwrap_or_else(|e| panic!("{e}"));
+        check(&e, 7);
+        // Anchored, not vacuous: the checks above agree on empty maps.
+        assert_eq!(e.diagnostics_for(7).live_runs, 2);
+        e.dispatch(a, StepIndex(0), 1, 10)
+            .unwrap_or_else(|e| panic!("{e}"));
+        check(&e, 7);
+        e.step_finished(a, StepIndex(0), Some(b"out".to_vec()), None, 20)
+            .unwrap_or_else(|e| panic!("{e}"));
+        check(&e, 7);
+        e.cancel(b, 30).unwrap_or_else(|e| panic!("{e}"));
+        check(&e, 7);
+        check(&e, 9);
+        // Replay: the recount must rebuild the same per-ws histogram.
+        drop(e);
+        let e = EngineCore::open(d.path()).unwrap_or_else(|e| panic!("{e}"));
+        check(&e, 7);
+        check(&e, 9);
     }
 
     #[test]

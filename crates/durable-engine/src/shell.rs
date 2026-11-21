@@ -556,9 +556,10 @@ pub struct ShellConfig {
     /// The share of `max_in_flight` one workspace may hold at once (S2
     /// review #6): without it a single tenant's slow handler parks every
     /// permit and starves the rest — the measured default of 256 held
-    /// entirely by one tenant was the cross-tenant DoS. 64 keeps one
-    /// tenant to a quarter of the pool while it is full; a ws below its
-    /// cap can still use idle capacity up to the global bound.
+    /// entirely by one tenant was the cross-tenant DoS. 50 keeps one
+    /// tenant under a fifth of the pool while it is full, so four
+    /// saturated tenants leave a fifth able to dispatch; a ws below
+    /// its cap can still use idle capacity up to the global bound.
     /// Compat (ws-0 only) deployments wanting more raise the flag.
     pub max_in_flight_per_ws: usize,
     /// Upper bound on dispatches (and on deadline expiries) per tick, so a
@@ -613,7 +614,7 @@ impl Default for ShellConfig {
     fn default() -> Self {
         Self {
             max_in_flight: 256,
-            max_in_flight_per_ws: 64,
+            max_in_flight_per_ws: 50,
             max_dispatch_per_tick: 512,
             tick_ms: 50,
             dead_handler_grace_ms: 30_000,
@@ -2076,6 +2077,15 @@ fn run_effects(
 mod tests {
     use super::*;
     use durable_domain::RunState;
+
+    /// S2 re-review N4: the shipped in-flight share must leave headroom —
+    /// four tenants each at their cap must not tile the permit pool, or a
+    /// fifth workspace's dispatches starve on capacity it never touched.
+    #[test]
+    fn shipped_in_flight_share_leaves_the_fifth_tenant_headroom() {
+        let c = ShellConfig::default();
+        assert!(4 * c.max_in_flight_per_ws < c.max_in_flight);
+    }
 
     struct Echo;
     #[async_trait::async_trait]

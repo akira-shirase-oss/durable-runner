@@ -115,7 +115,8 @@ contract + reference verifier ship in `docs/HANDLERS.md`.
   the server's test module is the reference check; `spawn_verifier` is
   the live fixture.
 - **Per-workspace live-run quota** (`--max-live-runs-per-ws`, default
-  25,000 — a quarter of the global pool): a tenant at its share is
+  20,000 — a fifth of the global pool, so four full tenants leave a
+  fifth able to admit): a tenant at its share is
   refused `429 workspace_quota` — distinct from the global
   `503 at_capacity`, which the rest of the pool still admits under —
   so one tenant can never fill every live slot. Compat mode (no

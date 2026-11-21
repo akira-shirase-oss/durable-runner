@@ -35,8 +35,8 @@ target/release/durable-server \
   `--max-index-bytes` (512 MiB of retained runs) bound the index; past them
   a submit is `503 at_capacity` (nothing journaled; retry with the same
   `op_key`). Each workspace's share is bounded separately —
-  `--max-live-runs-per-ws` (25,000) and `--max-index-bytes-per-ws`
-  (128 MiB, and never more than a quarter of the global index); a tenant
+  `--max-live-runs-per-ws` (20,000) and `--max-index-bytes-per-ws`
+  (100 MiB, and never more than a quarter of the global index); a tenant
   over its share is `429 workspace_quota` while other workspaces still
   admit. `--max-in-flight` (256 handler calls) and
   `--max-dispatch-per-tick` (512 per 50 ms tick) bound execution — sized
