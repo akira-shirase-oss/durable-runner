@@ -459,6 +459,14 @@ fn bad_shape(k: &str) -> io::Error {
 /// Two threads can reach this (the commit path and the compaction
 /// swap), so the read-merge-write runs under one lock and the value
 /// persisted is never lower than what is already durable.
+///
+/// `SHAPE_HOLD`/`SHAPE_PARKED` are a test seam: parked inside the merge
+/// window, one writer proves the mutex keeps a second writer out.
+#[cfg(test)]
+static SHAPE_HOLD: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+#[cfg(test)]
+static SHAPE_PARKED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
 pub fn write_shape(root: &Path, shape: Shape) -> io::Result<()> {
     static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
     let _guard = LOCK.lock().unwrap_or_else(|e| e.into_inner());
@@ -466,6 +474,13 @@ pub fn write_shape(root: &Path, shape: Shape) -> io::Result<()> {
         Ok(Some(current)) => current.merged(shape),
         _ => shape,
     };
+    #[cfg(test)]
+    if SHAPE_HOLD.load(std::sync::atomic::Ordering::Acquire) {
+        SHAPE_PARKED.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        while SHAPE_HOLD.load(std::sync::atomic::Ordering::Acquire) {
+            std::thread::yield_now();
+        }
+    }
     let text = format!(
         "records={}\nsnapshots={}\nws={}\n",
         shape.records, shape.snapshots, shape.max_ws
@@ -3416,5 +3431,128 @@ mod tests {
         assert!(!shape_path(&to).exists(), "restore materialized a sidecar");
         let j = Journal::open(&to).unwrap_or_else(|e| panic!("{e}"));
         assert_eq!(j.records_written(), 1);
+    }
+
+    /// A1 (S1 re-review): the read-merge inside `write_shape` is the only
+    /// thing keeping a seeded claim from being lowered by a later,
+    /// smaller one — a restore or upgrade can legitimately leave the
+    /// sidecar ahead of the journal's own records.
+    #[test]
+    fn write_shape_never_lowers_a_seeded_maximum() {
+        let d = tempfile::tempdir().unwrap_or_else(|e| panic!("{e}"));
+        let root = d.path().join("j");
+        fs::create_dir(&root).unwrap_or_else(|e| panic!("{e}"));
+        write_shape(
+            &root,
+            Shape {
+                records: 1,
+                snapshots: 1,
+                max_ws: 9,
+            },
+        )
+        .unwrap_or_else(|e| panic!("{e}"));
+        write_shape(
+            &root,
+            Shape {
+                records: 1,
+                snapshots: 1,
+                max_ws: 3,
+            },
+        )
+        .unwrap_or_else(|e| panic!("{e}"));
+        let s = read_shape(&root)
+            .unwrap_or_else(|e| panic!("{e}"))
+            .unwrap_or_else(|| panic!("no journal.shape"));
+        assert_eq!(s.max_ws, 9, "a lower claim lowered the sidecar");
+    }
+
+    /// A1 (S1 re-review): the mutex around the read-merge-write is the
+    /// only thing keeping a second writer out of the race window. t1 is
+    /// parked after its merge and before its write; a serialized t2 must
+    /// stay outside (PARKED stays 1) — if the lock were gone it would
+    /// slip in (PARKED 2) having read the pre-t1 file, and one writer's
+    /// bump would be lost.
+    ///
+    /// The two waits are bound detection, not ordering: under a working
+    /// lock t2 can *never* enter while t1 parks, so a longer probe only
+    /// finds the same exclusion — never a false failure.
+    #[test]
+    fn racing_shape_writes_serialize_on_the_lock() {
+        use std::sync::atomic::Ordering;
+        let d = tempfile::tempdir().unwrap_or_else(|e| panic!("{e}"));
+        let root = d.path().join("j");
+        fs::create_dir(&root).unwrap_or_else(|e| panic!("{e}"));
+        write_shape(
+            &root,
+            Shape {
+                records: 1,
+                snapshots: 1,
+                max_ws: 3,
+            },
+        )
+        .unwrap_or_else(|e| panic!("{e}"));
+
+        SHAPE_PARKED.store(0, Ordering::Release);
+        SHAPE_HOLD.store(true, Ordering::Release);
+        let r1 = root.clone();
+        let t1 = std::thread::spawn(move || {
+            write_shape(
+                &r1,
+                Shape {
+                    records: 1,
+                    snapshots: 5,
+                    max_ws: 0,
+                },
+            )
+            .unwrap_or_else(|e| panic!("{e}"));
+        });
+        // t1 must reach the hold; never reaching it is a bug, not a
+        // timing race — bounded so the test fails instead of hanging.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while SHAPE_PARKED.load(Ordering::Acquire) < 1 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the first writer never parked inside the merge window"
+            );
+            std::thread::yield_now();
+        }
+        let r2 = root.clone();
+        let t2 = std::thread::spawn(move || {
+            write_shape(
+                &r2,
+                Shape {
+                    records: 2,
+                    snapshots: 1,
+                    max_ws: 0,
+                },
+            )
+            .unwrap_or_else(|e| panic!("{e}"));
+        });
+        // Probe the exclusion: a lock-less t2 reaches the hold in
+        // microseconds; two seconds gives it ~10^4 times that to slip in.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while std::time::Instant::now() < deadline {
+            assert_eq!(
+                SHAPE_PARKED.load(Ordering::Acquire),
+                1,
+                "a second writer entered the merge window — the lock is gone"
+            );
+            std::thread::yield_now();
+        }
+        SHAPE_HOLD.store(false, Ordering::Release);
+        t1.join().unwrap_or_else(|_| panic!("t1 panicked"));
+        t2.join().unwrap_or_else(|_| panic!("t2 panicked"));
+        let s = read_shape(&root)
+            .unwrap_or_else(|e| panic!("{e}"))
+            .unwrap_or_else(|| panic!("no journal.shape"));
+        assert_eq!(
+            s,
+            Shape {
+                records: 2,
+                snapshots: 5,
+                max_ws: 3
+            },
+            "serialized writes must land the component-wise max of both"
+        );
     }
 }

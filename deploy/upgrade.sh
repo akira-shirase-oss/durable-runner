@@ -22,7 +22,10 @@ if ! systemctl stop durable-server; then
   fi
   echo "upgrade: stop reported an error but the unit is down — continuing" >&2
 fi
-if ! deploy/format-guard.sh "$new"; then
+# Files-only: the unit is down, so anything answering the port is a
+# squatter — the diagnostics path would leak the admin key and could
+# feed arithmetic-injection JSON into the guard's merges.
+if ! FORMAT_GUARD_FILES_ONLY=1 deploy/format-guard.sh "$new"; then
   if ! systemctl start durable-server; then
     echo "upgrade refused AND the restart failed — the service is DOWN" >&2
     exit 1

@@ -23,19 +23,24 @@
 # "<records> <snapshots> <parks-ws≠0>"; older binaries print only the
 # record version, and their snapshot capability is the release table
 # (record-reader 3 = DRIX 2; older = DRIX 1). None of them parks.
-# Env overrides exist only for the test (deploy/test-format-guard.sh).
+# Env overrides exist only for the test (deploy/test-format-guard.sh),
+# except FORMAT_GUARD_FILES_ONLY=1, which upgrade.sh/rollback.sh always
+# set: they stop the server first, so anything answering $LISTEN is a
+# squatter — curling it would hand over the admin key and feed
+# arithmetic-injection JSON into the merges below.
 set -euo pipefail
 bin=${1:?usage: format-guard.sh /path/to/durable-server}
 LISTEN=${FORMAT_GUARD_LISTEN:-127.0.0.1:58300}
 KEY_FILE=${FORMAT_GUARD_KEY_FILE:-/etc/durable/api-key}
 JOURNAL_ROOT=${FORMAT_GUARD_JOURNAL_ROOT:-/var/lib/durable/journal}
+FILES_ONLY=${FORMAT_GUARD_FILES_ONLY:-0}
 
 refuse() { echo "format-guard: REFUSED — $*" >&2; exit 1; }
 
 jmax=""
 jsnap=""
 jws=""
-if [[ -r $KEY_FILE ]]; then
+if [[ -r $KEY_FILE && $FILES_ONLY != 1 ]]; then
   diag=$(curl -fsS --max-time 5 \
     -H "authorization: Bearer $(tr -d '\n' <"$KEY_FILE")" \
     "http://$LISTEN/admin/diagnostics" 2>/dev/null || true)
@@ -88,12 +93,14 @@ else
     [[ -e $sbin ]] || continue
     [[ -f $sbin && -r $sbin ]] || refuse "cannot read $sbin"
     sz=$(wc -c <"$sbin" | tr -d ' ')
+    [[ $sz =~ ^[0-9]+$ ]] || refuse "cannot size $sbin"
     (( sz >= 34 )) || refuse "$sbin is too short to carry a DRIX header"
     magic=$(dd bs=1 skip=28 count=4 <"$sbin" 2>/dev/null || true)
     [[ $magic == DRIX ]] || refuse "$sbin is not a DRIX snapshot"
     vb=$(od -An -j32 -N2 -tu1 <"$sbin" 2>/dev/null) || refuse "cannot scan $sbin"
     read -r b0 b1 _ <<<"$vb"
-    [[ -n ${b0:-} && -n ${b1:-} ]] || refuse "$sbin is too short to carry a DRIX header"
+    [[ ${b0:-} =~ ^[0-9]+$ && ${b1:-} =~ ^[0-9]+$ ]] \
+      || refuse "$sbin is too short to carry a DRIX header"
     sv=$(( b0 * 256 + b1 ))
     (( sv > ssnap )) && ssnap=$sv
   done
@@ -129,13 +136,17 @@ fi
 # Whatever the files hold outranks whatever a still-running older
 # server reports — the journal is the authority, not the process.
 # (Defaults first: max() of two zeros must still land on a number.)
+# Anything diagnostics returned is UNTRUSTED input — with the server
+# down the port may be a squatter's: validate as plain integers BEFORE
+# any (( )) or $(( )) can evaluate it (bash arithmetic evaluates array
+# subscripts — "BASH_VERSINFO[$(cmd)0]" would run cmd as root).
 jmax=${jmax:-0}; jsnap=${jsnap:-0}; jws=${jws:-0}
-[[ $smax =~ ^[0-9]+$ ]] && (( smax > jmax )) && jmax=$smax
-[[ $ssnap =~ ^[0-9]+$ ]] && (( ssnap > jsnap )) && jsnap=$ssnap
-[[ $sws =~ ^[0-9]+$ ]] && (( sws > jws )) && jws=$sws
 [[ $jmax =~ ^[0-9]+$ ]] || refuse "cannot determine the journal's record version"
 [[ $jsnap =~ ^[0-9]+$ ]] || refuse "cannot determine the journal's snapshot version"
 [[ $jws =~ ^[0-9]+$ ]] || refuse "cannot determine the journal's workspace scope"
+[[ $smax =~ ^[0-9]+$ ]] && (( smax > jmax )) && jmax=$smax
+[[ $ssnap =~ ^[0-9]+$ ]] && (( ssnap > jsnap )) && jsnap=$ssnap
+[[ $sws =~ ^[0-9]+$ ]] && (( sws > jws )) && jws=$sws
 bmax=""
 bout=$("$bin" --journal-format 2>/dev/null) || {
   echo "format-guard: $bin --journal-format failed — refusing" >&2
@@ -145,7 +156,13 @@ bout=$("$bin" --journal-format 2>/dev/null) || {
 # predates the extra fields: its snapshot capability is the release
 # table (record-reader 3 = DRIX 2; older = DRIX 1) and it parks nothing.
 read -r bmax bsnap bpark <<<"$bout"
+# The binary's answer is untrusted too — validate every field before
+# arithmetic sees it (same subscript-injection class as diagnostics).
 [[ $bmax =~ ^[0-9]+$ ]] || refuse "cannot parse $bin --journal-format: '$bout'"
+[[ -z $bsnap || $bsnap =~ ^[0-9]+$ ]] \
+  || refuse "cannot parse $bin --journal-format: '$bout'"
+[[ -z ${bpark:-} || ${bpark:-} =~ ^[0-9]+$ ]] \
+  || refuse "cannot parse $bin --journal-format: '$bout'"
 if [[ -z $bsnap ]]; then bsnap=$(( bmax >= 3 ? 2 : 1 )); fi
 bpark=${bpark:-0}
 if (( bmax < jmax )); then

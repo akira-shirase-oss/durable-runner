@@ -1217,6 +1217,36 @@ mod tests {
         assert_eq!(e.diagnostics().journal_max_ws, 7);
     }
 
+    /// A1 (S1 re-review): a sidecar seeded ahead of the journal's own
+    /// records — exactly what a restore or upgrade can leave — must not
+    /// be lowered by a commit whose maxima are smaller. Only the
+    /// read-merge inside `write_shape` keeps the claim monotonic.
+    #[test]
+    fn a_seeded_higher_sidecar_survives_a_lower_ws_commit() {
+        let d = tempfile::tempdir().unwrap_or_else(|e| panic!("{e}"));
+        durable_journal::write_shape(
+            d.path(),
+            durable_journal::Shape {
+                records: ENVELOPE_VERSION,
+                snapshots: 1,
+                max_ws: 9,
+            },
+        )
+        .unwrap_or_else(|e| panic!("{e}"));
+        let mut e = EngineCore::open(d.path()).unwrap_or_else(|e| panic!("{e}"));
+        // A ws=3 commit asks the sidecar for max_ws 3; the file must
+        // still read the seeded 9 — under-reporting is the open failure.
+        e.submit_at(3, OperationKey("t".into()), spec(), 0, 0)
+            .unwrap_or_else(|e| panic!("{e}"));
+        let s = durable_journal::read_shape(d.path())
+            .unwrap_or_else(|e| panic!("{e}"))
+            .unwrap_or_else(|| panic!("no journal.shape"));
+        assert_eq!(
+            s.max_ws, 9,
+            "a ws=3 commit lowered a sidecar seeded at ws=9"
+        );
+    }
+
     #[test]
     fn compaction_moves_tenant_runs_into_the_snapshot_and_the_sidecar_knows() {
         let (d, mut e) = open();
