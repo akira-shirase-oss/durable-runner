@@ -257,6 +257,17 @@ copies only the backup's own regular files, refusing symlinks. An
 interrupted restore leaves generations without a manifest; a server
 refuses to start there, so remove the directory and restore again.
 
+The file set a backup may list is one agreed contract across versions
+(D-058; D-057 on the v1.0.2 line): the generation files, plus the
+journal-dir flats `journal.shape` and `public_id.key`. This build
+writes both flats — the sidecar preserves forward claims a replay
+cannot reconstruct, and the key keeps every issued public id
+decodable on the restored instance. v1.0.x writes generation files
+only but accepts all of them on restore, so this build's backup of a
+still-record-v2 journal is a legitimate rollback target there.
+Whether the restored journal can then run is the unchanged D-056
+gate (record/snapshot/ws versions), never the file list.
+
 ## What "honest" looks like in the output
 
 - `queued` / `retry_waiting:*` — scheduled, not yet attempted.

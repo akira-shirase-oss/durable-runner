@@ -116,9 +116,12 @@ contract + reference verifier ship in `docs/HANDLERS.md`.
   the live fixture.
 - **Per-workspace live-run quota** (`--max-live-runs-per-ws`, default
   25,000 — a quarter of the global pool): a tenant at its share is
-  refused `503 at_capacity` while other workspaces keep admitting, so
-  one tenant can never fill every live slot. The accounting is rebuilt
-  from the index on replay like the global counters.
+  refused `429 workspace_quota` — distinct from the global
+  `503 at_capacity`, which the rest of the pool still admits under —
+  so one tenant can never fill every live slot. Compat mode (no
+  account store) exempts workspace 0 and admits to the global bounds
+  exactly as v1.0.x did. The accounting is rebuilt from the index on
+  replay like the global counters.
 - **Per-workspace run index**: `GET /jobs` pages read a `ws → run ids`
   index instead of scanning the global index — a tenant's list cost is
   its own size, and a page never touches another workspace's runs.
@@ -138,6 +141,13 @@ contract + reference verifier ship in `docs/HANDLERS.md`.
   exactly like a missing run. The 32-byte key lives at
   `<journal>/public_id.key` (mode 0600, generated on first boot);
   losing it orphans every public id — never the runs.
+- **Backups carry the journal-dir flats** (`journal.shape`,
+  `public_id.key`), checksummed and owner-only (D-058): a restore
+  keeps the sidecar's forward claims and decodes every public id the
+  install issued — without the key they all orphaned to 404. The file
+  set is one agreed contract across versions, so v1.0.2's restore
+  accepts this build's backup whenever its journal is still
+  record-v2 — the upgrade-then-rollback-before-traffic floor.
 
 ### Security
 
