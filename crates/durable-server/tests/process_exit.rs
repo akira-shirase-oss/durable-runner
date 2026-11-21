@@ -476,7 +476,10 @@ async fn a_v1_journal_boots_and_reaches_ready() {
         .await
         .unwrap_or_else(|e| panic!("{e}"));
     let run = &ids["runs"][0];
-    let id = run["id"].as_str().unwrap_or_else(|| panic!("{ids}")).to_string();
+    let id = run["id"]
+        .as_str()
+        .unwrap_or_else(|| panic!("{ids}"))
+        .to_string();
     assert_eq!(
         run["key"].as_str(),
         Some("legacy"),

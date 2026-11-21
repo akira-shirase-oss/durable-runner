@@ -434,8 +434,7 @@ mod tests {
     fn a_malformed_sidecar_falls_back_to_record_evidence() {
         let d = tempfile::tempdir().unwrap_or_else(|e| panic!("{e}"));
         journal_log_with(d.path(), r#"{"v":2,"run":1,"at":1,"event":{"Done":{}}}"#);
-        std::fs::write(d.path().join("journal.shape"), "junk\n")
-            .unwrap_or_else(|e| panic!("{e}"));
+        std::fs::write(d.path().join("journal.shape"), "junk\n").unwrap_or_else(|e| panic!("{e}"));
         PubId::load_or_generate(d.path()).unwrap_or_else(|e| panic!("{e}"));
         assert!(d.path().join(KEY_FILE).exists());
     }
