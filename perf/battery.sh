@@ -14,6 +14,10 @@ MODE=${1:-smoke}
 PORT=${PORT:-53340}
 HPORT=${HPORT:-53341}
 FAILED=()
+# The generator is O(1) by design (measured peak ~170 MB at 1.1 M ops) —
+# cap the heap so a regression to per-op retention dies fast instead of
+# burning a runner for two hours first. Override with NODE_OPTIONS.
+export NODE_OPTIONS="${NODE_OPTIONS:---max-old-space-size=512}"
 
 run() {
   echo "== load.mjs $*"

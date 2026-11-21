@@ -1,0 +1,94 @@
+{
+  "machine": {
+    "host": "maintainer-laptop",
+    "platform": "darwin/arm64",
+    "cpu": "Apple M2 Pro",
+    "cores": 12,
+    "mem_gb": 32,
+    "date": "2026-11-21T04:38:41.363Z",
+    "commit": "57a0f07"
+  },
+  "scenario": "workspaces",
+  "peak_heap_mb": 191,
+  "undici_tos_races": 3,
+  "params": {
+    "workspaces": 4,
+    "submits_per_workspace": 275000,
+    "account_backend": "memory",
+    "submit_budget_ms": 22000000,
+    "drain_budget_ms": 1800000,
+    "smoke": false
+  },
+  "sent": 1100000,
+  "accepted": 1100000,
+  "http_codes": {
+    "200": 1100000
+  },
+  "backpressure": {
+    "at_capacity_503s": 21291,
+    "tcp_refusals": 3668749,
+    "retries": 54213236
+  },
+  "per_workspace": {
+    "01a1fc5c-bcee-778c-b9a1-8141662d1987": {
+      "runs": 275000,
+      "pages": 275
+    },
+    "01a1fc5c-bcf3-759c-b778-13059f2e5147": {
+      "runs": 275000,
+      "pages": 275
+    },
+    "01a1fc5c-bcf7-736a-aeb3-0f20cafd8d8a": {
+      "runs": 275000,
+      "pages": 275
+    },
+    "01a1fc5c-bcfb-7421-b14d-bbad60d5a2f3": {
+      "runs": 275000,
+      "pages": 275
+    }
+  },
+  "churn_registrations": 911,
+  "churn_errors": 201,
+  "done_after_drain": 1100000,
+  "drain_seconds": 2,
+  "drain_runs_per_s": 536847,
+  "submit_phase_s": 598,
+  "accept_rate_per_s": 1838,
+  "handler_calls": {
+    "signed": 1099969,
+    "unsigned": 0,
+    "signedProbes": 83,
+    "unsignedProbes": 0
+  },
+  "identity": {
+    "suspects_cross": 5,
+    "suspects_self": 1,
+    "suspect_overflow": false,
+    "shared_verified": [],
+    "dupes_verified": [],
+    "sample_leaks": []
+  },
+  "latency_ms": {
+    "p50": 116,
+    "p99": 573,
+    "max": 22301.307,
+    "note": "bucket upper edges: 1 ms to 2 s, x2 to ~4.4 min (true pXX <= value)"
+  },
+  "accept_latency_ms": {
+    "p50": 438,
+    "p99": 32768,
+    "max": 52939.173,
+    "note": "bucket upper edges: 1 ms to 2 s, x2 to ~4.4 min (true pXX <= value)"
+  },
+  "thresholds": {
+    "accepted": "every offered op admitted within the submit budget",
+    "sized": "275000 runs per workspace, no id listed twice",
+    "disjoint": "no run id shared across workspaces (bloom + exact checks)",
+    "oracle": "foreign run id \u2192 404",
+    "done": "every accepted run within 1800s drain",
+    "signed": "every handler call signed",
+    "p99_ms": "<2000 per-attempt response"
+  },
+  "verdict": "pass",
+  "note": "O(1) generator proof: 1.1M ops under node --max-old-space-size=256; the pre-rewrite script could not finish this shape at any cap (OOM on CI run 44760152519; setTypeOfService EINVAL locally). Harness ran ahead of the server binary by one commit; result records the producing tree state (57a0f07, attacks batch). accept p99 32.8 s is kernel pacing on a heavily loaded laptop (54M retries) \u2014 per-attempt server response p99 was 573 ms."
+}

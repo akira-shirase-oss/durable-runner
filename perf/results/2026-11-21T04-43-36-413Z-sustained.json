@@ -1,0 +1,54 @@
+{
+  "machine": {
+    "host": "maintainer-laptop",
+    "platform": "darwin/arm64",
+    "cpu": "Apple M2 Pro",
+    "cores": 12,
+    "mem_gb": 32,
+    "date": "2026-11-21T04:43:36.413Z",
+    "commit": "57a0f07"
+  },
+  "scenario": "sustained",
+  "peak_heap_mb": 63,
+  "params": {
+    "rate_per_s": 50,
+    "target_submits": 5000,
+    "fsync": "per-record",
+    "submit_budget_ms": 200000,
+    "drain_budget_ms": 100000,
+    "smoke": true
+  },
+  "sent": 5000,
+  "accepted": 5000,
+  "done_after_drain": 5000,
+  "http_codes": {
+    "200": 5000
+  },
+  "backpressure": {
+    "at_capacity_503s": 0,
+    "tcp_refusals": 0,
+    "retries": 0
+  },
+  "wall_clock_s": 101,
+  "submit_phase_s": 101,
+  "accept_rate_per_s": 49,
+  "journal_kb": 3088,
+  "latency_ms": {
+    "p50": 11,
+    "p99": 19,
+    "max": 35.126,
+    "note": "bucket upper edges: 1 ms to 2 s, x2 to ~4.4 min (true pXX <= value)"
+  },
+  "accept_latency_ms": {
+    "p50": 11,
+    "p99": 19,
+    "max": 35.13,
+    "note": "bucket upper edges: 1 ms to 2 s, x2 to ~4.4 min (true pXX <= value)"
+  },
+  "thresholds": {
+    "accepted": "every offered op admitted within the submit budget",
+    "done": "every accepted run finished within the drain budget",
+    "p99_ms": "<2000 per-attempt response"
+  },
+  "verdict": "pass"
+}

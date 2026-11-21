@@ -53,6 +53,9 @@ jobs:
       RUN_ID: ${{ github.run_id }}
       PERF_HOST_LABEL: github-ubuntu-24.04
       PG_DATABASE_URL: postgres://postgres:postgres@localhost:5432/durable_load
+      # Per-run results dir: the artifact uploads only this run's files,
+      # never the committed laptop history in perf/results/.
+      RESULTS_DIR: perf/results/${{ github.run_id }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -76,10 +79,11 @@ jobs:
       - name: Battery
         run: perf/battery.sh "--$BATTERY"
 
-      # Upload even on a failed battery: the miss is evidence.
+      # Upload even on a failed battery: the miss is evidence. Only this
+      # run's directory goes up; ${{ }} expands where $VAR did not.
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         if: always()
         with:
-          name: perf-results-$RUN_ID
-          path: perf/results/*.json
+          name: perf-results-${{ github.run_id }}
+          path: perf/results/${{ github.run_id }}/
           if-no-files-found: warn

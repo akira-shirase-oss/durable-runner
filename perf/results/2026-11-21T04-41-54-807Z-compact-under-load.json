@@ -1,0 +1,49 @@
+{
+  "machine": {
+    "host": "maintainer-laptop",
+    "platform": "darwin/arm64",
+    "cpu": "Apple M2 Pro",
+    "cores": 12,
+    "mem_gb": 32,
+    "date": "2026-11-21T04:41:54.808Z",
+    "commit": "57a0f07"
+  },
+  "scenario": "compact-under-load",
+  "peak_heap_mb": 21,
+  "params": {
+    "seconds": 15,
+    "submit_interval_ms": 20,
+    "smoke": true
+  },
+  "submitted": 700,
+  "http_codes": {
+    "200": 700
+  },
+  "compactions": [
+    {
+      "status": 200,
+      "ms": 42
+    },
+    {
+      "status": 200,
+      "ms": 36
+    },
+    {
+      "status": 200,
+      "ms": 42
+    }
+  ],
+  "runs_after": 700,
+  "latency_ms": {
+    "p50": 7,
+    "p99": 13,
+    "max": 46.518,
+    "note": "bucket upper edges: 1 ms to 2 s, x2 to ~4.4 min (true pXX <= value)"
+  },
+  "thresholds": {
+    "submits": "all 200",
+    "compactions": "all 200",
+    "p99_ms": "<2000"
+  },
+  "verdict": "pass"
+}

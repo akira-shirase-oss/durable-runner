@@ -1,0 +1,84 @@
+{
+  "machine": {
+    "host": "maintainer-laptop",
+    "platform": "darwin/arm64",
+    "cpu": "Apple M2 Pro",
+    "cores": 12,
+    "mem_gb": 32,
+    "date": "2026-11-21T04:43:39.516Z",
+    "commit": "57a0f07"
+  },
+  "scenario": "workspaces",
+  "peak_heap_mb": 0,
+  "params": {
+    "workspaces": 2,
+    "submits_per_workspace": 200,
+    "account_backend": "memory",
+    "submit_budget_ms": 8000,
+    "drain_budget_ms": 120000,
+    "smoke": true
+  },
+  "sent": 400,
+  "accepted": 400,
+  "http_codes": {
+    "200": 400
+  },
+  "backpressure": {
+    "at_capacity_503s": 0,
+    "tcp_refusals": 0,
+    "retries": 0
+  },
+  "per_workspace": {
+    "01a1fc6a-bf91-71cb-922a-3bce30a8a54f": {
+      "runs": 200,
+      "pages": 1
+    },
+    "01a1fc6a-bf96-71f6-bad8-a2f8ace5cada": {
+      "runs": 200,
+      "pages": 1
+    }
+  },
+  "churn_registrations": 73,
+  "churn_errors": 0,
+  "done_after_drain": 400,
+  "drain_seconds": 2,
+  "drain_runs_per_s": 198,
+  "submit_phase_s": 0,
+  "accept_rate_per_s": 2817,
+  "handler_calls": {
+    "signed": 400,
+    "unsigned": 0,
+    "signedProbes": 0,
+    "unsignedProbes": 0
+  },
+  "identity": {
+    "suspects_cross": 0,
+    "suspects_self": 0,
+    "suspect_overflow": false,
+    "shared_verified": [],
+    "dupes_verified": [],
+    "sample_leaks": []
+  },
+  "latency_ms": {
+    "p50": 27,
+    "p99": 35,
+    "max": 34.694,
+    "note": "bucket upper edges: 1 ms to 2 s, x2 to ~4.4 min (true pXX <= value)"
+  },
+  "accept_latency_ms": {
+    "p50": 27,
+    "p99": 35,
+    "max": 34.695,
+    "note": "bucket upper edges: 1 ms to 2 s, x2 to ~4.4 min (true pXX <= value)"
+  },
+  "thresholds": {
+    "accepted": "every offered op admitted within the submit budget",
+    "sized": "200 runs per workspace, no id listed twice",
+    "disjoint": "no run id shared across workspaces (bloom + exact checks)",
+    "oracle": "foreign run id → 404",
+    "done": "every accepted run within 120s drain",
+    "signed": "every handler call signed",
+    "p99_ms": "<2000 per-attempt response"
+  },
+  "verdict": "pass"
+}
