@@ -100,9 +100,11 @@ struct Args {
     max_in_flight: usize,
     /// The share of `--max-in-flight` one workspace may hold at once —
     /// a tenant's slow handler parks at most this many calls (S2
-    /// review #6). Compat (workspace-0 only) deployments wanting the
-    /// whole pool raise it to match `--max-in-flight`.
-    #[arg(long, default_value_t = 64)]
+    /// review #6). The default comes from `ShellConfig` so it cannot
+    /// drift from the value the engine documents (S2 re-review N3);
+    /// compat (workspace-0 only) deployments get the whole pool like
+    /// v1.0.x — see `ws_in_flight_cap`.
+    #[arg(long, default_value_t = ShellConfig::default().max_in_flight_per_ws)]
     max_in_flight_per_ws: usize,
     /// Dispatches per scheduler tick (ticks every 50 ms, so the deferred
     /// dispatch rate is at most 20 × this per second — 64 capped a backlog
@@ -2685,6 +2687,18 @@ fn prepare_backup_root(dir: &Path) -> Result<Arc<Path>> {
     Ok(Arc::from(canonical))
 }
 
+/// The in-flight cap one workspace may hold: the configured share for
+/// tenants, the whole pool for a compat (account-store-free, ws-0 only)
+/// install — v1.0.x gave ws 0 the pool and compat must not regress it
+/// (S2 re-review N3).
+fn ws_in_flight_cap(args: &Args, compat: bool) -> usize {
+    if compat {
+        args.max_in_flight.max(1)
+    } else {
+        args.max_in_flight_per_ws.max(1)
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let args = Args::parse();
@@ -2717,7 +2731,7 @@ async fn main() -> Result<()> {
             .then(|| Duration::from_secs(args.compact_every_secs)),
         max_snapshot_bytes: args.max_snapshot_bytes,
         max_in_flight: args.max_in_flight.max(1),
-        max_in_flight_per_ws: args.max_in_flight_per_ws.max(1),
+        max_in_flight_per_ws: ws_in_flight_cap(&args, store.is_none()),
         max_dispatch_per_tick: args.max_dispatch_per_tick.max(1),
         reply_timeout: Duration::from_millis(args.reply_timeout_ms.max(1)),
         limits: durable_domain::Limits {
@@ -6774,6 +6788,31 @@ mod tests {
             durable_domain::Limits::default().max_index_bytes
         );
         assert_eq!(args.max_index_bytes, 512 * 1024 * 1024);
+    }
+
+    /// S2 re-review N3: the shipped `--max-in-flight-per-ws` default is
+    /// the engine's own (the fifth-share that leaves a fifth tenant
+    /// headroom), and a compat install — no account store, ws 0 only —
+    /// caps at the whole pool like v1.0.x did. Asserted on the parsed
+    /// CLI, not `ShellConfig::default()`: the shell's default is what
+    /// the CLI overrides, so only the parse proves what ships.
+    #[test]
+    fn the_shipped_in_flight_share_matches_the_engine_default() {
+        let args = Args::try_parse_from(["durable-server"]).unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(
+            args.max_in_flight_per_ws,
+            ShellConfig::default().max_in_flight_per_ws
+        );
+        assert!(
+            args.max_in_flight_per_ws * 4 < args.max_in_flight,
+            "four maxed tenants must not tile the pool: {} × 4 vs {}",
+            args.max_in_flight_per_ws,
+            args.max_in_flight
+        );
+        // Compat (ws-0 only) gets the pool, like v1.0.x; a tenant
+        // deployment keeps the configured share.
+        assert_eq!(ws_in_flight_cap(&args, true), args.max_in_flight);
+        assert_eq!(ws_in_flight_cap(&args, false), args.max_in_flight_per_ws);
     }
 
     #[test]
