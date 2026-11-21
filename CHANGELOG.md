@@ -34,7 +34,8 @@ S2-6: **signed handler calls**. Every call a store-registered handler
 receives carries `x-durable-timestamp` + `x-durable-signature`
 (HMAC-SHA256 under the workspace's secret over the newline-joined
 `ts\nmethod\nauthority\npath\nrun\nstep\nattempt\nidem_key\nSHA256(body)` —
-`authority` is the `Host` header value verbatim, `run` the opaque
+`authority` is the handler's configured authority — never the
+received `Host`, which a replayer controls — `run` the opaque
 public id); `POST /handler-secret`
 rotates and re-arms the engine in the same request; the handler-side
 contract + reference verifier ship in `docs/HANDLERS.md`.
@@ -99,7 +100,7 @@ contract + reference verifier ship in `docs/HANDLERS.md`.
   `x-durable-timestamp` + `x-durable-signature` — hex HMAC-SHA256 under
   the workspace's 32-byte secret over the newline-joined
   `ts\nmethod\nauthority\npath\nrun\nstep\nattempt\nidem_key\nSHA256(body)`
-  (`authority` is the `Host` header verbatim, `run` the opaque
+  (`authority` is the handler's configured authority, `run` the opaque
   public id); probes sign the empty-digest form.
   The secret rides `handlers.json` so a restart during a store outage
   still signs. `--handler` flags and compat mode stay unsigned.

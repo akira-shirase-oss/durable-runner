@@ -128,7 +128,7 @@ scan per new connection; keep-alive calls pay nothing (measured in
 receives carries `x-durable-timestamp` and `x-durable-signature`: hex
 HMAC-SHA256 under the workspace's 32-byte secret over the newline-joined
 `ts\nmethod\nauthority\npath\nrun\nstep\nattempt\nidem_key\nSHA256(body)`
-(`authority` is the `Host` header verbatim, `run` the opaque public id;
+(`authority` is the handler's configured authority, `run` the opaque public id;
 probe: empty digest). The
 secret is drawn at workspace creation, shown once there and once at
 `POST /handler-secret` rotation, stored retrievably in the account

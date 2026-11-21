@@ -478,11 +478,11 @@ impl HttpHandler {
         .unwrap_or(false)
     }
 
-    /// The signed authority is the request's `Host` header value
-    /// verbatim — brackets on an IPv6 literal, a port only when the URL
-    /// names a non-default one — so a verifying handler signs what it
-    /// actually received (S3: a sig minted for `a/step` never verifies
-    /// at `b/step`).
+    /// The signed authority is the handler's configured authority —
+    /// brackets on an IPv6 literal, a port only when the URL names a
+    /// non-default one — bound at registration, never the received
+    /// `Host` (a replayer controls that: a sig minted for `a/step`
+    /// must never verify at `b/step`, S2 re-review #4).
     fn authority_and_path(&self) -> (String, String) {
         self.policy_url
             .as_ref()
@@ -878,12 +878,10 @@ async fn registry_sync(
                 secret: Some(hex(&ws.handler_secret)),
             });
         }
-        if stale() {
-            eprintln!(
-                "durable-server: registry reconcile discarded a pass overtaken by a mutation"
-            );
-            return Ok(());
-        }
+        // No pass-wide stale() bail here (S3 re-review N7): the per-ws
+        // stripe above already serializes this workspace's read+apply
+        // against its own mutations, so one tenant's mutation must not
+        // abort reconciliation for every later workspace.
         if let Err(e) = engine.set_workspace_handlers(ws.id, set).await {
             eprintln!("durable-server: registry reconcile skipped a workspace: {e}");
             // The engine keeps the last-armed set; the file keeps its

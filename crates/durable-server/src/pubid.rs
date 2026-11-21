@@ -146,8 +146,9 @@ impl PubId {
 /// True when the journal carries evidence a public-id binary has already
 /// run here — a `journal.shape` claiming record format ≥ 3 (the sidecar's
 /// monotonic max, which covers v3 records compaction pruned into a
-/// snapshot) or any generation's `journal.log` holding a `"v":3`
-/// envelope, which no v1.0.x binary ever wrote.
+/// snapshot), any generation's `journal.log` holding a `"v":3` envelope,
+/// or a `snapshot.bin` holding a ws ≠ 0 run (S2-created; v1.0.2 only ever
+/// parks them — S3 re-review N4).
 ///
 /// Any other journal — empty, v1/v2 records, no sidecar — is pre-pubid:
 /// the upgrade path mints the key there (S1: refusing to mint made every
@@ -182,8 +183,108 @@ fn journal_is_pubid_era(dir: &Path) -> io::Result<bool> {
             Err(e) if e.kind() == io::ErrorKind::NotFound => {}
             Err(e) => return Err(e),
         }
+        // A compacted journal drops its v3 history into snapshot.bin and
+        // is documented as still opening with journal.shape deleted — so
+        // the snapshot is the last era evidence left (S3 re-review N4).
+        match std::fs::read(entry.path().join("snapshot.bin")) {
+            Ok(bytes) => {
+                if snapshot_has_tenant_runs(&bytes) {
+                    return Ok(true);
+                }
+            }
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e),
+        }
     }
     Ok(false)
+}
+
+/// Scan a `snapshot.bin` for a run a v1.0.x binary could never have
+/// written: ws != 0. v1.0.2 parks tenant runs but only S2 creates them,
+/// so one in the snapshot proves the pubid era — a lost key must refuse
+/// re-minting rather than rename every public id (S3 re-review N4).
+///
+/// Layout mirrors `snapshot.rs` (the DRIX payload inside the framed
+/// container). A payload that ends mid-record decides nothing — open
+/// refuses a corrupt snapshot anyway, so no wrong mint ships.
+fn snapshot_has_tenant_runs(bytes: &[u8]) -> bool {
+    /// snapshot.bin: magic8 covered_seq u64 len u64 crc u32, then DRIX.
+    const FRAME: usize = 8 + 8 + 8 + 4;
+    let p = match bytes.get(FRAME..) {
+        Some(p) => p,
+        None => return false,
+    };
+    // DRIX header: magic4 | version u16 | next_run u64 | count u64.
+    if p.len() < 4 + 2 + 8 + 8 || &p[..4] != b"DRIX" {
+        return false;
+    }
+    if u16::from_be_bytes([p[4], p[5]]) < 2 {
+        return false; // version 1 predates ws — nothing to find
+    }
+    let count = u64::from_be_bytes(p[14..22].try_into().unwrap_or([0; 8]));
+    let mut at = 22usize;
+    // Field walkers: nothing allocates, a short read ends the scan.
+    let u32at = |p: &[u8], at: usize| -> Option<u32> {
+        p.get(at..at + 4)
+            .map(|b| u32::from_be_bytes(b.try_into().unwrap_or([0; 4])))
+    };
+    let u64at = |p: &[u8], at: usize| -> Option<u64> {
+        p.get(at..at + 8)
+            .map(|b| u64::from_be_bytes(b.try_into().unwrap_or([0; 8])))
+    };
+    for _ in 0..count {
+        // run = id u64 | ws u64 | key str | spec u32 | steps u32 ×
+        //       (name str, handler str) | input bytes | state | fin u8[+u64]
+        let Some(_id) = u64at(p, at) else {
+            return false;
+        };
+        let Some(ws) = u64at(p, at + 8) else {
+            return false;
+        };
+        if ws != 0 {
+            return true;
+        }
+        at += 16;
+        let Some(key_len) = u32at(p, at) else {
+            return false;
+        };
+        at += 4 + key_len as usize + 4; // key, then spec.version
+        let Some(steps) = u32at(p, at) else {
+            return false;
+        };
+        at += 4;
+        for _ in 0..steps {
+            for _ in 0..2 {
+                let Some(l) = u32at(p, at) else {
+                    return false;
+                };
+                at += 4 + l as usize;
+            }
+        }
+        let Some(input_len) = u32at(p, at) else {
+            return false;
+        };
+        at += 4 + input_len as usize;
+        let Some(tag) = p.get(at).copied() else {
+            return false;
+        };
+        at += 1;
+        // step/attempt are u32, timestamps u64 (mirrors snapshot.rs).
+        at += match tag {
+            0 => 8,             // Queued{at}
+            1 | 2 => 4 + 4 + 8, // Running / RetryWaiting{step, attempt, t}
+            3 => 4 + 4,         // Reconciling{step, attempt}
+            5 => 4,             // Failed{step}
+            4 | 6 => 0,         // Done / Cancelled
+            _ => return false,
+        };
+        match p.get(at).copied() {
+            Some(0) => at += 1,
+            Some(1) => at += 9,
+            _ => return false,
+        }
+    }
+    false
 }
 
 /// One Feistel round function: 32 bits of HMAC(key, domain‖round‖half).
@@ -426,6 +527,80 @@ mod tests {
         .unwrap_or_else(|e| panic!("{e}"));
         PubId::load_or_generate(d2.path()).unwrap_or_else(|e| panic!("{e}"));
         assert!(d2.path().join(KEY_FILE).exists(), "records=2 is pre-pubid");
+    }
+
+    /// S3 re-review N4: a compacted pubid-era journal holds its tenant
+    /// runs only inside snapshot.bin — a v1.0.x writer can park but
+    /// never create a ws != 0 run, so finding one in the snapshot is
+    /// unambiguous era evidence even with journal.shape deleted and no
+    /// v3 records left in the log. Minting there would rename every id.
+    #[test]
+    fn a_tenant_run_inside_a_snapshot_still_refuses_a_second_key() {
+        let d = tempfile::tempdir().unwrap_or_else(|e| panic!("{e}"));
+        journal_log_with(d.path(), r#"{"v":2,"run":1,"at":1,"event":{"Done":{}}}"#);
+        // DRIX v2 payload: one run, ws = 7, terminal Done, not finished.
+        let mut p = b"DRIX".to_vec();
+        p.extend(2u16.to_be_bytes()); // version
+        p.extend(2u64.to_be_bytes()); // next_run
+        p.extend(1u64.to_be_bytes()); // count
+        p.extend(1u64.to_be_bytes()); // run id
+        p.extend(7u64.to_be_bytes()); // ws — S2 only
+        p.extend(1u32.to_be_bytes());
+        p.extend(b"k"); // key
+        p.extend(1u32.to_be_bytes()); // spec.version
+        p.extend(1u32.to_be_bytes()); // steps
+        p.extend(1u32.to_be_bytes());
+        p.extend(b"s"); // step name
+        p.extend(1u32.to_be_bytes());
+        p.extend(b"h"); // handler
+        p.extend(0u32.to_be_bytes()); // input
+        p.push(4); // Done
+        p.push(0); // no finished_at
+        let mut snap = vec![0u8; 28]; // framed container header
+        snap.extend(p);
+        std::fs::write(d.path().join("gen-000001").join("snapshot.bin"), snap)
+            .unwrap_or_else(|e| panic!("{e}"));
+        let e = match PubId::load_or_generate(d.path()) {
+            Err(e) => e,
+            Ok(_) => panic!("a snapshot-held tenant run proves the era — refuse"),
+        };
+        assert!(
+            e.to_string().contains("no public-id key"),
+            "the refusal says what to do: {e}"
+        );
+        assert!(!d.path().join(KEY_FILE).exists(), "no key was generated");
+    }
+
+    /// The same snapshot holding only ws-0 runs is a pre-pubid v1.0.2
+    /// journal — it parks nothing its writer did not create, so the
+    /// upgrade path still mints.
+    #[test]
+    fn a_ws0_only_snapshot_still_mints_on_upgrade() {
+        let d = tempfile::tempdir().unwrap_or_else(|e| panic!("{e}"));
+        journal_log_with(d.path(), r#"{"v":2,"run":1,"at":1,"event":{"Done":{}}}"#);
+        let mut p = b"DRIX".to_vec();
+        p.extend(2u16.to_be_bytes());
+        p.extend(2u64.to_be_bytes());
+        p.extend(1u64.to_be_bytes());
+        p.extend(1u64.to_be_bytes());
+        p.extend(0u64.to_be_bytes()); // ws = 0
+        p.extend(1u32.to_be_bytes());
+        p.extend(b"k");
+        p.extend(1u32.to_be_bytes());
+        p.extend(1u32.to_be_bytes());
+        p.extend(1u32.to_be_bytes());
+        p.extend(b"s");
+        p.extend(1u32.to_be_bytes());
+        p.extend(b"h");
+        p.extend(0u32.to_be_bytes());
+        p.push(4);
+        p.push(0);
+        let mut snap = vec![0u8; 28];
+        snap.extend(p);
+        std::fs::write(d.path().join("gen-000001").join("snapshot.bin"), snap)
+            .unwrap_or_else(|e| panic!("{e}"));
+        PubId::load_or_generate(d.path()).unwrap_or_else(|e| panic!("{e}"));
+        assert!(d.path().join(KEY_FILE).exists(), "ws-0-only is pre-pubid");
     }
 
     /// A malformed sidecar decides nothing — the record evidence does —
