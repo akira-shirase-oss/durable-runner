@@ -4003,54 +4003,83 @@ mod tests {
     /// failed, dropping every other popped deadline until the next
     /// restart's recount. Two expired attempts at exactly the reserve:
     /// the first's lost-reply commit fails NoSpace, and BOTH entries must
-    /// survive to re-fire once space returns.
+    /// survive to re-fire once space returns. S3 re-review F5: the clock
+    /// is injected — `tick_at` and an explicit `now`, no sleeps, no
+    /// machine-speed dependence.
     #[tokio::test(flavor = "current_thread")]
     async fn the_sweep_requeues_every_popped_deadline_on_commit_error() {
         use std::sync::atomic::{AtomicU64, Ordering::SeqCst};
         let d = tempfile::tempdir().unwrap_or_else(|e| panic!("{e}"));
-        let free = Arc::new(AtomicU64::new(1 << 20));
-        let gate = Arc::new(Semaphore::new(0));
-        let mut reg = Registry::default();
-        reg.register("gated", Arc::new(GateThenFound(gate.clone())));
+        let free = Arc::new(AtomicU64::new(u64::MAX));
         let probe_free = free.clone();
         let reserve = 4096u64;
-        let cfg = ShellConfig {
-            tick_ms: 5,
-            limits: Limits {
-                // Expired fast: both attempts are out before the sweep.
-                max_step_deadline_ms: 60,
-                ..Limits::default()
-            },
-            journal: JournalOptions {
+        let mut core = EngineCore::open_with(
+            d.path(),
+            JournalOptions {
                 reserve_bytes: reserve,
                 space: durable_journal::SpaceProbe::new(move |_| Ok(probe_free.load(SeqCst))),
                 ..JournalOptions::default()
             },
-            ..Default::default()
-        };
-        let eng = spawn(d.path(), reg, cfg).unwrap_or_else(|e| panic!("{e}"));
-        let a = eng
-            .submit(OperationKey("sweep-a".into()), spec1("gated"))
-            .await
+        )
+        .unwrap_or_else(|e| panic!("{e}"));
+        core.limits.max_step_deadline_ms = 60;
+        // An injected epoch — the wall clock never enters this test.
+        let t0: Millis = 1_000_000;
+        let a = core
+            .submit_at(0, OperationKey("sweep-a".into()), spec1("gated"), 0, t0)
             .unwrap_or_else(|e| panic!("{e}"));
-        let b = eng
-            .submit(OperationKey("sweep-b".into()), spec1("gated"))
-            .await
+        let b = core
+            .submit_at(0, OperationKey("sweep-b".into()), spec1("gated"), 0, t0)
             .unwrap_or_else(|e| panic!("{e}"));
-        wait_state(&eng, a, "running").await;
-        wait_state(&eng, b, "running").await;
-        // Exactly at the reserve: the sweep's space gate still passes but
-        // the lost-reply record's commit refuses NoSpace — the break path.
+        let gate = Arc::new(Semaphore::new(0));
+        let mut reg = Registry::default();
+        reg.register("gated", Arc::new(GateThenFound(gate.clone())));
+        let mut sched = Sched::new(8);
+        // Dispatch both at t0: two attempts in flight, deadlines at
+        // t0+60 in the index.
+        {
+            let mut ex = sched.exec(&reg, 64, 0, 8);
+            tick_at(&mut core, &mut ex, t0);
+        }
+        assert_eq!(sched.attempts.len(), 2, "both runs dispatched");
+        // Exactly at the reserve: the sweep's space gate still passes
+        // but every record commit refuses NoSpace — the break path.
         free.store(reserve + 1, SeqCst);
-        // Both deadlines fire under the failed commit; give the sweep a
-        // few ticks to pop the batch and take the break.
-        tokio::time::sleep(Duration::from_millis(150)).await;
-        free.store(1 << 20, SeqCst);
-        // With every popped entry re-indexed, both runs re-fire and
-        // reconcile (the probe finds the effect); with the bug the second
-        // run's deadline is lost and it strands Running until restart.
-        assert!(matches!(until_done(&eng, a).await, RunState::Done));
-        assert!(matches!(until_done(&eng, b).await, RunState::Done));
+        // Both deadlines fire under the failed commit: the popped batch
+        // holds a and b; a's lost-reply commit fails first and the fix
+        // re-indexes EVERY remaining entry, not just a's.
+        {
+            let mut ex = sched.exec(&reg, 64, 0, 8);
+            tick_at(&mut core, &mut ex, t0 + 61);
+        }
+        // Space back: the requeued deadlines re-fire on the next sweep —
+        // b's only existed if the requeue kept it.
+        free.store(u64::MAX, SeqCst);
+        {
+            let mut ex = sched.exec(&reg, 64, 0, 8);
+            tick_at(&mut core, &mut ex, t0 + 62);
+        }
+        // Both expired attempts reconcile: the probes find the effect
+        // (GateThenFound::probe is true) — a reconcile that never fired
+        // leaves its run Running until a restart's recount.
+        let mut reconciled = 0;
+        while let Some(join) = sched.probes.join_next().await {
+            let (run, step, found, permit, slot) =
+                join.unwrap_or_else(|e| panic!("probe died: {e}"));
+            let mut ex = sched.exec(&reg, 64, 0, 8);
+            let effects = ex.mon.effects(core.reconciled(run, step, found, t0 + 62));
+            run_effects(&mut core, &mut ex, effects, run, Some(permit), Some(slot));
+            reconciled += 1;
+        }
+        assert_eq!(reconciled, 2, "both popped deadlines re-fired");
+        for run in [a, b] {
+            assert!(
+                matches!(core.run(run).map(|r| &r.state), Some(RunState::Done)),
+                "run {:?} did not reconcile: {:?}",
+                run,
+                core.run(run).map(|r| &r.state)
+            );
+        }
     }
 
     // ---- group commit (D-014 rules, D-015) --------------------------------

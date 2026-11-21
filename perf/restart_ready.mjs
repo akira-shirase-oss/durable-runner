@@ -19,6 +19,32 @@ import { fileURLToPath } from 'node:url';
 
 const ROOT = path.dirname(path.dirname(fileURLToPath(import.meta.url)));
 const SRV = `${ROOT}/target/release/durable-server`;
+
+// One heavy run per machine (S2 re-review F4): the slot is an flock(2)
+// on a fixed path — the git common dir, the one path every worktree of
+// this clone resolves identically — held by perf/heavy.sh on fd 9 and
+// inherited under it. The fd is the proof — DR_HEAVY_HELD is
+// informational only. A bare run re-execs under heavy.sh, which
+// refuses a contended slot with exit 3.
+const HEAVY_LOCK = process.env.DR_HEAVY_LOCK ??
+  path.resolve(ROOT,
+    execFileSync('git', ['rev-parse', '--git-common-dir'], { cwd: ROOT, encoding: 'utf8' }).trim(),
+    'durable-runner-heavy.lock');
+{
+  let held = false;
+  try {
+    const fd9 = fs.fstatSync(9);
+    const lock = fs.statSync(HEAVY_LOCK);
+    held = fd9.ino === lock.ino && fd9.dev === lock.dev;
+  } catch { held = false; }
+  if (!held) {
+    const r = spawnSync(path.join(ROOT, 'perf', 'heavy.sh'),
+      [process.execPath, import.meta.filename, ...process.argv.slice(2)],
+      { stdio: 'inherit' });
+    process.exit(r.status ?? (r.error ? 1 : 0));
+  }
+}
+
 const API_KEY = process.env.DURABLE_API_KEY ?? (await import('node:crypto')).randomBytes(32).toString('hex');
 const args = {};
 for (const a of process.argv.slice(2).filter((a) => a.startsWith('--'))) {

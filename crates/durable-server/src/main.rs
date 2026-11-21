@@ -3051,6 +3051,27 @@ impl Default for HttpLimits {
 // /health + /ready even while the work pool is dry (S2 wedge: a flood
 // once reset every probe at the kernel backlog).
 const READY_CONNECTIONS: usize = 8;
+/// A liveness reserve slot is capped per address bucket and its head
+/// must arrive inside a second: a flooder that piles onto the main
+/// listener while the pool is dry can hold at most this many reserve
+/// slots — and only by actually asking (S2 re-review F3).
+const READY_PER_ADDR: usize = 2;
+const READY_HEAD_TIMEOUT: Duration = Duration::from_secs(1);
+/// The overload lane: while every work and reserve permit is held the
+/// server keeps accepting into this bounded lane and answers each conn
+/// `503 overloaded` + `Retry-After`, then shuts its write side and
+/// drains briefly — the client reads a real HTTP refusal instead of a
+/// kernel RST it cannot tell from a crash (S2 re-review ruling F1: a
+/// TCP reset is not a bounded refusal). The lane is a fast lane, not a
+/// queue: conns live at most a second, so it drains at ~256/s.
+const OVERLOAD_LANE_CONNECTIONS: usize = 256;
+const OVERLOAD_LANE_LIFETIME: Duration = Duration::from_secs(1);
+/// Under slot pressure a conn whose request head has not produced a
+/// served request inside this window is closed — the attacker's
+/// favourite shape (a parked or trickled head camping a work slot for
+/// the whole header timeout) is evicted before eligible idle
+/// keep-alives are touched (S2 re-review design item 2 + F2).
+const PRESSURE_HEAD_DEADLINE: Duration = Duration::from_secs(1);
 
 /// Which pool a freshly-accepted connection drew its permit from.
 enum Slot {
@@ -3059,6 +3080,23 @@ enum Slot {
     /// Liveness-only service from the reserve (S2: /health must answer
     /// while a tenant's connection storm fills every work slot).
     Ready(tokio::sync::OwnedSemaphorePermit),
+    /// The overload lane: the conn gets a fixed `503 + Retry-After`, a
+    /// write-half close and a brief drain — a refusal the client can
+    /// read, never a bare RST.
+    Lane(tokio::sync::OwnedSemaphorePermit),
+}
+
+/// How a pressured connection is evicted (S2 re-review design items
+/// 2-3): a dead head is dropped outright — graceful shutdown would wait
+/// out the whole header timeout for a head that never finishes — while
+/// an over-share idle keep-alive drains first.
+#[derive(Debug, PartialEq, Eq)]
+enum Pressure {
+    /// `served == 0` past the head deadline: evicted first, no drain.
+    DeadHead,
+    /// `served >= 1 && in_flight == 0` from a bucket over its fair
+    /// share: graceful shutdown, the served work is already done.
+    OverShare,
 }
 
 /// The dedicated liveness listener's bounds: a small conn pool, no rate
@@ -3098,6 +3136,24 @@ async fn serve_http(
     // /ready — a tenant's connection storm can starve work, never probes
     // (S2 wedge: keep-alive hoarding froze /health behind a full pool).
     let ready_permits = Arc::new(tokio::sync::Semaphore::new(READY_CONNECTIONS));
+    // The overload lane behind both pools: a full backlog must not be the
+    // answer — every accepted conn gets a real HTTP response, even when
+    // that response is `503 overloaded` (S2 re-review ruling F1).
+    let lane_permits = Arc::new(tokio::sync::Semaphore::new(OVERLOAD_LANE_CONNECTIONS));
+    // The refusal bytes are one fixed response per conn — built once.
+    let lane_body = br#"{"error":"overloaded","code":"overloaded","retry_after_ms":1000}"#;
+    let lane_response = Arc::new(
+        format!(
+            "HTTP/1.1 503 Service Unavailable\r\n\
+         content-type: application/json\r\n\
+         retry-after: 1\r\n\
+         content-length: {}\r\n\
+         connection: close\r\n\r\n{}",
+            lane_body.len(),
+            String::from_utf8_lossy(lane_body),
+        )
+        .into_bytes(),
+    );
     let (closing_tx, closing) = tokio::sync::watch::channel(false);
     // ATTACK(body-deadline)
     let service = tower_http::timeout::RequestBodyDeadline::new(router, limits.body_deadline);
@@ -3115,8 +3171,17 @@ async fn serve_http(
             limits.v6_prefix,
         )))
     });
-    let conn_limit = (limits.max_conns_per_addr > 0 || limits.max_conns_per_proxy > 0)
-        .then(|| ConnLimit::new(limits.max_conns_per_addr, limits.max_conns_per_proxy));
+    // Always constructed: the counts feed fair-share eviction even when
+    // no cap is configured (S2 re-review F3 + design item 3). With caps
+    // at zero `acquire` only counts.
+    let conn_limit = ConnLimit::new(
+        limits.max_conns_per_addr,
+        limits.max_conns_per_proxy,
+        limits.v6_prefix,
+    );
+    // The liveness reserve is its own budget, capped per address — a
+    // flooder may not hold more than READY_PER_ADDR reserve slots.
+    let ready_limit = ConnLimit::new(READY_PER_ADDR, READY_PER_ADDR, limits.v6_prefix);
     let trusted = limits.trusted_proxies.clone();
     let mut conn_cap_refused = false;
     loop {
@@ -3132,6 +3197,10 @@ async fn serve_http(
             },
             p = ready_permits.clone().acquire_owned() => match p {
                 Ok(p) => Slot::Ready(p),
+                Err(_) => break,
+            },
+            p = lane_permits.clone().acquire_owned() => match p {
+                Ok(p) => Slot::Lane(p),
                 Err(_) => break,
             },
             _ = &mut stop => break,
@@ -3162,12 +3231,35 @@ async fn serve_http(
             },
             _ = &mut stop => break,
         };
+        if let Slot::Lane(lane_permit) = slot {
+            // ATTACK(overload-lane): both service pools are dry — the
+            // conn still gets a real HTTP refusal rather than a slot in
+            // the kernel backlog it would ride to a timeout or an RST.
+            // The write half closes right after the response so the 503
+            // is read, not raced by a reset; the read side drains briefly
+            // because closing with unread request bytes is what turns
+            // into an RST (S2 re-review design item 1).
+            drop(stream);
+            let _ = lane_permit; // MUTANT: lane takes the permit but never answers
+            continue;
+        }
         if let Slot::Ready(ready_permit) = slot {
             // Reserved capacity: liveness paths only, never keep-alive —
             // a conn answers one probe then closes, so the slice cannot
-            // be camped. Per-address caps do not apply: they exist to
-            // keep one client from spending general slots, and these
-            // slots are not spendable on work.
+            // be camped. The reserve is capped per address (F3): a
+            // flooder piling onto the main listener holds at most
+            // READY_PER_ADDR slots; over that the conn falls to the
+            // overload lane (or is dropped when even the lane is full).
+            let Some(ready_guard) = ready_limit.acquire(peer.ip(), trusted.trusts(peer.ip()))
+            else {
+                match lane_permits.clone().try_acquire_owned() {
+                    Ok(lane_permit) => {
+                        conns.spawn(overload_answer(stream, lane_permit, lane_response.clone()));
+                    }
+                    Err(_) => drop(stream),
+                }
+                continue;
+            };
             let io = TokioIo::new(StallGuard::new(stream, limits.write_stall));
             let svc = service.clone();
             let handler =
@@ -3196,12 +3288,13 @@ async fn serve_http(
                 });
             let conn = hyper::server::conn::http1::Builder::new()
                 .timer(TokioTimer::new())
-                .header_read_timeout(limits.header_timeout)
+                .header_read_timeout(READY_HEAD_TIMEOUT)
                 .serve_connection(io, handler);
             let mut closing = closing.clone();
             let lifetime = limits.max_lifetime;
             conns.spawn(async move {
                 let _permit = ready_permit;
+                let _ready_guard = ready_guard;
                 let mut conn = std::pin::pin!(conn);
                 tokio::select! {
                     _ = conn.as_mut() => return,
@@ -3214,29 +3307,32 @@ async fn serve_http(
             continue;
         }
         let Slot::Work(permit) = slot else {
-            unreachable!("slots are only Work or Ready")
+            unreachable!("Lane and Ready are handled above")
         };
-        // The per-peer connection cap: past it the socket is dropped at
-        // accept — the client sees a refused connection, not a queue slot
-        // held while one address spends them all.
-        let conn_guard = match &conn_limit {
-            Some(l) => match l.acquire(peer.ip(), trusted.trusts(peer.ip())) {
-                Some(g) => {
-                    conn_cap_refused = false;
-                    Some(g)
+        // The per-peer connection cap: past it the conn falls to the
+        // overload lane for a real 503, not a bare drop — a refused
+        // connection must still be an answer (S2 re-review F3).
+        let conn_guard = match conn_limit.acquire(peer.ip(), trusted.trusts(peer.ip())) {
+            Some(g) => {
+                conn_cap_refused = false;
+                g
+            }
+            None => {
+                if !conn_cap_refused {
+                    eprintln!(
+                        "durable-server: per-address connection cap reached; refusing {}",
+                        peer.ip()
+                    );
+                    conn_cap_refused = true;
                 }
-                None => {
-                    if !conn_cap_refused {
-                        eprintln!(
-                            "durable-server: per-address connection cap reached; refusing {}",
-                            peer.ip()
-                        );
-                        conn_cap_refused = true;
+                match lane_permits.clone().try_acquire_owned() {
+                    Ok(lane_permit) => {
+                        conns.spawn(overload_answer(stream, lane_permit, lane_response.clone()));
                     }
-                    continue; // the semaphore permit returns with the socket
+                    Err(_) => drop(stream),
                 }
-            },
-            None => None,
+                continue; // the work permit returns with the task
+            }
         };
         let io = TokioIo::new(StallGuard::new(stream, limits.write_stall));
         // The connection's `max_requests`-th answer says `Connection:
@@ -3259,10 +3355,18 @@ async fn serve_http(
                 let rate_limiter = rate_limiter.clone();
                 let trusted = trusted.clone();
                 async move {
+                    // A refused request is still a SERVED request (F2):
+                    // the 429 path used to return before `served` moved,
+                    // so a conn that only ever drew 429s stayed
+                    // yield-ineligible and escaped the request cap —
+                    // camping the slot until max_lifetime. Count first.
+                    let (svc, served, in_flight) = &*per_conn;
+                    let _flight = FlightGuard::enter(in_flight);
+                    let n = served.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
                     // The per-address request rate. Refused before auth:
                     // a flood without a key is still a flood, and the
                     // check is cheaper than the work behind it.
-                    if let Some(lim) = rate_limiter.as_ref() {
+                    let mut res = if let Some(lim) = rate_limiter.as_ref() {
                         let client = client_addr(
                             peer_ip,
                             &trusted,
@@ -3275,31 +3379,33 @@ async fn serve_http(
                             .unwrap_or_else(|p| p.into_inner())
                             .check(client, std::time::Instant::now())
                             .err();
-                        if let Some(retry) = refused {
-                            let mut res = Response::builder()
-                                .status(StatusCode::TOO_MANY_REQUESTS)
-                                .header(header::CONTENT_TYPE, "application/json")
-                                .body(axum::body::Body::from(
-                                    r#"{"error":"rate limited","code":"rate_limited"}"#,
-                                ))
-                                .unwrap_or_else(|_| Response::new(axum::body::Body::empty()));
-                            let secs = (retry.as_secs_f64().ceil() as u64).max(1);
-                            res.headers_mut().insert(
-                                header::RETRY_AFTER,
-                                header::HeaderValue::try_from(secs.to_string())
-                                    .unwrap_or_else(|_| header::HeaderValue::from_static("1")),
-                            );
-                            return Ok(res);
+                        match refused {
+                            Some(retry) => {
+                                let mut res = Response::builder()
+                                    .status(StatusCode::TOO_MANY_REQUESTS)
+                                    .header(header::CONTENT_TYPE, "application/json")
+                                    .body(axum::body::Body::from(
+                                        r#"{"error":"rate limited","code":"rate_limited"}"#,
+                                    ))
+                                    .unwrap_or_else(|_| Response::new(axum::body::Body::empty()));
+                                let secs = (retry.as_secs_f64().ceil() as u64).max(1);
+                                res.headers_mut().insert(
+                                    header::RETRY_AFTER,
+                                    header::HeaderValue::try_from(secs.to_string())
+                                        .unwrap_or_else(|_| header::HeaderValue::from_static("1")),
+                                );
+                                res
+                            }
+                            None => tower::ServiceExt::oneshot(svc.clone(), req).await?,
                         }
-                    }
-                    let (svc, served, in_flight) = &*per_conn;
-                    let _flight = FlightGuard::enter(in_flight);
-                    let n = served.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
-                    let mut res = tower::ServiceExt::oneshot(svc.clone(), req).await?;
+                    } else {
+                        tower::ServiceExt::oneshot(svc.clone(), req).await?
+                    };
                     // `Connection: close` at the request cap so
                     // pipelining cannot keep one connection busy for
-                    // ever. (Idle-conn eviction under slot pressure is
-                    // the yield arm's job, not the response's.)
+                    // ever — a 429-only conn hits it too (idle-conn
+                    // eviction under slot pressure is the yield arm's
+                    // job, not the response's).
                     if n >= max_requests {
                         res.headers_mut().insert(
                             header::CONNECTION,
@@ -3318,21 +3424,26 @@ async fn serve_http(
         let lifetime = limits.max_lifetime;
         let pool_pressure = permits.clone();
         let yield_state = (served, in_flight);
+        let conn_shares = conn_limit.clone();
+        let conn_peer = peer.ip();
+        let pool_size = limits.max_connections.max(1);
         conns.spawn(async move {
             let _permit = permit;
             let _conn_guard = conn_guard;
             let (served, in_flight) = yield_state;
             let mut conn = std::pin::pin!(conn);
-            // ATTACK(slot-camp): under slot pressure an idle keep-alive
-            // would still camp on its permit for up to max_lifetime — the
-            // S2 wedge shape, where one client's conn storm starved every
-            // other tenant's accept. Eligibility is narrow (R2): a conn
-            // yields only after it has served at least one request and
-            // while none is in flight — a fresh conn, whether unread or
-            // with a head still parsing, is never evicted into the
-            // flooded backlog it would have to fight for a slot. The
-            // first check lands a grace window after the conn opened, so
-            // pressure during a conn's first moments cannot close it.
+            let accepted_at = tokio::time::Instant::now();
+            // ATTACK(slot-camp): under slot pressure a conn camping its
+            // permit starves every other tenant's accept — the S2 wedge.
+            // Order of eviction while the pool is dry (S2 re-review F2 +
+            // design item 2): a head that never produced a served request
+            // dies at PRESSURE_HEAD_DEADLINE — the attacker's favourite
+            // shape (parked/trickled head) is evicted FIRST; then an idle
+            // keep-alive yields only if its address bucket holds MORE
+            // than its fair share of the pool (design item 3) — a client
+            // inside its share is never pushed back into the flooded
+            // backlog it would have to fight for a slot. The first check
+            // lands a grace window after the conn opened.
             let pressured = async {
                 let mut poll = tokio::time::interval_at(
                     tokio::time::Instant::now() + Duration::from_millis(250),
@@ -3341,23 +3452,44 @@ async fn serve_http(
                 poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
                 loop {
                     poll.tick().await;
-                    if pool_pressure.available_permits() == 0
-                        && served.load(std::sync::atomic::Ordering::Relaxed) >= 1
-                        && in_flight.load(std::sync::atomic::Ordering::Relaxed) == 0
+                    if pool_pressure.available_permits() != 0 {
+                        continue;
+                    }
+                    let served_n = served.load(std::sync::atomic::Ordering::Relaxed);
+                    let in_flight_n = in_flight.load(std::sync::atomic::Ordering::Relaxed);
+                    if served_n == 0
+                        && in_flight_n == 0
+                        && accepted_at.elapsed() >= PRESSURE_HEAD_DEADLINE
                     {
-                        break;
+                        return Pressure::DeadHead; // evicted first
+                    }
+                    if served_n >= 1 && in_flight_n == 0 {
+                        // Fair share: pool permits over the live buckets;
+                        // a lone tenant has no one starving behind it.
+                        let buckets = conn_shares.buckets().max(1);
+                        let share = (pool_size / buckets).max(1);
+                        if conn_shares.held(conn_peer) > share {
+                            return Pressure::OverShare;
+                        }
                     }
                 }
             };
             // A connection error (a reset, a timed-out head, a stalled
             // write) ends only that connection.
-            tokio::select! {
+            let evicted = tokio::select! {
                 _ = conn.as_mut() => return,
-                _ = closing.wait_for(|c| *c) => {}
-                () = tokio::time::sleep(lifetime) => {}
-                _ = pressured => {}
+                _ = closing.wait_for(|c| *c) => None,
+                () = tokio::time::sleep(lifetime) => None,
+                p = pressured => Some(p),
+            };
+            if evicted == Some(Pressure::DeadHead) {
+                // A head that never arrived is not graceful-drained —
+                // hyper counts the half-parsed head as in-flight and
+                // would wait out the whole header timeout for it. Drop
+                // the conn now; its slot is the point of the eviction.
+                return;
             }
-            // Shutting down, pressured, or the connection is old: answer
+            // Shutting down, yielding, or the connection is old: answer
             // the request in flight, then close.
             conn.as_mut().graceful_shutdown();
             let _ = conn.await;
@@ -3371,6 +3503,29 @@ async fn serve_http(
         }
     }
     Ok(())
+}
+
+/// One overload-lane conn: write the fixed `503 + Retry-After`, close
+/// the write half so the client reads the answer as a clean EOF rather
+/// than racing a reset, then drain the read side for at most
+/// `OVERLOAD_LANE_LIFETIME` — closing a socket that still holds unread
+/// request bytes is exactly what produces an RST, and an RST is a
+/// refusal the client cannot tell from a crash (S2 re-review design
+/// item 1). The permit frees with the task.
+async fn overload_answer(
+    mut stream: tokio::net::TcpStream,
+    permit: tokio::sync::OwnedSemaphorePermit,
+    response: Arc<Vec<u8>>,
+) {
+    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+    let _permit = permit;
+    let _ = stream.write_all(&response).await;
+    let _ = stream.shutdown().await; // half-close: FIN after the bytes
+    let mut sink = [0u8; 1024];
+    let _ = tokio::time::timeout(OVERLOAD_LANE_LIFETIME, async {
+        while stream.read(&mut sink).await.unwrap_or(0) != 0 {}
+    })
+    .await;
 }
 
 /// Increments a connection's in-flight count on entry and decrements it
@@ -6343,8 +6498,21 @@ mod tests {
         tokio::sync::oneshot::Sender<()>,
         Harness,
     ) {
+        serving_on(limits, "127.0.0.1:0").await
+    }
+
+    /// `serving` bound on `bind` — `"[::]:0"` dual-stacks so one test can
+    /// drive both 127.0.0.1 and ::1 clients at distinct address buckets.
+    async fn serving_on(
+        limits: HttpLimits,
+        bind: &str,
+    ) -> (
+        std::net::SocketAddr,
+        tokio::sync::oneshot::Sender<()>,
+        Harness,
+    ) {
         let h = harness(false);
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        let listener = tokio::net::TcpListener::bind(bind)
             .await
             .unwrap_or_else(|e| panic!("{e}"));
         let addr = listener.local_addr().unwrap_or_else(|e| panic!("{e}"));
@@ -6473,6 +6641,11 @@ mod tests {
                 .unwrap_or_else(|e| panic!("{e}"));
             held.push(s);
         }
+        // A probe from the SAME address as the flood cannot spend a
+        // reserve slot (READY_PER_ADDR — F3): it draws the overload lane
+        // and reads a real `503 + Retry-After`, never a bare RST. Once
+        // the parked heads die at the pressure head deadline (~1 s) a
+        // fresh probe gets a work slot and a 200.
         let mut probe = tokio::net::TcpStream::connect(addr)
             .await
             .unwrap_or_else(|e| panic!("{e}"));
@@ -6486,10 +6659,25 @@ mod tests {
             .unwrap_or_else(|_| panic!("/health never answered while connections were held"))
             .unwrap_or_else(|e| panic!("{e}"));
         assert!(
-            reply.starts_with(b"HTTP/1.1 200"),
-            "{}",
+            reply.starts_with(b"HTTP/1.1 200") || reply.starts_with(b"HTTP/1.1 503"),
+            "the probe got no real answer: {}",
             String::from_utf8_lossy(&reply)
         );
+        // The parked heads hold no head → they die at the pressure
+        // deadline; a work slot frees and the next probe is served.
+        for s in &mut held {
+            assert!(
+                closed_within(s, Duration::from_secs(10)).await,
+                "a head that never arrived outlived the pressure deadline"
+            );
+        }
+        let served = reqwest::Client::new()
+            .get(format!("http://{addr}/health"))
+            .send()
+            .await
+            .unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(served.status().as_u16(), 200);
+        let _ = served.text().await;
     }
 
     /// S2 wedge: a conn's permit outlived its request for the whole
@@ -6557,37 +6745,41 @@ mod tests {
         );
     }
 
-    /// The residual S2 wedge: a keep-alive conn that completed a request
-    /// while the pool still had room camps on its permit for the whole
-    /// connection lifetime — under a conn storm the pool converges to
-    /// campers plus one rotating slot, and every tenant's accept crawls.
-    /// Under pressure an idle conn must drain and yield its slot: the
-    /// camper below is closed proactively, so the probe draws a real work
-    /// permit (401) instead of the liveness reserve (503).
+    /// The residual S2 wedge, narrowed by fair-share (S2 re-review
+    /// design item 3): an idle keep-alive yields under pressure only
+    /// when its address bucket holds more than its share of the pool —
+    /// evicting a client at its share would push it back into the
+    /// flooded backlog for nothing. A 127.0.0.1 camper + two parked
+    /// heads share one bucket over share and yield; the lone ::1 client
+    /// at exactly its share does not — a lone camper starves nobody.
     #[tokio::test]
-    async fn an_idle_keep_alive_yields_its_slot_under_pressure() {
+    async fn an_idle_keep_alive_yields_only_over_its_fair_share() {
         use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
         let limits = HttpLimits {
-            max_connections: 3,
-            // Long enough that the parked heads below outlive the probe's
-            // deadline — they yield only at their own timeout, never
-            // proactively, so only the camper's yield can free a slot.
+            max_connections: 4,
+            // Long enough that nothing here outlives the test on its own
+            // deadline — only the pressure arms may close these conns.
             header_timeout: Duration::from_secs(60),
             ..lifted_limits()
         };
-        let (addr, _stop, _h) = serving(limits).await;
-        // Camp one slot: the request is served while the pool still has
-        // room (no Connection: close), then the conn goes keep-alive idle.
-        let mut camper = tokio::net::TcpStream::connect(addr)
+        let (addr, _stop, _h) = serving_on(limits, "[::]:0").await;
+        let v4 = std::net::SocketAddr::new(
+            std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+            addr.port(),
+        );
+        let v6 = std::net::SocketAddr::new(
+            std::net::IpAddr::V6(std::net::Ipv6Addr::LOCALHOST),
+            addr.port(),
+        );
+        // 127.0.0.1 bucket: one camper (served once, now idle) and two
+        // parked heads — three conns of the four-slot pool.
+        let mut camper = tokio::net::TcpStream::connect(v4)
             .await
             .unwrap_or_else(|e| panic!("{e}"));
         camper
             .write_all(b"GET /health HTTP/1.1\r\nhost: x\r\n\r\n")
             .await
             .unwrap_or_else(|e| panic!("{e}"));
-        // Drain the whole first response so the yield check below sees
-        // only the server's FIN, not leftover body bytes. EOF here means
-        // the conn never camped at all — a broken test, not a pass.
         let mut buf = [0u8; 512];
         loop {
             match tokio::time::timeout(Duration::from_millis(400), camper.read(&mut buf)).await {
@@ -6597,13 +6789,9 @@ mod tests {
                 Err(_) => break, // quiet socket: response fully consumed
             }
         }
-        // Pin the remaining two slots with heads that never complete.
-        // The pool is now dry and stays dry: only the camper can yield
-        // proactively — the parked heads hold out until their own
-        // 60 s deadline, far past this test's bound.
         let mut held = Vec::new();
         for _ in 0..2 {
-            let mut s = tokio::net::TcpStream::connect(addr)
+            let mut s = tokio::net::TcpStream::connect(v4)
                 .await
                 .unwrap_or_else(|e| panic!("{e}"));
             s.write_all(b"GET /health HTTP/1.1\r\n")
@@ -6611,71 +6799,358 @@ mod tests {
                 .unwrap_or_else(|e| panic!("{e}"));
             held.push(s);
         }
-        // The camping conn must be closed proactively (server FIN): its
-        // permit rotates to the backlog's next conn. Without the
-        // pressure-yield it stays open for the whole 600 s lifetime and
-        // this read times out.
+        // The lone ::1 client also serves once then camps: its bucket
+        // holds one conn — exactly its fair share (pool 4 / 2 buckets).
+        let mut bystander = tokio::net::TcpStream::connect(v6)
+            .await
+            .unwrap_or_else(|e| panic!("{e}"));
+        bystander
+            .write_all(b"GET /health HTTP/1.1\r\nhost: x\r\n\r\n")
+            .await
+            .unwrap_or_else(|e| panic!("{e}"));
+        loop {
+            match tokio::time::timeout(Duration::from_millis(400), bystander.read(&mut buf)).await {
+                Ok(Ok(0)) => panic!("the bystander closed instead of camping"),
+                Ok(Ok(_)) => continue,
+                Ok(Err(e)) => panic!("{e}"),
+                Err(_) => break,
+            }
+        }
+        // The camper's bucket is over share (3 > 4/2): it must yield.
         let n = tokio::time::timeout(Duration::from_secs(5), camper.read(&mut buf))
             .await
-            .unwrap_or_else(|_| panic!("idle keep-alive camped on its slot under pressure"))
+            .unwrap_or_else(|_| panic!("an over-share camper kept its slot under pressure"))
             .unwrap_or_else(|e| panic!("{e}"));
-        assert_eq!(n, 0, "camper did not yield its slot to the dry pool");
+        assert_eq!(n, 0, "the over-share camper did not yield");
+        // The at-share bystander must still be open and servable.
+        bystander
+            .write_all(b"GET /health HTTP/1.1\r\nhost: x\r\n\r\n")
+            .await
+            .unwrap_or_else(|e| panic!("{e}"));
+        let n = tokio::time::timeout(Duration::from_secs(5), bystander.read(&mut buf))
+            .await
+            .unwrap_or_else(|_| panic!("a client at its fair share was evicted"))
+            .unwrap_or_else(|e| panic!("{e}"));
+        assert!(n > 0, "the at-share conn was closed, not just evicted");
     }
 
-    /// The yield is narrow (S2 re-review R2): a conn that has never been
-    /// served is never evicted — closing it unread would push a legitimate
-    /// client back into the flooded backlog, worse than letting it wait.
-    /// Two parked heads dry the pool; a third conn sends nothing and must
-    /// still be alive and usable once it does ask.
+    /// The other half of fair-share (S2 re-review design item 3): with
+    /// every bucket exactly at its share, nothing may yield — the
+    /// pressure endures (the two conns themselves hold the whole pool),
+    /// so this discriminates "no eviction" from "pressure lifted". A
+    /// mutant that yields any served idle conn goes red here.
     #[tokio::test]
-    async fn an_unserved_connection_is_not_evicted_under_pressure() {
+    async fn clients_at_their_fair_share_are_not_evicted_under_pressure() {
         use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
         let limits = HttpLimits {
-            max_connections: 3,
+            max_connections: 2,
+            header_timeout: Duration::from_secs(60),
+            ..lifted_limits()
+        };
+        let (addr, _stop, _h) = serving_on(limits, "[::]:0").await;
+        let v4 = std::net::SocketAddr::new(
+            std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+            addr.port(),
+        );
+        let v6 = std::net::SocketAddr::new(
+            std::net::IpAddr::V6(std::net::Ipv6Addr::LOCALHOST),
+            addr.port(),
+        );
+        let mut campers = Vec::new();
+        for peer in [v4, v6] {
+            let mut s = tokio::net::TcpStream::connect(peer)
+                .await
+                .unwrap_or_else(|e| panic!("{e}"));
+            s.write_all(b"GET /health HTTP/1.1\r\nhost: x\r\n\r\n")
+                .await
+                .unwrap_or_else(|e| panic!("{e}"));
+            let mut buf = [0u8; 512];
+            loop {
+                match tokio::time::timeout(Duration::from_millis(400), s.read(&mut buf)).await {
+                    Ok(Ok(0)) => panic!("the conn closed instead of camping keep-alive"),
+                    Ok(Ok(_)) => continue,
+                    Ok(Err(e)) => panic!("{e}"),
+                    Err(_) => break,
+                }
+            }
+            campers.push(s);
+        }
+        // Pool of two, one conn per bucket, both at their share of one:
+        // pressure is continuous for well over a head deadline, yet both
+        // must still answer a second request.
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+        for (i, s) in campers.iter_mut().enumerate() {
+            s.write_all(b"GET /health HTTP/1.1\r\nhost: x\r\n\r\n")
+                .await
+                .unwrap_or_else(|e| panic!("{e}"));
+            let mut buf = [0u8; 512];
+            let n = tokio::time::timeout(Duration::from_secs(5), s.read(&mut buf))
+                .await
+                .unwrap_or_else(|_| panic!("at-share conn {i} was evicted under pressure"))
+                .unwrap_or_else(|e| panic!("{e}"));
+            assert!(n > 0, "at-share conn {i} was closed, not just idle");
+        }
+    }
+
+    /// The yield's grace window, not amnesty (S2 re-review design item
+    /// 2): a fresh conn that never sent a byte keeps a one-second head
+    /// grace under pressure — it is not evicted at the first tick — but
+    /// past PRESSURE_HEAD_DEADLINE a head that never arrived is evicted
+    /// FIRST, before any eligible idle keep-alive.
+    #[tokio::test]
+    async fn a_fresh_head_gets_a_one_second_grace_then_dies_under_pressure() {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+        let limits = HttpLimits {
+            max_connections: 2,
             header_timeout: Duration::from_secs(60),
             ..lifted_limits()
         };
         let (addr, _stop, _h) = serving(limits).await;
-        let mut held = Vec::new();
-        for _ in 0..2 {
-            let mut s = tokio::net::TcpStream::connect(addr)
-                .await
-                .unwrap_or_else(|e| panic!("{e}"));
-            s.write_all(b"GET /health HTTP/1.1\r\n")
-                .await
-                .unwrap_or_else(|e| panic!("{e}"));
-            held.push(s);
-        }
-        // The last slot goes to a conn that has sent nothing — it is
-        // waiting for service, not camping.
+        let mut held = tokio::net::TcpStream::connect(addr)
+            .await
+            .unwrap_or_else(|e| panic!("{e}"));
+        held.write_all(b"GET /health HTTP/1.1\r\n")
+            .await
+            .unwrap_or_else(|e| panic!("{e}"));
+        // The last slot goes to a conn that has sent nothing — it is in
+        // its head grace, not camping. With the pool dry the parked
+        // head's deadline is ~1 s from its own accept.
         let mut fresh = tokio::net::TcpStream::connect(addr)
             .await
             .unwrap_or_else(|e| panic!("{e}"));
-        // Past several pressure ticks the conn must still be open: if it
-        // had been yielded, the server's FIN reads as EOF here.
+        // Inside the grace window both conns must still be open —
+        // an instant eviction would read EOF or an error here.
         let mut buf = [0u8; 64];
-        for _ in 0..12 {
+        for _ in 0..5 {
+            match held.try_read(&mut buf) {
+                Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
+                Ok(0) => panic!("the parked head was cut inside its grace second"),
+                Ok(_) => panic!("unsolicited bytes on a conn mid-head"),
+                Err(e) => panic!("the parked head errored inside its grace second: {e}"),
+            }
             match tokio::time::timeout(Duration::from_millis(100), fresh.read(&mut buf)).await {
-                Ok(Ok(0)) => panic!("a conn that never served was evicted under pressure"),
+                Ok(Ok(0)) => panic!("a conn in its head grace was evicted under pressure"),
                 Ok(Ok(_)) => panic!("unsolicited bytes on an idle conn"),
                 Ok(Err(e)) => panic!("{e}"),
                 Err(_) => {}
             }
         }
-        // And it can still be served: a real request gets a real answer.
         fresh
             .write_all(b"GET /health HTTP/1.1\r\nhost: x\r\n\r\n")
             .await
             .unwrap_or_else(|e| panic!("{e}"));
         let n = tokio::time::timeout(Duration::from_secs(5), fresh.read(&mut buf))
             .await
-            .unwrap_or_else(|_| panic!("the never-served conn was left unusable"))
+            .unwrap_or_else(|_| panic!("the grace conn was left unusable"))
             .unwrap_or_else(|e| panic!("{e}"));
-        assert!(n > 0, "expected an HTTP answer on the held conn");
         assert!(
             buf[..n].starts_with(b"HTTP/1.1 200"),
             "expected 200, got {:?}",
             String::from_utf8_lossy(&buf[..n])
+        );
+        // Past the deadline, under a still-dry pool, the dead head is
+        // evicted first — long before the 60 s header timeout.
+        assert!(
+            closed_within(&mut held, Duration::from_secs(4)).await,
+            "a head that never arrived outlived the pressure deadline"
+        );
+    }
+
+    /// S2 re-review design item 1: a full backlog is never the answer.
+    /// Work and liveness pools dry, a conn must read a real
+    /// `503 overloaded` + `Retry-After` — not ride the kernel backlog to
+    /// a reset the client cannot tell from a crash.
+    #[tokio::test]
+    async fn an_overloaded_connection_reads_a_503_not_a_reset() {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+        let limits = HttpLimits {
+            max_connections: 1,
+            header_timeout: Duration::from_secs(60),
+            ..lifted_limits()
+        };
+        let (addr, _stop, _h) = serving(limits).await;
+        // Dry the work pool with a parked head…
+        let mut pin = tokio::net::TcpStream::connect(addr)
+            .await
+            .unwrap_or_else(|e| panic!("{e}"));
+        pin.write_all(b"GET /health HTTP/1.1\r\n")
+            .await
+            .unwrap_or_else(|e| panic!("{e}"));
+        // …and the liveness reserve with READY_PER_ADDR parked heads
+        // from the same address bucket.
+        let mut held = Vec::new();
+        for _ in 0..READY_PER_ADDR {
+            let mut s = tokio::net::TcpStream::connect(addr)
+                .await
+                .unwrap_or_else(|e| panic!("{e}"));
+            s.write_all(b"GET /health HTTP/1.1\r\n")
+                .await
+                .unwrap_or_else(|e| panic!("{e}"));
+            held.push(s);
+        }
+        // The next conn must get a REAL answer fast — the lane's 503 —
+        // not silence or a reset.
+        let mut probe = tokio::net::TcpStream::connect(addr)
+            .await
+            .unwrap_or_else(|e| panic!("{e}"));
+        probe
+            .write_all(b"GET /health HTTP/1.1\r\nhost: x\r\n\r\n")
+            .await
+            .unwrap_or_else(|e| panic!("{e}"));
+        let mut reply = Vec::new();
+        tokio::time::timeout(Duration::from_secs(5), probe.read_to_end(&mut reply))
+            .await
+            .unwrap_or_else(|_| panic!("an overloaded conn got no answer — it rode the backlog"))
+            .unwrap_or_else(|e| panic!("{e}"));
+        let text = String::from_utf8_lossy(&reply);
+        assert!(
+            text.starts_with("HTTP/1.1 503"),
+            "expected 503 overloaded, got: {text}"
+        );
+        assert!(
+            text.contains("retry-after") || text.contains("Retry-After"),
+            "no Retry-After in the refusal: {text}"
+        );
+        assert!(
+            text.contains("\"overloaded\""),
+            "body was not the lane's: {text}"
+        );
+    }
+
+    /// S2 re-review F2: a refused request is still a SERVED request — a
+    /// conn that only draws 429s must hit the request cap and close like
+    /// any other, not camp yield-ineligible to max_lifetime.
+    #[tokio::test]
+    async fn a_429_only_connection_still_hits_the_request_cap() {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+        let limits = HttpLimits {
+            max_connections: 4,
+            max_requests: 3,
+            rate_per_addr: 0.001, // every request 429s
+            header_timeout: Duration::from_secs(60),
+            ..lifted_limits()
+        };
+        let (addr, _stop, _h) = serving(limits).await;
+        let mut sock = tokio::net::TcpStream::connect(addr)
+            .await
+            .unwrap_or_else(|e| panic!("{e}"));
+        let mut buf = [0u8; 1024];
+        // The bucket bursts one token: request 0 is served (200) and the
+        // rest draw 429. The cap must still fire on answers 1..=3 —
+        // under the bug a 429 never incremented `served`, so this conn
+        // would ride to max_lifetime.
+        for i in 0..3 {
+            sock.write_all(b"GET /health HTTP/1.1\r\nhost: x\r\n\r\n")
+                .await
+                .unwrap_or_else(|e| panic!("{e}"));
+            // Read the response before sending the next — HTTP/1.1
+            // keep-alive is sequential here.
+            let mut got = Vec::new();
+            loop {
+                let n = tokio::time::timeout(Duration::from_secs(5), sock.read(&mut buf))
+                    .await
+                    .unwrap_or_else(|_| panic!("no answer to request {i}"))
+                    .unwrap_or_else(|e| panic!("{e}"));
+                if n == 0 {
+                    panic!("conn closed after only {i} answers");
+                }
+                got.extend_from_slice(&buf[..n]);
+                if got.windows(4).any(|w| w == b"\r\n\r\n") && got.len() > 40 {
+                    break;
+                }
+            }
+            let want = if i == 0 {
+                b"HTTP/1.1 200"
+            } else {
+                b"HTTP/1.1 429"
+            };
+            assert!(
+                got.starts_with(want),
+                "request {i}: {}",
+                String::from_utf8_lossy(&got)
+            );
+        }
+        // Three answers hit the same request cap as three 200s: the conn
+        // must close rather than keep a slot on refused requests.
+        assert!(
+            closed_within(&mut sock, Duration::from_secs(5)).await,
+            "a conn whose later answers were 429s escaped the request cap"
+        );
+    }
+
+    /// S2 re-review F3: the liveness reserve is per-address — one
+    /// flooding address may hold at most READY_PER_ADDR reserve slots,
+    /// so a probe from a DIFFERENT address still reaches /health while
+    /// the flood's extra conns take the 503 lane.
+    #[tokio::test]
+    async fn the_liveness_reserve_is_capped_per_address() {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+        let limits = HttpLimits {
+            max_connections: 1,
+            header_timeout: Duration::from_secs(60),
+            ..lifted_limits()
+        };
+        let (addr, _stop, _h) = serving_on(limits, "[::]:0").await;
+        let v4 = std::net::SocketAddr::new(
+            std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+            addr.port(),
+        );
+        let v6 = std::net::SocketAddr::new(
+            std::net::IpAddr::V6(std::net::Ipv6Addr::LOCALHOST),
+            addr.port(),
+        );
+        let mut pin = tokio::net::TcpStream::connect(v4)
+            .await
+            .unwrap_or_else(|e| panic!("{e}"));
+        pin.write_all(b"GET /health HTTP/1.1\r\n")
+            .await
+            .unwrap_or_else(|e| panic!("{e}"));
+        // READY_PER_ADDR parked heads from the flooding bucket.
+        let mut held = Vec::new();
+        for _ in 0..READY_PER_ADDR {
+            let mut s = tokio::net::TcpStream::connect(v4)
+                .await
+                .unwrap_or_else(|e| panic!("{e}"));
+            s.write_all(b"GET /health HTTP/1.1\r\n")
+                .await
+                .unwrap_or_else(|e| panic!("{e}"));
+            held.push(s);
+        }
+        // The flooder's next conn is over its reserve budget → the lane.
+        let mut extra = tokio::net::TcpStream::connect(v4)
+            .await
+            .unwrap_or_else(|e| panic!("{e}"));
+        extra
+            .write_all(b"GET /health HTTP/1.1\r\nhost: x\r\n\r\n")
+            .await
+            .unwrap_or_else(|e| panic!("{e}"));
+        let mut reply = Vec::new();
+        tokio::time::timeout(Duration::from_secs(5), extra.read_to_end(&mut reply))
+            .await
+            .unwrap_or_else(|_| panic!("the over-budget conn got no answer"))
+            .unwrap_or_else(|e| panic!("{e}"));
+        assert!(
+            reply.starts_with(b"HTTP/1.1 503"),
+            "expected the lane's 503, got: {}",
+            String::from_utf8_lossy(&reply)
+        );
+        // A probe from a different bucket still draws a reserve slot.
+        let mut probe = tokio::net::TcpStream::connect(v6)
+            .await
+            .unwrap_or_else(|e| panic!("{e}"));
+        probe
+            .write_all(b"GET /health HTTP/1.1\r\nhost: x\r\n\r\n")
+            .await
+            .unwrap_or_else(|e| panic!("{e}"));
+        let mut reply = Vec::new();
+        tokio::time::timeout(Duration::from_secs(5), probe.read_to_end(&mut reply))
+            .await
+            .unwrap_or_else(|_| panic!("the ::1 probe got no answer"))
+            .unwrap_or_else(|e| panic!("{e}"));
+        assert!(
+            reply.starts_with(b"HTTP/1.1 200"),
+            "the other bucket's probe lost liveness: {}",
+            String::from_utf8_lossy(&reply)
         );
     }
 

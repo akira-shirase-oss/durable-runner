@@ -20,9 +20,9 @@ set -u
 cd "$(dirname "$0")/.."
 # The heavy slot is machine-wide: a battery is one heavy run, and a second
 # heavy run anywhere on the box refuses rather than races it. Re-exec under
-# heavy.sh so every leg (each a load.mjs child) inherits DR_HEAVY_HELD and
-# skips its own acquire.
-if [ -z "${DR_HEAVY_HELD:-}" ]; then
+# heavy.sh so every leg (each a load.mjs child) inherits the lock fd —
+# the fd, not DR_HEAVY_HELD, is the proof we're under the slot (F4).
+if ! perf/heavy-held.sh; then
   exec perf/heavy.sh "$0" "$@"
 fi
 MODE=${1:-smoke}

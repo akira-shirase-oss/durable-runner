@@ -22,6 +22,7 @@ Standard library only. Usage:
   perf/drill.py --rounds 20 --targeted 15 --clients 16 --out perf/results/X.json
 """
 import argparse
+import fcntl
 import http.client
 import json
 import os
@@ -38,6 +39,59 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 FAR = 9_999_999_999_999
+
+# The heavy slot, same contract as perf/heavy.sh (S2 re-review F4): an
+# flock(2) on ONE FIXED PATH — the git common dir, the one path every
+# worktree of this clone resolves identically — kernel-held for as long
+# as this process (or an inheriting child) keeps the fd: no stale sweep,
+# no pid to liveness-check, refused loudly after a few tries, never a
+# silent unlocked run.
+def _heavy_lock_path():
+    if os.environ.get("DR_HEAVY_LOCK"):
+        return os.environ["DR_HEAVY_LOCK"]
+    out = subprocess.run(["git", "rev-parse", "--git-common-dir"],
+                         cwd=ROOT, capture_output=True, check=True)
+    return os.path.join(os.path.realpath(
+        os.path.join(ROOT, out.stdout.decode().strip())),
+        "durable-runner-heavy.lock")
+
+
+HEAVY_LOCK = _heavy_lock_path()
+
+
+def heavy_lock():
+    # Under perf/heavy.sh we already hold the slot: fd 9 IS the lock
+    # file's open description (the fd, not DR_HEAVY_HELD, is the proof).
+    # Acquiring a second description here would contend with our own
+    # parent — flock excludes other descriptions, not its own.
+    try:
+        held = os.fstat(9)
+        lock = os.stat(HEAVY_LOCK)
+        if (held.st_dev, held.st_ino) == (lock.st_dev, lock.st_ino):
+            return None
+    except OSError:
+        pass
+    fd = os.open(HEAVY_LOCK, os.O_RDWR | os.O_CREAT, 0o666)
+    for _ in range(4):
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            try:
+                with open(HEAVY_LOCK + ".holder", "w") as h:
+                    h.write(f"{os.getpid()} drill.py\n")
+            except OSError:
+                pass
+            return fd  # the caller keeps it alive for the whole run
+        except OSError:
+            time.sleep(1)
+    holder = ""
+    try:
+        with open(HEAVY_LOCK + ".holder") as h:
+            holder = h.read().strip()
+    except OSError:
+        pass
+    print(f"drill.py: the heavy slot is held ({holder or 'unknown'}) — "
+          "one load run per machine; refusing to race", file=sys.stderr)
+    sys.exit(3)
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -167,6 +221,7 @@ def all_runs(api):
 
 
 def main():
+    _heavy_fd = heavy_lock()  # held until exit: one load run per machine
     ap = argparse.ArgumentParser()
     ap.add_argument("--rounds", type=int, default=20, help="random-moment kills")
     ap.add_argument("--targeted", type=int, default=15, help="kills 0-30 ms after compact/backup/cancel burst")

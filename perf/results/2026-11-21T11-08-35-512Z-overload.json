@@ -1,0 +1,126 @@
+{
+  "machine": {
+    "host": "maintainer-laptop",
+    "platform": "darwin/arm64",
+    "cpu": "Apple M2 Pro",
+    "cores": 12,
+    "mem_gb": 32,
+    "date": "2026-11-21T11:08:35.549Z",
+    "commit": "5842e60"
+  },
+  "scenario": "overload",
+  "loadavg": [
+    28.41,
+    32.25,
+    40.9
+  ],
+  "peak_heap_mb": 48,
+  "socket_peak": 275,
+  "close_wait_peak": 257,
+  "fin_wait2_peak": 0,
+  "socket_bound": 1024,
+  "params": {
+    "flood_conns": 256,
+    "max_connections": 64,
+    "max_conns_per_addr": 8,
+    "legit_addr": "[::1]",
+    "established": 8,
+    "offers": 48,
+    "flood_secs": 15,
+    "smoke": false
+  },
+  "baseline_status": 200,
+  "flood": {
+    "open_peak": 256,
+    "answers": {
+      "503": 386475,
+      "closed_unanswered": 1262
+    },
+    "errors": {
+      "ECONNRESET": 1239
+    }
+  },
+  "answers_during_flood": {
+    "200": 6,
+    "503": 42
+  },
+  "http_answered": 48,
+  "tcp_refused": 0,
+  "offer_p99_ms": 16384,
+  "established": [
+    {
+      "socks": 1,
+      "ok": 58,
+      "other": 0,
+      "errs": {}
+    },
+    {
+      "socks": 1,
+      "ok": 58,
+      "other": 0,
+      "errs": {}
+    },
+    {
+      "socks": 1,
+      "ok": 58,
+      "other": 0,
+      "errs": {}
+    },
+    {
+      "socks": 1,
+      "ok": 58,
+      "other": 0,
+      "errs": {}
+    },
+    {
+      "socks": 1,
+      "ok": 58,
+      "other": 0,
+      "errs": {}
+    },
+    {
+      "socks": 1,
+      "ok": 58,
+      "other": 0,
+      "errs": {}
+    },
+    {
+      "socks": 1,
+      "ok": 58,
+      "other": 0,
+      "errs": {}
+    },
+    {
+      "socks": 40,
+      "ok": 19,
+      "other": 39,
+      "errs": {
+        "Error": 4
+      }
+    }
+  ],
+  "established_ok_rate": 0.9159,
+  "established_evictions": 39,
+  "health_during_flood": 200,
+  "health_failures": [],
+  "recovery": {
+    "submits_done": 40,
+    "ms": 207,
+    "codes": {
+      "200": 40
+    }
+  },
+  "thresholds": {
+    "offers": "48/48 real HTTP answers, zero RSTs, p99 < 1 s",
+    "established": "8 keep-alive clients >= 99% 200, never evicted",
+    "health": "200 on the dedicated listener, every probe <500 ms",
+    "recovery": "40 submits served <5 s after the flood"
+  },
+  "verdict": "FAIL",
+  "failures": [
+    "offer p99 under 1 s",
+    "established clients >= 99% 200",
+    "established clients never evicted"
+  ],
+  "note": "flood and legit on separate addresses with the per-addr cap on: the lane answers over-cap conns a real 503+Retry-After, never a bare RST; tcp refusals are failures, not answers"
+}

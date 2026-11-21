@@ -196,20 +196,7 @@ impl RateLimit {
     /// What a checked address is counted as: v4 as itself (a mapped v6
     /// unwrapped to the same key), v6 masked to `v6_prefix` bits.
     fn addr_key(&self, addr: IpAddr) -> LimitKey {
-        LimitKey::Addr(match addr {
-            IpAddr::V4(_) => addr,
-            IpAddr::V6(a) => match a.to_ipv4_mapped() {
-                Some(v4) => IpAddr::V4(v4),
-                None => {
-                    let masked = if self.v6_prefix == 0 {
-                        0
-                    } else {
-                        a.to_bits() & (!0u128 << (128 - self.v6_prefix))
-                    };
-                    IpAddr::V6(Ipv6Addr::from_bits(masked))
-                }
-            },
-        })
+        LimitKey::Addr(bucket_addr(addr, self.v6_prefix))
     }
 
     /// The `/48` aggregate for a real v6 address — only when it is
@@ -300,24 +287,52 @@ impl RateLimit {
     }
 }
 
-/// Per-peer open connections. Over the cap the socket is closed at
+/// The address a connection or request is counted under: v4 as itself
+/// (a v4-mapped v6 peer unwrapped to the same bucket), a real v6 masked
+/// to `v6_prefix` bits — one /64 is one bucket, so a host's 2^64 host
+/// bits cannot mint a fresh bucket per connection (S2 re-review F3: the
+/// conn cap used to key the exact address while the rate limiter keyed
+/// the prefix, giving one /64 an unbounded connection budget).
+fn bucket_addr(addr: IpAddr, v6_prefix: u8) -> IpAddr {
+    match addr {
+        IpAddr::V4(_) => addr,
+        IpAddr::V6(a) => match a.to_ipv4_mapped() {
+            Some(v4) => IpAddr::V4(v4),
+            None => {
+                let masked = if v6_prefix == 0 {
+                    0
+                } else {
+                    a.to_bits() & (!0u128 << (128 - v6_prefix))
+                };
+                IpAddr::V6(Ipv6Addr::from_bits(masked))
+            }
+        },
+    }
+}
+
+/// Per-peer open connections, counted by address bucket (v6 peers share
+/// the prefix bucket above). Over the cap the socket is refused at
 /// accept; the guard releases the slot when the connection ends. A peer
 /// inside the trusted-proxy ranges gets the larger `cap_trusted`: the
 /// peer is the proxy's edge, and one edge legitimately holds many real
 /// clients' connections (D-052). The global connection cap still bounds
-/// everything.
+/// everything. The counts are kept even with no cap configured — the
+/// fair-share pressure yield reads them to evict only conns whose
+/// bucket holds more than its share of the pool.
 #[derive(Debug, Clone)]
 pub struct ConnLimit {
     cap_untrusted: usize,
     cap_trusted: usize,
+    v6_prefix: u8,
     counts: std::sync::Arc<std::sync::Mutex<HashMap<IpAddr, usize>>>,
 }
 
 impl ConnLimit {
-    pub fn new(cap_untrusted: usize, cap_trusted: usize) -> Self {
+    pub fn new(cap_untrusted: usize, cap_trusted: usize, v6_prefix: u8) -> Self {
         Self {
             cap_untrusted,
             cap_trusted,
+            v6_prefix: v6_prefix.min(128),
             counts: std::sync::Arc::new(std::sync::Mutex::new(HashMap::new())),
         }
     }
@@ -328,42 +343,49 @@ impl ConnLimit {
         } else {
             self.cap_untrusted
         };
+        let bucket = bucket_addr(addr, self.v6_prefix);
         let mut counts = self.counts.lock().unwrap_or_else(|p| p.into_inner());
-        let n = counts.entry(addr).or_insert(0);
+        let n = counts.entry(bucket).or_insert(0);
         if cap > 0 && *n >= cap {
             return None;
         }
         *n += 1;
         Some(ConnGuard {
-            addr,
+            bucket,
             counts: self.counts.clone(),
         })
     }
 
-    #[cfg(test)]
-    fn held(&self, addr: IpAddr) -> usize {
+    /// Conns held under `addr`'s bucket — the fair-share numerator.
+    pub fn held(&self, addr: IpAddr) -> usize {
         *self
             .counts
             .lock()
             .unwrap_or_else(|p| p.into_inner())
-            .get(&addr)
+            .get(&bucket_addr(addr, self.v6_prefix))
             .unwrap_or(&0)
+    }
+
+    /// Distinct buckets currently holding conns — the fair-share
+    /// denominator.
+    pub fn buckets(&self) -> usize {
+        self.counts.lock().unwrap_or_else(|p| p.into_inner()).len()
     }
 }
 
 #[derive(Debug)]
 pub struct ConnGuard {
-    addr: IpAddr,
+    bucket: IpAddr,
     counts: std::sync::Arc<std::sync::Mutex<HashMap<IpAddr, usize>>>,
 }
 
 impl Drop for ConnGuard {
     fn drop(&mut self) {
         let mut counts = self.counts.lock().unwrap_or_else(|p| p.into_inner());
-        match counts.get_mut(&self.addr) {
+        match counts.get_mut(&self.bucket) {
             Some(n) if *n > 1 => *n -= 1,
             _ => {
-                counts.remove(&self.addr);
+                counts.remove(&self.bucket);
             }
         }
     }
@@ -582,7 +604,7 @@ mod tests {
 
     #[test]
     fn the_connection_cap_releases_on_drop() {
-        let limit = ConnLimit::new(2, 4);
+        let limit = ConnLimit::new(2, 4, DEFAULT_V6_PREFIX);
         let a = ip("192.0.2.1");
         let b = ip("192.0.2.2");
         let g1 = limit
@@ -607,7 +629,7 @@ mod tests {
     /// larger `cap_trusted`, the untrusted-peer cap does not apply.
     #[test]
     fn a_trusted_peer_gets_the_higher_cap() {
-        let limit = ConnLimit::new(2, 4);
+        let limit = ConnLimit::new(2, 4, DEFAULT_V6_PREFIX);
         let a = ip("192.0.2.1");
         let _held: Vec<ConnGuard> = (0..4)
             .map(|_| {
@@ -624,5 +646,38 @@ mod tests {
             limit.acquire(ip("192.0.2.2"), false).is_some(),
             "an untrusted peer still gets its own count"
         );
+    }
+
+    /// S2 re-review F3: the conn cap keys the same bucket as the rate
+    /// limiter — a /64's 2^64 host addresses share one count, so a host
+    /// cannot mint a fresh connection budget per address. A v4-mapped v6
+    /// peer lands in its v4 bucket.
+    #[test]
+    fn a_slash64_shares_one_connection_budget() {
+        let limit = ConnLimit::new(2, 4, 64);
+        let a1 = ip("2001:db8::1");
+        let a2 = ip("2001:db8::2");
+        let _g1 = limit.acquire(a1, false).unwrap_or_else(|| panic!("conn 1"));
+        let _g2 = limit.acquire(a2, false).unwrap_or_else(|| panic!("conn 2"));
+        assert_eq!(limit.held(a1), 2, "one /64 is one bucket");
+        assert!(
+            limit.acquire(ip("2001:db8::3"), false).is_none(),
+            "a third address in the /64 is over the cap"
+        );
+        assert!(
+            limit.acquire(ip("2001:db8:1::1"), false).is_some(),
+            "a different /64 is a different bucket"
+        );
+        // The mapped v4 peer is its v4 self, not a fresh v6 bucket.
+        let mapped = limit.acquire(ip("::ffff:192.0.2.1"), false);
+        assert!(mapped.is_some(), "v4-mapped: its own bucket");
+        let _gv4 = limit
+            .acquire(ip("192.0.2.1"), false)
+            .unwrap_or_else(|| panic!("v4"));
+        assert!(
+            limit.acquire(ip("::ffff:192.0.2.1"), false).is_none(),
+            "the mapped form shares the v4 bucket"
+        );
+        drop(mapped);
     }
 }
