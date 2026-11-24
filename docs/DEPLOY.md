@@ -241,9 +241,13 @@ All of these live in `/etc/durable/durable.env`. Restart after a change
 (`systemctl restart durable-server`), or let the next deploy pick it up.
 
 - `DURABLE_OPS_LISTEN=127.0.0.1:58301`: set this once the server has
-  `--ops-listen` (S3 ruling 2'). The server on main refuses unknown flags, so
-  the wrapper passes the flag only when this line is set. The ops keys are
-  then answered there only, through `ssh -L 58301:127.0.0.1:58301 $H`.
+  `--ops-listen` (S3 ruling 2'). clap refuses unknown flags, so the wrapper
+  passes it only when this line is set and the binary's `--help` lists it. If
+  the setting is on but the binary lacks the flag, the wrapper logs a warning
+  instead. The ops keys are then answered there only, through
+  `ssh -L 58301:127.0.0.1:58301 $H`. `--public-origin` follows the same rule:
+  it is passed only to a server that has it (the S3 branch has it, main at
+  8b46ec3 doesn't).
 - `DURABLE_DASHBOARD_PATH=/app/`: set this once the server mounts the
   dashboard at `/app` (with `/inspector` answering 308). Then rerun
   `caddy-merge.sh` (for the root redirect) and pass

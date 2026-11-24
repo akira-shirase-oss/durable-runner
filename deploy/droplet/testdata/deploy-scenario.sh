@@ -84,7 +84,7 @@ mkstub() {
   cat >"$1" <<EOF
 #!/usr/bin/env bash
 case "\${1:-}" in
-  --help) echo "Usage: durable-server [OPTIONS]"; echo "      --journal <JOURNAL>"; [[ $3 == lab ]] && echo "      --allow-local-tenant-handlers"; exit 0 ;;
+  --help) echo "Usage: durable-server [OPTIONS]"; echo "      --journal <JOURNAL>"; echo "      --public-origin <PUBLIC_ORIGIN>"; [[ $3 == lab ]] && echo "      --allow-local-tenant-handlers"; exit 0 ;;
   --version) echo "durable-server $2"; exit 0 ;;
   --journal-format) echo "3 2 1"; exit 0 ;;
 esac

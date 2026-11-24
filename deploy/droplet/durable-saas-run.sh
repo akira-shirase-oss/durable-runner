@@ -15,9 +15,9 @@
 #   database_url     DATABASE_URL       DURABLE_REQUIRE_ACCOUNTS=1 (Neon, verify-full, direct host)
 #   resend_api_key   RESEND_API_KEY     DURABLE_REQUIRE_MAIL=1 (with DURABLE_MAIL_FROM)
 #
-# Hosted flags, from settings: --public-origin "$DURABLE_PUBLIC_ORIGIN" (required with an account
-# store), and --ops-listen "$DURABLE_OPS_LISTEN" only when that is set (the flag isn't on the
-# server yet: durable.env.template). Refused: DURABLE_MAILER=log (it prints mail bodies, tokens
+# Hosted flags, from settings, each only when the binary's --help lists it: --public-origin
+# "$DURABLE_PUBLIC_ORIGIN" (required with an account store by a server that has it), and
+# --ops-listen "$DURABLE_OPS_LISTEN" when that is set (durable.env.template). Refused: DURABLE_MAILER=log (it prints mail bodies, tokens
 # included, to the journal) and DURABLE_ACCOUNTS_BACKEND (an in-memory account store).
 set -euo pipefail
 here=$(cd "$(dirname "$0")" && pwd)
@@ -74,21 +74,35 @@ if [[ -n "${DURABLE_INVITE_ONLY+set}" ]]; then
   esac
 fi
 
+# The hosted flags go only to a server that has them: clap refuses an unknown flag, and main's
+# server can predate S3's (--public-origin is on the S3 branch; --ops-listen isn't written yet).
+# The binary's own --help says, as the lab guard reads it.
+bin=${DURABLE_SERVER_BIN:-/usr/local/bin/durable-server}
+help=$("$bin" --help 2>&1 || true)
+has_flag() { grep -qE -- "(^|[[:space:],])$1([[:space:]=,<]|$)" <<<"$help"; }
 extra=""
 origin=${DURABLE_PUBLIC_ORIGIN:-}
 if [[ -n "$origin" ]]; then
   origin=${origin%/}
   [[ "$origin" =~ ^https://([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$ ]] \
     || refuse "DURABLE_PUBLIC_ORIGIN='$origin' must be https://<host>, nothing else"
-  extra="--public-origin $origin"
-elif [[ -n "${DATABASE_URL:-}" ]]; then
+  if has_flag --public-origin; then
+    extra="--public-origin $origin"
+  else
+    echo "durable-saas-run: this server has no --public-origin yet (it predates S3); not passed" >&2
+  fi
+elif [[ -n "${DATABASE_URL:-}" ]] && has_flag --public-origin; then
   refuse "an account store needs DURABLE_PUBLIC_ORIGIN: mailed links are built from it"
 fi
 if [[ -n "${DURABLE_OPS_LISTEN:-}" ]]; then
   [[ "$DURABLE_OPS_LISTEN" =~ ^(127\.0\.0\.1|\[::1\]):[0-9]{1,5}$ ]] \
     || refuse "DURABLE_OPS_LISTEN='$DURABLE_OPS_LISTEN' must be a loopback address:port (the ops keys answer there)"
   [[ "$DURABLE_OPS_LISTEN" != "${DURABLE_LISTEN:-127.0.0.1:58300}" ]] || refuse "DURABLE_OPS_LISTEN can't be the public listener's address"
-  extra="$extra --ops-listen $DURABLE_OPS_LISTEN"
+  if has_flag --ops-listen; then
+    extra="$extra --ops-listen $DURABLE_OPS_LISTEN"
+  else
+    echo "durable-saas-run: WARNING DURABLE_OPS_LISTEN is set but this server has no --ops-listen: not passed, so the ops keys still answer on the public listener" >&2
+  fi
 fi
 case " ${DURABLE_EXTRA_ARGS:-} " in
   *" --public-origin"*|*" --ops-listen"*) refuse "DURABLE_EXTRA_ARGS repeats a flag this wrapper sets (--public-origin / --ops-listen): use DURABLE_PUBLIC_ORIGIN / DURABLE_OPS_LISTEN" ;;

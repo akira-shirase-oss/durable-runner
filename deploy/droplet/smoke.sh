@@ -63,11 +63,19 @@ fi
 has_env() { grep -qx -- "$1" <<<"$envnames"; }
 [[ "$argv" == *"--trusted-proxy 127.0.0.1/32"* ]] && ok "trusts the loopback proxy hop (Caddy)" \
   || bad "does not trust the loopback hop: every visitor would share one rate bucket"
-if [[ -n "$host" ]]; then
+help=""
+(( pid > 0 )) && help=$("$proc/exe" --help 2>&1 || true)
+if [[ -z "$host" ]]; then
+  bad "DURABLE_PUBLIC_ORIGIN in $DR_ENV isn't https://<host>"
+elif ! grep -q -- '--public-origin' <<<"$help"; then
+  ok "this server has no --public-origin yet (it predates S3)"
+else
   [[ "$argv" == *"--public-origin https://$host"* ]] && ok "--public-origin https://$host" \
     || bad "not started with --public-origin https://$host (mailed links need it)"
-else
-  bad "DURABLE_PUBLIC_ORIGIN in $DR_ENV isn't https://<host>"
+fi
+ops=$(env_get DURABLE_OPS_LISTEN "$DR_ENV")
+if [[ -n "$ops" ]] && grep -q -- '--ops-listen' <<<"$help"; then
+  [[ "$argv" == *"--ops-listen $ops"* ]] && ok "the ops keys answer on $ops only" || bad "not started with --ops-listen $ops"
 fi
 [[ "$argv" != *--allow-local-tenant-handlers* ]] && ok "no lab flag in argv" || bad "a lab flag is in argv"
 if [[ "$need_accounts" == 1 ]]; then

@@ -32,7 +32,11 @@ RESEND=re_TestKey_0123456789abcdef
 echo "durable-saas-run.sh"
 cat >"$work/stub" <<'EOF'
 #!/usr/bin/env bash
-if [[ "${1:-}" == --help ]]; then echo "Usage: durable-server [OPTIONS]"; echo "      --journal <JOURNAL>"; exit 0; fi
+if [[ "${1:-}" == --help ]]; then
+  echo "Usage: durable-server [OPTIONS]"; echo "      --journal <JOURNAL>"
+  [[ -n "${STUB_OLD:-}" ]] || { echo "      --public-origin <PUBLIC_ORIGIN>"; echo "      --ops-listen <OPS_LISTEN>"; }
+  exit 0
+fi
 printf '%s\n' "$@" >"$STUB_DIR/argv"
 env >"$STUB_DIR/env"
 EOF
@@ -63,6 +67,9 @@ has_pair --trusted-proxy 127.0.0.1/32 && ok "durable-run still adds the loopback
 grep -q '^DURABLE_INVITE_ONLY=' "$work/env" && bad "DURABLE_INVITE_ONLY=0 reached the server (it would turn invite-only ON)" || ok "DURABLE_INVITE_ONLY=0 is dropped (off)"
 runw DURABLE_INVITE_ONLY=yes && [[ "$(envval DURABLE_INVITE_ONLY)" == 1 ]] && ok "DURABLE_INVITE_ONLY=yes reaches the server as 1" || bad "invite-only on didn't reach the server"
 runw DURABLE_OPS_LISTEN=127.0.0.1:58301 && has_pair --ops-listen 127.0.0.1:58301 && ok "--ops-listen when DURABLE_OPS_LISTEN is set" || bad "no --ops-listen with the setting on"
+runw STUB_OLD=1 DURABLE_OPS_LISTEN=127.0.0.1:58301 && ! grep -qx -- --public-origin "$work/argv" && ! grep -qx -- --ops-listen "$work/argv" \
+  && grep -q 'WARNING DURABLE_OPS_LISTEN' "$work/out" && ok "a server without the S3 flags gets neither (clap would refuse them), with a warning for --ops-listen" \
+  || bad "an older server: $(tr '\n' ' ' <"$work/argv"; cat "$work/out")"
 rm -f "$creds/database_url" "$creds/resend_api_key"
 runw DURABLE_REQUIRE_ACCOUNTS=0 DURABLE_REQUIRE_MAIL=0 && ! grep -q '^DATABASE_URL=' "$work/env" && ok "a key-only server starts without the account store when told to" || bad "REQUIRE_*=0 didn't start without them: $(cat "$work/out")"
 
