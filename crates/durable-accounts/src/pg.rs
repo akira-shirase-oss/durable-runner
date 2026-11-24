@@ -490,6 +490,7 @@ impl AccountStore for Pg {
             )
             .await?;
             SignupOutcome::VerifyResent {
+                account: account_id as u64,
                 outbox: Self::issue_verify(
                     &mut tx,
                     account_id,
@@ -584,8 +585,8 @@ impl AccountStore for Pg {
             sqlx::query(
                 "INSERT INTO sessions \
                  (account_id, token_hash, csrf_seed, expires_at, idle_expires_at, \
-                  last_seen_at, user_agent, ip) \
-                 VALUES ($1, $2, $3, $4, $5, now(), $6, $7::inet)",
+                  last_seen_at, user_agent, ip, replaced_by) \
+                 VALUES ($1, $2, $3, $4, $5, now(), $6, $7::inet, $8)",
             )
             .bind(to_i64(session.account, "account")?)
             .bind(session.token_hash.as_slice())
@@ -594,6 +595,12 @@ impl AccountStore for Pg {
             .bind(ts(session.idle_expires_at_ms))
             .bind(session.user_agent.as_deref())
             .bind(session.ip.map(|a| a.to_string()))
+            .bind(
+                session
+                    .replaces
+                    .map(|id| to_i64(id, "session"))
+                    .transpose()?,
+            )
             .execute(&mut *tx),
         )
         .await?;
@@ -624,6 +631,149 @@ impl AccountStore for Pg {
             .execute(&self.pool),
         )
         .await?;
+        Ok(())
+    }
+
+    async fn sessions_for_account(
+        &self,
+        account: u64,
+        limit: u32,
+    ) -> Result<Vec<crate::SessionInfo>, AccountError> {
+        let rows = bounded(
+            sqlx::query(
+                "SELECT public_id, created_at, last_seen_at, expires_at, \
+                        idle_expires_at, user_agent, host(ip) AS ip \
+                 FROM sessions \
+                 WHERE account_id = $1 AND revoked_at IS NULL \
+                 ORDER BY created_at DESC LIMIT $2",
+            )
+            .bind(to_i64(account, "account")?)
+            .bind(limit as i64)
+            .fetch_all(&self.pool),
+        )
+        .await?;
+        rows.iter()
+            .map(|r| {
+                Ok(crate::SessionInfo {
+                    public_id: r.try_get("public_id")?,
+                    created_at_ms: ms(r.try_get::<time::OffsetDateTime, _>("created_at")?),
+                    last_seen_at_ms: ms(r.try_get::<time::OffsetDateTime, _>("last_seen_at")?),
+                    expires_at_ms: ms(r.try_get::<time::OffsetDateTime, _>("expires_at")?),
+                    idle_expires_at_ms: ms(
+                        r.try_get::<time::OffsetDateTime, _>("idle_expires_at")?,
+                    ),
+                    user_agent: r.try_get("user_agent")?,
+                    ip: r.try_get("ip")?,
+                })
+            })
+            .collect()
+    }
+
+    async fn revoke_session_public(
+        &self,
+        account: u64,
+        public_id: uuid::Uuid,
+    ) -> Result<Option<[u8; 32]>, AccountError> {
+        // The account bind is inside the WHERE — a foreign public_id is
+        // the same empty answer as an unknown one (no idor oracle).
+        let row = bounded(
+            sqlx::query(
+                "UPDATE sessions SET revoked_at = now() \
+                 WHERE public_id = $1 AND account_id = $2 AND revoked_at IS NULL \
+                 RETURNING token_hash",
+            )
+            .bind(public_id)
+            .bind(to_i64(account, "account")?)
+            .fetch_optional(&self.pool),
+        )
+        .await?;
+        row.map(|r| {
+            let h: Vec<u8> = r.try_get("token_hash")?;
+            <[u8; 32]>::try_from(h.as_slice())
+                .map_err(|_| AccountError::Store("bad token_hash length".into()))
+        })
+        .transpose()
+    }
+
+    async fn revoke_sessions_except(
+        &self,
+        account: u64,
+        keep_public_id: uuid::Uuid,
+    ) -> Result<u64, AccountError> {
+        let done = bounded(
+            sqlx::query(
+                "UPDATE sessions SET revoked_at = now() \
+                 WHERE account_id = $1 AND public_id <> $2 AND revoked_at IS NULL",
+            )
+            .bind(to_i64(account, "account")?)
+            .bind(keep_public_id)
+            .execute(&self.pool),
+        )
+        .await?;
+        Ok(done.rows_affected())
+    }
+
+    async fn change_password(
+        &self,
+        account: u64,
+        new_password_hash: &str,
+    ) -> Result<(), AccountError> {
+        // One transaction: the new hash, dead pending tokens (a verify
+        // token's stale pending hash must never revert the change) and
+        // every session revoked — no partial win.
+        let mut tx = bounded(self.pool.begin()).await?;
+        bounded(
+            sqlx::query("UPDATE accounts SET password_hash = $2 WHERE id = $1")
+                .bind(to_i64(account, "account")?)
+                .bind(new_password_hash)
+                .execute(&mut *tx),
+        )
+        .await?;
+        bounded(
+            sqlx::query(
+                "UPDATE email_tokens SET superseded_at = now() \
+                 WHERE account_id = $1 AND consumed_at IS NULL AND superseded_at IS NULL",
+            )
+            .bind(to_i64(account, "account")?)
+            .execute(&mut *tx),
+        )
+        .await?;
+        bounded(
+            sqlx::query(
+                "UPDATE sessions SET revoked_at = now() \
+                 WHERE account_id = $1 AND revoked_at IS NULL",
+            )
+            .bind(to_i64(account, "account")?)
+            .execute(&mut *tx),
+        )
+        .await?;
+        bounded(tx.commit()).await?;
+        Ok(())
+    }
+
+    async fn touch_sessions(&self, touches: &[crate::SessionTouch]) -> Result<(), AccountError> {
+        if touches.is_empty() {
+            return Ok(());
+        }
+        // GREATEST keeps the slide monotonic — a stale flush never
+        // pulls last_seen or idle backwards.
+        let mut tx = bounded(self.pool.begin()).await?;
+        for t in touches {
+            bounded(
+                sqlx::query(
+                    "UPDATE sessions SET \
+                         last_seen_at = GREATEST(last_seen_at, $2), \
+                         idle_expires_at = GREATEST(idle_expires_at, $3) \
+                     WHERE token_hash = $1 AND revoked_at IS NULL",
+                )
+                .bind(t.token_hash.as_slice())
+                .bind(ts(t.seen_ms))
+                .bind(ts(t.idle_expires_at_ms))
+                .execute(&mut *tx),
+            )
+            .await?;
+        }
+        bounded(tx.commit()).await?;
         Ok(())
     }
 
@@ -1459,6 +1609,7 @@ mod tests {
                 csrf_seed: hash(9),
                 expires_at_ms: 4_000_000_000_000,
                 idle_expires_at_ms: 4_000_000_000_000,
+                replaces: None,
                 user_agent: Some("pg-test".into()),
                 ip: Some(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)),
             })
@@ -1510,6 +1661,7 @@ mod tests {
                 csrf_seed: hash(9),
                 expires_at_ms: 4_000_000_000_000,
                 idle_expires_at_ms: 4_000_000_000_000,
+                replaces: None,
                 user_agent: None,
                 ip: None,
             })
@@ -1591,6 +1743,7 @@ mod tests {
                 csrf_seed: hash(9),
                 expires_at_ms: 4_000_000_000_000,
                 idle_expires_at_ms: 4_000_000_000_000,
+                replaces: None,
                 user_agent: None,
                 ip: None,
             })
@@ -1646,6 +1799,7 @@ mod tests {
                 csrf_seed: hash(9),
                 expires_at_ms: 4_000_000_000_000,
                 idle_expires_at_ms: 4_000_000_000_000,
+                replaces: None,
                 user_agent: None,
                 ip: None,
             })
@@ -1720,6 +1874,222 @@ mod tests {
                 .len(),
             0,
             "a failed row is terminal"
+        );
+    }
+
+    /// S3-2's session surface on the real dialect: the account-scoped
+    /// list, revoke-one bound inside the lookup (a foreign public_id
+    /// answers the same None as an unknown), revoke-all-but-one,
+    /// change_password's hash+supersede+revoke transaction, the
+    /// monotonic touch slide, and `replaced_by` rotation linkage.
+    #[tokio::test]
+    #[ignore = "needs DURABLE_TEST_DATABASE_URL (CI: neon job runs --include-ignored)"]
+    async fn pg_session_lifecycle() {
+        let Some(store) = store().await else { return };
+        let email = format!("pg-s32-{}@example.com", std::process::id());
+        let verify = mail("verify", &email);
+        let notice = mail("notice", &email);
+        store
+            .signup(
+                &email,
+                "$argon2id$v=19$m=19456,t=2,p=1$AAAAAAAAAAA$fakehashfakehashfakehashfakehashfakeh",
+                &hash(1),
+                1_800_000_000_000,
+                &verify,
+                &notice,
+            )
+            .await
+            .unwrap_or_else(|e| panic!("signup: {e}"));
+        let account = store
+            .account_by_email(&email)
+            .await
+            .unwrap_or_else(|e| panic!("by email: {e}"))
+            .unwrap_or_else(|| panic!("account"));
+        let session = |token_hash: [u8; 32]| crate::NewSession {
+            account: account.id,
+            token_hash,
+            csrf_seed: hash(9),
+            expires_at_ms: 4_000_000_000_000,
+            idle_expires_at_ms: 4_000_000_000_000,
+            replaces: None,
+            user_agent: Some("pg-test".into()),
+            ip: None,
+        };
+        store
+            .create_session(&session(hash(7)))
+            .await
+            .unwrap_or_else(|e| panic!("s1: {e}"));
+        store
+            .create_session(&session(hash(8)))
+            .await
+            .unwrap_or_else(|e| panic!("s2: {e}"));
+        // The list answers both rows, newest first, ids opaque.
+        let rows = store
+            .sessions_for_account(account.id, 10)
+            .await
+            .unwrap_or_else(|e| panic!("list: {e}"));
+        assert_eq!(rows.len(), 2, "two live sessions list");
+        assert!(rows.iter().all(|r| r.created_at_ms > 0));
+        let s1_public = store
+            .session_grant(&hash(7))
+            .await
+            .unwrap_or_else(|e| panic!("grant: {e}"))
+            .unwrap_or_else(|| panic!("live"))
+            .public_id;
+        let s2_public = store
+            .session_grant(&hash(8))
+            .await
+            .unwrap_or_else(|e| panic!("grant: {e}"))
+            .unwrap_or_else(|| panic!("live"))
+            .public_id;
+        // A second account's sessions can't be revoked through this
+        // account's binding: the public_id answers None — the same as
+        // an unknown one — and the row lives.
+        let email2 = format!("pg-s32b-{}@example.com", std::process::id());
+        let verify2 = mail("verify", &email2);
+        let notice2 = mail("notice", &email2);
+        store
+            .signup(
+                &email2,
+                "$argon2id$v=19$m=19456,t=2,p=1$AAAAAAAAAAA$fakehashfakehashfakehashfakehashfakeh",
+                &hash(2),
+                1_800_000_000_000,
+                &verify2,
+                &notice2,
+            )
+            .await
+            .unwrap_or_else(|e| panic!("signup 2: {e}"));
+        let account2 = store
+            .account_by_email(&email2)
+            .await
+            .unwrap_or_else(|e| panic!("by email 2: {e}"))
+            .unwrap_or_else(|| panic!("account 2"));
+        store
+            .create_session(&crate::NewSession {
+                account: account2.id,
+                ..session(hash(11))
+            })
+            .await
+            .unwrap_or_else(|e| panic!("other session: {e}"));
+        assert!(store
+            .revoke_session_public(account.id, uuid::Uuid::now_v7())
+            .await
+            .unwrap_or_else(|e| panic!("unknown id: {e}"))
+            .is_none());
+        assert!(store
+            .revoke_session_public(account.id, s2_public)
+            .await
+            .unwrap_or_else(|e| panic!("foreign? — s2 IS account's: {e}"))
+            .is_some());
+        // The foreign session of account2 survives account's binding:
+        // account can't reach it even if it learned the public_id.
+        let foreign_public = store
+            .session_grant(&hash(11))
+            .await
+            .unwrap_or_else(|e| panic!("foreign grant: {e}"))
+            .unwrap_or_else(|| panic!("live"))
+            .public_id;
+        assert!(store
+            .revoke_session_public(account.id, foreign_public)
+            .await
+            .unwrap_or_else(|e| panic!("idor: {e}"))
+            .is_none());
+        assert!(store
+            .session_grant(&hash(11))
+            .await
+            .unwrap_or_else(|e| panic!("foreign still live: {e}"))
+            .is_some());
+        // Revoke-all-but-one keeps the named survivor.
+        let n = store
+            .revoke_sessions_except(account.id, s1_public)
+            .await
+            .unwrap_or_else(|e| panic!("except: {e}"));
+        assert_eq!(n, 0, "s2 was already revoked; only s1 could die — kept");
+        assert!(store
+            .session_grant(&hash(7))
+            .await
+            .unwrap_or_else(|e| panic!("survivor: {e}"))
+            .is_some());
+        // The rotation linkage: a session minted with `replaces` chains
+        // back to the row it supersedes.
+        store
+            .create_session(&crate::NewSession {
+                replaces: Some(
+                    store
+                        .session_grant(&hash(7))
+                        .await
+                        .unwrap_or_else(|e| panic!("old: {e}"))
+                        .unwrap_or_else(|| panic!("live"))
+                        .session_id,
+                ),
+                ..session(hash(12))
+            })
+            .await
+            .unwrap_or_else(|e| panic!("rotated: {e}"));
+        // change_password installs the hash, supersedes pending tokens
+        // and revokes every live session in one transaction.
+        store
+            .change_password(
+                account.id,
+                "$argon2id$v=19$m=19456,t=2,p=1$DDDDDDDDDDD$changedhashchangedhashchangedhashchang",
+            )
+            .await
+            .unwrap_or_else(|e| panic!("change: {e}"));
+        let after = store
+            .account_by_email(&email)
+            .await
+            .unwrap_or_else(|e| panic!("after: {e}"))
+            .unwrap_or_else(|| panic!("account"));
+        assert!(after
+            .password_hash
+            .as_deref()
+            .is_some_and(|h| h.contains("changedhash")));
+        assert!(store
+            .session_grant(&hash(7))
+            .await
+            .unwrap_or_else(|e| panic!("old dead: {e}"))
+            .is_none());
+        assert!(store
+            .session_grant(&hash(12))
+            .await
+            .unwrap_or_else(|e| panic!("rotated dead: {e}"))
+            .is_none());
+        // The pending verify token died with the change (superseded) —
+        // its stale pending hash can never revert this password.
+        assert!(store
+            .consume_verify_token(&hash(1))
+            .await
+            .unwrap_or_else(|e| panic!("superseded verify: {e}"))
+            .is_none());
+        // The touch slides monotonically — a stale (smaller) slide
+        // never walks the deadline backward.
+        store
+            .create_session(&session(hash(13)))
+            .await
+            .unwrap_or_else(|e| panic!("s4: {e}"));
+        store
+            .touch_sessions(&[
+                crate::SessionTouch {
+                    token_hash: hash(13),
+                    seen_ms: 5_000_000_000_000,
+                    idle_expires_at_ms: 5_000_000_000_000,
+                },
+                crate::SessionTouch {
+                    token_hash: hash(13),
+                    seen_ms: 1_000,
+                    idle_expires_at_ms: 1_000,
+                },
+            ])
+            .await
+            .unwrap_or_else(|e| panic!("touch: {e}"));
+        let touched = store
+            .session_grant(&hash(13))
+            .await
+            .unwrap_or_else(|e| panic!("touched: {e}"))
+            .unwrap_or_else(|| panic!("live"));
+        assert_eq!(
+            touched.idle_expires_at_ms, 5_000_000_000_000,
+            "GREATEST keeps the furthest slide — never backward"
         );
     }
 

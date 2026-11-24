@@ -64,6 +64,13 @@ struct SessionRow {
     csrf_seed: [u8; 32],
     expires_at_ms: i64,
     idle_expires_at_ms: i64,
+    created_at_ms: i64,
+    last_seen_at_ms: i64,
+    user_agent: Option<String>,
+    ip: Option<String>,
+    /// Audit parity with pg's `replaced_by` — written, never read here.
+    #[allow(dead_code)]
+    replaces: Option<u64>,
     revoked: bool,
 }
 
@@ -452,7 +459,10 @@ impl AccountStore for Memory {
                     Some(password_hash.to_string()),
                     verify_mail,
                 );
-                Ok(SignupOutcome::VerifyResent { outbox })
+                Ok(SignupOutcome::VerifyResent {
+                    account: acct.id,
+                    outbox,
+                })
             }
             None => {
                 let id = self.next_account.fetch_add(1, Ordering::Relaxed);
@@ -531,6 +541,7 @@ impl AccountStore for Memory {
             }
         }
         let id = self.next_session.fetch_add(1, Ordering::Relaxed);
+        let now = now_ms();
         inner.sessions.insert(
             id,
             SessionRow {
@@ -540,6 +551,11 @@ impl AccountStore for Memory {
                 csrf_seed: session.csrf_seed,
                 expires_at_ms: session.expires_at_ms,
                 idle_expires_at_ms: session.idle_expires_at_ms,
+                created_at_ms: now,
+                last_seen_at_ms: now,
+                user_agent: session.user_agent.clone(),
+                ip: session.ip.map(|a| a.to_string()),
+                replaces: session.replaces,
                 revoked: false,
             },
         );
@@ -566,6 +582,109 @@ impl AccountStore for Memory {
         for row in inner.sessions.values_mut() {
             if row.account == account {
                 row.revoked = true;
+            }
+        }
+        Ok(())
+    }
+
+    async fn sessions_for_account(
+        &self,
+        account: u64,
+        limit: u32,
+    ) -> Result<Vec<crate::SessionInfo>, AccountError> {
+        self.check_up()?;
+        let inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        let mut rows: Vec<crate::SessionInfo> = inner
+            .sessions
+            .values()
+            .filter(|s| !s.revoked && s.account == account)
+            .map(|s| crate::SessionInfo {
+                public_id: s.public_id,
+                created_at_ms: s.created_at_ms,
+                last_seen_at_ms: s.last_seen_at_ms,
+                expires_at_ms: s.expires_at_ms,
+                idle_expires_at_ms: s.idle_expires_at_ms,
+                user_agent: s.user_agent.clone(),
+                ip: s.ip.clone(),
+            })
+            .collect();
+        rows.sort_by_key(|s| std::cmp::Reverse(s.created_at_ms));
+        rows.truncate(limit as usize);
+        Ok(rows)
+    }
+
+    async fn revoke_session_public(
+        &self,
+        account: u64,
+        public_id: uuid::Uuid,
+    ) -> Result<Option<[u8; 32]>, AccountError> {
+        self.check_up()?;
+        let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(row) = inner.sessions.values_mut().find(|s| {
+            !s.revoked
+                && s.public_id == public_id
+                // ATTACK(session-idor)
+                && s.account == account
+        }) else {
+            return Ok(None);
+        };
+        row.revoked = true;
+        Ok(Some(row.token_hash))
+    }
+
+    async fn revoke_sessions_except(
+        &self,
+        account: u64,
+        keep_public_id: uuid::Uuid,
+    ) -> Result<u64, AccountError> {
+        self.check_up()?;
+        let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        let mut n = 0u64;
+        for row in inner.sessions.values_mut() {
+            if row.account == account && row.public_id != keep_public_id && !row.revoked {
+                row.revoked = true;
+                n += 1;
+            }
+        }
+        Ok(n)
+    }
+
+    async fn change_password(
+        &self,
+        account: u64,
+        new_password_hash: &str,
+    ) -> Result<(), AccountError> {
+        self.check_up()?;
+        let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(acct) = inner.accounts.get_mut(&account) {
+            acct.password_hash = Some(new_password_hash.to_string());
+        }
+        // A pending token minted before the change carries a stale
+        // pending hash — it must never land over the new password.
+        for row in inner.email_tokens.values_mut() {
+            if row.account == account && !row.consumed && !row.superseded {
+                row.superseded = true;
+            }
+        }
+        for row in inner.sessions.values_mut() {
+            if row.account == account {
+                row.revoked = true;
+            }
+        }
+        Ok(())
+    }
+
+    async fn touch_sessions(&self, touches: &[crate::SessionTouch]) -> Result<(), AccountError> {
+        self.check_up()?;
+        let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        for touch in touches {
+            if let Some(row) = inner
+                .sessions
+                .values_mut()
+                .find(|s| !s.revoked && s.token_hash == touch.token_hash)
+            {
+                row.last_seen_at_ms = row.last_seen_at_ms.max(touch.seen_ms);
+                row.idle_expires_at_ms = row.idle_expires_at_ms.max(touch.idle_expires_at_ms);
             }
         }
         Ok(())
@@ -635,6 +754,7 @@ impl AccountStore for Memory {
         let Some(token) = inner.email_tokens.values_mut().find(|t| {
             t.hash == *token_hash
                 && t.kind == "reset"
+                // ATTACK(reset-token-replay)
                 && !t.consumed
                 && !t.superseded
                 && t.expires_at_ms > now

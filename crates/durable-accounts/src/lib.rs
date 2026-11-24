@@ -136,9 +136,40 @@ pub struct NewSession {
     pub expires_at_ms: i64,
     /// Idle expiry — unix millis; slid forward on use.
     pub idle_expires_at_ms: i64,
+    /// Rotation linkage (`sessions.replaced_by`): the session this one
+    /// supersedes — the privilege-change mint's chain back to the
+    /// revoked session it replaced. `None` for a fresh sign-in.
+    pub replaces: Option<u64>,
     /// Truncated by the caller (the boundary owns string bounds).
     pub user_agent: Option<String>,
     pub ip: Option<std::net::IpAddr>,
+}
+
+/// One live session row for the `/me/sessions` list — the account's own
+/// audit view. `public_id` is the only id that crosses the API; the
+/// internal `sessions.id` never serializes (no sequential ids exposed,
+/// review S3). Deadlines ride along so the caller applies its clock.
+#[derive(Debug, Clone)]
+pub struct SessionInfo {
+    pub public_id: uuid::Uuid,
+    pub created_at_ms: i64,
+    pub last_seen_at_ms: i64,
+    pub expires_at_ms: i64,
+    pub idle_expires_at_ms: i64,
+    pub user_agent: Option<String>,
+    pub ip: Option<String>,
+}
+
+/// A pending idle slide (D-067): use of a session is recorded in memory
+/// and flushed on an interval rather than written per request — the
+/// store row lags by at most the flush interval.
+#[derive(Debug, Clone)]
+pub struct SessionTouch {
+    pub token_hash: [u8; 32],
+    /// When the session was last used — unix millis.
+    pub seen_ms: i64,
+    /// The new idle deadline (`seen_ms` + the server's idle window).
+    pub idle_expires_at_ms: i64,
 }
 
 /// What `signup` decided — the three outcomes the API deliberately
@@ -150,8 +181,10 @@ pub enum SignupOutcome {
     /// A new unverified account + a fresh verify token + verify mail.
     Created { outbox: Option<u64> },
     /// The address existed unverified: the pending verify token was
-    /// superseded and a fresh token + mail issued.
-    VerifyResent { outbox: Option<u64> },
+    /// superseded and a fresh token + mail issued. `account` is the
+    /// internal id — the transaction also revoked its sessions, so the
+    /// caller needs it to invalidate caches, not to expose.
+    VerifyResent { account: u64, outbox: Option<u64> },
     /// The address has a verified account: the notice mail was queued
     /// (no token — the account's sign-in state is untouched).
     Taken { outbox: Option<u64> },
@@ -379,6 +412,52 @@ pub trait AccountStore: Send + Sync {
     /// the verify link's sign-up wins, and any session minted before
     /// the mailbox owner proved ownership dies.
     async fn revoke_sessions_for_account(&self, account: u64) -> Result<(), AccountError>;
+
+    // --- S3-2: session lifecycle + /me -------------------------------
+
+    /// The account's live sessions (not revoked), newest first,
+    /// bounded by `limit` — the `/me/sessions` list. Expiry filtering
+    /// is the caller's check (it owns the clock).
+    async fn sessions_for_account(
+        &self,
+        account: u64,
+        limit: u32,
+    ) -> Result<Vec<SessionInfo>, AccountError>;
+
+    /// Revoke the session whose `public_id` the caller named — bound to
+    /// `account` inside the lookup, so another account's public_id
+    /// answers the same `None` as an unknown one (no idor oracle).
+    /// `Some(token_hash)` is the revoked session's hash for the
+    /// caller's cache bump.
+    async fn revoke_session_public(
+        &self,
+        account: u64,
+        public_id: uuid::Uuid,
+    ) -> Result<Option<[u8; 32]>, AccountError>;
+
+    /// Revoke every live session of `account` except `keep_public_id`
+    /// (revoke-all-but-current). Returns the number revoked.
+    async fn revoke_sessions_except(
+        &self,
+        account: u64,
+        keep_public_id: uuid::Uuid,
+    ) -> Result<u64, AccountError>;
+
+    /// The privilege-change write (review #2 carried to S3-2): install
+    /// `new_password_hash`, supersede every pending token — a verify
+    /// token's stale pending hash must never revert the change — and
+    /// revoke every session, all in one transaction so a partial win
+    /// is impossible.
+    async fn change_password(
+        &self,
+        account: u64,
+        new_password_hash: &str,
+    ) -> Result<(), AccountError>;
+
+    /// Flush pending idle slides (D-067): each touch stamps
+    /// `last_seen_at` and slides `idle_expires_at` on its live session
+    /// — never backward, and never onto a revoked row.
+    async fn touch_sessions(&self, touches: &[SessionTouch]) -> Result<(), AccountError>;
 
     /// The member row's role for `account` in `workspace`, or `None`.
     /// ws 0 can never answer: the `workspace_id <> 0` CHECK means no

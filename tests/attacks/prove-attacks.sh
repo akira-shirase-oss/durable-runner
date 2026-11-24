@@ -63,6 +63,11 @@ mutations=(
   "verify-sets-cookie|crates/durable-server/src/main.rs|unit:durable-server|s31_verify_round_trip|TokenCookie::Never~~>TokenCookie::UnlessForeignSession"
   "lockout-shape|crates/durable-server/src/main.rs|unit:durable-server|s31_lockout_cools_off|app\.lockouts\.fail\(&email, prefix, now\)~~>false"
   "mail-global|crates/durable-server/src/main.rs|unit:durable-server|s31_mail_global_budget_stops_drain|!app\.mail_budget\.open\(unix_ms\(\)\)~~>false"
+  "session-fixation|crates/durable-server/src/main.rs|unit:durable-server|s32_login_never_adopts_a_planted_cookie|mint_session_token\(&app\.session_key\)~~>session_cookie(&parts).unwrap_or_default()"
+  "cooloff|crates/durable-server/src/main.rs|unit:durable-server|s31_lockout_cools_off|app\.lockouts\.check\(&email, prefix, now\)~~>None::<u64>"
+  "idle-timeout|crates/durable-server/src/main.rs|unit:durable-server|s32_idle_slides_then_times_out|grant\.expires_at_ms <= now \|\| idle <= now~~>false"
+  "session-idor|crates/durable-accounts/src/memory.rs|unit:durable-server|s32_revoke_one_session|s\.account == account~~>true"
+  "reset-token-replay|crates/durable-accounts/src/memory.rs|unit:durable-server|s32_reset_kills_cached_sessions_and_replay_dies|!t\.consumed~~>true"
 )
 
 # Every marker in the source has exactly one mutation, and every mutation

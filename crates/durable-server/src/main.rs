@@ -16,7 +16,7 @@ use axum::{
     extract::{DefaultBodyLimit, FromRequestParts, Path as AxPath, Query, State},
     http::{header, request::Parts, StatusCode},
     response::{IntoResponse, Response},
-    routing::{get, post},
+    routing::{delete, get, post},
     Json, Router,
 };
 use base64::Engine as _;
@@ -1295,6 +1295,24 @@ struct App {
     /// (never the request Host). Required at boot with an account
     /// store (review #18); a test harness may pass None.
     public_origin: Option<String>,
+    /// Session-clock override for tests (the idle-timeout proof is
+    /// clock-injected): 0 = wall clock. Only the session-expiry and
+    /// session-mint paths consult it; lockouts keep wall time.
+    now_override_ms: std::sync::Arc<std::sync::atomic::AtomicI64>,
+}
+
+impl App {
+    /// The session clock — the override when a test set one, else wall.
+    fn now_ms(&self) -> i64 {
+        let v = self
+            .now_override_ms
+            .load(std::sync::atomic::Ordering::Relaxed);
+        if v == 0 {
+            unix_ms()
+        } else {
+            v
+        }
+    }
 }
 
 /// Test constructor: the registry plumbing (`handlers.json`, factory,
@@ -1341,6 +1359,7 @@ fn test_app(
         mail_budget: std::sync::Arc::new(MailBudget::new(MAIL_DAILY_BUDGET)),
         invite_only: false,
         public_origin: None,
+        now_override_ms: std::sync::Arc::new(std::sync::atomic::AtomicI64::new(0)),
         pubid,
     }
 }
@@ -1796,13 +1815,48 @@ fn spawn_mail_drain(app: App) {
     });
 }
 
+/// Idle-expiry sliding (D-067): requests record touches in memory; one
+/// batched monotonic store update per tick keeps `idle_expires_at`
+/// moving without a write per request. A missed flush only slides
+/// less — never serves a dead session.
+const SESSION_TOUCH_TICK: std::time::Duration = std::time::Duration::from_secs(30);
+
+async fn flush_session_touches(app: &App) {
+    let Some(store) = app.keyring.store.clone() else {
+        return;
+    };
+    let touches = app.sessions.drain_touches();
+    if touches.is_empty() {
+        return;
+    }
+    let _ = store.touch_sessions(&touches).await;
+}
+
+fn spawn_session_flush(app: App) {
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(SESSION_TOUCH_TICK);
+        loop {
+            tick.tick().await;
+            flush_session_touches(&app).await;
+        }
+    });
+}
+
 /// Generation-checked session cache (review #10): a fill that spans an
 /// invalidation is dropped; a hit older than its key's bump is a miss.
-/// The bump map is bounded; overflow clears the grants — a safe global
-/// invalidation.
+/// Bumps come in two keys — a session's token hash (logout, revoke-one)
+/// and its account (revoke-all, verify, reset, password change) — so an
+/// account-wide revocation dies in cache too, not just in the store.
+/// The bump maps are bounded; overflow clears the grants — a safe
+/// global invalidation. `touches` is the pending idle slide (D-067).
 struct SessionCache {
     grants: Mutex<HashMap<[u8; 32], SessionEntry>>,
     bumps: Mutex<HashMap<[u8; 32], Instant>>,
+    account_bumps: Mutex<HashMap<u64, Instant>>,
+    /// token_hash → last-seen unix ms, flushed to the store on the
+    /// D-067 interval; bounded — overflow clears (a lost touch slides
+    /// less, never serves a dead session).
+    touches: Mutex<HashMap<[u8; 32], i64>>,
 }
 
 struct SessionEntry {
@@ -1810,12 +1864,58 @@ struct SessionEntry {
     grant: std::sync::Arc<durable_accounts::SessionGrant>,
 }
 
+const TOUCH_CAP: usize = 50_000;
+
 impl SessionCache {
     fn new() -> Self {
         Self {
             grants: Mutex::new(HashMap::new()),
             bumps: Mutex::new(HashMap::new()),
+            account_bumps: Mutex::new(HashMap::new()),
+            touches: Mutex::new(HashMap::new()),
         }
+    }
+
+    /// The slide floor a pending touch gives this token's idle
+    /// deadline — the store row lags by up to the flush interval, so
+    /// expiry checks take max(stored, pending) rather than under-live.
+    fn touch_idle(&self, hash: &[u8; 32]) -> i64 {
+        self.touches
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(hash)
+            .map(|seen| seen + SESSION_IDLE_MS)
+            .unwrap_or(0)
+    }
+
+    /// Record use of a resolved session for the next flush.
+    fn touch(&self, hash: [u8; 32], now_ms: i64) {
+        let mut touches = self.touches.lock().unwrap_or_else(|e| e.into_inner());
+        if touches.len() >= TOUCH_CAP {
+            touches.clear();
+        }
+        touches.insert(hash, now_ms);
+    }
+
+    /// Drain pending touches for the flush task.
+    fn drain_touches(&self) -> Vec<durable_accounts::SessionTouch> {
+        let mut touches = self.touches.lock().unwrap_or_else(|e| e.into_inner());
+        std::mem::take(&mut *touches)
+            .into_iter()
+            .map(|(token_hash, seen_ms)| durable_accounts::SessionTouch {
+                token_hash,
+                seen_ms,
+                idle_expires_at_ms: seen_ms + SESSION_IDLE_MS,
+            })
+            .collect()
+    }
+
+    fn account_bumped(&self, account: u64, since: Instant) -> bool {
+        self.account_bumps
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&account)
+            .is_some_and(|b| *b > since)
     }
 
     fn get(
@@ -1823,8 +1923,13 @@ impl SessionCache {
         hash: &[u8; 32],
         now_ms: i64,
     ) -> Option<std::sync::Arc<durable_accounts::SessionGrant>> {
-        let grants = self.grants.lock().unwrap_or_else(|e| e.into_inner());
-        let entry = grants.get(hash)?;
+        let entry = {
+            let grants = self.grants.lock().unwrap_or_else(|e| e.into_inner());
+            grants.get(hash).map(|e| SessionEntry {
+                at: e.at,
+                grant: std::sync::Arc::clone(&e.grant),
+            })
+        }?;
         if entry.at.elapsed() >= SESSION_GRANT_TTL {
             return None;
         }
@@ -1834,13 +1939,15 @@ impl SessionCache {
             .unwrap_or_else(|e| e.into_inner())
             .get(hash)
             .is_some_and(|b| *b > entry.at)
+            || self.account_bumped(entry.grant.account.id, entry.at)
         {
             return None;
         }
-        if entry.grant.expires_at_ms <= now_ms || entry.grant.idle_expires_at_ms <= now_ms {
+        let idle = entry.grant.idle_expires_at_ms.max(self.touch_idle(hash));
+        if entry.grant.expires_at_ms <= now_ms || idle <= now_ms {
             return None;
         }
-        Some(std::sync::Arc::clone(&entry.grant))
+        Some(entry.grant)
     }
 
     /// `fill_start` is the instant BEFORE the store await; a bump inside
@@ -1858,6 +1965,7 @@ impl SessionCache {
             .unwrap_or_else(|e| e.into_inner())
             .get(&hash)
             .is_some_and(|b| *b > fill_start)
+            || self.account_bumped(grant.account.id, fill_start)
         {
             return false;
         }
@@ -1893,6 +2001,25 @@ impl SessionCache {
         }
         bumps.insert(hash, Instant::now());
     }
+
+    /// Account-wide invalidation (review #10's account key): verify,
+    /// reset, password change, revoke-all and unverified re-sign-up all
+    /// kill sessions in the store — this makes the cache agree before
+    /// the next request rather than at TTL.
+    fn bump_account(&self, account: u64) {
+        let mut bumps = self.account_bumps.lock().unwrap_or_else(|e| e.into_inner());
+        if bumps.len() >= BUMP_CAP {
+            bumps.retain(|_, at| at.elapsed() < BUMP_TTL);
+            if bumps.len() >= BUMP_CAP {
+                self.grants
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .clear();
+                bumps.clear();
+            }
+        }
+        bumps.insert(account, Instant::now());
+    }
 }
 
 /// The bounded argon2 queue (review #9): the job permit is acquired on
@@ -1900,7 +2027,13 @@ impl SessionCache {
 /// park on auth work. Waiters are bounded and timed out; one job per
 /// client address at a time.
 struct ArgonQueue {
+    /// The public pool — `ARGON_PERMITS - 1`, so one permit is always
+    /// left for the reserve (review #13/S3-2).
     jobs: tokio::sync::Semaphore,
+    /// The single reserved permit: only requests carrying a valid
+    /// known-device cookie may take it, so a credential-stuffing flood
+    /// that saturates the public pool can never starve the owner out.
+    reserve: tokio::sync::Semaphore,
     tickets: tokio::sync::Semaphore,
     addrs: Mutex<HashSet<std::net::IpAddr>>,
     /// Test-visible count of hashes run — the dummy path must cost the
@@ -1911,7 +2044,8 @@ struct ArgonQueue {
 impl ArgonQueue {
     fn new() -> Self {
         Self {
-            jobs: tokio::sync::Semaphore::new(ARGON_PERMITS),
+            jobs: tokio::sync::Semaphore::new(ARGON_PERMITS - 1),
+            reserve: tokio::sync::Semaphore::new(1),
             tickets: tokio::sync::Semaphore::new(ARGON_WAITERS),
             addrs: Mutex::new(HashSet::new()),
             ran: std::sync::atomic::AtomicU64::new(0),
@@ -1928,9 +2062,14 @@ impl ArgonQueue {
         e
     }
 
+    /// `reserved_ok` marks a request the reserve may serve (a valid
+    /// known-device cookie): it competes for the public pool first and
+    /// falls back to the one reserved permit — total concurrency still
+    /// caps at `ARGON_PERMITS`.
     async fn run<T: Send + 'static>(
         &self,
         addr: std::net::IpAddr,
+        reserved_ok: bool,
         work: impl FnOnce() -> T + Send + 'static,
     ) -> Result<T, ApiError> {
         {
@@ -1951,10 +2090,14 @@ impl ArgonQueue {
         }
         let _addr = AddrGuard(self, addr);
         let _ticket = self.tickets.try_acquire().map_err(|_| Self::busy())?;
-        let _permit = tokio::time::timeout(ARGON_WAIT, self.jobs.acquire())
-            .await
-            .map_err(|_| Self::busy())?
-            .map_err(|_| Self::busy())?;
+        let _permit = match tokio::time::timeout(ARGON_WAIT, self.jobs.acquire()).await {
+            Ok(Ok(permit)) => permit,
+            Ok(Err(_)) | Err(_) if !reserved_ok => return Err(Self::busy()),
+            _ => tokio::time::timeout(ARGON_WAIT, self.reserve.acquire())
+                .await
+                .map_err(|_| Self::busy())?
+                .map_err(|_| Self::busy())?,
+        };
         self.ran.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         tokio::task::spawn_blocking(work)
             .await
@@ -2141,8 +2284,9 @@ impl FromRequestParts<App> for SessionAuth {
                 "no session",
             ));
         };
-        let now = unix_ms();
+        let now = app.now_ms();
         if let Some(grant) = app.sessions.get(&hash, now) {
+            app.sessions.touch(hash, now);
             return Ok(SessionAuth(grant));
         }
         let fill_start = Instant::now();
@@ -2157,7 +2301,11 @@ impl FromRequestParts<App> for SessionAuth {
             }
             Err(_) => return Err(accounts_unavailable()),
         };
-        if grant.expires_at_ms <= now || grant.idle_expires_at_ms <= now {
+        // The idle check takes the pending-touch floor too — a slide
+        // queued but not yet flushed still counts as use (D-067).
+        let idle = grant.idle_expires_at_ms.max(app.sessions.touch_idle(&hash));
+        // ATTACK(idle-timeout)
+        if grant.expires_at_ms <= now || idle <= now {
             return Err(ApiError::new(
                 StatusCode::UNAUTHORIZED,
                 "unauthenticated",
@@ -2177,6 +2325,7 @@ impl FromRequestParts<App> for SessionAuth {
                 "no session",
             ));
         }
+        app.sessions.touch(hash, now);
         Ok(SessionAuth(grant))
     }
 }
@@ -2315,7 +2464,7 @@ async fn cookie_account(
     let Some(hash) = session_token_hash(&app.session_key, &token) else {
         return Ok(None);
     };
-    let now = unix_ms();
+    let now = app.now_ms();
     if let Some(grant) = app.sessions.get(&hash, now) {
         return Ok(Some(grant.account.id));
     }
@@ -2361,7 +2510,7 @@ async fn finish_redeem(
     let mut seed = [0u8; 32];
     ring::rand::SecureRandom::fill(&ring::rand::SystemRandom::new(), &mut seed)
         .unwrap_or_else(|_| panic!("rng"));
-    let now = unix_ms();
+    let now = app.now_ms();
     store
         .create_session(&durable_accounts::NewSession {
             account: account.id,
@@ -2369,6 +2518,7 @@ async fn finish_redeem(
             csrf_seed: seed,
             expires_at_ms: now + SESSION_ABS_MS,
             idle_expires_at_ms: now + SESSION_IDLE_MS,
+            replaces: None,
             user_agent: parts
                 .headers
                 .get(header::USER_AGENT)
@@ -2443,7 +2593,7 @@ async fn auth_signup(
     let password = req.password.clone();
     let phc = app
         .argon
-        .run(addr, move || {
+        .run(addr, false, move || {
             durable_accounts::password::hash_password(&password)
         })
         .await?
@@ -2475,7 +2625,7 @@ async fn auth_signup(
     // The outbox row commits inside the signup transaction; the drain
     // worker owns delivery — a racing immediate send could double-send
     // with a claimed row, so there is none.
-    store
+    let outcome = store
         .signup(
             &email,
             &phc,
@@ -2486,6 +2636,11 @@ async fn auth_signup(
         )
         .await
         .map_err(|_| accounts_unavailable())?;
+    // An unverified re-sign-up revoked that account's sessions inside
+    // the transaction — the cache agrees before the next request.
+    if let durable_accounts::SignupOutcome::VerifyResent { account, .. } = outcome {
+        app.sessions.bump_account(account);
+    }
     Ok(no_store(
         (
             StatusCode::ACCEPTED,
@@ -2531,6 +2686,7 @@ async fn auth_login(
         .as_ref()
         .is_some_and(|a| known_device_ok(&app.session_key, &parts, &a.public_id));
     if !known_device {
+        // ATTACK(cooloff)
         if let Some(retry) = app.lockouts.check(&email, prefix, now) {
             let mut e = ApiError::new(
                 StatusCode::TOO_MANY_REQUESTS,
@@ -2550,7 +2706,7 @@ async fn auth_login(
     let password = req.password.clone();
     let ok = app
         .argon
-        .run(addr, move || {
+        .run(addr, known_device, move || {
             durable_accounts::password::verify_password(&phc, &password)
         })
         .await?;
@@ -2589,12 +2745,15 @@ async fn auth_login(
     }
     let account = account.unwrap_or_else(|| panic!("checked"));
     app.lockouts.clear(&email, prefix);
+    // Sign-in always mints a fresh token — a cookie value the client
+    // arrived with can never become the session (no fixation).
+    // ATTACK(session-fixation)
     let token = mint_session_token(&app.session_key);
     let hash = sha256(token.as_bytes());
     let mut seed = [0u8; 32];
     ring::rand::SecureRandom::fill(&ring::rand::SystemRandom::new(), &mut seed)
         .unwrap_or_else(|_| panic!("rng"));
-    let now = unix_ms();
+    let now = app.now_ms();
     store
         .create_session(&durable_accounts::NewSession {
             account: account.id,
@@ -2602,6 +2761,7 @@ async fn auth_login(
             csrf_seed: seed,
             expires_at_ms: now + SESSION_ABS_MS,
             idle_expires_at_ms: now + SESSION_IDLE_MS,
+            replaces: None,
             user_agent: parts
                 .headers
                 .get(header::USER_AGENT)
@@ -2697,6 +2857,9 @@ async fn auth_verify(
         .await
         .map_err(|_| accounts_unavailable())?
         .ok_or_else(token_gone)?;
+    // The store revoked every session in that transaction — the cache
+    // must agree immediately, not at grant TTL.
+    app.sessions.bump_account(account.id);
     Ok(no_store(
         finish_redeem(
             &parts,
@@ -2835,7 +2998,7 @@ async fn auth_reset(
     let password = req.password.clone();
     let phc = app
         .argon
-        .run(addr, move || {
+        .run(addr, false, move || {
             durable_accounts::password::hash_password(&password)
         })
         .await?
@@ -2848,6 +3011,9 @@ async fn auth_reset(
         .await
         .map_err(|_| accounts_unavailable())?
         .ok_or_else(token_gone)?;
+    // Every session died in that transaction — the cache agrees at
+    // once, so a just-reset account's stolen cookie dies mid-flight.
+    app.sessions.bump_account(account.id);
     app.lockouts.clear_email(&account.email);
     Ok(no_store(
         finish_redeem(
@@ -2875,6 +3041,218 @@ async fn auth_session(SessionAuth(grant): SessionAuth) -> Result<Response, ApiEr
         }))
         .into_response(),
     ))
+}
+
+async fn me_account(SessionAuth(grant): SessionAuth) -> Result<Response, ApiError> {
+    Ok(no_store(
+        Json(serde_json::json!({
+            "account": {
+                "public_id": grant.account.public_id,
+                "email": grant.account.email,
+                "verified": grant.account.email_verified,
+            },
+        }))
+        .into_response(),
+    ))
+}
+
+async fn me_sessions(
+    SessionAuth(grant): SessionAuth,
+    State(app): State<App>,
+) -> Result<Response, ApiError> {
+    let Some(store) = app.keyring.store.clone() else {
+        return Err(accounts_unavailable());
+    };
+    let sessions = store
+        .sessions_for_account(
+            grant.account.id,
+            durable_accounts::MAX_SESSIONS_PER_ACCOUNT as u32,
+        )
+        .await
+        .map_err(|_| accounts_unavailable())?;
+    let list: Vec<serde_json::Value> = sessions
+        .iter()
+        .map(|s| {
+            serde_json::json!({
+                // The opaque public_id is the only id that crosses —
+                // the internal row id never does (S3-2).
+                "id": s.public_id,
+                "current": s.public_id == grant.public_id,
+                "created_at_ms": s.created_at_ms,
+                "last_seen_at_ms": s.last_seen_at_ms,
+                "expires_at_ms": s.expires_at_ms,
+                "idle_expires_at_ms": s.idle_expires_at_ms,
+                "user_agent": s.user_agent,
+                "ip": s.ip,
+            })
+        })
+        .collect();
+    Ok(no_store(
+        Json(serde_json::json!({"sessions": list})).into_response(),
+    ))
+}
+
+/// Revoke one session by its opaque public_id — the account binding
+/// lives inside the store query, so a foreign (or unknown) id answers
+/// the same 404 either way: no cross-account oracle (S3-2).
+async fn me_revoke_one(
+    SessionWrite(grant): SessionWrite,
+    State(app): State<App>,
+    axum::extract::Path(public_id): axum::extract::Path<uuid::Uuid>,
+) -> Result<Response, ApiError> {
+    let Some(store) = app.keyring.store.clone() else {
+        return Err(accounts_unavailable());
+    };
+    match store
+        .revoke_session_public(grant.account.id, public_id)
+        .await
+        .map_err(|_| accounts_unavailable())?
+    {
+        Some(hash) => {
+            app.sessions.bump(hash);
+            Ok(no_store(StatusCode::NO_CONTENT.into_response()))
+        }
+        None => Err(ApiError::new(
+            StatusCode::NOT_FOUND,
+            "not_found",
+            "no such session",
+        )),
+    }
+}
+
+/// Revoke every session except the requester's — sign-out-everywhere-
+/// else. The account bump kills the victims' cached grants at once;
+/// the survivor is re-warmed so the caller stays signed in.
+async fn me_revoke_all(
+    SessionWrite(grant): SessionWrite,
+    State(app): State<App>,
+    parts: Parts,
+) -> Result<Response, ApiError> {
+    let Some(store) = app.keyring.store.clone() else {
+        return Err(accounts_unavailable());
+    };
+    let revoked = store
+        .revoke_sessions_except(grant.account.id, grant.public_id)
+        .await
+        .map_err(|_| accounts_unavailable())?;
+    app.sessions.bump_account(grant.account.id);
+    // The bump also shadows this session's entry — re-warm it.
+    if let Some(token) = session_cookie(&parts) {
+        app.sessions
+            .put(sha256(token.as_bytes()), grant.clone(), Instant::now());
+    }
+    Ok(no_store(
+        Json(serde_json::json!({"revoked": revoked})).into_response(),
+    ))
+}
+
+#[derive(serde::Deserialize)]
+struct PasswordChangeReq {
+    current_password: String,
+    new_password: String,
+}
+
+/// Password change with re-auth (S3-2): the current password is
+/// verified through the same bounded argon queue as sign-in, then one
+/// transaction installs the hash, supersedes every pending token and
+/// revokes every session — the caller gets a fresh rotated session
+/// (`replaces` links the old row for audit).
+async fn me_password(
+    SessionWrite(grant): SessionWrite,
+    State(app): State<App>,
+    parts: Parts,
+    J(req): J<PasswordChangeReq>,
+) -> Result<Response, ApiError> {
+    let Some(store) = app.keyring.store.clone() else {
+        return Err(accounts_unavailable());
+    };
+    if let Some(why) = durable_accounts::password::policy_refusal(&req.new_password) {
+        return Err(ApiError::new(StatusCode::BAD_REQUEST, "bad_input", why));
+    }
+    let addr = client(&parts);
+    // Re-auth: a found laptop can't rotate the password. One failure
+    // shape — no "wrong current password" oracle beyond the 403.
+    let phc = grant
+        .account
+        .password_hash
+        .clone()
+        .unwrap_or_else(|| durable_accounts::password::DUMMY_PHC.to_string());
+    let password = req.current_password.clone();
+    let ok = app
+        .argon
+        .run(addr, false, move || {
+            durable_accounts::password::verify_password(&phc, &password)
+        })
+        .await?;
+    if !ok || grant.account.password_hash.is_none() {
+        return Err(ApiError::new(
+            StatusCode::FORBIDDEN,
+            "invalid_credentials",
+            "current password does not match",
+        ));
+    }
+    let password = req.new_password.clone();
+    let new_phc = app
+        .argon
+        .run(addr, false, move || {
+            durable_accounts::password::hash_password(&password)
+        })
+        .await?
+        .map_err(|e| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "internal", e.to_string()))?;
+    // One transaction: new hash, pending tokens superseded, every
+    // session revoked — then the cache agrees.
+    store
+        .change_password(grant.account.id, &new_phc)
+        .await
+        .map_err(|_| accounts_unavailable())?;
+    app.sessions.bump_account(grant.account.id);
+    app.lockouts.clear_email(&grant.account.email);
+    // Rotation on privilege change (S3-2): a fresh session linked to
+    // the one it replaces — the old token is dead in the same tx.
+    let token = mint_session_token(&app.session_key);
+    let hash = sha256(token.as_bytes());
+    let mut seed = [0u8; 32];
+    ring::rand::SecureRandom::fill(&ring::rand::SystemRandom::new(), &mut seed)
+        .unwrap_or_else(|_| panic!("rng"));
+    let now = app.now_ms();
+    store
+        .create_session(&durable_accounts::NewSession {
+            account: grant.account.id,
+            token_hash: hash,
+            csrf_seed: seed,
+            expires_at_ms: now + SESSION_ABS_MS,
+            idle_expires_at_ms: now + SESSION_IDLE_MS,
+            replaces: Some(grant.session_id),
+            user_agent: parts
+                .headers
+                .get(header::USER_AGENT)
+                .and_then(|v| v.to_str().ok())
+                .map(|s| s[..s.len().min(256)].to_string()),
+            ip: Some(addr),
+        })
+        .await
+        .map_err(|_| accounts_unavailable())?;
+    let mut res = no_store(
+        Json(serde_json::json!({
+            "changed": true,
+            "csrf": csrf_token(&seed),
+        }))
+        .into_response(),
+    );
+    res.headers_mut().append(
+        header::SET_COOKIE,
+        header::HeaderValue::from_str(&session_set_cookie(&token))
+            .unwrap_or_else(|_| header::HeaderValue::from_static("")),
+    );
+    res.headers_mut().append(
+        header::SET_COOKIE,
+        header::HeaderValue::from_str(&known_device_set_cookie(&mint_known_device(
+            &app.session_key,
+            &grant.account.public_id,
+        )))
+        .unwrap_or_else(|_| header::HeaderValue::from_static("")),
+    );
+    Ok(res)
 }
 
 /// `Cache-Control: no-store` + `Vary: Cookie` on every session-surface
@@ -4103,6 +4481,10 @@ fn router(app: App, ui_dir: Option<&Path>) -> Router {
         .route("/auth/resend-verification", post(auth_resend_verification))
         .route("/auth/forgot", post(auth_forgot))
         .route("/auth/reset", post(auth_reset))
+        .route("/me", get(me_account))
+        .route("/me/password", post(me_password))
+        .route("/me/sessions", get(me_sessions).delete(me_revoke_all))
+        .route("/me/sessions/{public_id}", delete(me_revoke_one))
         .route("/admin/compact", post(compact))
         .route("/admin/backup", post(backup))
         .route("/admin/diagnostics", get(diagnostics))
@@ -4513,6 +4895,7 @@ async fn main() -> Result<()> {
         ))),
         invite_only: std::env::var_os("DURABLE_INVITE_ONLY").is_some(),
         public_origin: args.public_origin.clone(),
+        now_override_ms: std::sync::Arc::new(std::sync::atomic::AtomicI64::new(0)),
         pubid,
     };
     if let Some(store) = &store {
@@ -4520,6 +4903,8 @@ async fn main() -> Result<()> {
         // The outbox drain owns every send — the mail row committed in
         // the same transaction as its fact is the only truth (D-064).
         spawn_mail_drain(app.clone());
+        // Idle-expiry slides in one batched store write per tick (D-067).
+        spawn_session_flush(app.clone());
     }
     let router = router(app.clone(), args.ui_dir.as_deref());
     let listener = tokio::net::TcpListener::bind(&args.listen)
@@ -7229,6 +7614,42 @@ mod tests {
         }
         async fn outbox_mark(&self, id: u64, outcome: MailOutcome) -> Result<(), AccountError> {
             self.inner.outbox_mark(id, outcome).await
+        }
+        async fn sessions_for_account(
+            &self,
+            account: u64,
+            limit: u32,
+        ) -> Result<Vec<durable_accounts::SessionInfo>, AccountError> {
+            self.inner.sessions_for_account(account, limit).await
+        }
+        async fn revoke_session_public(
+            &self,
+            account: u64,
+            public_id: uuid::Uuid,
+        ) -> Result<Option<[u8; 32]>, AccountError> {
+            self.inner.revoke_session_public(account, public_id).await
+        }
+        async fn revoke_sessions_except(
+            &self,
+            account: u64,
+            keep_public_id: uuid::Uuid,
+        ) -> Result<u64, AccountError> {
+            self.inner
+                .revoke_sessions_except(account, keep_public_id)
+                .await
+        }
+        async fn change_password(
+            &self,
+            account: u64,
+            new_password_hash: &str,
+        ) -> Result<(), AccountError> {
+            self.inner.change_password(account, new_password_hash).await
+        }
+        async fn touch_sessions(
+            &self,
+            touches: &[durable_accounts::SessionTouch],
+        ) -> Result<(), AccountError> {
+            self.inner.touch_sessions(touches).await
         }
         async fn consume_verify_token(
             &self,
@@ -11418,7 +11839,10 @@ mod tests {
         // always refuse the second.
         let slow = || std::thread::sleep(Duration::from_millis(50));
         let addr = std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST);
-        let (r1, r2) = tokio::join!(h.app.argon.run(addr, slow), h.app.argon.run(addr, slow));
+        let (r1, r2) = tokio::join!(
+            h.app.argon.run(addr, false, slow),
+            h.app.argon.run(addr, false, slow)
+        );
         busy = [r1, r2].into_iter().filter(|r| r.is_err()).count();
         assert_eq!(busy, 1, "one job per address");
     }
@@ -12201,5 +12625,540 @@ mod tests {
         )
         .await;
         assert_eq!(st, StatusCode::OK);
+    }
+
+    // ---- S3-2: session lifecycle + /me ------------------------------
+
+    /// A pure login (no signup) — the second+ session on one account.
+    async fn login_only(router: &Router, email: &str, password: &str) -> (String, String) {
+        let (st, heads, v) = raw(
+            router,
+            "POST",
+            "/auth/login",
+            &[],
+            Some(json!({"email": email, "password": password})),
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK, "login: {v}");
+        let set = heads
+            .get(header::SET_COOKIE)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or_default()
+            .to_string();
+        (
+            cookie_header(&set),
+            v["csrf"].as_str().unwrap_or_default().to_string(),
+        )
+    }
+
+    /// The opaque ids the sessions list reports for `cookie`.
+    async fn session_public_ids(router: &Router, cookie: &str) -> Vec<String> {
+        let (st, _, v) = raw(
+            router,
+            "GET",
+            "/me/sessions",
+            &[("cookie", cookie.to_string())],
+            None,
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK, "{v}");
+        v["sessions"]
+            .as_array()
+            .unwrap_or_else(|| panic!("sessions array: {v}"))
+            .iter()
+            .map(|s| s["id"].as_str().unwrap_or_default().to_string())
+            .collect()
+    }
+
+    /// `/me` needs a session (401 without); the mutation routes need
+    /// the synchroniser CSRF (403 csrf_failed without it).
+    #[tokio::test]
+    async fn s32_me_requires_session_and_csrf() {
+        let store = Arc::new(Memory::new());
+        let h = harness_store(false, None, Some(store.clone()));
+        let (st, _, _) = raw(&h.router, "GET", "/me", &[], None).await;
+        assert_eq!(st, StatusCode::UNAUTHORIZED);
+        let (st, _, _) = raw(&h.router, "GET", "/me/sessions", &[], None).await;
+        assert_eq!(st, StatusCode::UNAUTHORIZED);
+        signup_only(&h.router, "me@me.co", "a-long-enough-passphrase").await;
+        let (cookie, _) = login_only(&h.router, "me@me.co", "a-long-enough-passphrase").await;
+        let (st, _, v) = raw(&h.router, "GET", "/me", &[("cookie", cookie.clone())], None).await;
+        assert_eq!(st, StatusCode::OK, "{v}");
+        assert_eq!(v["account"]["email"], "me@me.co");
+        // No CSRF header on the mutations → 403.
+        let (st, _, v) = raw(
+            &h.router,
+            "DELETE",
+            "/me/sessions",
+            &[("cookie", cookie.clone())],
+            None,
+        )
+        .await;
+        assert_eq!(st, StatusCode::FORBIDDEN, "{v}");
+        assert_eq!(v["code"], "csrf_failed");
+        let (st, _, v) = raw(
+            &h.router,
+            "POST",
+            "/me/password",
+            &[("cookie", cookie)],
+            Some(json!({"current_password": "x", "new_password": "y"})),
+        )
+        .await;
+        assert_eq!(st, StatusCode::FORBIDDEN, "{v}");
+        assert_eq!(v["code"], "csrf_failed");
+    }
+
+    /// The sessions list carries opaque public_ids only — the internal
+    /// row id never serializes — and `current` marks the requester's
+    /// own row.
+    #[tokio::test]
+    async fn s32_me_lists_sessions() {
+        let store = Arc::new(Memory::new());
+        let h = harness_store(false, None, Some(store.clone()));
+        signup_only(&h.router, "l@l.co", "a-long-enough-passphrase").await;
+        let (c1, _) = login_only(&h.router, "l@l.co", "a-long-enough-passphrase").await;
+        let (c2, _) = login_only(&h.router, "l@l.co", "a-long-enough-passphrase").await;
+        let (st, _, v) = raw(&h.router, "GET", "/me/sessions", &[("cookie", c1)], None).await;
+        assert_eq!(st, StatusCode::OK, "{v}");
+        let rows = v["sessions"]
+            .as_array()
+            .unwrap_or_else(|| panic!("list: {v}"));
+        assert_eq!(rows.len(), 2, "two live sessions");
+        assert!(
+            rows.iter()
+                .all(|r| uuid::Uuid::parse_str(r["id"].as_str().unwrap_or_default()).is_ok()),
+            "opaque public ids only: {rows:?}"
+        );
+        assert!(
+            rows.iter().all(|r| r.get("session_id").is_none()),
+            "the internal id never serializes: {rows:?}"
+        );
+        let currents: Vec<String> = rows
+            .iter()
+            .filter(|r| r["current"] == true)
+            .map(|r| r["id"].as_str().unwrap_or_default().to_string())
+            .collect();
+        assert_eq!(currents.len(), 1, "exactly one row is the requester's");
+        // From c2's view a different row is current.
+        let (st, _, v) = raw(&h.router, "GET", "/me/sessions", &[("cookie", c2)], None).await;
+        assert_eq!(st, StatusCode::OK);
+        let other: Vec<String> = v["sessions"]
+            .as_array()
+            .unwrap_or_else(|| panic!("list: {v}"))
+            .iter()
+            .filter(|r| r["current"] == true)
+            .map(|r| r["id"].as_str().unwrap_or_default().to_string())
+            .collect();
+        assert_eq!(other.len(), 1);
+        assert_ne!(other[0], currents[0], "the flag follows the requester");
+    }
+
+    /// Revoke-one by public_id is bound to the account inside the
+    /// store's lookup: another account's id answers the same 404 as an
+    /// unknown one — and the foreign session lives on. Proves
+    /// `session-idor`.
+    #[tokio::test]
+    async fn s32_revoke_one_session() {
+        let store = Arc::new(Memory::new());
+        let h = harness_store(false, None, Some(store.clone()));
+        signup_only(&h.router, "a@a.co", "a-long-enough-passphrase").await;
+        signup_only(&h.router, "b@b.co", "a-long-enough-passphrase").await;
+        let (ca, csrf_a) = login_only(&h.router, "a@a.co", "a-long-enough-passphrase").await;
+        let (cb, csrf_b) = login_only(&h.router, "b@b.co", "a-long-enough-passphrase").await;
+        let sa = session_public_ids(&h.router, &ca).await;
+        let sb = session_public_ids(&h.router, &cb).await;
+        assert_eq!(sa.len(), 1);
+        assert_eq!(sb.len(), 1);
+        // A revoking B's id → 404, and B's session still resolves.
+        let (st, _, _) = raw(
+            &h.router,
+            "DELETE",
+            &format!("/me/sessions/{}", sb[0]),
+            &[("cookie", ca.clone()), ("x-durable-csrf", csrf_a.clone())],
+            None,
+        )
+        .await;
+        assert_eq!(st, StatusCode::NOT_FOUND, "no cross-account session write");
+        let (st, _, _) = raw(
+            &h.router,
+            "GET",
+            "/auth/session",
+            &[("cookie", cb.clone())],
+            None,
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK, "the victim session lives");
+        // An unknown id reads identically.
+        let (st, _, _) = raw(
+            &h.router,
+            "DELETE",
+            &format!("/me/sessions/{}", uuid::Uuid::now_v7()),
+            &[("cookie", ca), ("x-durable-csrf", csrf_a)],
+            None,
+        )
+        .await;
+        assert_eq!(st, StatusCode::NOT_FOUND);
+        // B revoking its own → 204 and B's cached grant dies at once.
+        let (st, _, _) = raw(
+            &h.router,
+            "DELETE",
+            &format!("/me/sessions/{}", sb[0]),
+            &[("cookie", cb.clone()), ("x-durable-csrf", csrf_b)],
+            None,
+        )
+        .await;
+        assert_eq!(st, StatusCode::NO_CONTENT);
+        let (st, _, _) = raw(&h.router, "GET", "/auth/session", &[("cookie", cb)], None).await;
+        assert_eq!(st, StatusCode::UNAUTHORIZED);
+    }
+
+    /// Revoke-all-but-current: the victims' cached grants die with the
+    /// account bump, the requester's is re-warmed and keeps working.
+    #[tokio::test]
+    async fn s32_revoke_all_but_current() {
+        let store = Arc::new(Memory::new());
+        let h = harness_store(false, None, Some(store.clone()));
+        signup_only(&h.router, "all@all.co", "a-long-enough-passphrase").await;
+        let (c1, csrf1) = login_only(&h.router, "all@all.co", "a-long-enough-passphrase").await;
+        let (c2, _) = login_only(&h.router, "all@all.co", "a-long-enough-passphrase").await;
+        let (c3, _) = login_only(&h.router, "all@all.co", "a-long-enough-passphrase").await;
+        // Prime every grant into the cache — the victims must die in
+        // cache too, not just in the store.
+        for c in [&c1, &c2, &c3] {
+            let (st, _, _) = raw(
+                &h.router,
+                "GET",
+                "/auth/session",
+                &[("cookie", c.clone())],
+                None,
+            )
+            .await;
+            assert_eq!(st, StatusCode::OK);
+        }
+        let (st, _, v) = raw(
+            &h.router,
+            "DELETE",
+            "/me/sessions",
+            &[("cookie", c1.clone()), ("x-durable-csrf", csrf1)],
+            None,
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK, "{v}");
+        assert_eq!(v["revoked"], 2);
+        for c in [c2, c3] {
+            let (st, _, _) = raw(&h.router, "GET", "/auth/session", &[("cookie", c)], None).await;
+            assert_eq!(st, StatusCode::UNAUTHORIZED, "the victim dies in cache too");
+        }
+        let (st, _, _) = raw(&h.router, "GET", "/auth/session", &[("cookie", c1)], None).await;
+        assert_eq!(st, StatusCode::OK, "the requester keeps its session");
+    }
+
+    /// Password change: re-auth gates it (wrong current → 403, nothing
+    /// mutated), then one transaction installs the hash and revokes
+    /// every session — the caller leaves with a rotated cookie and the
+    /// account's other session dies too.
+    #[tokio::test]
+    async fn s32_password_change_reauths_and_rotates() {
+        let store = Arc::new(Memory::new());
+        let h = harness_store(false, None, Some(store.clone()));
+        signup_and_verify(&h.router, &store, "pw@pw.co", "a-long-enough-passphrase").await;
+        let (c1, csrf1) = login_only(&h.router, "pw@pw.co", "a-long-enough-passphrase").await;
+        let (c2, _) = login_only(&h.router, "pw@pw.co", "a-long-enough-passphrase").await;
+        // Prime both grants in the cache.
+        for c in [&c1, &c2] {
+            let (st, _, _) = raw(
+                &h.router,
+                "GET",
+                "/auth/session",
+                &[("cookie", c.clone())],
+                None,
+            )
+            .await;
+            assert_eq!(st, StatusCode::OK);
+        }
+        // Re-auth: the wrong current password is refused and mutates
+        // nothing.
+        let (st, _, v) = raw(
+            &h.router,
+            "POST",
+            "/me/password",
+            &[("cookie", c1.clone()), ("x-durable-csrf", csrf1.clone())],
+            Some(json!({"current_password": "the-wrong-passphrase", "new_password": "a-new-long-passphrase"})),
+        )
+        .await;
+        assert_eq!(st, StatusCode::FORBIDDEN, "{v}");
+        assert_eq!(v["code"], "invalid_credentials");
+        let (st, _, _) = raw(
+            &h.router,
+            "GET",
+            "/auth/session",
+            &[("cookie", c1.clone())],
+            None,
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK, "a refused change mutates nothing");
+        // The right pair: new hash + every session revoked in one
+        // transaction; the response carries the rotated cookie.
+        let (st, heads, v) = raw(
+            &h.router,
+            "POST",
+            "/me/password",
+            &[("cookie", c1.clone()), ("x-durable-csrf", csrf1)],
+            Some(json!({"current_password": "a-long-enough-passphrase", "new_password": "a-new-long-passphrase"})),
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK, "{v}");
+        assert_eq!(v["changed"], true);
+        assert!(v["csrf"].is_string(), "the new session's csrf");
+        let new_cookie = heads
+            .get(header::SET_COOKIE)
+            .and_then(|v| v.to_str().ok())
+            .map(cookie_header)
+            .unwrap_or_else(|| panic!("a rotated cookie is set: {heads:?}"));
+        assert_ne!(new_cookie, c1, "the session token rotated");
+        let new_cookie_for_list = new_cookie.clone();
+        // Every old grant is dead — in store AND cache — immediately.
+        for c in [c1, c2] {
+            let (st, _, _) = raw(&h.router, "GET", "/auth/session", &[("cookie", c)], None).await;
+            assert_eq!(st, StatusCode::UNAUTHORIZED);
+        }
+        let (st, _, v) = raw(
+            &h.router,
+            "GET",
+            "/auth/session",
+            &[("cookie", new_cookie)],
+            None,
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK, "{v}");
+        // The old password can't sign in; the new one can.
+        let (st, _, _) = raw(
+            &h.router,
+            "POST",
+            "/auth/login",
+            &[],
+            Some(json!({"email": "pw@pw.co", "password": "a-long-enough-passphrase"})),
+        )
+        .await;
+        assert_eq!(st, StatusCode::UNAUTHORIZED);
+        let (_, _) = login_only(&h.router, "pw@pw.co", "a-new-long-passphrase").await;
+        // And the sessions list shows only the live rows — the revoked
+        // ones never list.
+        let ids = session_public_ids(&h.router, &new_cookie_for_list).await;
+        assert_eq!(ids.len(), 2, "the rotated session + the fresh login");
+    }
+
+    /// The injected clock proves idle expiry: use slides the deadline
+    /// (the flush lands it in the store), disuse lets it die — even
+    /// inside the absolute window. Proves `idle-timeout`.
+    #[tokio::test]
+    async fn s32_idle_slides_then_times_out() {
+        let store = Arc::new(Memory::new());
+        let h = harness_store(false, None, Some(store.clone()));
+        let t0 = 1_700_000_000_000i64;
+        h.app
+            .now_override_ms
+            .store(t0, std::sync::atomic::Ordering::Relaxed);
+        let (cookie, _) = sign_in(&h.router, "i@i.co", "a-long-enough-passphrase").await;
+        let set_now = |t: i64| {
+            h.app
+                .now_override_ms
+                .store(t, std::sync::atomic::Ordering::Relaxed)
+        };
+        let probe = |cookie: &str| {
+            let r = h.router.clone();
+            let c = cookie.to_string();
+            async move {
+                raw(&r, "GET", "/auth/session", &[("cookie", c)], None)
+                    .await
+                    .0
+            }
+        };
+        // Use at t0+1 keeps it alive to t0+IDLE+1 — a pending touch is
+        // a live floor before the store ever sees it.
+        set_now(t0 + 1);
+        assert_eq!(probe(&cookie).await, StatusCode::OK);
+        set_now(t0 + SESSION_IDLE_MS);
+        assert_eq!(
+            probe(&cookie).await,
+            StatusCode::OK,
+            "the touch slid the idle deadline"
+        );
+        // Flush lands the slide in the store.
+        flush_session_touches(&h.app).await;
+        let account = store
+            .account_by_email("i@i.co")
+            .await
+            .unwrap_or_else(|e| panic!("{e}"))
+            .unwrap_or_else(|| panic!("account"));
+        let rows = store
+            .sessions_for_account(account.id, 10)
+            .await
+            .unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            rows[0].idle_expires_at_ms,
+            t0 + 2 * SESSION_IDLE_MS,
+            "the flushed slide moved the store's deadline"
+        );
+        // Disuse past that deadline dies — inside the absolute window.
+        set_now(t0 + 2 * SESSION_IDLE_MS + 1);
+        assert_eq!(probe(&cookie).await, StatusCode::UNAUTHORIZED);
+    }
+
+    /// Absolute expiry caps the slide: use right up to the boundary
+    /// keeps a session alive, but past `expires_at` no amount of use
+    /// revives it.
+    #[tokio::test]
+    async fn s32_absolute_expiry_caps_the_slide() {
+        let store = Arc::new(Memory::new());
+        let h = harness_store(false, None, Some(store.clone()));
+        let t0 = 1_700_000_000_000i64;
+        h.app
+            .now_override_ms
+            .store(t0, std::sync::atomic::Ordering::Relaxed);
+        let (cookie, _) = sign_in(&h.router, "abs@abs.co", "a-long-enough-passphrase").await;
+        let probe = |cookie: &str, at: i64| {
+            h.app
+                .now_override_ms
+                .store(at, std::sync::atomic::Ordering::Relaxed);
+            let r = h.router.clone();
+            let c = cookie.to_string();
+            async move {
+                raw(&r, "GET", "/auth/session", &[("cookie", c)], None)
+                    .await
+                    .0
+            }
+        };
+        // Stay active in steps under the idle window until just inside
+        // the absolute deadline — each step lands strictly inside the
+        // slide floor the previous touch set (a deadline equal to now
+        // is dead).
+        for at in [
+            t0 + SESSION_IDLE_MS / 2,
+            t0 + SESSION_IDLE_MS * 3 / 2 - 1,
+            t0 + SESSION_ABS_MS - 1,
+        ] {
+            assert_eq!(probe(&cookie, at).await, StatusCode::OK, "at {at}");
+        }
+        // One millisecond past: the pending slide floor outlives the
+        // absolute deadline, and the absolute deadline wins.
+        assert_eq!(
+            probe(&cookie, t0 + SESSION_ABS_MS + 1).await,
+            StatusCode::UNAUTHORIZED
+        );
+    }
+
+    /// Sign-in always mints a fresh server-chosen token — a cookie the
+    /// client arrived with can never become the session. Proves
+    /// `session-fixation`.
+    #[tokio::test]
+    async fn s32_login_never_adopts_a_planted_cookie() {
+        let store = Arc::new(Memory::new());
+        let h = harness_store(false, None, Some(store.clone()));
+        signup_only(&h.router, "f@f.co", "a-long-enough-passphrase").await;
+        // A structurally valid drs_ token the attacker prepared — it
+        // passes the tag check but the server never minted it.
+        let planted = mint_session_token(&h.app.session_key);
+        assert!(
+            session_token_hash(&h.app.session_key, &planted).is_some(),
+            "a valid planted value for the fixation attempt"
+        );
+        let (st, heads, v) = raw(
+            &h.router,
+            "POST",
+            "/auth/login",
+            &[("cookie", format!("{SESSION_COOKIE}={planted}"))],
+            Some(json!({"email": "f@f.co", "password": "a-long-enough-passphrase"})),
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK, "{v}");
+        let issued = heads
+            .get(header::SET_COOKIE)
+            .and_then(|v| v.to_str().ok())
+            .map(cookie_header)
+            .unwrap_or_else(|| panic!("login mints a cookie: {heads:?}"));
+        assert_ne!(
+            issued,
+            format!("{SESSION_COOKIE}={planted}"),
+            "the server chooses the session value"
+        );
+        // The planted value resolves no session — it was never minted
+        // server-side.
+        let (st, _, _) = raw(
+            &h.router,
+            "GET",
+            "/auth/session",
+            &[("cookie", format!("{SESSION_COOKIE}={planted}"))],
+            None,
+        )
+        .await;
+        assert_eq!(st, StatusCode::UNAUTHORIZED);
+    }
+
+    /// A reset revokes every session in the store's transaction and the
+    /// account bump makes the cache agree at once — the stale cookie
+    /// dies mid-flight, not at grant TTL. And the token is single-use:
+    /// the replay answers the one 410. Proves `reset-token-replay`.
+    #[tokio::test]
+    async fn s32_reset_kills_cached_sessions_and_replay_dies() {
+        let store = Arc::new(Memory::new());
+        let h = harness_store(false, None, Some(store.clone()));
+        signup_and_verify(&h.router, &store, "rs@rs.co", "a-long-enough-passphrase").await;
+        let (cookie, _) = login_only(&h.router, "rs@rs.co", "a-long-enough-passphrase").await;
+        // Prime the grant into the cache.
+        let (st, _, _) = raw(
+            &h.router,
+            "GET",
+            "/auth/session",
+            &[("cookie", cookie.clone())],
+            None,
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK);
+        let (st, _, _) = raw(
+            &h.router,
+            "POST",
+            "/auth/forgot",
+            &[],
+            Some(json!({"email": "rs@rs.co"})),
+        )
+        .await;
+        assert_eq!(st, StatusCode::ACCEPTED);
+        let token = mailed_token(&store, "reset", "rs@rs.co");
+        let (st, _, v) = raw(
+            &h.router,
+            "POST",
+            "/auth/reset",
+            &[],
+            Some(json!({"token": token, "password": "a-new-long-passphrase"})),
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK, "{v}");
+        // The cached grant died with the account bump — instantly.
+        let (st, _, _) = raw(
+            &h.router,
+            "GET",
+            "/auth/session",
+            &[("cookie", cookie)],
+            None,
+        )
+        .await;
+        assert_eq!(
+            st,
+            StatusCode::UNAUTHORIZED,
+            "reset kills the cached grant at once"
+        );
+        // And the consumed token replays to the one 410.
+        let (st, _, v) = raw(
+            &h.router,
+            "POST",
+            "/auth/reset",
+            &[],
+            Some(json!({"token": token, "password": "another-long-passphrase"})),
+        )
+        .await;
+        assert_eq!(st, StatusCode::GONE, "{v}");
+        assert_eq!(v["code"], "token_gone");
     }
 }
