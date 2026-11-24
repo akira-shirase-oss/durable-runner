@@ -2214,8 +2214,8 @@ fn check_request_origin(parts: &Parts) -> Result<(), ApiError> {
         .get("sec-fetch-site")
         .and_then(|v| v.to_str().ok())
     {
+        // ATTACK(csrf-open-post)
         if site != "same-origin" && site != "none" {
-            // ATTACK(csrf-open-post)
             return Err(csrf_failed());
         }
     }

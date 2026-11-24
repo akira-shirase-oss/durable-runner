@@ -81,6 +81,43 @@ if [ "$found" != "$defined" ]; then
   exit 1
 fi
 
+# Pre-flight, before ANY build: apply every row's substitution to the real
+# source and require it to change the marked line. A stale pattern or a
+# marker one line off its guard is a NO-OP that otherwise costs a whole
+# scratch rebuild per row to discover (CI run 45481961653). Same targeting
+# rule as mutate(): an inline marker mutates its own line, a standalone
+# `// ATTACK(<name>)` comment mutates the line below it.
+cat > "$work/selfcheck.py" <<'PY'
+import re, sys
+bad = []
+for row in sys.stdin:
+    row = row.rstrip("\n")
+    if not row:
+        continue
+    name, file, _target, _test, subst = row.split("|", 4)
+    pattern, replacement = subst.split("~~>", 1)
+    lines = open(file).read().split("\n")
+    tag = f"ATTACK({name})"
+    hits = [i for i, l in enumerate(lines) if tag in l]
+    changed = any(
+        re.sub(pattern, replacement, lines[t], count=1) != lines[t]
+        for i in hits
+        for t in [i if lines[i].split("//")[0].strip() else i + 1]
+    )
+    if not hits:
+        bad.append(f"{name}: no ATTACK marker found")
+    elif not changed:
+        bad.append(f"{name}: mutation changes nothing on its target line(s)")
+if bad:
+    for b in bad:
+        print(f"prove-attacks self-check: {b}", file=sys.stderr)
+    sys.exit(1)
+PY
+printf '%s\n' "${mutations[@]}" | python3 -I "$work/selfcheck.py" || {
+  echo "prove-attacks: a mutation row is a no-op — fix the pattern or the marker" >&2
+  exit 1
+}
+
 mutate() { # file marker pattern replacement
   python3 -I - "$work/$1" "$2" "$3" "$4" <<'PY'
 import re, sys
