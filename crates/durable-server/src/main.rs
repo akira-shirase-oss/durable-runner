@@ -2264,6 +2264,9 @@ struct BudgetInner {
     day: i64,
     sent: u32,
     cap: u32,
+    /// Sends the `verify` kind may not touch — kept so a sign-up flood
+    /// can never starve reset/invite/notice mail (S2-3).
+    reserve: u32,
     fails: u32,
     open_until_ms: i64,
 }
@@ -2275,21 +2278,29 @@ impl MailBudget {
                 day: 0,
                 sent: 0,
                 cap,
+                reserve: cap / 5,
                 fails: 0,
                 open_until_ms: 0,
             }),
         }
     }
 
-    /// Sends may proceed: budget left today and the breaker is closed.
-    fn open(&self, now_ms: i64) -> bool {
+    /// Sends may proceed: budget left for this kind today and the
+    /// breaker is closed. `verify` mails answer to cap-minus-reserve;
+    /// every other kind to the full cap.
+    fn open(&self, kind: &str, now_ms: i64) -> bool {
         let mut b = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         let day = now_ms / 86_400_000;
         if b.day != day {
             b.day = day;
             b.sent = 0;
         }
-        b.sent < b.cap && b.open_until_ms <= now_ms
+        let cap = if kind == "verify" {
+            b.cap.saturating_sub(b.reserve)
+        } else {
+            b.cap
+        };
+        b.sent < cap && b.open_until_ms <= now_ms
     }
 
     fn sent(&self, now_ms: i64) {
@@ -2331,7 +2342,7 @@ async fn drain_outbox_once(app: &App) -> usize {
     let mut sent = 0;
     for row in claimed {
         // ATTACK(mail-global)
-        if !app.mail_budget.open(unix_ms()) {
+        if !app.mail_budget.open(row.mail.kind, unix_ms()) {
             break; // claimed rows stay 'sending' — reclaimable later
         }
         let res = tokio::time::timeout(OUTBOX_SEND_DEADLINE, app.mailer.send(&row.mail)).await;
@@ -2728,7 +2739,7 @@ impl ArgonQueue {
     ) -> Result<T, ApiError> {
         {
             let mut addrs = self.addrs.lock().unwrap_or_else(|e| e.into_inner());
-            if !addrs.insert(addr) {
+            if !addrs.insert(client_prefix(addr)) {
                 return Err(Self::busy());
             }
         }
@@ -3222,8 +3233,8 @@ async fn auth_signup(
 ) -> Result<Response, ApiError> {
     check_request_origin(&parts)?;
     let addr = client(&parts);
-    AuthLimits::check(&app.auth_limits.signup_hour, addr)?;
-    AuthLimits::check(&app.auth_limits.signup_day, addr)?;
+    AuthLimits::check(&app.auth_limits.signup_hour, client_prefix(addr))?;
+    AuthLimits::check(&app.auth_limits.signup_day, client_prefix(addr))?;
     let Some(email) = normalize_email(&req.email) else {
         return Err(ApiError::new(
             StatusCode::BAD_REQUEST,
@@ -3368,7 +3379,7 @@ async fn auth_login(
             return Err(e);
         }
     }
-    AuthLimits::check(&app.auth_limits.login, addr)?;
+    AuthLimits::check(&app.auth_limits.login, client_prefix(addr))?;
     // Unknown address: verify the dummy PHC — identical work, no oracle.
     let phc = account
         .as_ref()
@@ -3508,7 +3519,7 @@ async fn auth_verify(
     J(req): J<VerifyReq>,
 ) -> Result<Response, ApiError> {
     check_request_origin(&parts)?;
-    AuthLimits::check(&app.auth_limits.redeem, client(&parts))?;
+    AuthLimits::check(&app.auth_limits.redeem, client_prefix(client(&parts)))?;
     let Some(store) = app.keyring.store.clone() else {
         return Err(ApiError::new(
             StatusCode::NOT_FOUND,
@@ -3563,7 +3574,7 @@ async fn auth_resend_verification(
     J(req): J<EmailReq>,
 ) -> Result<Response, ApiError> {
     check_request_origin(&parts)?;
-    AuthLimits::check(&app.auth_limits.mail_req, client(&parts))?;
+    AuthLimits::check(&app.auth_limits.mail_req, client_prefix(client(&parts)))?;
     let res = accepted_sent();
     let (Some(store), Some(email)) = (app.keyring.store.clone(), normalize_email(&req.email))
     else {
@@ -3650,7 +3661,7 @@ async fn auth_reset(
 ) -> Result<Response, ApiError> {
     check_request_origin(&parts)?;
     let addr = client(&parts);
-    AuthLimits::check(&app.auth_limits.redeem, addr)?;
+    AuthLimits::check(&app.auth_limits.redeem, client_prefix(addr))?;
     if let Some(why) = durable_accounts::password::policy_refusal(&req.password) {
         return Err(ApiError::new(StatusCode::BAD_REQUEST, "bad_input", why));
     }
@@ -6548,7 +6559,7 @@ async fn test_call_run(
         .test_calls_addr
         .lock()
         .unwrap_or_else(|e| e.into_inner())
-        .check(addr, Instant::now())
+        .check(client_prefix(addr), Instant::now())
     {
         return Err(ApiError::new(
             StatusCode::TOO_MANY_REQUESTS,
@@ -19521,6 +19532,46 @@ mod tests {
             assert!(!valid_ws_name(bad), "{bad:?}");
         }
         assert!(valid_ws_name("Team Ω (west)"));
+    }
+
+    /// S2-3: address-keyed limiters bucket IPv6 by /64 — one host
+    /// rotating through its /64 can't multiply the budget; a /64 away
+    /// is a different client. And the mail budget's reserve keeps
+    /// reset-kind mail deliverable through a verify flood.
+    #[test]
+    fn s2d_prefix_keyed_limits_and_mail_reserve() {
+        let a1: std::net::IpAddr = "2001:db8:ffff:aaaa::1".parse().unwrap_or_else(|e| panic!("{e}"));
+        let a2: std::net::IpAddr = "2001:db8:ffff:aaaa::2".parse().unwrap_or_else(|e| panic!("{e}"));
+        let b: std::net::IpAddr = "2001:db8:ffff:bbbb::1".parse().unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(client_prefix(a1), client_prefix(a2), "same /64");
+        assert_ne!(client_prefix(a1), client_prefix(b), "different /64");
+        let v4a: std::net::IpAddr = "203.0.113.7".parse().unwrap_or_else(|e| panic!("{e}"));
+        let v4b: std::net::IpAddr = "203.0.113.99".parse().unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(client_prefix(v4a), client_prefix(v4b), "same /24");
+
+        // SlidingWindow keyed on the PREFIX shares the bucket.
+        let mut w = SlidingWindow::new(1, Duration::from_secs(60));
+        assert!(w.check(client_prefix(a1), Instant::now()).is_ok());
+        assert!(
+            w.check(client_prefix(a2), Instant::now()).is_err(),
+            "the /64 sibling hits the same bucket"
+        );
+        assert!(
+            w.check(client_prefix(b), Instant::now()).is_ok(),
+            "a different /64 has its own"
+        );
+
+        // The reserve: `verify` mail stops at cap-reserve while other
+        // kinds still go.
+        let budget = MailBudget::new(10);
+        let now = unix_ms();
+        for _ in 0..8 {
+            assert!(budget.open("verify", now), "verify spends its share");
+            budget.sent(now);
+        }
+        assert!(!budget.open("verify", now), "verify hit cap-reserve");
+        assert!(budget.open("reset", now), "the reserve kept a slot");
+        assert!(budget.open("invite", now));
     }
 
     /// S2-2 stopgaps, each with its named envelope: ≤3 owned
