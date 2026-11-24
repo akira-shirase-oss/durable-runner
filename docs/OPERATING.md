@@ -44,6 +44,9 @@ target/release/durable-server \
   size, as the review saw on the HTTP server. The 512 MiB default keeps
   that within 1.5 GiB of a 2 GB host. On a bigger host raise
   `--max-index-bytes` in proportion, and leave the OS at least 0.5 GiB.
+  The observability layer (D-058) adds at most about 65 MiB plus 0.4 MiB
+  per registered handler on top, whatever the traffic — see
+  "Observability" below; it fits in the 100 MiB term, but uses most of it.
 
   *Capacity arithmetic.* A run is charged `160 + key + Σ(48 + step name +
   handler name) + input` bytes while it is live. When it finishes its
@@ -88,7 +91,9 @@ target/release/durable-server \
   `POST /admin/compact`, `POST /admin/backup`, `GET /admin/diagnostics` —
   needs `Authorization: Bearer $DURABLE_API_KEY`, else `401
   {"code":"unauthorized"}`.
-- **Reads need a key too** (D-037): `GET /jobs` and `GET /jobs/{id}` take
+- **Reads need a key too** (D-037): `GET /jobs`, `GET /jobs/{id}` and the
+  observability reads (`GET /metrics`, `GET /jobs/{id}/events`,
+  `GET /events`, D-058) take
   the API key or the optional read-only `DURABLE_READ_KEY` (at least 32
   characters, different from the API key; it gets `403 forbidden` on
   every other route). Give the inspector or a dashboard the read key, not
@@ -164,6 +169,9 @@ $CLI list --newest --limit 50         # newest first; continue with --before <ne
 $CLI cancel --run 1
 $CLI compact
 $CLI backup --name nightly-1          # -> data/backups/nightly-1
+$CLI metrics --window 15m             # GET /metrics (15m, 1h, 6h, 24h)
+$CLI events --limit 20                # GET /events: the activity feed
+$CLI events --run 1                   # GET /jobs/1/events: one run's timeline
 ```
 
 Bounds a submit must respect (refused `409 {"code":"over_limits"}`
@@ -184,6 +192,81 @@ the next attempt or the next server start removes.
 `--op-key` is the dedup contract: resubmitting the same key returns the
 same run id, nothing re-executes. Cancel stops scheduling — it never
 undoes a remote effect already attempted.
+
+## Observability (D-058)
+
+Three reads, each taking the read key or the API key (or nothing under
+`--open-reads`, loopback Host only), rate-limited per address like every
+request, and answered with `Cache-Control: no-store`. All of it is derived
+in memory from the journal and bounded; nothing here is authority, and
+nothing shows a job's input, a checkpoint's output, or a record before
+its fsync returned.
+
+- `GET /metrics?window=15m|1h|6h|24h` (default `1h`; anything else, or
+  the parameter twice, is `400 invalid_window`). 15m and 1h are 10-second
+  buckets from a 360-bucket ring, 6h and 24h 60-second buckets from a
+  1,440-bucket ring. `points` holds every bucket of the window, oldest
+  first, the last being the one in progress (`t` is a bucket's start);
+  idle buckets are zeros. Counters: `accepted` (new runs committed),
+  `deduplicated` (a submit answered with its op_key's existing run),
+  `refused` (submits refused `429 rate_limited`, `503 at_capacity`,
+  `503 busy`, `503 no_space`, `409 over_limits` or `409
+  unregistered_handler` — not malformed bodies, missing keys or
+  timeouts), `completed`/`failed`/`cancelled` (runs that reached that
+  state), `dispatched` (attempts started, a chained step's checkpoint
+  included), `steps_ok`, `steps_failed`, `replies_lost`, `reconciled` —
+  each counted from its durable journal record. Gauges (`live_runs` =
+  retained runs, `active_runs` = non-terminal, `in_flight` = handler
+  calls) are sampled every second, the last sample in a bucket winning,
+  and are `null` for a bucket never sampled (before `since`, the
+  server's start: metrics do not survive a restart). `step_ms` is the
+  dispatch-to-answer latency of the attempts that ended in the bucket:
+  `p50`/`p95` are the upper bound of the 47-bucket log histogram's bucket
+  that holds them (1, 2, 3, 4, 5, 6, 8, 10, 12, 15, 20 … 60,000 ms, then
+  overflow), capped at the exact `max` — so they over-report by at most
+  one bucket width (a third, above 4 ms). `states` are the current
+  counts by state (the same as `/admin/diagnostics`, all seven keys).
+  `handlers` lists every registered handler by name with its calls,
+  `ok`, `failed`, `replies_lost` (a reply that vanished, a timeout, or a
+  call cut off at its deadline) and `step_ms` over the window, and its
+  latest `last_ok_at` / `last_failure_at` since `since`.
+- `GET /jobs/{id}/events`: one run's timeline in commit order — kinds
+  `accepted`, `dispatched`, `checkpointed`, `step_failed`, `reply_lost`,
+  `reconciled`, `cancel_requested`, and the derived `finished` (`outcome`
+  done/failed/cancelled, at the time of the record that ended the run).
+  `404 not_found` exactly when `GET /jobs/{id}` is. `complete: false`
+  says why the history is short: `compacted` (the server started from a
+  snapshot that folded the earlier events; a run accepted after it is
+  complete), `evicted` (the timeline store dropped the run; what came
+  after is shown), or `truncated` (over 96 events: the first 16 and the
+  last 80 are kept).
+- `GET /events?limit=N` (1-200, default 50; else `400 invalid_limit`):
+  the activity feed across runs, newest first, the same events with
+  `run` and `key` added (`key` is `null` only for a run that has since
+  left the index). It and the timelines are rebuilt from replay at
+  startup; `since` is the server's start, as in `/metrics`.
+
+**Caps and memory** (constants in `durable-engine/src/observe.rs`):
+
+| Structure | Cap | Memory |
+|---|---|---|
+| Metrics rings | 360 × 10 s + 1,440 × 60 s buckets | 1,800 × 328 B ≈ 0.6 MiB |
+| Per-handler stats | the same rings per registered handler | 1,800 × 240 B ≈ 0.4 MiB each |
+| Run timelines | 20,000 runs (LRU on the last event) × 96 events | 32 B per event + 90 B per run; at most ≈ 60 MiB (every run past 96 events), ≈ 4-12 MiB when runs carry 3-10 events |
+| Activity feed | 1,000 events | 40 KiB |
+| Not-yet-durable observations | one per record not yet fsynced: the actor's outbox (16,384 records before it stops taking commands) plus the writer's queue (8 × 1,024) | 72 B each, about 1.7 MiB at the default bounds (and a reused hand-over buffer of about the same size) |
+
+So the worst case is about **65 MiB + 0.4 MiB per handler**, reached only
+when 20,000 runs each have more than 96 events, and it does not grow with
+traffic or uptime. Measured on the development laptop (a development
+observation, not capacity), with every structure filled to its cap and 10
+handlers, the probe's resident size grew about 66 MiB against a
+size-based bound of 65 MiB; feeding the observer cost about 66 ns per event, eviction
+churn included, which is what replay adds per record at startup:
+
+```sh
+cargo test --release -p durable-engine --test observe_probe -- --ignored --nocapture
+```
 
 ## Crash drills
 
