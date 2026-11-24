@@ -6822,6 +6822,29 @@ fn check_ops_listen(ops_listen: &Option<String>) -> Result<()> {
     }
 }
 
+/// `DURABLE_INVITE_ONLY` is a value, not a presence flag (deploy review):
+/// `1/true/yes/on` turns the gate on, `0/false/no/off`/empty off; any
+/// other spelling refuses the boot rather than silently gating sign-up.
+fn invite_only_env() -> Result<bool> {
+    invite_only_value(
+        std::env::var_os("DURABLE_INVITE_ONLY")
+            .map(|v| v.to_string_lossy().into_owned())
+            .as_deref(),
+    )
+}
+
+fn invite_only_value(raw: Option<&str>) -> Result<bool> {
+    let Some(raw) = raw else { return Ok(false) };
+    let v = raw.trim().to_ascii_lowercase();
+    match v.as_str() {
+        "1" | "true" | "yes" | "on" => Ok(true),
+        "" | "0" | "false" | "no" | "off" => Ok(false),
+        _ => anyhow::bail!(
+            "DURABLE_INVITE_ONLY={v:?} is not a boolean; use 1/true/yes/on or 0/false/no/off (or unset)"
+        ),
+    }
+}
+
 fn check_open_reads(listen: &str, open_reads: bool) -> Result<()> {
     if !open_reads {
         return Ok(());
@@ -7020,7 +7043,7 @@ async fn main() -> Result<()> {
         mail_budget: std::sync::Arc::new(MailBudget::new(mailout::mail_budget_from_env(
             MAIL_DAILY_BUDGET,
         ))),
-        invite_only: std::env::var_os("DURABLE_INVITE_ONLY").is_some(),
+        invite_only: invite_only_env()?,
         public_origin: args.public_origin.clone(),
         now_override_ms: std::sync::Arc::new(std::sync::atomic::AtomicI64::new(0)),
         pubid,
@@ -19053,5 +19076,35 @@ mod tests {
             );
         }
         assert!(check_ops_listen(&None).is_ok());
+    }
+
+    /// `DURABLE_INVITE_ONLY` is parsed, not presence-checked: every on
+    /// spelling gates, every off spelling doesn't, junk refuses to boot.
+    #[test]
+    fn invite_only_env_parses_values() {
+        for (v, want) in [
+            ("1", true),
+            ("true", true),
+            ("TRUE", true),
+            ("yes", true),
+            ("on", true),
+            (" ON ", true),
+            ("0", false),
+            ("false", false),
+            ("no", false),
+            ("off", false),
+            ("", false),
+            ("  ", false),
+        ] {
+            let got = invite_only_value(Some(v));
+            assert_eq!(got.ok(), Some(want), "DURABLE_INVITE_ONLY={v:?}");
+        }
+        for bad in ["2", "enable", "enabled", "y", "n", "t", "f"] {
+            assert!(
+                invite_only_value(Some(bad)).is_err(),
+                "DURABLE_INVITE_ONLY={bad:?} must refuse the boot"
+            );
+        }
+        assert_eq!(invite_only_value(None).ok(), Some(false));
     }
 }
