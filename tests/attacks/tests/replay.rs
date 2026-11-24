@@ -12,12 +12,12 @@ use durable_attacks::*;
 async fn a_replayed_submit_returns_the_same_run() {
     let s = spawn(&[]).await;
     let c = http();
-    let (s1, run1) = submit(&c, &s.base, OPS_KEY, "replay-me").await;
+    let (s1, run1) = submit(&c, &s.ops_base, OPS_KEY, "replay-me").await;
     assert_eq!(s1, 200, "first submit failed");
     let run1 = run1.unwrap_or_else(|| panic!("no run id"));
 
     // The replay: same op_key, same spec — byte-for-byte the first POST.
-    let (s2, run2) = submit(&c, &s.base, OPS_KEY, "replay-me").await;
+    let (s2, run2) = submit(&c, &s.ops_base, OPS_KEY, "replay-me").await;
     assert_eq!(s2, 200, "the replayed submit must still be answered");
     // DECISIVE(submit-dedup)
     assert_eq!(
@@ -27,12 +27,12 @@ async fn a_replayed_submit_returns_the_same_run() {
     );
 
     // And again, harder — a third replay proves it stays deduplicated.
-    let (_, run3) = submit(&c, &s.base, OPS_KEY, "replay-me").await;
+    let (_, run3) = submit(&c, &s.ops_base, OPS_KEY, "replay-me").await;
     assert_eq!(run3.as_deref(), Some(run1.as_str()));
 
     // Re-read the workspace: exactly one run exists for the replayed key.
     let l = c
-        .get(format!("{}/jobs", s.base))
+        .get(format!("{}/jobs", s.ops_base))
         .bearer_auth(OPS_KEY)
         .send()
         .await
@@ -50,7 +50,7 @@ async fn a_replayed_handler_put_stays_one_entry() {
     let c = http();
     for i in 0..3 {
         let r = c
-            .put(format!("{}/handlers/rep", s.base))
+            .put(format!("{}/handlers/rep", s.ops_base))
             .bearer_auth(OPS_KEY)
             .json(&serde_json::json!({ "url": "http://8.8.8.8/hook" }))
             .send()
@@ -59,7 +59,7 @@ async fn a_replayed_handler_put_stays_one_entry() {
         assert_eq!(r.status().as_u16(), 200, "replayed PUT must stay answered");
     }
     let l = c
-        .get(format!("{}/handlers", s.base))
+        .get(format!("{}/handlers", s.ops_base))
         .bearer_auth(OPS_KEY)
         .send()
         .await

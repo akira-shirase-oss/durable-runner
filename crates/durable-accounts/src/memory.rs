@@ -65,6 +65,7 @@ struct KeyRow {
     revoked: bool,
     last_used_at_ms: Option<i64>,
     created_by: Option<u64>,
+    created_at_ms: i64,
 }
 
 impl KeyRow {
@@ -82,6 +83,7 @@ impl KeyRow {
             created_by: self
                 .created_by
                 .and_then(|a| inner.accounts.get(&a).map(|acc| acc.public_id)),
+            created_at_ms: self.created_at_ms,
         }
     }
 }
@@ -130,6 +132,7 @@ struct InviteRow {
     invited_by: u64,
     token_hash: [u8; 32],
     expires_at_ms: i64,
+    created_at_ms: i64,
     accepted: bool,
     revoked: bool,
 }
@@ -221,6 +224,7 @@ impl Memory {
                 invited_by: 0,
                 token_hash,
                 expires_at_ms,
+                created_at_ms: now_ms(),
                 accepted: false,
                 revoked: false,
             },
@@ -352,6 +356,14 @@ impl AccountStore for Memory {
                 "workspace {workspace} does not exist"
             )));
         }
+        let live = inner
+            .keys
+            .values()
+            .filter(|k| k.workspace == workspace && !k.revoked)
+            .count() as u64;
+        if live >= crate::STOPGAP_KEYS_PER_WS {
+            return Err(AccountError::PlanLimit("api_keys"));
+        }
         let id = self.next_key.fetch_add(1, Ordering::Relaxed);
         let public_id = uuid::Uuid::now_v7();
         inner.keys.insert(
@@ -366,6 +378,7 @@ impl AccountStore for Memory {
                 revoked: false,
                 last_used_at_ms: None,
                 created_by,
+                created_at_ms: now_ms(),
             },
         );
         Ok(inner
@@ -457,6 +470,7 @@ impl AccountStore for Memory {
                 revoked: false,
                 last_used_at_ms: None,
                 created_by,
+                created_at_ms: now_ms(),
             },
         );
         let info = inner
@@ -864,6 +878,19 @@ impl AccountStore for Memory {
     ) -> Result<Workspace, AccountError> {
         // One atomic write: the row and its owner member row land or
         // neither does — an ownerless workspace can never exist.
+        // The stopgap cap counts every owned row — a soft-deleted ws
+        // keeps its seat until the purge (S2-2).
+        {
+            let inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+            let owned = inner
+                .members
+                .iter()
+                .filter(|((_, acc), m)| *acc == account && m.role == crate::Role::Owner)
+                .count() as u64;
+            if owned >= crate::STOPGAP_WS_PER_ACCOUNT {
+                return Err(AccountError::PlanLimit("workspaces_per_account"));
+            }
+        }
         let workspace = self.create_workspace(name).await?;
         let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         inner.members.insert(
@@ -1012,6 +1039,15 @@ impl AccountStore for Memory {
         if dup {
             return Ok(None);
         }
+        let day_ago = now_ms() - 86_400_000;
+        let today = inner
+            .invites
+            .values()
+            .filter(|i| i.workspace == workspace && i.created_at_ms > day_ago)
+            .count() as u64;
+        if today >= crate::STOPGAP_INVITES_PER_WS_DAY {
+            return Err(AccountError::PlanLimit("invites_per_day"));
+        }
         let invite = crate::WorkspaceInvite {
             public_id: uuid::Uuid::now_v7(),
             email: email.to_string(),
@@ -1029,6 +1065,7 @@ impl AccountStore for Memory {
                 invited_by,
                 token_hash: *token_hash,
                 expires_at_ms,
+                created_at_ms: now_ms(),
                 accepted: false,
                 revoked: false,
             },
@@ -1157,6 +1194,33 @@ impl AccountStore for Memory {
             }
         }
         Ok(inner.accounts.get(&account).cloned())
+    }
+
+    async fn peek_verify_token(
+        &self,
+        token_hash: &[u8; 32],
+    ) -> Result<Option<crate::VerifyPeek>, AccountError> {
+        self.check_up()?;
+        let inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        let now = now_ms();
+        // The same live check consume_verify_token applies — a dead
+        // token peeks as nothing, so the route's 410 stays honest.
+        let Some(token) = inner.email_tokens.values().find(|t| {
+            t.hash == *token_hash
+                && t.kind == "verify"
+                && !t.consumed
+                && !t.superseded
+                && t.expires_at_ms > now
+        }) else {
+            return Ok(None);
+        };
+        let password_hash = token.password_hash.clone().or_else(|| {
+            inner
+                .accounts
+                .get(&token.account)
+                .and_then(|a| a.password_hash.clone())
+        });
+        Ok(Some(crate::VerifyPeek { password_hash }))
     }
 
     async fn consume_reset_token(
@@ -1379,6 +1443,10 @@ impl AccountStore for Memory {
             MailOutcome::Sent => {
                 if row.status == "pending" || row.status == "sending" {
                     row.status = "sent";
+                    // The body holds the mailed secret — keep it no
+                    // longer than needed (S3 cheap).
+                    row.mail.text.clear();
+                    row.mail.html.clear();
                 }
             }
             MailOutcome::Retry {
@@ -1393,6 +1461,8 @@ impl AccountStore for Memory {
             MailOutcome::Failed { error } => {
                 row.status = "failed";
                 row.last_error = Some(error);
+                row.mail.text.clear();
+                row.mail.html.clear();
             }
         }
         Ok(())

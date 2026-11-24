@@ -130,6 +130,7 @@ fn key_info_from(row: &sqlx::postgres::PgRow) -> Result<ApiKeyInfo, AccountError
         // the store is the account's public_id (selected as
         // created_by_pid by the caller's LEFT JOIN).
         created_by: row.try_get::<Option<uuid::Uuid>, _>("created_by_pid")?,
+        created_at_ms: ms(row.try_get::<time::OffsetDateTime, _>("created_at")?),
     })
 }
 
@@ -264,12 +265,35 @@ impl AccountStore for Pg {
         prefix: &str,
         created_by: Option<u64>,
     ) -> Result<ApiKeyInfo, AccountError> {
+        // The cap lives in the transaction with the insert, behind a
+        // per-workspace advisory lock — two racing mints cannot both
+        // count 9 (S2-2). Live keys only; revoked rows don't count.
+        let mut tx = bounded(self.pool.begin()).await?;
+        bounded(
+            sqlx::query("SELECT pg_advisory_xact_lock($1)")
+                .bind(to_i64(workspace, "workspace")?)
+                .execute(&mut *tx),
+        )
+        .await?;
+        let live: i64 = bounded(
+            sqlx::query(
+                "SELECT COUNT(*) FROM api_keys \
+                 WHERE workspace_id = $1 AND revoked_at IS NULL",
+            )
+            .bind(to_i64(workspace, "workspace")?)
+            .fetch_one(&mut *tx),
+        )
+        .await?
+        .try_get(0)?;
+        if live as u64 >= crate::STOPGAP_KEYS_PER_WS {
+            return Err(AccountError::PlanLimit("api_keys"));
+        }
         let row = bounded(
             sqlx::query(
                 "INSERT INTO api_keys \
                  (workspace_id, name, key_hash, prefix, permission, created_by) \
                  VALUES ($1, $2, $3, $4, $5, $6) \
-                 RETURNING id, public_id, \
+                 RETURNING id, public_id, created_at, \
                      (SELECT public_id FROM accounts WHERE id = $6) AS created_by_pid",
             )
             .bind(to_i64(workspace, "workspace")?)
@@ -278,9 +302,10 @@ impl AccountStore for Pg {
             .bind(prefix)
             .bind(permission.as_str())
             .bind(created_by.map(|a| to_i64(a, "account")).transpose()?)
-            .fetch_one(&self.pool),
+            .fetch_one(&mut *tx),
         )
         .await?;
+        bounded(tx.commit()).await?;
         Ok(ApiKeyInfo {
             id: to_u64(row.try_get("id")?, "api key")?,
             public_id: row.try_get("public_id")?,
@@ -290,6 +315,7 @@ impl AccountStore for Pg {
             revoked: false,
             last_used_at_ms: None,
             created_by: row.try_get("created_by_pid")?,
+            created_at_ms: ms(row.try_get::<time::OffsetDateTime, _>("created_at")?),
         })
     }
 
@@ -327,7 +353,7 @@ impl AccountStore for Pg {
             sqlx::query(
                 "SELECT k.id, k.public_id, k.name, k.prefix, k.permission, \
                         (k.revoked_at IS NOT NULL) AS revoked, k.last_used_at, \
-                        a.public_id AS created_by_pid \
+                        k.created_at, a.public_id AS created_by_pid \
                  FROM api_keys k LEFT JOIN accounts a ON a.id = k.created_by \
                  WHERE k.workspace_id = $1 ORDER BY k.id",
             )
@@ -347,7 +373,7 @@ impl AccountStore for Pg {
             sqlx::query(
                 "SELECT k.id, k.public_id, k.name, k.prefix, k.permission, \
                         (k.revoked_at IS NOT NULL) AS revoked, k.last_used_at, \
-                        a.public_id AS created_by_pid \
+                        k.created_at, a.public_id AS created_by_pid \
                  FROM api_keys k LEFT JOIN accounts a ON a.id = k.created_by \
                  WHERE k.workspace_id = $1 AND k.public_id = $2 AND k.revoked_at IS NULL",
             )
@@ -399,7 +425,7 @@ impl AccountStore for Pg {
                 "INSERT INTO api_keys \
                  (workspace_id, name, key_hash, prefix, permission, created_by) \
                  VALUES ($1, $2, $3, $4, $5, $6) \
-                 RETURNING id, public_id, \
+                 RETURNING id, public_id, created_at, \
                      (SELECT public_id FROM accounts WHERE id = $6) AS created_by_pid",
             )
             .bind(to_i64(workspace, "workspace")?)
@@ -420,6 +446,7 @@ impl AccountStore for Pg {
             revoked: false,
             last_used_at_ms: None,
             created_by: row.try_get("created_by_pid")?,
+            created_at_ms: ms(row.try_get::<time::OffsetDateTime, _>("created_at")?),
         };
         bounded(tx.commit()).await?;
         Ok(Some((info, old_hash)))
@@ -975,7 +1002,26 @@ impl AccountStore for Pg {
     ) -> Result<Workspace, AccountError> {
         // One transaction: the workspace row and its owner member row
         // land or neither does — an ownerless workspace cannot exist.
+        // The advisory lock + the count are in that same transaction:
+        // two racing creates cannot both pass the stopgap cap (S2-2);
+        // soft-deleted rows count until the purge removes them.
         let mut tx = bounded(self.pool.begin()).await?;
+        bounded(
+            sqlx::query("SELECT pg_advisory_xact_lock($1)")
+                .bind(to_i64(account, "account")?)
+                .execute(&mut *tx),
+        )
+        .await?;
+        let owned: i64 = bounded(
+            sqlx::query("SELECT COUNT(*) FROM workspaces WHERE created_by = $1")
+                .bind(to_i64(account, "account")?)
+                .fetch_one(&mut *tx),
+        )
+        .await?
+        .try_get(0)?;
+        if owned as u64 >= crate::STOPGAP_WS_PER_ACCOUNT {
+            return Err(AccountError::PlanLimit("workspaces_per_account"));
+        }
         let public_id = uuid::Uuid::now_v7();
         let mut secret = [0u8; 32];
         getrandom::fill(&mut secret)
@@ -1191,6 +1237,29 @@ impl AccountStore for Pg {
         token_hash: &[u8; 32],
         expires_at_ms: i64,
     ) -> Result<Option<crate::WorkspaceInvite>, AccountError> {
+        // The daily cap and the dup check are one transaction behind a
+        // per-workspace advisory lock — a burst cannot race past the
+        // count (S2-2).
+        let mut tx = bounded(self.pool.begin()).await?;
+        bounded(
+            sqlx::query("SELECT pg_advisory_xact_lock($1)")
+                .bind(to_i64(workspace, "workspace")?)
+                .execute(&mut *tx),
+        )
+        .await?;
+        let today: i64 = bounded(
+            sqlx::query(
+                "SELECT COUNT(*) FROM invites \
+                 WHERE workspace_id = $1 AND created_at > now() - interval '1 day'",
+            )
+            .bind(to_i64(workspace, "workspace")?)
+            .fetch_one(&mut *tx),
+        )
+        .await?
+        .try_get(0)?;
+        if today as u64 >= crate::STOPGAP_INVITES_PER_WS_DAY {
+            return Err(AccountError::PlanLimit("invites_per_day"));
+        }
         let public_id = uuid::Uuid::now_v7();
         // `invites_pending` makes the live-dup refusal atomic: ON
         // CONFLICT (workspace_id, email) WHERE pending DO NOTHING.
@@ -1209,12 +1278,13 @@ impl AccountStore for Pg {
             .bind(to_i64(invited_by, "account")?)
             .bind(token_hash.as_slice())
             .bind(ts(expires_at_ms))
-            .execute(&self.pool),
+            .execute(&mut *tx),
         )
         .await?;
         if done.rows_affected() == 0 {
             return Ok(None);
         }
+        bounded(tx.commit()).await?;
         Ok(Some(crate::WorkspaceInvite {
             public_id,
             email: email.to_string(),
@@ -1396,6 +1466,28 @@ impl AccountStore for Pg {
         .and_then(|r| account_from(&r))?;
         bounded(tx.commit()).await?;
         Ok(Some(account))
+    }
+
+    async fn peek_verify_token(
+        &self,
+        token_hash: &[u8; 32],
+    ) -> Result<Option<crate::VerifyPeek>, AccountError> {
+        // Same live predicate as consume_verify_token — a dead token
+        // peeks as nothing so the route's 410 stays honest.
+        let row = bounded(
+            sqlx::query(
+                "SELECT COALESCE(t.password_hash, a.password_hash) AS phc                  FROM email_tokens t JOIN accounts a ON a.id = t.account_id                  WHERE t.token_hash = $1 AND t.kind = 'verify'                    AND t.consumed_at IS NULL AND t.superseded_at IS NULL                    AND t.expires_at > now()",
+            )
+            .bind(token_hash.as_slice())
+            .fetch_optional(&self.pool),
+        )
+        .await?;
+        let Some(row) = row else {
+            return Ok(None);
+        };
+        Ok(Some(crate::VerifyPeek {
+            password_hash: row.try_get("phc")?,
+        }))
     }
 
     async fn consume_reset_token(
@@ -1629,15 +1721,41 @@ impl AccountStore for Pg {
             .fetch_all(&self.pool),
         )
         .await?;
+        // An unknown kind dead-letters ITS row only — one poisoned row
+        // must never burn the batch's attempts (pre-deploy S2-1: a
+        // "workspace-invite" kind once failed every claim in the
+        // rhythm). The CHECK in 0003 makes new bad kinds impossible;
+        // this stays as the belt for any written before it landed.
+        let mut dead: Vec<i64> = Vec::new();
+        for r in &rows {
+            let kind: String = r.try_get("kind")?;
+            match kind.as_str() {
+                "verify" | "reset" | "invite" | "notice" => {}
+                _ => dead.push(r.try_get("id")?),
+            }
+        }
+        if !dead.is_empty() {
+            bounded(
+                sqlx::query(
+                    "UPDATE email_outbox SET status = 'failed',                          text = '', html = '', subject = ''                      WHERE id = ANY($1) AND status = 'sending'",
+                )
+                .bind(&dead)
+                .execute(&self.pool),
+            )
+            .await?;
+        }
         rows.iter()
+            .filter(|r| {
+                let kind: String = r.try_get("kind").unwrap_or_default();
+                matches!(kind.as_str(), "verify" | "reset" | "invite" | "notice")
+            })
             .map(|r| {
                 let kind: String = r.try_get("kind")?;
                 let kind: &'static str = match kind.as_str() {
                     "verify" => "verify",
                     "reset" => "reset",
                     "invite" => "invite",
-                    "notice" => "notice",
-                    other => return Err(AccountError::Store(format!("bad outbox kind {other:?}"))),
+                    _ => "notice",
                 };
                 Ok(crate::OutboxMail {
                     id: to_u64(r.try_get("id")?, "outbox")?,
@@ -1704,7 +1822,7 @@ impl AccountStore for Pg {
                 bounded(
                     sqlx::query(
                         "UPDATE email_outbox SET status = 'sent', sent_at = now(), \
-                         last_error = NULL \
+                         last_error = NULL, mail_text = '', mail_html = '' \
                          WHERE id = $1 AND status IN ('pending', 'sending')",
                     )
                     .bind(to_i64(id, "outbox")?)
@@ -1732,7 +1850,8 @@ impl AccountStore for Pg {
             MailOutcome::Failed { error } => {
                 bounded(
                     sqlx::query(
-                        "UPDATE email_outbox SET status = 'failed', last_error = $2 \
+                        "UPDATE email_outbox SET status = 'failed', last_error = $2, \
+                         mail_text = '', mail_html = '' \
                          WHERE id = $1 AND status IN ('pending', 'sending')",
                     )
                     .bind(to_i64(id, "outbox")?)
@@ -2629,6 +2748,68 @@ mod tests {
             touched.idle_expires_at_ms, 5_000_000_000_000,
             "GREATEST keeps the furthest slide — never backward"
         );
+    }
+
+    /// Pre-deploy S2-1: a claim batch with one unknown-kind row returns
+    /// the good rows and fails ONLY the poisoned one — never the whole
+    /// rhythm. The CHECK in 0003 makes a bad kind unwritable, so the
+    /// test drops it for the fixture then restores it.
+    #[tokio::test]
+    #[ignore = "needs DURABLE_TEST_DATABASE_URL (CI: neon job runs --include-ignored)"]
+    async fn pg_outbox_claim_dead_letters_a_bad_kind_not_the_batch() {
+        let Some(store) = store().await else { return };
+        sqlx::query("ALTER TABLE email_outbox DROP CONSTRAINT email_outbox_kind_ok")
+            .execute(&store.pool)
+            .await
+            .unwrap_or_else(|e| panic!("drop check: {e}"));
+        let unique = format!("pg-s2-{}", std::process::id());
+        sqlx::query(
+            "INSERT INTO email_outbox \
+             (kind, send_to, subject, text, html, idempotency_key, status) \
+             VALUES ('bogus-kind', 'b@b.co', 's', 't', '', $1, 'pending')",
+        )
+        .bind(format!("{unique}-bad"))
+        .execute(&store.pool)
+        .await
+        .unwrap_or_else(|e| panic!("plant bad kind: {e}"));
+        sqlx::query(
+            "ALTER TABLE email_outbox ADD CONSTRAINT email_outbox_kind_ok \
+             CHECK (kind IN ('verify', 'reset', 'invite', 'notice'))",
+        )
+        .execute(&store.pool)
+        .await
+        .unwrap_or_else(|e| panic!("restore check: {e}"));
+        let good = mail("notice", "g@g.co");
+        store
+            .enqueue_mail(&Mail {
+                idempotency_key: format!("{unique}-good"),
+                ..good
+            })
+            .await
+            .unwrap_or_else(|e| panic!("enqueue: {e}"));
+        // The claim returns the good row; the batch does not error.
+        let claimed = store
+            .outbox_claim(unix_ms(), 8, 60_000)
+            .await
+            .unwrap_or_else(|e| panic!("claim must not fail the batch: {e}"));
+        assert!(
+            claimed.iter().any(|m| m.mail.send_to == "g@g.co"),
+            "the good row was claimed"
+        );
+        assert!(
+            claimed
+                .iter()
+                .all(|m| { matches!(m.mail.kind, "verify" | "reset" | "invite" | "notice") }),
+            "no bad-kind row crosses the boundary"
+        );
+        // The poisoned row is 'failed' — it can never claim again.
+        let bad: (String,) =
+            sqlx::query_as("SELECT status FROM email_outbox WHERE idempotency_key = $1")
+                .bind(format!("{unique}-bad"))
+                .fetch_one(&store.pool)
+                .await
+                .unwrap_or_else(|e| panic!("read bad row: {e}"));
+        assert_eq!(bad.0, "failed");
     }
 
     fn unix_ms() -> i64 {

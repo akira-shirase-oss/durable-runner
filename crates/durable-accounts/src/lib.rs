@@ -125,6 +125,8 @@ pub struct ApiKeyInfo {
     /// The member account that issued it (its public id — internal
     /// account ids never leave the store), when self-service created it.
     pub created_by: Option<uuid::Uuid>,
+    /// unix millis — the row's birth stamp, surfaced for the dashboard.
+    pub created_at_ms: i64,
 }
 
 /// One handler registered for a workspace.
@@ -202,6 +204,13 @@ pub struct SessionInfo {
     pub idle_expires_at_ms: i64,
     pub user_agent: Option<String>,
     pub ip: Option<String>,
+}
+
+/// The password-check target for a live `verify` token (S2-6).
+pub struct VerifyPeek {
+    /// What the presented password must argon-match: the token's
+    /// pending hash, else the account's current hash.
+    pub password_hash: Option<String>,
 }
 
 /// A pending idle slide (D-071): use of a session is recorded in memory
@@ -314,7 +323,19 @@ pub enum AccountError {
     /// (S2 review #6: the route's pre-check is TOCTOU by nature).
     #[error("handler registry is full ({MAX_HANDLERS_PER_WS} per workspace)")]
     RegistryFull,
+    /// A stopgap cap refused the write atomically in the same
+    /// transaction/lock as the insert (S2-2): the `limit` name is the
+    /// API's `plan_limit` envelope field.
+    #[error("limit reached: {0}")]
+    PlanLimit(&'static str),
 }
+
+/// Pre-deploy S2-2 stopgap caps — S3-4's `plans` rows replace them
+/// with plan-shaped numbers; until then these are the same edges the
+/// Free row will carry.
+pub const STOPGAP_WS_PER_ACCOUNT: u64 = 3;
+pub const STOPGAP_KEYS_PER_WS: u64 = 10;
+pub const STOPGAP_INVITES_PER_WS_DAY: u64 = 20;
 
 impl From<sqlx::Error> for AccountError {
     fn from(err: sqlx::Error) -> Self {
@@ -670,6 +691,17 @@ pub trait AccountStore: Send + Sync {
         &self,
         token_hash: &[u8; 32],
     ) -> Result<Option<Account>, AccountError>;
+
+    /// Peek at a live `verify` token WITHOUT consuming it (S2-6): the
+    /// verify route argon-checks the presented password against
+    /// `VerifyPeek::password_hash` — the token's pending hash, else the
+    /// account's current one — and refuses mismatches while the token
+    /// stays alive. `Ok(None)` is the dead-token answer, identical to
+    /// `consume_verify_token`'s.
+    async fn peek_verify_token(
+        &self,
+        token_hash: &[u8; 32],
+    ) -> Result<Option<VerifyPeek>, AccountError>;
 
     /// Consume a live `reset` token atomically: mark it consumed,
     /// install `new_password_hash`, prove mailbox ownership (sets

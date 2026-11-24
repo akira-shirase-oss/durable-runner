@@ -14,12 +14,12 @@ use durable_attacks::*;
 async fn a_second_workspace_cannot_read_anothers_run() {
     let s = spawn(&[]).await;
     let c = http();
-    let (status, run) = submit(&c, &s.base, OPS_KEY, "ws0-run").await;
+    let (status, run) = submit(&c, &s.ops_base, OPS_KEY, "ws0-run").await;
     assert_eq!(status, 200, "setup submit failed");
     let run_id = run.unwrap_or_else(|| panic!("no run id"));
 
-    let ws_b = create_workspace(&c, &s.base, "tenant-b").await;
-    let key_b = create_key(&c, &s.base, &ws_b, "admin").await;
+    let ws_b = create_workspace(&c, &s.ops_base, "tenant-b").await;
+    let key_b = create_key(&c, &s.ops_base, &ws_b, "admin").await;
 
     for (name, req) in [
         (
@@ -65,7 +65,7 @@ async fn a_second_workspace_cannot_read_anothers_run() {
 
     // The owner still reads its run — nothing was disturbed.
     let r = c
-        .get(format!("{}/jobs/{run_id}", s.base))
+        .get(format!("{}/jobs/{run_id}", s.ops_base))
         .bearer_auth(OPS_KEY)
         .send()
         .await
@@ -78,8 +78,8 @@ async fn a_second_workspace_cannot_read_anothers_run() {
 async fn a_tenant_admin_cannot_reach_ops_routes() {
     let s = spawn(&[]).await;
     let c = http();
-    let ws_b = create_workspace(&c, &s.base, "tenant-b").await;
-    let key_b = create_key(&c, &s.base, &ws_b, "admin").await;
+    let ws_b = create_workspace(&c, &s.ops_base, "tenant-b").await;
+    let key_b = create_key(&c, &s.ops_base, &ws_b, "admin").await;
 
     for (name, req) in [
         (
@@ -122,11 +122,11 @@ async fn a_tenant_admin_cannot_reach_ops_routes() {
 async fn a_numeric_run_id_is_no_oracle_for_other_tenants() {
     let s = spawn(&[]).await;
     let c = http();
-    let (status, run) = submit(&c, &s.base, OPS_KEY, "ws0-run").await;
+    let (status, run) = submit(&c, &s.ops_base, OPS_KEY, "ws0-run").await;
     assert_eq!(status, 200);
     assert!(run.is_some(), "setup submit failed");
-    let ws_b = create_workspace(&c, &s.base, "tenant-b").await;
-    let key_b = create_key(&c, &s.base, &ws_b, "admin").await;
+    let ws_b = create_workspace(&c, &s.ops_base, "tenant-b").await;
+    let key_b = create_key(&c, &s.ops_base, &ws_b, "admin").await;
 
     // Internal ids are never issued externally, but a tenant asking for
     // run 1 numerically must get 404, never a decode of another's run.
@@ -148,10 +148,10 @@ async fn a_numeric_run_id_is_no_oracle_for_other_tenants() {
 async fn a_tenant_cannot_address_its_own_run_by_its_internal_number() {
     let s = spawn(&[]).await;
     let c = http();
-    let (status, _) = submit(&c, &s.base, OPS_KEY, "ws0-first").await;
+    let (status, _) = submit(&c, &s.ops_base, OPS_KEY, "ws0-first").await;
     assert_eq!(status, 200);
-    let ws_b = create_workspace(&c, &s.base, "tenant-b").await;
-    let key_b = create_key(&c, &s.base, &ws_b, "admin").await;
+    let ws_b = create_workspace(&c, &s.ops_base, "tenant-b").await;
+    let key_b = create_key(&c, &s.ops_base, &ws_b, "admin").await;
     // B needs a handler named `step` to admit.
     let r = c
         .put(format!("{}/handlers/step", s.base))

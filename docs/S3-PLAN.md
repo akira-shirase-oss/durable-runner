@@ -649,7 +649,7 @@ keys need no header: the workspace is in the key.
 | `GET/POST …/members`, `GET …/invites` | — | — | — | ✓ | ✓ | ✓ GET only | ✓ GET only |
 | `POST/DELETE …/invites*` | — | — | — | ✓ | ✓ | — | — |
 | `PATCH/DELETE …/members/{account_pid}` | — | — | — | ✓ | ✓ (not owner) | — | — |
-| `GET/POST/DELETE/POST-rotate …/keys*` | — | — | — | ✓ | ✓ | — | ✓ GET only |
+| `GET/POST/DELETE/POST-rotate …/keys*` | — | — | — | ✓ | ✓ | ✓ GET only | ✓ GET only |
 | `POST …/workflows`, `POST …/workflows/{wid}/run`, `PATCH/DELETE …/workflows/{wid}` | — | — | — | ✓ | ✓ | ✓ | — |
 | `GET …/workflows*`, `GET …/workflows/{wid}/runs` | — | — | — | ✓ | ✓ | ✓ | ✓ |
 | `GET …/usage`, `GET …/onboarding` | — | — | — | ✓ | ✓ | ✓ | ✓ |

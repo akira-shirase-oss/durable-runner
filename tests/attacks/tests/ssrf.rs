@@ -45,7 +45,7 @@ async fn local_handler_urls_are_refused_at_registration() {
     ];
     for (url, want) in cases {
         let r = c
-            .put(format!("{}/handlers/evil", s.base))
+            .put(format!("{}/handlers/evil", s.ops_base))
             .bearer_auth(OPS_KEY)
             .json(&serde_json::json!({ "url": url }))
             .send()
@@ -65,7 +65,7 @@ async fn local_handler_urls_are_refused_at_registration() {
     }
     // Re-read the registry: nothing refused made it in.
     let l = c
-        .get(format!("{}/handlers", s.base))
+        .get(format!("{}/handlers", s.ops_base))
         .bearer_auth(OPS_KEY)
         .send()
         .await
@@ -110,7 +110,7 @@ async fn a_domain_that_resolves_local_never_gets_a_packet() {
     // verdict to the dial-time resolver.
     let url = format!("http://localhost:{lport}/step");
     let r = c
-        .put(format!("{}/handlers/step", s.base))
+        .put(format!("{}/handlers/step", s.ops_base))
         .bearer_auth(OPS_KEY)
         .json(&serde_json::json!({ "url": url }))
         .send()
@@ -128,7 +128,7 @@ async fn a_domain_that_resolves_local_never_gets_a_packet() {
         },
     });
     let r = c
-        .post(format!("{}/jobs", s.base))
+        .post(format!("{}/jobs", s.ops_base))
         .bearer_auth(OPS_KEY)
         .json(&body)
         .send()
@@ -150,7 +150,7 @@ async fn a_domain_that_resolves_local_never_gets_a_packet() {
     let mut state = String::new();
     while std::time::Instant::now() < deadline {
         let r = c
-            .get(format!("{}/jobs/{run_id}", s.base))
+            .get(format!("{}/jobs/{run_id}", s.ops_base))
             .bearer_auth(OPS_KEY)
             .send()
             .await;
@@ -209,11 +209,11 @@ async fn the_operators_local_opt_out_never_reaches_a_tenant() {
     // The operator follows the deploy guide for a same-host handler.
     let s = spawn(&["--allow-local-handlers"]).await;
     let c = http();
-    let ws = create_workspace(&c, &s.base, "tenant").await;
-    let tenant = create_key(&c, &s.base, &ws, "admin").await;
+    let ws = create_workspace(&c, &s.ops_base, "tenant").await;
+    let tenant = create_key(&c, &s.ops_base, &ws, "admin").await;
     let put = |key: String, url: String| {
         let c = c.clone();
-        let base = s.base.clone();
+        let base = s.ops_base.clone();
         async move {
             let r = c
                 .put(format!("{base}/handlers/evil"))
