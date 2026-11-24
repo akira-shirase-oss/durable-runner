@@ -45,6 +45,7 @@ class Account {
 	pendingEmail = $state('');
 
 	#rechecking: Promise<void> | null = null;
+	#watching = false;
 	#lastRecheck = 0;
 
 	get current(): WorkspaceRef | null {
@@ -72,6 +73,12 @@ class Account {
 	/** Decide the mode: GET /auth/session. */
 	async boot(): Promise<void> {
 		onSessionLost(() => void this.recheck());
+		if (!this.#watching && typeof document !== 'undefined') {
+			this.#watching = true;
+			document.addEventListener('visibilitychange', () => {
+				if (document.visibilityState === 'visible') void this.recheck();
+			});
+		}
 		this.bootError = null;
 		try {
 			const r = await probeSession();
@@ -101,9 +108,10 @@ class Account {
 		}
 	}
 
-	/** A signed-in request answered 401: the session may have ended (expired, revoked elsewhere, a password
-	 *  change). At most one check in flight and one per 10 s; only a 401 from /auth/session itself signs out —
-	 *  a route that does not take sessions yet must not sign anybody out. */
+	/** A signed-in request answered 401 (the session may have ended: expired, revoked elsewhere, a password
+	 *  change) or 403 forbidden (an admin may have changed this account's role: the controls must follow). At most
+	 *  one check in flight and one per 10 s; only a 401 from /auth/session itself signs out — a route that does not
+	 *  take sessions yet must not sign anybody out. A tab coming back into view re-reads too. */
 	recheck(): Promise<void> {
 		if (this.mode !== 'signed-in') return Promise.resolve();
 		if (this.#rechecking) return this.#rechecking;

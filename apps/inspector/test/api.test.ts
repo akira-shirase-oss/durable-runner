@@ -73,6 +73,12 @@ test('a signed-in 401 asks the account to re-check the session; a refused login 
 	const e = await login('a@b.c', 'wrong password!').then(() => null, (err: unknown) => err);
 	assert.ok(e instanceof ApiError && e.code === 'invalid_credentials');
 	assert.equal(lost, 1, 'a wrong password is not a lost session');
+	answer(403, { error: 'your role cannot do this', code: 'forbidden' });
+	await listRuns(cred, 'desc').catch(() => {});
+	assert.equal(lost, 2, 'a 403 forbidden re-reads the role');
+	answer(403, { error: 'cross-site request refused', code: 'csrf_failed' });
+	await listRuns(cred, 'desc').catch(() => {});
+	assert.equal(lost, 2, 'other 403s do not');
 });
 
 test('probeSession returns the status that decides the mode, with or without a body', async () => {

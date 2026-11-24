@@ -8,7 +8,7 @@ import { session } from './session.svelte.ts';
 import { ApiError } from './api.ts';
 import { nextDelay, POLL_MS } from './poll.ts';
 
-export type ResourceStatus = 'idle' | 'loading' | 'ok' | 'error' | 'unsupported' | 'needs-key';
+export type ResourceStatus = 'idle' | 'loading' | 'ok' | 'error' | 'unsupported' | 'needs-key' | 'gone';
 
 class LiveController {
 	/** The viewer pressed pause. */
@@ -103,6 +103,9 @@ export interface ResourceOptions {
 	interval?: number | (() => number);
 	/** Counts toward the live indicator (default true). */
 	live?: boolean;
+	/** A 404 `not_found` means the thing is not there (a run id from another workspace, an expired run): stop
+	 *  asking and do not count it as failing. The page shows its own not-found state. */
+	goneOn404?: boolean;
 }
 
 /** One polled read. Pages hand it to `poll()`, which starts it with the component and refetches (abandoning a
@@ -113,6 +116,7 @@ export class Resource<T> {
 	status = $state<ResourceStatus>('idle');
 	updatedAt = $state<number | null>(null);
 	readonly live: boolean;
+	readonly #goneOn404: boolean;
 	/** When the next retry is due while failing (ms since epoch). */
 	retryAt: number | null = null;
 
@@ -130,6 +134,7 @@ export class Resource<T> {
 		const iv = opts.interval ?? POLL_MS;
 		this.#interval = typeof iv === 'function' ? iv : () => iv;
 		this.live = opts.live ?? true;
+		this.#goneOn404 = opts.goneOn404 ?? false;
 	}
 
 	/** First load still pending (no data yet). */
@@ -180,6 +185,7 @@ export class Resource<T> {
 			const err = e instanceof ApiError ? e : new ApiError(e instanceof Error ? e.message : String(e), 0);
 			this.error = err;
 			if (err.unsupported) this.status = 'unsupported';
+			else if (this.#goneOn404 && err.status === 404 && err.code === 'not_found') this.status = 'gone';
 			else if (err.needsKey) this.status = 'needs-key';
 			else {
 				this.status = 'error';
@@ -205,7 +211,7 @@ export class Resource<T> {
 	wake() {
 		if (!this.#active || this.#abort) return;
 		const s = untrack(() => this.status);
-		if (s === 'unsupported' || s === 'needs-key') return;
+		if (s === 'unsupported' || s === 'needs-key' || s === 'gone') return;
 		void this.refresh();
 	}
 
@@ -215,7 +221,7 @@ export class Resource<T> {
 		const base = untrack(() => this.#interval());
 		if (!this.#active || base <= 0 || live.paused || !live.visible) return;
 		const s = untrack(() => this.status);
-		if (s === 'unsupported' || s === 'needs-key') return;
+		if (s === 'unsupported' || s === 'needs-key' || s === 'gone') return;
 		const delay = nextDelay(base, this.#errors, this.#retryAfter);
 		if (s === 'error') this.retryAt = Date.now() + delay;
 		this.#timer = setTimeout(() => void this.refresh(), delay);

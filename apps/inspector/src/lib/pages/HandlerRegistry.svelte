@@ -259,7 +259,7 @@ def verified(method, path, headers, raw_body):
 								{@const r = testResult.r}
 								{@const text = b64ToText(r.replyB64)}
 								<div class="test-result" role="status">
-									<p class="row-title"><span class="badge {TEST_TONE[r.status] ?? ''}">{r.status}</span>{h.name} {TEST_WORD[r.status] ?? `answered ${r.status}`}.</p>
+									<p class="row-title"><span class="badge {TEST_TONE[r.status] ?? ''}">{r.status}</span>{' '}<span>{h.name} {TEST_WORD[r.status] ?? `answered ${r.status}`}.</span></p>
 									<p class="row-meta">
 										{#if r.httpStatus !== null}<span>HTTP {r.httpStatus}</span>{/if}
 										{#if r.latencyMs !== null}<span>{r.latencyMs} ms</span>{/if}

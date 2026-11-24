@@ -80,7 +80,8 @@ export class ApiError extends Error {
 	}
 }
 
-/** Called when a signed-in request answers 401: the account store re-checks the session (it may have ended). */
+/** Called when a signed-in request answers 401 (the session may have ended) or 403 `forbidden` (the role may have
+ *  changed since the page read it): the account store re-reads the session and the workspace list. */
 let sessionLost: (() => void) | null = null;
 export function onSessionLost(fn: (() => void) | null): void {
 	sessionLost = fn;
@@ -117,7 +118,7 @@ async function req<T>(path: string, cred: Cred, init: RequestInit = {}, opts: { 
 		const env = parseEnvelope(body);
 		// 429 rate_limited carries Retry-After; a 503 (busy, at_capacity) may: either way polling waits that long
 		const retryAfterMs = r.status === 429 || r.status === 503 ? parseRetryAfter(r.headers.get('retry-after'), Date.now()) : null;
-		if (signedIn && r.status === 401 && !opts.quiet401) sessionLost?.();
+		if (signedIn && !opts.quiet401 && (r.status === 401 || (r.status === 403 && env.code === 'forbidden'))) sessionLost?.();
 		throw new ApiError(env.message ?? `${r.status}`, r.status, env.code, retryAfterMs, env.extra);
 	}
 	if (r.status === 204) return undefined as T;
