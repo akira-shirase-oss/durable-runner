@@ -1632,15 +1632,43 @@ impl AccountStore for Pg {
             .fetch_all(&self.pool),
         )
         .await?;
+        // An unknown kind dead-letters ITS row only — one poisoned row
+        // must never burn the batch's attempts (pre-deploy S2-1: a
+        // "workspace-invite" kind once failed every claim in the
+        // rhythm). The CHECK in 0003 makes new bad kinds impossible;
+        // this stays as the belt for any written before it landed.
+        let mut dead: Vec<i64> = Vec::new();
+        for r in &rows {
+            let kind: String = r.try_get("kind")?;
+            match kind.as_str() {
+                "verify" | "reset" | "invite" | "notice" => {}
+                _ => dead.push(r.try_get("id")?),
+            }
+        }
+        if !dead.is_empty() {
+            bounded(
+                sqlx::query(
+                    "UPDATE email_outbox SET status = 'failed', \
+                         text = '', html = '', subject = '' \
+                     WHERE id = ANY($1) AND status = 'sending'",
+                )
+                .bind(&dead)
+                .execute(&self.pool),
+            )
+            .await?;
+        }
         rows.iter()
+            .filter(|r| {
+                let kind: String = r.try_get("kind").unwrap_or_default();
+                matches!(kind.as_str(), "verify" | "reset" | "invite" | "notice")
+            })
             .map(|r| {
                 let kind: String = r.try_get("kind")?;
                 let kind: &'static str = match kind.as_str() {
                     "verify" => "verify",
                     "reset" => "reset",
                     "invite" => "invite",
-                    "notice" => "notice",
-                    other => return Err(AccountError::Store(format!("bad outbox kind {other:?}"))),
+                    _ => "notice",
                 };
                 Ok(crate::OutboxMail {
                     id: to_u64(r.try_get("id")?, "outbox")?,
@@ -2632,6 +2660,66 @@ mod tests {
             touched.idle_expires_at_ms, 5_000_000_000_000,
             "GREATEST keeps the furthest slide — never backward"
         );
+    }
+
+    /// Pre-deploy S2-1: a claim batch with one unknown-kind row returns
+    /// the good rows and fails ONLY the poisoned one — never the whole
+    /// rhythm. The CHECK in 0003 makes a bad kind unwritable, so the
+    /// test drops it for the fixture then restores it.
+    #[tokio::test]
+    #[ignore = "needs DURABLE_TEST_DATABASE_URL (CI: neon job runs --include-ignored)"]
+    async fn pg_outbox_claim_dead_letters_a_bad_kind_not_the_batch() {
+        let Some(store) = store().await else { return };
+        sqlx::query("ALTER TABLE email_outbox DROP CONSTRAINT email_outbox_kind_ok")
+            .execute(&store.pool)
+            .await
+            .unwrap_or_else(|e| panic!("drop check: {e}"));
+        let unique = format!("pg-s2-{}", std::process::id());
+        sqlx::query(
+            "INSERT INTO email_outbox \
+             (kind, send_to, subject, text, html, idempotency_key, status) \
+             VALUES ('bogus-kind', 'b@b.co', 's', 't', '', $1, 'pending')",
+        )
+        .bind(format!("{unique}-bad"))
+        .execute(&store.pool)
+        .await
+        .unwrap_or_else(|e| panic!("plant bad kind: {e}"));
+        sqlx::query(
+            "ALTER TABLE email_outbox ADD CONSTRAINT email_outbox_kind_ok \
+             CHECK (kind IN ('verify', 'reset', 'invite', 'notice'))",
+        )
+        .execute(&store.pool)
+        .await
+        .unwrap_or_else(|e| panic!("restore check: {e}"));
+        let good = mail("notice", "g@g.co");
+        store
+            .enqueue_mail(&Mail {
+                idempotency_key: format!("{unique}-good"),
+                ..good
+            })
+            .await
+            .unwrap_or_else(|e| panic!("enqueue: {e}"));
+        let claimed = store
+            .outbox_claim(unix_ms(), 8, 60_000)
+            .await
+            .unwrap_or_else(|e| panic!("claim must not fail the batch: {e}"));
+        assert!(
+            claimed.iter().any(|m| m.mail.send_to == "g@g.co"),
+            "the good row was claimed"
+        );
+        assert!(
+            claimed
+                .iter()
+                .all(|m| { matches!(m.mail.kind, "verify" | "reset" | "invite" | "notice") }),
+            "no bad-kind row crosses the boundary"
+        );
+        let bad: (String,) =
+            sqlx::query_as("SELECT status FROM email_outbox WHERE idempotency_key = $1")
+                .bind(format!("{unique}-bad"))
+                .fetch_one(&store.pool)
+                .await
+                .unwrap_or_else(|e| panic!("read bad row: {e}"));
+        assert_eq!(bad.0, "failed");
     }
 
     fn unix_ms() -> i64 {

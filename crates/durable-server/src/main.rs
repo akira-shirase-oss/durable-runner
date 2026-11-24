@@ -4280,7 +4280,17 @@ fn mint_invite_token() -> String {
 
 fn valid_ws_name(name: &str) -> bool {
     let n = name.trim();
-    !n.is_empty() && n.len() <= 128 && n.chars().all(|c| c != '\u{0}')
+    !n.is_empty()
+        && n.len() <= 128
+        && n.chars().all(|c| {
+            !c.is_control()
+                && !matches!(
+                    c,
+                    '\u{2028}'..='\u{2029}' // line/paragraph separators
+                        | '\u{202a}'..='\u{202e}' // bidi embedding/override
+                        | '\u{2066}'..='\u{2069}' // bidi isolates
+                )
+        })
 }
 
 async fn ws_create(
@@ -4537,17 +4547,27 @@ async fn ws_invite_member(
     // the inviter's response, and the store keeps only its sha256.
     let origin = app.public_origin.as_deref().unwrap_or("http://localhost");
     let link = format!("{origin}/app#/accept-invite?token={token}");
+    // The subject is fixed — a workspace name never reaches a header or
+    // a log line. In the body it's still capped and stripped of any
+    // line/paragraph/bidi character (defence in depth past the name
+    // check): a poisoned name could redraw the mail's text.
+    let ws_name_rendered: String = ws
+        .name
+        .chars()
+        .filter(|c| !c.is_control() && !matches!(*c, '\u{2028}'..='\u{2029}' | '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}'))
+        .take(64)
+        .collect();
     let (subject, body) = (
-        format!("Invitation to {}", ws.name),
+        "You're invited".to_string(),
         format!(
-            "You were invited to {} as {}. Accept the invitation: {link}\n\n\
+            "You were invited to the workspace {ws_name_rendered:?} as {}. \
+             Accept the invitation: {link}\n\n\
              If you did not expect this, ignore the message — the link expires.",
-            ws.name,
             role.as_str()
         ),
     );
     let mail = Mail {
-        kind: "workspace-invite",
+        kind: "invite",
         send_to: email.clone(),
         subject,
         text: body,
@@ -19429,13 +19449,44 @@ mod tests {
             .unwrap_or_else(|e| panic!("{e}"));
         let invite_mail = mail
             .iter()
-            .find(|m| m.mail.kind == "workspace-invite")
+            .find(|m| m.mail.kind == "invite")
             .unwrap_or_else(|| panic!("invite mail queued"));
         assert!(
             invite_mail.mail.text.contains(&url),
             "mail body lacks the app link: {}",
             invite_mail.mail.text
         );
+        // S2-1: kind is 'invite' (the batch-poisoning name is gone) and
+        // the subject is fixed — the ws name only ever lives in the
+        // body, quoted + stripped to printables.
+        assert_eq!(invite_mail.mail.kind, "invite");
+        assert_eq!(invite_mail.mail.subject, "You're invited");
+        assert!(
+            invite_mail.mail.text.contains("\"alpha\""),
+            "the name appears quoted in the body: {}",
+            invite_mail.mail.text
+        );
+    }
+
+    /// S2-1's name gate: separators, bidi marks and controls are not
+    /// workspace names — they could redraw a mail's text.
+    #[test]
+    fn s2d_ws_name_rejects_invisible_and_bidi() {
+        for bad in [
+            "a\u{2028}b",
+            "a\u{2029}b",
+            "a\u{202a}b",
+            "a\u{202e}b",
+            "a\u{2066}b",
+            "a\u{2069}b",
+            "a\u{000d}b",
+            "a\u{000a}b",
+            "a\u{0000}b",
+            "a\u{009f}b",
+        ] {
+            assert!(!valid_ws_name(bad), "{bad:?}");
+        }
+        assert!(valid_ws_name("Team Ω (west)"));
     }
 
     /// The dashboard's shape contract: GET /workspaces and
