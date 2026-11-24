@@ -50,6 +50,15 @@ struct Args {
     /// Listen address.
     #[arg(long, default_value = "127.0.0.1:58300")]
     listen: String,
+    /// Dedicated ops listener (review finding 18): when set, the env
+    /// keys (DURABLE_API_KEY / DURABLE_READ_KEY) are accepted only on
+    /// this socket — point the platform's private network here and
+    /// publish only `--listen`. A request on `--listen` bearing an env
+    /// key answers 401 like any bad bearer. Must be a loopback address:
+    /// anything else refuses at boot. Unset (self-host): env keys work
+    /// on `--listen` as always.
+    #[arg(long)]
+    ops_listen: Option<String>,
     /// Dedicated liveness listener: /health and /ready on their own
     /// socket and backlog, so a connection flood on the main port cannot
     /// starve probes (S2 wedge: keep-alive hoarding RST'd /health at the
@@ -1735,6 +1744,8 @@ struct App {
     /// D-070 probe budgets: 30/hour per workspace (the Free plan's
     /// bound; S3-4 makes it plan-read) + 10/minute per client address.
     test_calls_ws: std::sync::Arc<Mutex<HashMap<u64, std::collections::VecDeque<Instant>>>>,
+    /// `--ops-listen` is set: env-key grants hold only on that socket.
+    ops_gate: bool,
     test_calls_addr: std::sync::Arc<Mutex<SlidingWindow>>,
     /// The bounded argon2 queue (review #9).
     argon: std::sync::Arc<ArgonQueue>,
@@ -1858,6 +1869,7 @@ fn test_app(
     backup_root: Option<Arc<Path>>,
     journal_dir: &Path,
     allow_local: bool,
+    ops_gate: bool,
 ) -> App {
     let pubid = pubid::PubId::load_or_generate(journal_dir).unwrap_or_else(|e| panic!("{e}"));
     let registry_epoch = Arc::new(std::sync::atomic::AtomicU64::new(0));
@@ -1871,6 +1883,7 @@ fn test_app(
     App {
         engine,
         keyring,
+        ops_gate,
         open_reads,
         backup_root,
         handler_factory: Arc::new(HandlerFactory {
@@ -2827,6 +2840,11 @@ impl AuthLimits {
 /// service wrapper (computed once there through `client_addr`).
 #[derive(Clone, Copy)]
 struct ClientAddr(std::net::IpAddr);
+
+/// Request extension: this connection arrived on the `--ops-listen`
+/// socket — the only place env-key principals hold (finding 18).
+#[derive(Clone, Copy)]
+struct OpsListener;
 
 fn client(parts: &Parts) -> std::net::IpAddr {
     parts
@@ -4039,6 +4057,24 @@ async fn flat_member(
     Ok((ws, role))
 }
 
+/// The `--ops-listen` gate around `keyring.verify`: with the flag set,
+/// an env-key grant is honoured only on the ops socket — on `--listen`
+/// the same bearer answers `Denied`, indistinguishable from a bad key
+/// (finding 18). Store keys and sessions are unaffected everywhere.
+/// Without the flag nothing changes.
+async fn verify_key(app: &App, parts: &Parts, key: &str) -> Verified {
+    match app.keyring.verify(key).await {
+        Verified::Granted(p)
+            if app.ops_gate
+                && matches!(p, Principal::OpsKey | Principal::OpsRead)
+                && parts.extensions.get::<OpsListener>().is_none() =>
+        {
+            Verified::Denied
+        }
+        v => v,
+    }
+}
+
 /// The dual-auth resolution for flat tenant routes (D-066/D-073): a
 /// bearer takes the key path (workspace from the grant, `key_need` the
 /// permission the call requires); a session takes the member path
@@ -4054,7 +4090,7 @@ async fn flat_access(
 ) -> Result<u64, ApiError> {
     if let Some(key) = bearer(parts) {
         // ATTACK(auth)
-        return match app.keyring.verify(key).await {
+        return match verify_key(app, parts, key).await {
             Verified::Granted(Principal::OpsKey) => Ok(0),
             Verified::Granted(Principal::OpsRead) if key_need == Permission::Read => Ok(0),
             Verified::Granted(Principal::StoreKey { ws, permission })
@@ -4108,7 +4144,7 @@ impl FlatWs {
 /// a data-plane key is refused outright even when it can write.
 async fn flat_admin_access(app: &App, parts: &Parts) -> Result<u64, ApiError> {
     if let Some(key) = bearer(parts) {
-        return match app.keyring.verify(key).await {
+        return match verify_key(app, parts, key).await {
             Verified::Granted(Principal::OpsKey) => Ok(0),
             Verified::Granted(_) => Err(ApiError::new(
                 StatusCode::FORBIDDEN,
@@ -4882,7 +4918,7 @@ impl FromRequestParts<App> for Authorized {
             return Err(unauthorized());
         };
         // ATTACK(auth)
-        match app.keyring.verify(key).await {
+        match verify_key(app, parts, key).await {
             Verified::Granted(auth)
                 if auth.may_write() && !matches!(auth, Principal::Member { .. }) =>
             {
@@ -4917,7 +4953,7 @@ impl FromRequestParts<App> for ReadAuthorized {
         }
         match bearer(parts) {
             // ATTACK(auth)
-            Some(key) => match app.keyring.verify(key).await {
+            Some(key) => match verify_key(app, parts, key).await {
                 Verified::Granted(auth) => Ok(ReadAuthorized(auth)),
                 Verified::Denied => Err(unauthorized()),
                 Verified::Unavailable => Err(accounts_unavailable()),
@@ -6770,6 +6806,22 @@ fn loopback_host(parts: &Parts) -> bool {
 /// `--open-reads` is allowed only where nothing but this host can connect:
 /// a loopback IP address (a name such as `localhost` is not trusted to
 /// resolve to one).
+/// `--ops-listen` must be a loopback socket address (finding 18): the
+/// flag exists to keep env keys off the public socket, so a non-loopback
+/// value would re-publish them — refuse the boot with the reason.
+fn check_ops_listen(ops_listen: &Option<String>) -> Result<()> {
+    let Some(addr) = ops_listen else {
+        return Ok(());
+    };
+    match addr.parse::<std::net::SocketAddr>() {
+        Ok(sa) if sa.ip().is_loopback() => Ok(()),
+        Ok(_) => anyhow::bail!(
+            "--ops-listen must be a loopback address (127.0.0.1 or [::1]);              {addr} would re-publish the env keys it exists to keep private"
+        ),
+        Err(e) => anyhow::bail!("--ops-listen {addr:?} is not a socket address: {e}"),
+    }
+}
+
 fn check_open_reads(listen: &str, open_reads: bool) -> Result<()> {
     if !open_reads {
         return Ok(());
@@ -6834,6 +6886,7 @@ async fn main() -> Result<()> {
         anyhow::bail!("--public-origin is required when an account store is configured");
     }
     check_open_reads(&args.listen, args.open_reads)?;
+    check_ops_listen(&args.ops_listen)?;
     let backup_root = args
         .backup_root
         .as_deref()
@@ -6941,6 +6994,7 @@ async fn main() -> Result<()> {
     let app = App {
         engine,
         keyring: Arc::new(Keyring::new(api_key, read_key, store.clone())),
+        ops_gate: args.ops_listen.is_some(),
         open_reads: args.open_reads,
         backup_root,
         handler_factory: factory,
@@ -7018,7 +7072,7 @@ async fn main() -> Result<()> {
             eprintln!("durable-server liveness listening on {addr}");
             Some((
                 hs_stop,
-                tokio::spawn(serve_http(l, r, health_limits(), None, hs_rx)),
+                tokio::spawn(serve_http(l, r, health_limits(), None, hs_rx, false)),
             ))
         }
         None => None,
@@ -7037,7 +7091,30 @@ async fn main() -> Result<()> {
         trusted_proxies: TrustedProxies(args.trusted_proxies),
         ..HttpLimits::default()
     };
-    let serve = serve_http(listener, router, limits, Some(obs), http_stopped);
+    let serve = serve_http(
+        listener,
+        router.clone(),
+        limits.clone(),
+        Some(obs.clone()),
+        http_stopped,
+        false,
+    );
+    // The ops listener (finding 18): same router, same bounds, plus the
+    // `OpsListener` request extension the env-key gate checks for.
+    let ops_serve = match &args.ops_listen {
+        Some(addr) => {
+            let l = tokio::net::TcpListener::bind(addr)
+                .await
+                .with_context(|| format!("bind ops listener {addr}"))?;
+            let (os_stop, os_rx) = tokio::sync::oneshot::channel::<()>();
+            eprintln!("durable-server ops listening on {addr}");
+            Some((
+                os_stop,
+                tokio::spawn(serve_http(l, router, limits, Some(obs), os_rx, true)),
+            ))
+        }
+        None => None,
+    };
     tokio::pin!(serve);
     tokio::select! {
         r = &mut serve => return r.context("serve"),
@@ -7059,6 +7136,10 @@ async fn main() -> Result<()> {
     if let Some((hs_stop, hs_task)) = health_serve {
         let _ = hs_stop.send(());
         let _ = hs_task.await;
+    }
+    if let Some((os_stop, os_task)) = ops_serve {
+        let _ = os_stop.send(());
+        let _ = os_task.await;
     }
     let cut = match tokio::time::timeout(limit, &mut serve).await {
         Ok(r) => {
@@ -7341,6 +7422,7 @@ async fn serve_http(
     limits: HttpLimits,
     obs: Option<Arc<Observer>>,
     mut stop: tokio::sync::oneshot::Receiver<()>,
+    ops_side: bool,
 ) -> std::io::Result<()> {
     use hyper_util::rt::{TokioIo, TokioTimer};
     let permits = Arc::new(tokio::sync::Semaphore::new(limits.max_connections.max(1)));
@@ -7679,6 +7761,9 @@ async fn serve_http(
                     );
                     let mut req = req;
                     req.extensions_mut().insert(ClientAddr(client));
+                    if ops_side {
+                        req.extensions_mut().insert(OpsListener);
+                    }
                     // The per-address request rate. Refused before auth:
                     // a flood without a key is still a flood, and the
                     // check is cheaper than the work behind it.
@@ -8144,13 +8229,20 @@ mod tests {
         free: Option<Arc<std::sync::atomic::AtomicU64>>,
         store: Option<Arc<dyn AccountStore>>,
     ) -> Harness {
-        harness_store_local(with_backup_root, free, store, true)
+        harness_store_local(with_backup_root, free, store, true, false)
     }
 
     /// `harness_store` with the shipped strict SSRF policy — every other
     /// test wants loopback fixture handlers, this one wants the guard.
     fn harness_strict(store: Option<Arc<dyn AccountStore>>) -> Harness {
-        harness_store_local(false, None, store, false)
+        harness_store_local(false, None, store, false, false)
+    }
+
+    /// `harness_store` with the `--ops-listen` gate armed (finding 18):
+    /// env-key grants hold only when the request carries the
+    /// `OpsListener` extension (`raw_ops`); everywhere else they 401.
+    fn harness_ops(store: Option<Arc<dyn AccountStore>>) -> Harness {
+        harness_store_local(false, None, store, true, true)
     }
 
     fn harness_store_local(
@@ -8158,6 +8250,7 @@ mod tests {
         free: Option<Arc<std::sync::atomic::AtomicU64>>,
         store: Option<Arc<dyn AccountStore>>,
         allow_local: bool,
+        ops_gate: bool,
     ) -> Harness {
         let journal = tempfile::tempdir().unwrap_or_else(|e| panic!("{e}"));
         let backups = tempfile::tempdir().unwrap_or_else(|e| panic!("{e}"));
@@ -8192,6 +8285,7 @@ mod tests {
             backup_root,
             journal.path(),
             allow_local,
+            ops_gate,
         );
         Harness {
             router: router(app.clone(), None),
@@ -8305,6 +8399,7 @@ mod tests {
                 None,
                 journal.path(),
                 true,
+                false,
             ),
             None,
         );
@@ -10358,7 +10453,7 @@ mod tests {
         .unwrap_or_else(|e| panic!("{e}"));
         let keyring = Arc::new(Keyring::new(ApiKey::new(KEY), None, Some(store)));
         // The shipped store policy: strict.
-        let app = test_app(engine, keyring, false, None, journal.path(), false);
+        let app = test_app(engine, keyring, false, None, journal.path(), false, false);
         (app.clone(), router(app, None), key, a, journal)
     }
 
@@ -12377,7 +12472,7 @@ mod tests {
         // The strict app — allow_local false, as the shipped default runs.
         let keyring = Arc::new(Keyring::new(ApiKey::new(KEY), None, Some(store)));
         let r = router(
-            test_app(engine, keyring, false, None, journal.path(), false),
+            test_app(engine, keyring, false, None, journal.path(), false, false),
             None,
         );
         for bad in [
@@ -12441,6 +12536,7 @@ mod tests {
                 None,
                 journal.path(),
                 true,
+                false,
             ),
             None,
         );
@@ -13177,6 +13273,7 @@ mod tests {
                 None,
                 journal.path(),
                 true,
+                false,
             ),
             Some(ui.path()),
         );
@@ -13321,6 +13418,7 @@ mod tests {
                 None,
                 journal.path(),
                 true,
+                false,
             ),
             None,
         );
@@ -13396,6 +13494,7 @@ mod tests {
             limits,
             Some(h.obs.clone()),
             stopped,
+            false,
         ));
         (addr, stop, h)
     }
@@ -14699,6 +14798,7 @@ mod tests {
                 None,
                 journal.path(),
                 true,
+                false,
             ),
             None,
         );
@@ -14734,6 +14834,7 @@ mod tests {
                 None,
                 journal.path(),
                 true,
+                false,
             ),
             None,
         );
@@ -15736,6 +15837,7 @@ mod tests {
                 None,
                 journal.path(),
                 true,
+                false,
             );
             for s in corpus_str("decode-id") {
                 decode_id_at(&app, &s);
@@ -15928,6 +16030,50 @@ mod tests {
         let res = router
             .clone()
             .oneshot(req)
+            .await
+            .unwrap_or_else(|e| panic!("{e}"));
+        let status = res.status();
+        let heads = res.headers().clone();
+        let bytes = res
+            .into_body()
+            .collect()
+            .await
+            .unwrap_or_else(|e| panic!("{e}"))
+            .to_bytes();
+        (
+            status,
+            heads,
+            serde_json::from_slice(&bytes).unwrap_or(Value::Null),
+        )
+    }
+
+    /// `raw` carrying the `OpsListener` extension — what a request on
+    /// the `--ops-listen` socket looks like to the router.
+    async fn raw_ops(
+        router: &Router,
+        method: &str,
+        uri: &str,
+        headers: &[(&str, String)],
+        body: Option<Value>,
+    ) -> (StatusCode, header::HeaderMap, Value) {
+        let mut req = Request::builder().method(method).uri(uri);
+        for (k, v) in headers {
+            req = req.header(*k, v.as_str());
+        }
+        let req = match body {
+            Some(b) => req
+                .header("content-type", "application/json")
+                .body(Body::from(b.to_string())),
+            None => req.body(Body::empty()),
+        }
+        .unwrap_or_else(|e| panic!("{e}"));
+        let res = router
+            .clone()
+            .oneshot({
+                let mut req = req;
+                req.extensions_mut().insert(OpsListener);
+                req
+            })
             .await
             .unwrap_or_else(|e| panic!("{e}"));
         let status = res.status();
@@ -18801,5 +18947,111 @@ mod tests {
             .await;
             assert_eq!(st, StatusCode::NOT_FOUND, "{method} {uri}: {v}");
         }
+    }
+
+    // ---- finding 18: --ops-listen gates env keys to the ops socket ----
+
+    /// With the gate armed, an env key on the public socket answers 401
+    /// on every auth path it could take — flat member routes,
+    /// `Authorized` admin routes, read routes — indistinguishable from a
+    /// bad bearer, while the same key on the ops socket works and
+    /// store-key/session callers are unaffected on either side.
+    #[tokio::test]
+    async fn ops_listen_confines_env_keys_to_the_ops_socket() {
+        let store = Arc::new(Memory::new());
+        let a = store
+            .create_workspace("a")
+            .await
+            .unwrap_or_else(|e| panic!("{e}"));
+        let key_a = "dr_a51a51a51a51a51a51a51a51a51a51a51a51a51a51a51a51";
+        store
+            .create_key(
+                a.id,
+                "k",
+                Permission::Write,
+                &sha256(key_a.as_bytes()),
+                "dr_a",
+                None,
+            )
+            .await
+            .unwrap_or_else(|e| panic!("{e}"));
+        let h = harness_ops(Some(store));
+        let env = [("authorization", format!("Bearer {KEY}"))];
+
+        // Public side: env key is just a bad bearer — 401 everywhere it
+        // could authenticate.
+        for (method, uri) in [
+            ("GET", "/whoami"),
+            ("GET", "/admin/workspaces"),
+            ("GET", "/handlers"),
+            ("POST", "/handler-secret"),
+        ] {
+            let (st, _, _) = raw(&h.router, method, uri, &env, None).await;
+            assert_eq!(st, StatusCode::UNAUTHORIZED, "{method} {uri} on --listen");
+        }
+        // The ops socket answers the same key normally.
+        let (st, _, v) = raw_ops(&h.router, "GET", "/whoami", &env, None).await;
+        assert_eq!(st, StatusCode::OK, "{v}");
+        let (st, _, v) = raw_ops(&h.router, "GET", "/admin/workspaces", &env, None).await;
+        assert_eq!(st, StatusCode::OK, "{v}");
+        let (st, _, v) = raw_ops(&h.router, "GET", "/handlers", &env, None).await;
+        assert_eq!(st, StatusCode::OK, "{v}");
+        // The read env key is confined the same way.
+        let renv = [("authorization", format!("Bearer {READ_KEY}"))];
+        let (st, _, _) = raw(&h.router, "GET", "/whoami", &renv, None).await;
+        assert_eq!(st, StatusCode::UNAUTHORIZED);
+        let (st, _, _) = raw_ops(&h.router, "GET", "/whoami", &renv, None).await;
+        assert_eq!(st, StatusCode::OK);
+        // A store key is unaffected on the public side (data plane).
+        let (st, _, v) = raw(
+            &h.router,
+            "GET",
+            "/handlers",
+            &[("authorization", format!("Bearer {key_a}"))],
+            None,
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK, "{v}");
+    }
+
+    /// Without the flag nothing changes — env keys work on --listen as
+    /// always (the self-host shape).
+    #[tokio::test]
+    async fn no_ops_listen_leaves_env_keys_as_before() {
+        let h = harness_store(false, None, None);
+        let (st, _, v) = raw(
+            &h.router,
+            "GET",
+            "/whoami",
+            &[("authorization", format!("Bearer {KEY}"))],
+            None,
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK, "{v}");
+    }
+
+    /// Boot refuses a non-loopback --ops-listen and a non-address, and
+    /// takes every loopback spelling.
+    #[test]
+    fn ops_listen_must_be_loopback() {
+        for good in ["127.0.0.1:9100", "[::1]:9100", "127.42.0.9:1"] {
+            assert!(
+                check_ops_listen(&Some(good.to_string())).is_ok(),
+                "{good} must be accepted"
+            );
+        }
+        for bad in [
+            "0.0.0.0:9100",
+            "8.8.8.8:9100",
+            "[::]:9100",
+            "junk",
+            "127.0.0.1",
+        ] {
+            assert!(
+                check_ops_listen(&Some(bad.to_string())).is_err(),
+                "{bad} must be refused"
+            );
+        }
+        assert!(check_ops_listen(&None).is_ok());
     }
 }
