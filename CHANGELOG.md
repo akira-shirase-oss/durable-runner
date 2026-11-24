@@ -4,6 +4,30 @@ All notable changes to Durable Runner are recorded here. The format
 follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the
 versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- **Observability reads for the dashboard** (D-058), each taking the read
+  key or the API key and answered `Cache-Control: no-store`:
+  `GET /metrics?window=15m|1h|6h|24h` (counters, sampled gauges and
+  step-latency percentiles per 10 s or 60 s bucket, window totals, state
+  counts, per-handler call stats), `GET /jobs/{id}/events` (one run's
+  timeline in commit order, with a derived `finished` event and an honest
+  `complete`/`reason` when compaction, eviction or the per-run cap
+  shortened it), and `GET /events?limit=` (the activity feed across runs,
+  newest first). Everything is derived in memory with fixed caps (about
+  65 MiB at worst plus 0.4 MiB per handler); timelines and the feed are
+  rebuilt from journal replay at startup, metrics start empty. Nothing
+  shown is ever a job's input, a checkpoint's output, or a record whose
+  fsync has not returned.
+- `durable-cli metrics` and `durable-cli events [--run N]`.
+
+### Changed
+
+- Diagnostics' `states` counts are kept incrementally instead of by a scan
+  of every run per request (same output).
+
 ## [1.0.2] - 2026-11-20
 
 Rollback-safety release: the independent review of the workspace work

@@ -17,11 +17,12 @@ use axum::{
 };
 use clap::Parser;
 use durable_domain::{JobSpec, Millis, OperationKey, RunId, RunState, StepSpec};
+use durable_engine::observe::{self, Observer, Window};
 use durable_engine::shell::{
     spawn, Call, Engine, Order, Outcome, Registry, ShellConfig, StepHandler,
 };
 use durable_engine::EngineError;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -361,6 +362,29 @@ struct App {
     open_reads: bool,
     /// Canonical backup directory; `None` disables `/admin/backup`.
     backup_root: Option<Arc<Path>>,
+    /// The engine's observer (D-058): metrics, timelines, the feed.
+    obs: Arc<Observer>,
+}
+
+impl App {
+    /// The observer comes with the engine.
+    fn new(
+        engine: Engine,
+        api_key: ApiKey,
+        read_key: Option<ApiKey>,
+        open_reads: bool,
+        backup_root: Option<Arc<Path>>,
+    ) -> Self {
+        let obs = engine.observer().clone();
+        Self {
+            engine,
+            api_key,
+            read_key,
+            open_reads,
+            backup_root,
+            obs,
+        }
+    }
 }
 
 /// The bearer token a request carries: `<scheme> <token>`, the scheme
@@ -682,11 +706,169 @@ async fn submit(
         input,
     };
     let key = OperationKey(req.op_key);
-    let run = match req.not_before {
-        Some(at) => app.engine.submit_at(key, spec, at).await,
-        None => app.engine.submit(key, spec).await,
-    }?;
-    Ok(Json(serde_json::json!({ "run_id": run.0 })))
+    let submitted = match app.engine.submit_with(key, spec, req.not_before).await {
+        Ok(s) => s,
+        Err(e) => {
+            if admission_refusal(&e) {
+                app.obs.refused(observe::wall_ms());
+            }
+            return Err(e.into());
+        }
+    };
+    if submitted.deduplicated {
+        app.obs.deduplicated(observe::wall_ms());
+    }
+    Ok(Json(serde_json::json!({ "run_id": submitted.run.0 })))
+}
+
+/// A submit refused at admission — what `/metrics` counts as `refused`
+/// with the 429s: at capacity, the command queue full (busy), over the
+/// limits, an unregistered handler, or below the free-space reserve. A
+/// malformed request, a missing key, or a timeout (the submit may still
+/// commit) is not one.
+fn admission_refusal(e: &EngineError) -> bool {
+    use durable_domain::Refusal;
+    matches!(
+        e,
+        EngineError::Refused(Refusal::AtCapacity | Refusal::ReserveExhausted | Refusal::OverLimits)
+            | EngineError::UnregisteredHandler(_)
+            | EngineError::Journal(durable_journal::JournalError::NoSpace { .. })
+    )
+}
+
+/// Whether a request is a submit (a 429 for it counts as `refused`).
+fn is_submit<B>(req: &hyper::Request<B>) -> bool {
+    req.method() == axum::http::Method::POST && req.uri().path() == "/jobs"
+}
+
+/// The value of query parameter `name`: `Ok(None)` when absent, `Err`
+/// when it is given more than once.
+fn single_param<'a>(pairs: &'a [(String, String)], name: &str) -> Result<Option<&'a str>, ()> {
+    let mut found = pairs
+        .iter()
+        .filter(|(k, _)| k == name)
+        .map(|(_, v)| v.as_str());
+    match (found.next(), found.next()) {
+        (v, None) => Ok(v),
+        (Some(_), Some(_)) => Err(()),
+        (None, Some(_)) => Err(()),
+    }
+}
+
+/// `GET /metrics?window=15m|1h|6h|24h` (D-058): the metrics ring for the
+/// window, totals, current state counts and per-handler stats.
+async fn metrics(
+    _: ReadAuthorized,
+    State(app): State<App>,
+    Q(pairs): Q<Vec<(String, String)>>,
+) -> Result<Json<observe::MetricsOut>, ApiError> {
+    let invalid = || {
+        ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "invalid_window",
+            "window must be one of 15m, 1h, 6h, 24h",
+        )
+    };
+    let window = match single_param(&pairs, "window").map_err(|()| invalid())? {
+        None => Window::H1,
+        Some(w) => Window::parse(w).ok_or_else(invalid)?,
+    };
+    let counts = app.engine.index_counts().await?;
+    Ok(Json(app.obs.metrics(window, observe::wall_ms(), counts)))
+}
+
+/// `GET /jobs/{id}/events` (D-058): the run's timeline. 404 exactly when
+/// `GET /jobs/{id}` is.
+async fn run_events(
+    _: ReadAuthorized,
+    State(app): State<App>,
+    P(id): P<u64>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let run = app
+        .engine
+        .summary(RunId(id))
+        .await?
+        .ok_or_else(|| ApiError::new(StatusCode::NOT_FOUND, "not_found", "no such run"))?;
+    let t = app.obs.timeline(RunId(id));
+    Ok(Json(serde_json::json!({
+        "run": id,
+        "key": run.key.0,
+        "state": state_name(&run.state),
+        "complete": t.complete,
+        "reason": t.reason,
+        "events": t.events,
+    })))
+}
+
+/// One activity-feed entry: the timeline event plus its run and key.
+#[derive(Serialize)]
+struct FeedItem<'a> {
+    at: Millis,
+    run: u64,
+    /// `None` only for a run that has since left the index (expired by a
+    /// compaction seven days after it finished).
+    key: Option<&'a str>,
+    #[serde(flatten)]
+    kind: observe::Kind,
+}
+
+/// `GET /events?limit=1..200` (D-058): the activity feed, newest first.
+async fn feed(
+    _: ReadAuthorized,
+    State(app): State<App>,
+    Q(pairs): Q<Vec<(String, String)>>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let invalid = || {
+        ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "invalid_limit",
+            "limit must be an integer from 1 to 200",
+        )
+    };
+    let limit = match single_param(&pairs, "limit").map_err(|()| invalid())? {
+        None => 50,
+        Some(v) => v
+            .parse::<usize>()
+            .ok()
+            .filter(|n| (1..=observe::MAX_FEED_PAGE).contains(n))
+            .ok_or_else(invalid)?,
+    };
+    let events = app.obs.feed(limit);
+    // Keys come from the index at read time: the observer holds no keys,
+    // so its memory stays fixed per event (D-058).
+    let mut runs: Vec<RunId> = events.iter().map(|(r, _)| *r).collect();
+    runs.sort_unstable();
+    runs.dedup();
+    let keys = app.engine.keys(runs.clone()).await?;
+    let key_of = |run: RunId| {
+        runs.binary_search(&run)
+            .ok()
+            .and_then(|i| keys.get(i))
+            .and_then(|k| k.as_ref())
+            .map(|k| k.0.as_str())
+    };
+    let items: Vec<FeedItem<'_>> = events
+        .iter()
+        .map(|(run, ev)| FeedItem {
+            at: ev.at,
+            run: run.0,
+            key: key_of(*run),
+            kind: ev.kind,
+        })
+        .collect();
+    Ok(Json(serde_json::json!({
+        "since": app.obs.since(),
+        "events": items,
+    })))
+}
+
+/// The observability routes answer `Cache-Control: no-store`, errors too.
+async fn no_store(mut res: Response) -> Response {
+    res.headers_mut().insert(
+        header::CACHE_CONTROL,
+        header::HeaderValue::from_static("no-store"),
+    );
+    res
 }
 
 fn state_name(s: &RunState) -> String {
@@ -921,6 +1103,12 @@ fn base64_decode(s: &str) -> Result<Vec<u8>, String> {
 /// admin handler takes `Authorized`, so it is unreachable without the API
 /// key.
 fn router(app: App, ui_dir: Option<&Path>) -> Router {
+    // Read-only observability (D-058): `ReadAuthorized`, never cached.
+    let observability = Router::new()
+        .route("/metrics", get(metrics))
+        .route("/events", get(feed))
+        .route("/jobs/{id}/events", get(run_events))
+        .layer(axum::middleware::map_response(no_store));
     let mut router = Router::new()
         .route("/health", get(health))
         .route("/ready", get(ready))
@@ -931,6 +1119,7 @@ fn router(app: App, ui_dir: Option<&Path>) -> Router {
         .route("/admin/compact", post(compact))
         .route("/admin/backup", post(backup))
         .route("/admin/diagnostics", get(diagnostics))
+        .merge(observability)
         // A submit is at most 64 KiB of input (base64: ~88 KiB) plus its
         // spec; nothing legitimate comes near this.
         .layer(DefaultBodyLimit::max(MAX_REQUEST_BYTES))
@@ -1160,13 +1349,8 @@ async fn main() -> Result<()> {
         }
     }
     let stopped = engine.clone();
-    let app = App {
-        engine,
-        api_key,
-        read_key,
-        open_reads: args.open_reads,
-        backup_root,
-    };
+    let obs = engine.observer().clone();
+    let app = App::new(engine, api_key, read_key, args.open_reads, backup_root);
     let router = router(app, args.ui_dir.as_deref());
     let listener = tokio::net::TcpListener::bind(&args.listen)
         .await
@@ -1186,7 +1370,7 @@ async fn main() -> Result<()> {
         max_conns_per_proxy: args.max_conns_per_proxy,
         trusted_proxies: TrustedProxies(args.trusted_proxies),
     };
-    let serve = serve_http(listener, router, limits, http_stopped);
+    let serve = serve_http(listener, router, limits, Some(obs), http_stopped);
     tokio::pin!(serve);
     tokio::select! {
         r = &mut serve => return r.context("serve"),
@@ -1291,6 +1475,7 @@ async fn serve_http(
     listener: tokio::net::TcpListener,
     router: Router,
     limits: HttpLimits,
+    obs: Option<Arc<Observer>>,
     mut stop: tokio::sync::oneshot::Receiver<()>,
 ) -> std::io::Result<()> {
     use hyper_util::rt::{TokioIo, TokioTimer};
@@ -1380,11 +1565,13 @@ async fn serve_http(
         let peer_ip = peer.ip();
         let rate_limiter = rate_limiter.clone();
         let trusted = trusted.clone();
+        let obs = obs.clone();
         let handler =
             hyper::service::service_fn(move |req: hyper::Request<hyper::body::Incoming>| {
                 let per_conn = per_conn.clone();
                 let rate_limiter = rate_limiter.clone();
                 let trusted = trusted.clone();
+                let obs = obs.clone();
                 async move {
                     // The per-address request rate. Refused before auth:
                     // a flood without a key is still a flood, and the
@@ -1403,6 +1590,10 @@ async fn serve_http(
                             .check(client, std::time::Instant::now())
                             .err();
                         if let Some(retry) = refused {
+                            // A refused submit counts in `/metrics` (D-058).
+                            if let Some(o) = obs.as_ref().filter(|_| is_submit(&req)) {
+                                o.refused(observe::wall_ms());
+                            }
                             let mut res = Response::builder()
                                 .status(StatusCode::TOO_MANY_REQUESTS)
                                 .header(header::CONTENT_TYPE, "application/json")
@@ -1615,9 +1806,21 @@ mod tests {
         }
     }
 
+    /// Answers with an output no observability response may contain.
+    struct Secret;
+    #[async_trait::async_trait]
+    impl StepHandler for Secret {
+        async fn execute(&self, _s: &StepSpec, _i: &[u8], _k: &str) -> Outcome {
+            Outcome::Checkpoint(SECRET_OUTPUT.to_vec())
+        }
+    }
+    const SECRET_OUTPUT: &[u8] = b"SECRET-OUTPUT-7f3a";
+    const SECRET_INPUT: &[u8] = b"SECRET-INPUT-91c2";
+
     struct Harness {
         router: Router,
         backups: tempfile::TempDir,
+        obs: Arc<Observer>,
         _journal: tempfile::TempDir,
     }
 
@@ -1634,6 +1837,7 @@ mod tests {
         let backups = tempfile::tempdir().unwrap_or_else(|e| panic!("{e}"));
         let mut reg = Registry::default();
         reg.register("step", Arc::new(Echo));
+        reg.register("secret", Arc::new(Secret));
         let mut opts = durable_journal::JournalOptions::default();
         if let Some(free) = free {
             opts.reserve_bytes = 4096;
@@ -1650,18 +1854,503 @@ mod tests {
         let backup_root = with_backup_root.then(|| {
             prepare_backup_root(&backups.path().join("root")).unwrap_or_else(|e| panic!("{e}"))
         });
-        let app = App {
+        let app = App::new(
             engine,
-            api_key: ApiKey::new(KEY),
-            read_key: Some(ApiKey::new(READ_KEY)),
-            open_reads: false,
+            ApiKey::new(KEY),
+            Some(ApiKey::new(READ_KEY)),
+            false,
             backup_root,
-        };
+        );
         Harness {
+            obs: app.obs.clone(),
             router: router(app, None),
             backups,
             _journal: journal,
         }
+    }
+
+    /// `call`, keeping the headers and the raw body text.
+    async fn call_raw(
+        router: &Router,
+        uri: &str,
+        key: Option<&str>,
+    ) -> (StatusCode, axum::http::HeaderMap, String) {
+        let mut req = Request::builder().method("GET").uri(uri);
+        if let Some(k) = key {
+            req = req.header("authorization", format!("Bearer {k}"));
+        }
+        let res = router
+            .clone()
+            .oneshot(req.body(Body::empty()).unwrap_or_else(|e| panic!("{e}")))
+            .await
+            .unwrap_or_else(|e| panic!("{e}"));
+        let (status, headers) = (res.status(), res.headers().clone());
+        let bytes = res
+            .into_body()
+            .collect()
+            .await
+            .unwrap_or_else(|e| panic!("{e}"))
+            .to_bytes();
+        (
+            status,
+            headers,
+            String::from_utf8_lossy(&bytes).into_owned(),
+        )
+    }
+
+    /// Poll `GET /jobs/{id}` until the run's state is `want`, against a
+    /// wall-clock deadline (never a count of sleeps).
+    async fn until_state(router: &Router, id: u64, want: &str) {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        while tokio::time::Instant::now() < deadline {
+            let (_, v) = call(router, "GET", &format!("/jobs/{id}"), Some(KEY), None).await;
+            if v["state"] == want {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        panic!("run {id} never reached {want}");
+    }
+
+    const OBS_ROUTES: [&str; 3] = ["/metrics", "/events", "/jobs/1/events"];
+
+    /// D-058: the three observability reads take `ReadAuthorized`: the
+    /// read key or the API key, never nothing — unless `--open-reads`,
+    /// and then only for a loopback Host.
+    #[tokio::test]
+    async fn observability_reads_need_a_read_key() {
+        let h = harness(false);
+        let (status, _) = call(
+            &h.router,
+            "POST",
+            "/jobs",
+            Some(KEY),
+            Some(submit_body("o")),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        for uri in OBS_ROUTES {
+            for key in [None, Some("wrong"), Some(&KEY[..KEY.len() - 1])] {
+                let (status, v) = call(&h.router, "GET", uri, key, None).await;
+                assert_eq!(
+                    (status, v["code"].clone()),
+                    (StatusCode::UNAUTHORIZED, json!("unauthorized")),
+                    "GET {uri} key={key:?}"
+                );
+            }
+            for key in [KEY, READ_KEY] {
+                let (status, v) = call(&h.router, "GET", uri, Some(key), None).await;
+                assert_eq!(status, StatusCode::OK, "GET {uri}: {v}");
+            }
+        }
+        // --open-reads: a loopback Host reads without a key; any other is 401.
+        let journal = tempfile::tempdir().unwrap_or_else(|e| panic!("{e}"));
+        let mut reg = Registry::default();
+        reg.register("step", Arc::new(Echo));
+        let engine =
+            spawn(journal.path(), reg, ShellConfig::default()).unwrap_or_else(|e| panic!("{e}"));
+        let r = router(App::new(engine, ApiKey::new(KEY), None, true, None), None);
+        for uri in ["/metrics", "/events"] {
+            for (host, want) in [
+                ("127.0.0.1:58300", StatusCode::OK),
+                ("attacker.example", StatusCode::UNAUTHORIZED),
+            ] {
+                let req = Request::builder()
+                    .uri(uri)
+                    .header("host", host)
+                    .body(Body::empty())
+                    .unwrap_or_else(|e| panic!("{e}"));
+                let status = r
+                    .clone()
+                    .oneshot(req)
+                    .await
+                    .unwrap_or_else(|e| panic!("{e}"))
+                    .status();
+                assert_eq!(status, want, "GET {uri} Host {host}");
+            }
+        }
+    }
+
+    /// Every observability answer — success or refusal — says
+    /// `Cache-Control: no-store`.
+    #[tokio::test]
+    async fn observability_answers_are_never_cached() {
+        let h = harness(false);
+        call(
+            &h.router,
+            "POST",
+            "/jobs",
+            Some(KEY),
+            Some(submit_body("c")),
+        )
+        .await;
+        for (uri, key, want) in [
+            ("/metrics", Some(READ_KEY), StatusCode::OK),
+            ("/events", Some(READ_KEY), StatusCode::OK),
+            ("/jobs/1/events", Some(READ_KEY), StatusCode::OK),
+            ("/metrics", None, StatusCode::UNAUTHORIZED),
+            (
+                "/metrics?window=2h",
+                Some(READ_KEY),
+                StatusCode::BAD_REQUEST,
+            ),
+            ("/events?limit=0", Some(READ_KEY), StatusCode::BAD_REQUEST),
+            ("/jobs/999/events", Some(READ_KEY), StatusCode::NOT_FOUND),
+        ] {
+            let (status, headers, _) = call_raw(&h.router, uri, key).await;
+            assert_eq!(status, want, "{uri}");
+            assert_eq!(
+                headers
+                    .get(header::CACHE_CONTROL)
+                    .and_then(|v| v.to_str().ok()),
+                Some("no-store"),
+                "{uri}"
+            );
+        }
+        // Other reads are unchanged.
+        let (_, headers, _) = call_raw(&h.router, "/jobs/1", Some(KEY)).await;
+        assert!(headers.get(header::CACHE_CONTROL).is_none());
+    }
+
+    /// `window` selects the ring and bucket size; every bucket is present;
+    /// anything else is 400 `invalid_window` in the error envelope.
+    #[tokio::test]
+    async fn metrics_windows_and_their_refusals() {
+        let h = harness(false);
+        for (q, window, bucket, points) in [
+            ("", 3_600_000u64, 10_000u64, 360usize),
+            ("?window=1h", 3_600_000, 10_000, 360),
+            ("?window=15m", 900_000, 10_000, 90),
+            ("?window=6h", 21_600_000, 60_000, 360),
+            ("?window=24h", 86_400_000, 60_000, 1440),
+            ("?window=15m&other=x", 900_000, 10_000, 90),
+        ] {
+            let (status, v) = call(
+                &h.router,
+                "GET",
+                &format!("/metrics{q}"),
+                Some(READ_KEY),
+                None,
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "{q}: {v}");
+            assert_eq!(v["window_ms"], window, "{q}");
+            assert_eq!(v["bucket_ms"], bucket, "{q}");
+            let pts = v["points"].as_array().map_or(0, Vec::len);
+            assert_eq!(pts, points, "{q}");
+            assert_eq!(v["states"].as_object().map_or(0, |o| o.len()), 7, "{q}");
+            assert!(v["now"].as_u64() >= v["since"].as_u64(), "{q}");
+        }
+        for q in [
+            "window=2h",
+            "window=",
+            "window=1H",
+            "window=60m",
+            "window=1h&window=1h",
+            "window=%31h%00",
+        ] {
+            let (status, v) = call(
+                &h.router,
+                "GET",
+                &format!("/metrics?{q}"),
+                Some(READ_KEY),
+                None,
+            )
+            .await;
+            assert_eq!(
+                (status, v["code"].clone()),
+                (StatusCode::BAD_REQUEST, json!("invalid_window")),
+                "{q}"
+            );
+            assert!(v["error"].is_string(), "{q}: the error envelope");
+        }
+    }
+
+    /// `limit` is 1–200 (default 50); anything else is 400 `invalid_limit`.
+    #[tokio::test]
+    async fn the_feed_limit_is_bounded() {
+        let h = harness(false);
+        for i in 0..60 {
+            let mut b = submit_body(&format!("f-{i}"));
+            b["not_before"] = json!(9_999_999_999_999u64); // one event each
+            let (status, _) = call(&h.router, "POST", "/jobs", Some(KEY), Some(b)).await;
+            assert_eq!(status, StatusCode::OK);
+        }
+        for (q, n) in [
+            ("", 50usize),
+            ("?limit=1", 1),
+            ("?limit=200", 60),
+            ("?limit=60", 60),
+        ] {
+            let (status, v) = call(
+                &h.router,
+                "GET",
+                &format!("/events{q}"),
+                Some(READ_KEY),
+                None,
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "{q}: {v}");
+            assert_eq!(v["events"].as_array().map_or(0, Vec::len), n, "{q}");
+        }
+        let (_, v) = call(&h.router, "GET", "/events?limit=2", Some(READ_KEY), None).await;
+        assert_eq!(v["events"][0]["run"], 60, "newest first: {v}");
+        assert_eq!(v["events"][0]["key"], "f-59");
+        assert_eq!(v["events"][0]["kind"], "accepted");
+        assert_eq!(v["events"][1]["run"], 59);
+        for q in [
+            "limit=0",
+            "limit=201",
+            "limit=abc",
+            "limit=-1",
+            "limit=",
+            "limit=1.5",
+            "limit=5&limit=5",
+        ] {
+            let (status, v) = call(
+                &h.router,
+                "GET",
+                &format!("/events?{q}"),
+                Some(READ_KEY),
+                None,
+            )
+            .await;
+            assert_eq!(
+                (status, v["code"].clone()),
+                (StatusCode::BAD_REQUEST, json!("invalid_limit")),
+                "{q}"
+            );
+        }
+    }
+
+    /// `GET /jobs/{id}/events` is 404 exactly where `GET /jobs/{id}` is,
+    /// and a malformed id is the same 400 for both.
+    #[tokio::test]
+    async fn run_events_404_exactly_like_inspect() {
+        let h = harness(false);
+        call(
+            &h.router,
+            "POST",
+            "/jobs",
+            Some(KEY),
+            Some(submit_body("n")),
+        )
+        .await;
+        for (id, want) in [
+            ("1", StatusCode::OK),
+            ("2", StatusCode::NOT_FOUND),
+            ("0", StatusCode::NOT_FOUND),
+        ] {
+            let (a, va) = call(&h.router, "GET", &format!("/jobs/{id}"), Some(KEY), None).await;
+            let (b, vb) = call(
+                &h.router,
+                "GET",
+                &format!("/jobs/{id}/events"),
+                Some(KEY),
+                None,
+            )
+            .await;
+            assert_eq!((a, b), (want, want), "{id}");
+            assert_eq!(va["code"], vb["code"], "{id}");
+        }
+        let (a, va) = call(&h.router, "GET", "/jobs/abc", Some(KEY), None).await;
+        let (b, vb) = call(&h.router, "GET", "/jobs/abc/events", Some(KEY), None).await;
+        assert_eq!((a, b), (StatusCode::BAD_REQUEST, StatusCode::BAD_REQUEST));
+        assert_eq!(
+            (va["code"].clone(), vb["code"].clone()),
+            (json!("bad_path"), json!("bad_path"))
+        );
+        let (_, v) = call(&h.router, "GET", "/jobs/404/events", Some(KEY), None).await;
+        assert_eq!(v["code"], "not_found");
+    }
+
+    /// A run through a handler, then both event views: the timeline in
+    /// commit order with the derived events, and neither view carries the
+    /// job's input or the checkpointed output in any encoding.
+    #[tokio::test]
+    async fn event_views_never_show_inputs_or_outputs() {
+        use base64::Engine as _;
+        let b64 = base64::engine::general_purpose::STANDARD;
+        let h = harness(false);
+        let body = json!({
+            "op_key": "secret-run",
+            "spec": {
+                "version": 1,
+                "steps": [{ "name": "a", "handler": "secret" }, { "name": "b", "handler": "secret" }],
+                "input_b64": b64.encode(SECRET_INPUT),
+            },
+        });
+        let (status, v) = call(&h.router, "POST", "/jobs", Some(KEY), Some(body)).await;
+        assert_eq!(status, StatusCode::OK, "{v}");
+        until_state(&h.router, 1, "done").await;
+
+        let (status, _, timeline) = call_raw(&h.router, "/jobs/1/events", Some(READ_KEY)).await;
+        assert_eq!(status, StatusCode::OK);
+        let (_, _, feed) = call_raw(&h.router, "/events?limit=200", Some(READ_KEY)).await;
+        let as_numbers = |b: &[u8]| b.iter().map(u8::to_string).collect::<Vec<_>>().join(",");
+        for text in [&timeline, &feed] {
+            for needle in [
+                "SECRET".to_string(),
+                b64.encode(SECRET_INPUT),
+                b64.encode(SECRET_OUTPUT),
+                as_numbers(SECRET_INPUT),
+                as_numbers(SECRET_OUTPUT),
+            ] {
+                assert!(!text.contains(&needle), "{needle} leaked: {text}");
+            }
+        }
+        let t: Value = serde_json::from_str(&timeline).unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(
+            (t["run"].clone(), t["key"].clone(), t["state"].clone()),
+            (json!(1), json!("secret-run"), json!("done"))
+        );
+        assert_eq!(
+            (t["complete"].clone(), t["reason"].clone()),
+            (json!(true), Value::Null)
+        );
+        let kinds: Vec<&str> = t["events"]
+            .as_array()
+            .map(|a| a.iter().filter_map(|e| e["kind"].as_str()).collect())
+            .unwrap_or_default();
+        assert_eq!(
+            kinds,
+            [
+                "accepted",
+                "dispatched",
+                "checkpointed",
+                "dispatched",
+                "checkpointed",
+                "finished"
+            ]
+        );
+        assert_eq!(t["events"][5]["outcome"], "done");
+        assert_eq!(t["events"][1]["attempt"], 1);
+        assert!(t["events"][1]["deadline"].as_u64() > t["events"][1]["at"].as_u64());
+        let f: Value = serde_json::from_str(&feed).unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(f["events"][0]["kind"], "finished");
+        assert_eq!(f["events"][0]["key"], "secret-run");
+        assert_eq!(f["events"].as_array().map_or(0, Vec::len), 6);
+        assert_eq!(f["since"], h.obs.since());
+
+        // The metrics see the same run.
+        let (_, m) = call(
+            &h.router,
+            "GET",
+            "/metrics?window=15m",
+            Some(READ_KEY),
+            None,
+        )
+        .await;
+        let t = &m["totals"];
+        assert_eq!(
+            (
+                t["accepted"].clone(),
+                t["completed"].clone(),
+                t["steps_ok"].clone()
+            ),
+            (json!(1), json!(1), json!(2))
+        );
+        assert_eq!(m["states"]["done"], 1);
+        let secret = m["handlers"]
+            .as_array()
+            .and_then(|a| a.iter().find(|x| x["name"] == "secret"))
+            .cloned()
+            .unwrap_or_default();
+        assert_eq!(
+            (secret["calls"].clone(), secret["ok"].clone()),
+            (json!(2), json!(2))
+        );
+        let names: Vec<&str> = m["handlers"]
+            .as_array()
+            .map(|a| a.iter().filter_map(|x| x["name"].as_str()).collect())
+            .unwrap_or_default();
+        assert_eq!(names, ["secret", "step"], "every handler, by name");
+    }
+
+    /// Deduplicated and refused submits are counted where they are
+    /// answered.
+    #[tokio::test]
+    async fn submits_count_as_deduplicated_or_refused() {
+        let h = harness(false);
+        let mut later = submit_body("same");
+        later["not_before"] = json!(9_999_999_999_999u64);
+        for _ in 0..3 {
+            let (status, v) =
+                call(&h.router, "POST", "/jobs", Some(KEY), Some(later.clone())).await;
+            assert_eq!((status, v["run_id"].clone()), (StatusCode::OK, json!(1)));
+        }
+        let mut unknown = submit_body("u");
+        unknown["spec"]["steps"][0]["handler"] = json!("nope");
+        let (status, _) = call(&h.router, "POST", "/jobs", Some(KEY), Some(unknown)).await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        let (status, _) = call(
+            &h.router,
+            "POST",
+            "/jobs",
+            Some(KEY),
+            Some(submit_body(&"k".repeat(300))),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        // Not refusals: a malformed body, no key.
+        let mut bad = submit_body("b");
+        bad["spec"]["input_b64"] = json!("***");
+        let (status, _) = call(&h.router, "POST", "/jobs", Some(KEY), Some(bad)).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        let (status, _) = call(&h.router, "POST", "/jobs", None, Some(submit_body("x"))).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        let (_, m) = call(
+            &h.router,
+            "GET",
+            "/metrics?window=15m",
+            Some(READ_KEY),
+            None,
+        )
+        .await;
+        let t = &m["totals"];
+        assert_eq!(
+            (
+                t["accepted"].clone(),
+                t["deduplicated"].clone(),
+                t["refused"].clone()
+            ),
+            (json!(1), json!(2), json!(2)),
+            "{t}"
+        );
+    }
+
+    /// A submit refused 429 by the per-address limit counts as refused; a
+    /// limited read does not.
+    #[tokio::test]
+    async fn a_rate_limited_submit_counts_as_refused() {
+        // One request, then one token per 1000 s: deterministic refusals.
+        let limits = HttpLimits {
+            rate_per_addr: 0.001,
+            ..HttpLimits::default()
+        };
+        let (addr, _stop, h) = serving(limits).await;
+        let client = reqwest::Client::new();
+        let post = || {
+            client
+                .post(format!("http://{addr}/jobs"))
+                .bearer_auth(KEY)
+                .json(&submit_body("rl"))
+                .send()
+        };
+        let first = post().await.unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(first.status().as_u16(), 200);
+        let second = post().await.unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(second.status().as_u16(), 429);
+        let read = client
+            .get(format!("http://{addr}/health"))
+            .send()
+            .await
+            .unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(read.status().as_u16(), 429);
+        let m = h
+            .obs
+            .metrics(Window::M15, observe::wall_ms(), Default::default());
+        assert_eq!(m.totals.counters.refused, 1);
     }
 
     async fn call(
@@ -1851,16 +2540,7 @@ mod tests {
         reg.register("step", Arc::new(Echo));
         let engine =
             spawn(journal.path(), reg, ShellConfig::default()).unwrap_or_else(|e| panic!("{e}"));
-        let r = router(
-            App {
-                engine,
-                api_key: ApiKey::new(KEY),
-                read_key: None,
-                open_reads: true,
-                backup_root: None,
-            },
-            None,
-        );
+        let r = router(App::new(engine, ApiKey::new(KEY), None, true, None), None);
         let get = |host: Option<&'static str>| {
             let r = r.clone();
             async move {
@@ -2532,13 +3212,7 @@ mod tests {
         let engine = spawn(journal.path(), Registry::default(), ShellConfig::default())
             .unwrap_or_else(|e| panic!("{e}"));
         let r = router(
-            App {
-                engine,
-                api_key: ApiKey::new(KEY),
-                read_key: None,
-                open_reads: false,
-                backup_root: None,
-            },
+            App::new(engine, ApiKey::new(KEY), None, false, None),
             Some(ui.path()),
         );
         use base64::Engine as _;
@@ -2618,7 +3292,13 @@ mod tests {
             .unwrap_or_else(|e| panic!("{e}"));
         let addr = listener.local_addr().unwrap_or_else(|e| panic!("{e}"));
         let (stop, stopped) = tokio::sync::oneshot::channel();
-        tokio::spawn(serve_http(listener, h.router.clone(), limits, stopped));
+        tokio::spawn(serve_http(
+            listener,
+            h.router.clone(),
+            limits,
+            Some(h.obs.clone()),
+            stopped,
+        ));
         (addr, stop, h)
     }
 
@@ -3215,16 +3895,7 @@ mod tests {
             ..Default::default()
         };
         let engine = spawn(journal.path(), reg, cfg).unwrap_or_else(|e| panic!("{e}"));
-        let r = router(
-            App {
-                engine,
-                api_key: ApiKey::new(KEY),
-                read_key: None,
-                open_reads: false,
-                backup_root: None,
-            },
-            None,
-        );
+        let r = router(App::new(engine, ApiKey::new(KEY), None, false, None), None);
         fail.store(true, std::sync::atomic::Ordering::SeqCst);
         let (status, v) = call(&r, "POST", "/jobs", Some(KEY), Some(submit_body("p"))).await;
         assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{v}");
@@ -3249,16 +3920,7 @@ mod tests {
             ..Default::default()
         };
         let engine = spawn(journal.path(), reg, cfg).unwrap_or_else(|e| panic!("{e}"));
-        let r = router(
-            App {
-                engine,
-                api_key: ApiKey::new(KEY),
-                read_key: None,
-                open_reads: false,
-                backup_root: None,
-            },
-            None,
-        );
+        let r = router(App::new(engine, ApiKey::new(KEY), None, false, None), None);
         faults.hold_syncs();
         let within = |f| tokio::time::timeout(Duration::from_secs(5), f);
         let (status, v) = within(call(&r, "POST", "/jobs", Some(KEY), Some(submit_body("s"))))

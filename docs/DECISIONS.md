@@ -1030,3 +1030,54 @@ The agreed contract, decided for both branches:
   `public_id.key` lists that key, and a backup listing it is refused
   by v1.0.1's restore, which admits generation paths only — the
   rollback floor for a key-holding backup is this release.
+
+## D-058: observability is derived, in memory and bounded
+
+Observability is derived, in memory and bounded; the journal stays the
+only authority. The server keeps a metrics ring, per-handler call stats,
+run timelines and an activity feed, fed O(1) per event from the commit
+path, the executor and journal replay. Every structure has a fixed cap. A
+restart rebuilds timelines and the activity feed from replay (journal
+records carry `at`); it does NOT rebuild metrics buckets older than the
+start (they begin at `since`). Compaction or eviction can shorten a run's
+timeline: the API says so (`complete`/`reason`), never invents.
+
+How the engine keeps that rule:
+
+- **Durable before observed.** In the running server the actor holds
+  each record's contribution until the writer reports the fsync that
+  covers it, and hands it over before it releases anything else that
+  fsync covers — so a read that waited for a record finds it, and the
+  observer never shows what a crash could take back (D-014's rule for
+  every other read). The pending queue is bounded by the outbox and the
+  writer's queue.
+- **Derived events.** `finished` (done, failed, cancelled) is emitted
+  with the record that made the run terminal. A checkpoint (or a found
+  reconcile) that moves a run onto its next step is that step's durable
+  dispatch — the engine journals no separate `StepDispatched` for it —
+  so it is shown, and counted, as a `dispatched` event at the same `at`.
+- **No payloads, no keys.** Events carry kinds and small numbers only:
+  never an input, an output or an operation key. The feed's keys are
+  read from the index when it is served, so every event costs a fixed
+  32 bytes; a run that has since left the index (expired seven days
+  after finishing) answers `key: null`.
+- **What replay can know.** The opened snapshot's `next_run` is a
+  watermark: a run below it came from the snapshot, so its history before
+  the snapshot is gone (`compacted`, with whatever came after). A run
+  accepted in the replayed log, or live, has a timeline from its
+  acceptance; one without a timeline was evicted. A live compaction drops
+  nothing from memory, so timelines stay complete until a restart.
+- **Bounds.** 360 × 10 s and 1440 × 60 s buckets; per handler the same
+  two rings (handlers are a static allowlist); 20,000 timelines, LRU on
+  the last event, each at most the first 16 and the last 80 events; a
+  1,000-event feed. Latency percentiles come from a fixed 47-bucket
+  log histogram and are the holding bucket's upper bound capped at the
+  exact maximum (over-reports by at most one bucket width).
+- **Locks.** Short `std::sync::Mutex` sections and atomics, no I/O or
+  await under a lock; a reader copies the window out and aggregates
+  outside the lock; the writer thread never touches the observer. State
+  counts are kept incrementally by the engine (O(1) for `/metrics` and
+  diagnostics alike) and recomputed after replay.
+- **Gauges** (`live_runs`, `active_runs`, `in_flight`) are sampled once a
+  second; the last sample in a bucket wins, so a bucket's gauges are its
+  value within a second of its end, `null` if it was never sampled.

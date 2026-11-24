@@ -15,7 +15,7 @@
 |---|---|
 | `durable-domain` | Pure state machine: job/step identities, transitions, invalid-state list, limits. No I/O — enforced. |
 | `durable-journal` | Framed append-only store: frame v2 = version, length, sequence, batch length, payload checksum and a header checksum per record (D-032; v1 still read); generation manifest; torn-tail detection that never cuts more than an incomplete final frame; exclusive writer lock. |
-| `durable-engine` | Execution: step claims, per-attempt deadlines, bounded retries with capped jitter, cancellation, effect reconciliation. |
+| `durable-engine` | Execution: step claims, per-attempt deadlines, bounded retries with capped jitter, cancellation, effect reconciliation. `observe`: the bounded, derived observability layer (D-058). |
 | `durable-server` | Axum API + the coordinator loop (pure reducer + fake clock, bounded channels). |
 | `durable-cli` | Submit/inspect/cancel/backup/restore from a shell. |
 | `apps/inspect` | Small SvelteKit inspection UI (read-only views of runs, steps, journal stats). |
@@ -70,6 +70,9 @@ delete every superseded `gen-*` directory (retention). Runs on `POST
 | `POST /admin/compact` | API key | compact into a new generation |
 | `POST /admin/backup {name}` | API key | backup to `<backup-root>/<name>` only |
 | `GET /admin/diagnostics` | API key | bounded counts |
+| `GET /metrics?window=15m\|1h\|6h\|24h` | read key or API key (same) | metrics ring for the window, totals, state counts, per-handler stats (D-058) |
+| `GET /jobs/{id}/events` | read key or API key (same) | a run's timeline: commit-order events, `complete`/`reason` (D-058) |
+| `GET /events?limit=` | read key or API key (same) | the activity feed across runs, newest first (1-200, default 50) |
 | `/inspector/` | static files open; the UI sends its key on every call | SvelteKit UI |
 
 The key is `DURABLE_API_KEY`; the optional `DURABLE_READ_KEY` may only read
