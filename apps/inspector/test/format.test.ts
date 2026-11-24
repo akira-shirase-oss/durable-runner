@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import { fmtAgo, fmtBytes, fmtClock, fmtClockMs, fmtCompact, fmtDateTime, fmtInt, fmtMs, fmtMsTick, fmtOffset, fmtPct, fmtRate } from '../src/lib/format.ts';
+import { fmtAgo, fmtApproxMs, fmtBytes, fmtClock, fmtClockMs, fmtCompact, fmtDateTime, fmtInt, fmtMs, fmtMsTick, fmtOffset, fmtPct, fmtRate } from '../src/lib/format.ts';
 
 test('counts: full under 10,000, compact above, never "10.0K"', () => {
 	assert.equal(fmtInt(1204318), '1,204,318');
@@ -39,6 +39,8 @@ test('latency axis ticks are short', () => {
 	assert.equal(fmtMsTick(1500), '1.5s');
 	assert.equal(fmtMsTick(20_000), '20s');
 	assert.equal(fmtMsTick(120_000), '2m');
+	assert.equal(fmtMsTick(70_000), '1m 10s'); // a Gantt offset between whole minutes
+	assert.equal(fmtMsTick(3_600_000), '1h');
 });
 
 test('percentages never round a real failure away', () => {
@@ -85,4 +87,10 @@ test('bytes in binary units', () => {
 	assert.equal(fmtBytes(2_846_720), '2.71 MiB');
 	assert.equal(fmtBytes(1536), '1.5 KiB');
 	assert.equal(fmtBytes(null), '—');
+});
+
+test('latency percentiles read as approximate', () => {
+	assert.equal(fmtApproxMs(1), '≈1 ms');
+	assert.equal(fmtApproxMs(1200), '≈1.2 s');
+	assert.equal(fmtApproxMs(null), '—');
 });

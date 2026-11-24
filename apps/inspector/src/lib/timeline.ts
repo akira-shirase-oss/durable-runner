@@ -30,13 +30,23 @@ export interface Attempt {
 	effectFound: boolean | null;
 }
 
-/** Attempts per step from the events, in dispatch order. `finishedAt` closes anything left open when the run is
- *  terminal. */
-export function buildAttempts(events: readonly RunEvent[]): Attempt[] {
+/** Attempts per step from the events, in dispatch order. A `finished` event closes anything left open. `gapAt`
+ *  is the index of the first event after a hole the server reported (gapIndex): attempts open across it are
+ *  closed as unknown at the last event before it, because their answers fell into the hole, and an answer after
+ *  it is never matched to a dispatch before it. Zero-length steps are normal: a step's dispatch shares its `at`
+ *  with the previous step's checkpoint. */
+export function buildAttempts(events: readonly RunEvent[], gapAt = -1): Attempt[] {
 	const out: Attempt[] = [];
 	const open = new Map<number, Attempt>(); // step → the attempt awaiting its answer
 	const lost = new Map<number, Attempt>(); // step → the attempt awaiting reconciliation
-	for (const e of events) {
+	for (let i = 0; i < events.length; i++) {
+		const e = events[i]!;
+		if (i === gapAt && i > 0) {
+			const lastAt = events[i - 1]!.at;
+			for (const a of open.values()) close(a, lastAt, 'unknown');
+			open.clear();
+			lost.clear();
+		}
 		const step = typeof e.step === 'number' ? e.step : null;
 		switch (e.kind) {
 			case 'dispatched': {
@@ -101,7 +111,7 @@ export function attemptSucceeded(a: Attempt): boolean {
 /** The Gantt's time domain. It starts at the first dispatch (a run that waited in the queue would otherwise squash
  *  every bar into the right edge; the wait is reported separately) and ends at the last answer, or `now` while an
  *  attempt is open. Never empty: at least `minSpan` wide. */
-export function ganttDomain(attempts: readonly Attempt[], now: number, minSpan = 1000): [number, number] | null {
+export function ganttDomain(attempts: readonly Attempt[], now: number, minSpan = 20): [number, number] | null {
 	if (attempts.length === 0) return null;
 	let start = Infinity;
 	let end = -Infinity;
@@ -166,13 +176,23 @@ export interface TimelineRow {
 	answeredIn: number | null;
 }
 
-/** The vertical timeline's rows, with the durations the server's events imply. */
-export function timelineRows(events: readonly RunEvent[], stepName: (i: number) => string | null = () => null): TimelineRow[] {
+/** The vertical timeline's rows, with the durations the server's events imply. Durations never reach across a
+ *  hole the server reported (`gapAt`, as for buildAttempts). */
+export function timelineRows(
+	events: readonly RunEvent[],
+	stepName: (i: number) => string | null = () => null,
+	gapAt = -1,
+): TimelineRow[] {
 	const t0 = events[0]?.at ?? 0;
 	const dispatchedAt = new Map<number, number>();
 	const answeredAt = new Map<number, number>();
 	const lostAt = new Map<number, number>();
-	return events.map((e) => {
+	return events.map((e, i) => {
+		if (i === gapAt) {
+			dispatchedAt.clear();
+			answeredAt.clear();
+			lostAt.clear();
+		}
 		const step = typeof e.step === 'number' ? e.step : null;
 		const name = step !== null ? stepName(step) : null;
 		const label = step !== null ? `step ${step}${name ? ` (${name})` : ''}` : '';

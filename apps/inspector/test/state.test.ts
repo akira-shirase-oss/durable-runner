@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import { share, stateView } from '../src/lib/state.ts';
+import { cancellable, share, stateView, terminal } from '../src/lib/state.ts';
 
 test('every state the server reports maps to its chip, label and detail', () => {
 	assert.deepEqual(stateView('queued'), { kind: 'queued', label: 'Queued', detail: '' });
@@ -31,4 +31,15 @@ test('diagnostics bars: proportional, visible when non-zero, never NaN', () => {
 	assert.equal(share(0, 0), 0); // every state empty
 	assert.equal(share(5, 0), 0);
 	assert.equal(share(200, 100), 100); // clamped
+});
+
+test('cancellable until terminal, whatever the tail', () => {
+	assert.equal(cancellable('queued'), true);
+	assert.equal(cancellable('running:step:1:attempt:2'), true);
+	assert.equal(cancellable('reconciling:step:4'), true);
+	assert.equal(cancellable('done'), false);
+	assert.equal(cancellable('failed:step:2'), false);
+	assert.equal(cancellable('cancelled'), false);
+	assert.equal(terminal('failed:step:2'), true);
+	assert.equal(terminal('retry_waiting:step:0:attempt:3'), false);
 });

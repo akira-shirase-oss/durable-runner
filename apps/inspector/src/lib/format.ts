@@ -43,7 +43,11 @@ export function fmtMsTick(ms: number): string {
 	if (ms === 0) return '0';
 	if (ms < 1000) return `${trim(ms.toFixed(ms < 10 ? 1 : 0))}ms`;
 	if (ms < 60_000) return `${trim((ms / 1000).toFixed(ms < 10_000 ? 1 : 0))}s`;
-	if (ms < 3_600_000) return `${trim((ms / 60_000).toFixed(1))}m`;
+	if (ms < 3_600_000) {
+		const m = Math.floor(ms / 60_000);
+		const s = Math.round((ms % 60_000) / 1000);
+		return s === 0 ? `${m}m` : `${m}m ${s}s`;
+	}
 	return `${trim((ms / 3_600_000).toFixed(1))}h`;
 }
 
@@ -125,4 +129,9 @@ function pad2(n: number): string {
 
 function trim(s: string): string {
 	return s.includes('.') ? s.replace(/\.?0+$/, '') : s;
+}
+
+/** A latency percentile from the server's histogram: its bucket's upper bound, so approximate ("≈120 ms"). */
+export function fmtApproxMs(ms: number | null | undefined): string {
+	return ms === null || ms === undefined || !Number.isFinite(ms) ? '—' : `≈${fmtMs(ms)}`;
 }

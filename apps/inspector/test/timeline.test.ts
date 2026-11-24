@@ -58,7 +58,7 @@ test('the Gantt domain starts at the first dispatch and ends at the last answer 
 	assert.deepEqual(ganttDomain(a, T + 99_999), [T + 50, T + 5100]); // the probe's answer extends the end
 	const open = buildAttempts([{ at: T, kind: 'dispatched', step: 0 }]);
 	assert.deepEqual(ganttDomain(open, T + 4000), [T, T + 4000]);
-	assert.deepEqual(ganttDomain(open, T + 10), [T, T + 1000]); // never narrower than minSpan
+	assert.deepEqual(ganttDomain(open, T + 10), [T, T + 20]); // never narrower than minSpan (20 ms)
 	assert.equal(ganttDomain([], T), null);
 });
 
@@ -121,4 +121,41 @@ test('step progress from the state the server reports', () => {
 	assert.deepEqual(stepStates('queued', 2), ['pending', 'pending']);
 	assert.deepEqual(stepStates('cancelled', 3, EXAMPLE.slice(0, 3)), ['done', 'cancelled', 'cancelled']);
 	assert.deepEqual(stepStates('running:step:0:attempt:1', 0), []);
+});
+
+test('a hole the server reported is never bridged: no attempt or duration spans it', () => {
+	const ev: RunEvent[] = [
+		{ at: T, kind: 'dispatched', step: 1, attempt: 7 },
+		// … events dropped by the per-run cap …
+		{ at: T + 9000, kind: 'step_failed', step: 1 },
+		{ at: T + 9500, kind: 'dispatched', step: 1, attempt: 10 },
+		{ at: T + 9900, kind: 'checkpointed', step: 1 },
+	];
+	const a = buildAttempts(ev, 1);
+	assert.deepEqual(a.map((x) => [x.attempt, x.outcome, x.end === null ? null : x.end - T]), [[7, 'unknown', 0], [10, 'ok', 9900]]);
+	const rows = timelineRows(ev, () => null, 1);
+	assert.equal(rows[1]!.answeredIn, null); // not "answered in 9 s"
+	assert.deepEqual(rows[1]!.notes, []);
+	assert.equal(rows[3]!.answeredIn, 400);
+	// without the hole the same events would pair up
+	assert.equal(timelineRows(ev)[1]!.answeredIn, 9000);
+});
+
+test('zero-length steps: a dispatch at the same instant as the previous checkpoint', () => {
+	// GET /jobs/1/events from a real server (obs-check): steps 6 and 9 ms long, the second dispatched at the
+	// checkpoint's own millisecond
+	const ev: RunEvent[] = [
+		{ at: 1795540014541, kind: 'accepted', not_before: 1795540014541 },
+		{ at: 1795540014560, attempt: 1, deadline: 1795540044560, kind: 'dispatched', step: 0 },
+		{ at: 1795540014566, kind: 'checkpointed', step: 0 },
+		{ at: 1795540014566, attempt: 1, deadline: 1795540044566, kind: 'dispatched', step: 1 },
+		{ at: 1795540014575, kind: 'checkpointed', step: 1 },
+		{ at: 1795540014575, kind: 'finished', outcome: 'done' },
+	];
+	const a = buildAttempts(ev);
+	assert.deepEqual(a.map((x) => [x.step, x.outcome, x.end! - x.start]), [[0, 'ok', 6], [1, 'ok', 9]]);
+	assert.deepEqual(ganttDomain(a, 0), [1795540014560, 1795540014580]); // 15 ms, widened to 20
+	const rows = timelineRows(ev);
+	assert.deepEqual(rows.map((r) => r.offset), [0, 19, 25, 25, 34, 34]);
+	assert.ok(rows[4]!.notes.includes('answered in 9 ms'));
 });

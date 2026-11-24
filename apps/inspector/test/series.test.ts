@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import type { MetricPoint } from '../src/lib/api.ts';
-import { lastValue, mergeFactor, mergePoints, niceScale, parseWindow, peak, perMinute, stackedMax, successRate, timeTicks, total } from '../src/lib/series.ts';
+import { areaPath, columnPath, lastValue, linePath, mergeFactor, mergePoints, niceScale, parseWindow, peak, perMinute, stackedMax, stackSegments, successRate, timeTicks, total } from '../src/lib/series.ts';
 
 function pt(t: number, o: Partial<MetricPoint> = {}): MetricPoint {
 	return {
@@ -93,4 +93,31 @@ test('series helpers skip nulls', () => {
 	assert.equal(total([1, null, 2]), 3);
 	assert.equal(stackedMax([[1, 5], [2, null], [0, 1]]), 6);
 	assert.equal(stackedMax([]), 0);
+});
+
+test('stacked segments leave a 2 px gap between neighbours and keep tiny values visible', () => {
+	const y = (v: number) => 100 - v; // 1 px per unit, baseline at 100
+	assert.deepEqual(stackSegments([10, 0, 5, null, 3], y), [
+		{ top: 90, bottom: 100 },
+		null,
+		{ top: 85, bottom: 88 },
+		null,
+		{ top: 82, bottom: 83 },
+	]);
+	assert.deepEqual(stackSegments([0.2], y), [{ top: 99, bottom: 100 }]); // min 1 px
+	assert.deepEqual(stackSegments([], y), []);
+});
+
+test('columns: rounded data end, square base, nothing for an empty bar', () => {
+	assert.equal(columnPath(0, 10, 50, 100), 'M0 100V54A4 4 0 0 1 4 50H6A4 4 0 0 1 10 54V100Z');
+	assert.equal(columnPath(0, 2, 99, 100), 'M0 100V100A1 1 0 0 1 1 99H1A1 1 0 0 1 2 100V100Z'); // radius ≤ half width, ≤ height
+	assert.equal(columnPath(0, 10, 50, 100, 0), 'M0 100V50H10V100Z');
+	assert.equal(columnPath(0, 10, 100, 100), '');
+	assert.equal(columnPath(0, 0, 50, 100), '');
+});
+
+test('lines and areas break at null samples', () => {
+	assert.equal(linePath([0, 10, 20, 30], [5, 6, null, 8]), 'M0 5L10 6M30 8h0');
+	assert.equal(linePath([0, 10], [null, null]), '');
+	assert.equal(areaPath([0, 10, 20, 30], [5, 6, null, 8], 100), 'M0 100L0 5L10 6L10 100Z');
 });

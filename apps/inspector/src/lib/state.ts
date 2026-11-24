@@ -39,3 +39,14 @@ export function share(n: number, max: number): number {
 	if (!(n > 0) || !(max > 0)) return 0;
 	return Math.min(100, Math.max(4, (n / max) * 100));
 }
+
+/** Whether a run can still be cancelled: anything not yet terminal (done, failed, cancelled). */
+export function cancellable(state: string): boolean {
+	const kind = state.split(':')[0];
+	return kind !== 'done' && kind !== 'failed' && kind !== 'cancelled';
+}
+
+/** Whether a run is terminal: its timeline will not grow any more. */
+export function terminal(state: string): boolean {
+	return !cancellable(state);
+}

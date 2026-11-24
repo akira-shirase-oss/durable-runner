@@ -72,8 +72,13 @@ async function req<T>(path: string, key: string, init: RequestInit = {}): Promis
 		if (e instanceof DOMException && e.name === 'AbortError') throw e;
 		throw new ApiError('the server did not answer (network error)', 0);
 	}
-	if (r.status === 401) throw new ApiError('needs a key: the read key for reads, the API key for everything else', 401, 'unauthorized');
-	if (r.status === 403) throw new ApiError('this key may only read; this operation needs the API key', 403, 'forbidden');
+	// a refusal's body is never needed, but it is always drained: an unread body keeps the request open (and its
+	// connection busy) until the response is garbage-collected
+	if (r.status === 401 || r.status === 403) {
+		await r.text().catch(() => '');
+		if (r.status === 401) throw new ApiError('needs a key: the read key for reads, the API key for everything else', 401, 'unauthorized');
+		throw new ApiError('this key may only read; this operation needs the API key', 403, 'forbidden');
+	}
 	if (!r.ok) {
 		let detail = `${r.status}`;
 		let code: string | null = null;
@@ -84,7 +89,8 @@ async function req<T>(path: string, key: string, init: RequestInit = {}): Promis
 		} catch {
 			/* not JSON: a route this server does not have, or a proxy's page */
 		}
-		const retryAfterMs = r.status === 429 ? parseRetryAfter(r.headers.get('retry-after'), Date.now()) : null;
+		// 429 rate_limited carries Retry-After; a 503 (busy, at_capacity) may: either way polling waits that long
+		const retryAfterMs = r.status === 429 || r.status === 503 ? parseRetryAfter(r.headers.get('retry-after'), Date.now()) : null;
 		throw new ApiError(detail, r.status, code, retryAfterMs);
 	}
 	return (await r.json()) as T;
@@ -123,8 +129,25 @@ export async function health(signal?: AbortSignal): Promise<{ ok: boolean }> {
 	return req('/health', '', { signal });
 }
 
+/** /ready answers 200 when ready and 503 with `{"ready": false, "code": <reason>}` while not: both are answers. */
 export async function ready(signal?: AbortSignal): Promise<{ ready: boolean; code: string | null }> {
-	return req('/ready', '', { signal });
+	let r: Response;
+	try {
+		r = await fetch(`${API}/ready`, { signal });
+	} catch (e) {
+		if (e instanceof DOMException && e.name === 'AbortError') throw e;
+		throw new ApiError('the server did not answer (network error)', 0);
+	}
+	if (r.status === 200 || r.status === 503) {
+		try {
+			const b = (await r.json()) as { ready?: boolean; code?: string | null };
+			return { ready: b.ready === true, code: typeof b.code === 'string' ? b.code : null };
+		} catch {
+			/* fall through */
+		}
+	}
+	await r.text().catch(() => '');
+	throw new ApiError(`${r.status}`, r.status);
 }
 
 export async function listRuns(
@@ -254,7 +277,8 @@ export interface RunEvent {
 
 export interface RunTimeline {
 	run: number;
-	key: string;
+	/** null when the run has left the index (expired) */
+	key: string | null;
 	state: string;
 	/** false when compaction, eviction or the per-run cap shortened the timeline; `reason` says which. */
 	complete: boolean;
@@ -264,10 +288,12 @@ export interface RunTimeline {
 
 export interface FeedEvent extends RunEvent {
 	run: number;
-	key: string;
+	/** null when the run has left the index (expired) */
+	key: string | null;
 }
 
 export interface Feed {
+	/** the server's start; replayed events may be older */
 	since: number;
 	events: FeedEvent[];
 }
