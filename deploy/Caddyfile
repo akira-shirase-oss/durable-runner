@@ -1,9 +1,11 @@
 # Caddy for the Durable Runner droplet (deploy/CREATE.md + docs/DEPLOY.md).
 # Cloudflare terminates visitor TLS and connects here with "Full (strict)"
-# and Authenticated Origin Pulls, so Caddy serves Cloudflare's Origin
-# Certificate AND requires a client certificate signed by Cloudflare's
-# origin-pull CA — a direct hit on the droplet's 443 fails the handshake
-# even before ufw's range check (which allows only Cloudflare anyway).
+# and ZONE-LEVEL Authenticated Origin Pulls: Caddy serves Cloudflare's
+# Origin Certificate AND requires a client certificate signed by OUR
+# origin-pull CA (deploy/CREATE.md 3) — not Cloudflare's shared global one,
+# which every Cloudflare zone presents, so any Cloudflare customer could
+# point a zone at this droplet and pass. A direct hit on 443 fails the
+# handshake even before ufw's range check (which allows only Cloudflare).
 {
 	auto_https off
 	servers {
@@ -18,11 +20,12 @@
 
 durable.404human.dev:443 {
 	tls /etc/caddy/origin.pem /etc/caddy/origin.key {
-		# Authenticated Origin Pulls: only connections presenting a cert
-		# signed by Cloudflare's origin-pull CA are let in.
+		# Zone-level Authenticated Origin Pulls: only connections
+		# presenting the client certificate we uploaded to THIS zone
+		# (signed by our own CA) are let in.
 		client_auth {
 			mode require_and_verify
-			trusted_ca_cert_file /etc/caddy/cloudflare-origin-pull-ca.pem
+			trusted_ca_cert_file /etc/caddy/aop-zone-ca.pem
 		}
 	}
 	encode zstd gzip

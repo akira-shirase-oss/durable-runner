@@ -1231,6 +1231,25 @@ canonicalizes peers (`::ffff:a.b.c.d` → `a.b.c.d`), or a dual-stack
 listener would neither trust the IPv4 hop nor key IPv4 clients apart
 (all of them sharing one /64).
 
+Tracked, not built (re-review #8, #9):
+
+- **Interface addresses are read once, at boot.** An address added later
+  (a new interface, a re-attached reserved IP) is not refused until a
+  restart; list such addresses with `--deny-cidr`, or restart.
+- **Behind the proxy, single-host connection fairness does not hold.**
+  Every connection comes from Caddy on loopback, so the connection-level
+  budgets — the ready reserve, the overload lane, the per-address
+  connection cap and fair-share eviction — all key on 127.0.0.1 (the
+  trusted flag raises only the connection cap, not the ready or lane caps:
+  they are passed the same cap twice). On the droplet those budgets bound
+  the server as a whole; per-visitor fairness at the connection level is
+  Caddy's and Cloudflare's job there. Only the per-request rate limit keys
+  each visitor (by the header Caddy writes).
+- **Authenticated Origin Pulls are zone-level with our own CA** (the
+  workspace deploy rule): the global Cloudflare origin-pull CA would admit
+  any Cloudflare zone pointed at the droplet. `deploy/test-proxy-hop.sh`
+  refuses a Caddyfile trusting it; `smoke.sh` checks the installed one.
+
 Proved by `the_hosts_own_addresses_are_refused_by_both_layers`,
 `deny_cidr_ranges_are_refused_even_with_allow_local`,
 `boot_refuses_every_interface_address`, `a_denied_or_own_address_gets_no_packet`

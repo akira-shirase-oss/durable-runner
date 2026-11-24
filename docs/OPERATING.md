@@ -220,7 +220,7 @@ target/release/durable-server \
   goes in `--deny-cidr ADDR[/PREFIX]` (repeatable; on the droplet, one
   per line in `/etc/durable/deny-cidrs`), refused even with
   `--allow-local-handlers`. Interface addresses are read once at
-  startup: restart after attaching a new one. The startup log says how
+  startup: restart after attaching a new one (tracked, D-061). The startup log says how
   many host addresses and deny ranges the guard holds. Pair it with the
   egress firewall in `docs/DEPLOY.md`: the guard decides by address, the
   firewall by destination at the kernel.
@@ -516,7 +516,14 @@ it):
   `--trusted-proxy` so the per-address limits count real clients — the
   trusted edges then get `--max-conns-per-proxy` (4096) instead of the
   untrusted `--max-conns-per-addr` (64). Never combine a proxy with
-  `--open-reads`.
+  `--open-reads`. **Behind a proxy, single-host fairness holds for the
+  request rate only** (D-061, tracked): every connection comes from the
+  proxy, so the connection-level budgets — the ready reserve, the
+  overload lane, the per-address connection cap, fair-share eviction —
+  key on the proxy's address (and the trusted flag raises only the
+  connection cap, not the reserve or lane caps). They bound the server as
+  a whole; per-visitor connection fairness is the proxy's and the edge's
+  job (Caddy and Cloudflare on the droplet).
 - **Handler calls are unsigned.** A handler cannot tell a call came from
   this runner except by network placement (D-039); keep handlers on a
   private network.

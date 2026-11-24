@@ -38,7 +38,7 @@ cat <<'EOF'
 installed. Next (docs/DEPLOY.md):
   1. /etc/durable/handlers        — one name=url per handler step
   2. deploy/cloudflare-ips.sh     — CF ranges to Caddy, trusted-proxies, ufw
-  3. /etc/caddy/origin.{pem,key} + cloudflare-origin-pull-ca.pem, Caddyfile
+  3. /etc/caddy/origin.{pem,key} + aop-zone-ca.pem (OUR zone AOP CA), Caddyfile
   4. /etc/durable/backup-age-recipient (+ offline private half)
   5. deploy/smoke.sh
 EOF

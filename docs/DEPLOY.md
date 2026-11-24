@@ -97,9 +97,11 @@ apt-get update && apt-get install -y caddy
 
 umask 077; cat >/etc/caddy/origin.pem        # paste, Ctrl-D
 cat >/etc/caddy/origin.key                    # paste, Ctrl-D
-# Cloudflare's Authenticated-Origin-Pulls CA (CREATE.md 3):
-cat >/etc/caddy/cloudflare-origin-pull-ca.pem # paste, Ctrl-D
-chown root:caddy /etc/caddy/origin.* && chmod 0640 /etc/caddy/origin.* /etc/caddy/cloudflare-origin-pull-ca.pem
+# OUR zone-level Authenticated-Origin-Pulls CA certificate (CREATE.md 3) —
+# public, but only its holder's client certificate gets in:
+cat >/etc/caddy/aop-zone-ca.pem # paste, Ctrl-D
+chown root:caddy /etc/caddy/origin.* /etc/caddy/aop-zone-ca.pem
+chmod 0640 /etc/caddy/origin.* /etc/caddy/aop-zone-ca.pem
 
 install -m 0644 $CHECKOUT/deploy/Caddyfile /etc/caddy/Caddyfile
 $CHECKOUT/deploy/cloudflare-ips.sh          # CF ranges → Caddy + trusted-proxies + ufw
@@ -268,7 +270,7 @@ version replays under the current binary.
 |---|---|
 | `durable-server` won't start | `journalctl -u durable-server -n 100` — a corrupt journal or a second writer names itself |
 | `/ready` stuck | replay still running on a big journal (see table); `DURABLE_PROFILE_OPEN=1` logs the phases |
-| Cloudflare 52x | `systemctl status caddy`, origin.pem/origin-pull CA, `ufw status` |
+| Cloudflare 52x | `systemctl status caddy`, origin.pem, `aop-zone-ca.pem` matches the client certificate uploaded to the zone (and zone-level AOP is on), `ufw status` |
 | Every visitor shares one rate limit | the server does not trust the loopback hop (an old `durable-run`, or a non-loopback `DURABLE_LISTEN`), or Caddy does not overwrite `CF-Connecting-IP` — reinstall `deploy/durable-run.sh` and `deploy/Caddyfile`; `smoke.sh` names which |
 | `durable-backup` fails | `journalctl -u durable-backup`: `backups_disabled` → `--backup-root` unset; rclone remote `r2` misnamed |
 | Second writer refused | expected — the lock worked; find the stray process |

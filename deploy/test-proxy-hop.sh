@@ -56,6 +56,12 @@ check_run() { # script → 0 when every rule holds
 
 check_caddy() { # file → 0 when Caddy resolves and overwrites the header
   local f="$1" ok=0
+  # Zone-level AOP with OUR CA, never Cloudflare's shared global one.
+  grep -Eq '^[[:space:]]*trusted_ca_cert_file[[:space:]]+/etc/caddy/aop-zone-ca\.pem[[:space:]]*$' "$f" \
+    || { echo "  client_auth does not trust our zone AOP CA"; ok=1; }
+  if grep -q 'cloudflare-origin-pull-ca' "$f"; then
+    echo "  the global Cloudflare origin-pull CA is trusted"; ok=1
+  fi
   grep -Eq '^[[:space:]]*client_ip_headers[[:space:]]+CF-Connecting-IP[[:space:]]*$' "$f" \
     || { echo "  no client_ip_headers CF-Connecting-IP"; ok=1; }
   grep -Eq '^[[:space:]]*header_up[[:space:]]+CF-Connecting-IP[[:space:]]+\{client_ip\}[[:space:]]*$' "$f" \
@@ -82,9 +88,13 @@ grep -v 'header_up CF-Connecting-IP' deploy/Caddyfile >"$work/bad-Caddyfile"
 if check_caddy "$work/bad-Caddyfile" >/dev/null; then
   echo "FAIL: the Caddyfile check passed without the overwrite"; fails=1
 fi
+sed 's#/etc/caddy/aop-zone-ca.pem#/etc/caddy/cloudflare-origin-pull-ca.pem#' deploy/Caddyfile >"$work/bad-aop"
+if check_caddy "$work/bad-aop" >/dev/null; then
+  echo "FAIL: the Caddyfile check passed trusting the global origin-pull CA"; fails=1
+fi
 
 if [[ "$fails" -ne 0 ]]; then
   echo "test-proxy-hop: FAILED" >&2
   exit 1
 fi
-echo "test-proxy-hop: the hop is trusted, the header is Caddy's, deny-cidrs pass through (and each check goes red without its rule)"
+echo "test-proxy-hop: the hop is trusted, the header is Caddy's, AOP is zone-level, deny-cidrs pass through (and each check goes red without its rule)"
