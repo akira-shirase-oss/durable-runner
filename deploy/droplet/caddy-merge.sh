@@ -85,6 +85,7 @@ if is_uint "$n" && (( n > KEEP_BACKUPS )); then
   while IFS= read -r d; do [[ -n "$d" ]] && rm -rf "$d"; done < <(head -n "$((n - KEEP_BACKUPS))" <<<"$all")
 fi
 
+sites_made=0
 restore() {
   local tmp
   tmp=$(mktemp "$CADDY_DIR/.dr-restore.XXXXXX")
@@ -94,12 +95,16 @@ restore() {
     cp -p "$bdir/durable-runner.caddy" "$tmp" && mv -f "$tmp" "$site"
   else
     rm -f "$site"
+    # The directory too, when this run made it and nothing else is in it.
+    if (( sites_made == 1 )); then rmdir "$sites" 2>/dev/null || true; fi
   fi
   cmp -s "$bdir/Caddyfile" "$root_file" || { echo "error: the root Caddyfile could NOT be restored from $bdir: copy it back by hand" >&2; return 1; }
   say "restored $root_file and $site from $bdir"
 }
 
 # 3. The change: our site file, then the import line.
+sites_made=0
+[[ -d "$sites" ]] || sites_made=1
 ensure_dir "$sites" 0755
 if put_file "$rendered" "$site" 0644; then say "site file: $site ($host, / -> $dash)"; fi
 if (( imports == 0 )); then
