@@ -148,6 +148,9 @@ ALTER TABLE api_keys
 UPDATE api_keys SET public_id = gen_random_uuid() WHERE public_id IS NULL;
 ALTER TABLE api_keys ALTER COLUMN public_id SET NOT NULL;
 CREATE UNIQUE INDEX api_keys_public_id ON api_keys (public_id);
+-- D-071: verify-time "used" markers coalesce in memory and flush as at
+-- most one UPDATE per key per tick — no per-request writes.
+ALTER TABLE api_keys ADD COLUMN last_used_at TIMESTAMPTZ;
 
 -- The mail outbox (D-068): every mail is a row written in the same
 -- transaction as the fact that needs it, so a lost send is a pending

@@ -113,6 +113,26 @@ async fn bounded<T>(
     }
 }
 
+/// Map one `api_keys` row (id, public_id, name, prefix, permission,
+/// revoked, last_used_at, created_by selected) to `ApiKeyInfo`.
+fn key_info_from(row: &sqlx::postgres::PgRow) -> Result<ApiKeyInfo, AccountError> {
+    Ok(ApiKeyInfo {
+        id: to_u64(row.try_get("id")?, "api key")?,
+        public_id: row.try_get("public_id")?,
+        name: row.try_get("name")?,
+        prefix: row.try_get("prefix")?,
+        permission: Permission::parse(row.try_get::<&str, _>("permission")?)?,
+        revoked: row.try_get("revoked")?,
+        last_used_at_ms: row
+            .try_get::<Option<time::OffsetDateTime>, _>("last_used_at")?
+            .map(ms),
+        // api_keys.created_by is the internal account id; what leaves
+        // the store is the account's public_id (selected as
+        // created_by_pid by the caller's LEFT JOIN).
+        created_by: row.try_get::<Option<uuid::Uuid>, _>("created_by_pid")?,
+    })
+}
+
 fn to_u64(id: i64, what: &str) -> Result<u64, AccountError> {
     u64::try_from(id).map_err(|_| AccountError::Store(format!("{what} id {id} does not fit u64")))
 }
@@ -242,27 +262,34 @@ impl AccountStore for Pg {
         permission: Permission,
         key_hash: &[u8; 32],
         prefix: &str,
+        created_by: Option<u64>,
     ) -> Result<ApiKeyInfo, AccountError> {
         let row = bounded(
             sqlx::query(
-                "INSERT INTO api_keys (workspace_id, name, key_hash, prefix, permission) \
-                 VALUES ($1, $2, $3, $4, $5) RETURNING id",
+                "INSERT INTO api_keys \
+                 (workspace_id, name, key_hash, prefix, permission, created_by) \
+                 VALUES ($1, $2, $3, $4, $5, $6) \
+                 RETURNING id, public_id, \
+                     (SELECT public_id FROM accounts WHERE id = $6) AS created_by_pid",
             )
             .bind(to_i64(workspace, "workspace")?)
             .bind(name)
             .bind(key_hash.as_slice())
             .bind(prefix)
             .bind(permission.as_str())
+            .bind(created_by.map(|a| to_i64(a, "account")).transpose()?)
             .fetch_one(&self.pool),
         )
         .await?;
-        let id: i64 = row.try_get("id")?;
         Ok(ApiKeyInfo {
-            id: to_u64(id, "api key")?,
+            id: to_u64(row.try_get("id")?, "api key")?,
+            public_id: row.try_get("public_id")?,
             name: name.to_string(),
             prefix: prefix.to_string(),
             permission,
             revoked: false,
+            last_used_at_ms: None,
+            created_by: row.try_get("created_by_pid")?,
         })
     }
 
@@ -298,24 +325,128 @@ impl AccountStore for Pg {
     async fn list_keys(&self, workspace: u64) -> Result<Vec<ApiKeyInfo>, AccountError> {
         let rows = bounded(
             sqlx::query(
-                "SELECT id, name, prefix, permission, (revoked_at IS NOT NULL) AS revoked \
-                 FROM api_keys WHERE workspace_id = $1 ORDER BY id",
+                "SELECT k.id, k.public_id, k.name, k.prefix, k.permission, \
+                        (k.revoked_at IS NOT NULL) AS revoked, k.last_used_at, \
+                        a.public_id AS created_by_pid \
+                 FROM api_keys k LEFT JOIN accounts a ON a.id = k.created_by \
+                 WHERE k.workspace_id = $1 ORDER BY k.id",
             )
             .bind(to_i64(workspace, "workspace")?)
             .fetch_all(&self.pool),
         )
         .await?;
-        rows.iter()
-            .map(|row| {
-                Ok(ApiKeyInfo {
-                    id: to_u64(row.try_get("id")?, "api key")?,
-                    name: row.try_get("name")?,
-                    prefix: row.try_get("prefix")?,
-                    permission: Permission::parse(row.try_get::<&str, _>("permission")?)?,
-                    revoked: row.try_get("revoked")?,
-                })
-            })
-            .collect()
+        rows.iter().map(key_info_from).collect()
+    }
+
+    async fn key_by_public_id(
+        &self,
+        workspace: u64,
+        public_id: uuid::Uuid,
+    ) -> Result<Option<ApiKeyInfo>, AccountError> {
+        let row = bounded(
+            sqlx::query(
+                "SELECT k.id, k.public_id, k.name, k.prefix, k.permission, \
+                        (k.revoked_at IS NOT NULL) AS revoked, k.last_used_at, \
+                        a.public_id AS created_by_pid \
+                 FROM api_keys k LEFT JOIN accounts a ON a.id = k.created_by \
+                 WHERE k.workspace_id = $1 AND k.public_id = $2 AND k.revoked_at IS NULL",
+            )
+            .bind(to_i64(workspace, "workspace")?)
+            .bind(public_id)
+            .fetch_optional(&self.pool),
+        )
+        .await?;
+        row.as_ref().map(key_info_from).transpose()
+    }
+
+    async fn rotate_key(
+        &self,
+        workspace: u64,
+        key_id: u64,
+        new_key_hash: &[u8; 32],
+        new_prefix: &str,
+        created_by: Option<u64>,
+    ) -> Result<Option<(ApiKeyInfo, [u8; 32])>, AccountError> {
+        // One tx: the old key dies and its replacement exists before any
+        // other reader can look — "old 401s on the next call" is atomic.
+        let mut tx = bounded(self.pool.begin()).await?;
+        let old = bounded(
+            sqlx::query(
+                "UPDATE api_keys SET revoked_at = now() \
+                 WHERE id = $1 AND workspace_id = $2 AND revoked_at IS NULL \
+                 RETURNING name, permission, key_hash",
+            )
+            .bind(to_i64(key_id, "api key")?)
+            .bind(to_i64(workspace, "workspace")?)
+            .fetch_optional(&mut *tx),
+        )
+        .await?;
+        let Some(old) = old else {
+            bounded(tx.rollback()).await?;
+            return Ok(None);
+        };
+        let old_hash: Vec<u8> = old.try_get("key_hash")?;
+        let old_hash: [u8; 32] = old_hash.as_slice().try_into().map_err(|_| {
+            AccountError::Store(format!(
+                "api_keys.key_hash for id {key_id} is {} bytes, expected 32",
+                old_hash.len()
+            ))
+        })?;
+        let name: String = old.try_get("name")?;
+        let permission = Permission::parse(old.try_get::<&str, _>("permission")?)?;
+        let row = bounded(
+            sqlx::query(
+                "INSERT INTO api_keys \
+                 (workspace_id, name, key_hash, prefix, permission, created_by) \
+                 VALUES ($1, $2, $3, $4, $5, $6) \
+                 RETURNING id, public_id, \
+                     (SELECT public_id FROM accounts WHERE id = $6) AS created_by_pid",
+            )
+            .bind(to_i64(workspace, "workspace")?)
+            .bind(&name)
+            .bind(new_key_hash.as_slice())
+            .bind(new_prefix)
+            .bind(permission.as_str())
+            .bind(created_by.map(|a| to_i64(a, "account")).transpose()?)
+            .fetch_one(&mut *tx),
+        )
+        .await?;
+        let info = ApiKeyInfo {
+            id: to_u64(row.try_get("id")?, "api key")?,
+            public_id: row.try_get("public_id")?,
+            name,
+            prefix: new_prefix.to_string(),
+            permission,
+            revoked: false,
+            last_used_at_ms: None,
+            created_by: row.try_get("created_by_pid")?,
+        };
+        bounded(tx.commit()).await?;
+        Ok(Some((info, old_hash)))
+    }
+
+    async fn touch_keys(&self, touches: &[crate::KeyTouch]) -> Result<(), AccountError> {
+        if touches.is_empty() {
+            return Ok(());
+        }
+        // GREATEST keeps last_used monotonic — a stale flush never
+        // rewinds it.
+        let mut tx = bounded(self.pool.begin()).await?;
+        for t in touches {
+            bounded(
+                sqlx::query(
+                    "UPDATE api_keys \
+                     SET last_used_at = GREATEST(COALESCE(last_used_at, '-infinity'), $2) \
+                     WHERE key_hash = $1 AND revoked_at IS NULL",
+                )
+                .bind(t.key_hash.as_slice())
+                .bind(ts(t.seen_ms))
+                .execute(&mut *tx),
+            )
+            .await?;
+        }
+        bounded(tx.commit()).await?;
+        Ok(())
     }
 
     async fn list_handlers(
@@ -1804,7 +1935,7 @@ mod tests {
             .await
             .unwrap_or_else(|e| panic!("ws: {e}"));
         let info = store
-            .create_key(ws.id, "ci", Permission::Write, &hash(11), "dr_pg")
+            .create_key(ws.id, "ci", Permission::Write, &hash(11), "dr_pg", None)
             .await
             .unwrap_or_else(|e| panic!("key: {e}"));
         let grant = store

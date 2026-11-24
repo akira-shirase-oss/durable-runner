@@ -50,11 +50,33 @@ struct Inner {
 
 struct KeyRow {
     workspace: u64,
+    public_id: uuid::Uuid,
     name: String,
     hash: [u8; 32],
     prefix: String,
     permission: Permission,
     revoked: bool,
+    last_used_at_ms: Option<i64>,
+    created_by: Option<u64>,
+}
+
+impl KeyRow {
+    /// ApiKeyInfo.created_by is the creator's PUBLIC id — internal
+    /// account ids never leave the store.
+    fn info(&self, id: u64, inner: &Inner) -> ApiKeyInfo {
+        ApiKeyInfo {
+            id,
+            public_id: self.public_id,
+            name: self.name.clone(),
+            prefix: self.prefix.clone(),
+            permission: self.permission,
+            revoked: self.revoked,
+            last_used_at_ms: self.last_used_at_ms,
+            created_by: self
+                .created_by
+                .and_then(|a| inner.accounts.get(&a).map(|acc| acc.public_id)),
+        }
+    }
 }
 
 struct SessionRow {
@@ -314,6 +336,7 @@ impl AccountStore for Memory {
         permission: Permission,
         key_hash: &[u8; 32],
         prefix: &str,
+        created_by: Option<u64>,
     ) -> Result<ApiKeyInfo, AccountError> {
         self.check_up()?;
         let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
@@ -323,24 +346,26 @@ impl AccountStore for Memory {
             )));
         }
         let id = self.next_key.fetch_add(1, Ordering::Relaxed);
+        let public_id = uuid::Uuid::now_v7();
         inner.keys.insert(
             id,
             KeyRow {
                 workspace,
+                public_id,
                 name: name.to_string(),
                 hash: *key_hash,
                 prefix: prefix.to_string(),
                 permission,
                 revoked: false,
+                last_used_at_ms: None,
+                created_by,
             },
         );
-        Ok(ApiKeyInfo {
-            id,
-            name: name.to_string(),
-            prefix: prefix.to_string(),
-            permission,
-            revoked: false,
-        })
+        Ok(inner
+            .keys
+            .get(&id)
+            .map(|row| row.info(id, &inner))
+            .unwrap_or_else(|| panic!("key {id}")))
     }
 
     async fn revoke_key(
@@ -367,16 +392,88 @@ impl AccountStore for Memory {
             .keys
             .iter()
             .filter(|(_, row)| row.workspace == workspace)
-            .map(|(id, row)| ApiKeyInfo {
-                id: *id,
-                name: row.name.clone(),
-                prefix: row.prefix.clone(),
-                permission: row.permission,
-                revoked: row.revoked,
-            })
+            .map(|(id, row)| row.info(*id, &inner))
             .collect();
         keys.sort_by_key(|info| info.id);
         Ok(keys)
+    }
+
+    async fn key_by_public_id(
+        &self,
+        workspace: u64,
+        public_id: uuid::Uuid,
+    ) -> Result<Option<ApiKeyInfo>, AccountError> {
+        self.check_up()?;
+        let inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        Ok(inner
+            .keys
+            .iter()
+            .find(|(_, row)| {
+                row.workspace == workspace && row.public_id == public_id && !row.revoked
+            })
+            .map(|(id, row)| row.info(*id, &inner)))
+    }
+
+    async fn rotate_key(
+        &self,
+        workspace: u64,
+        key_id: u64,
+        new_key_hash: &[u8; 32],
+        new_prefix: &str,
+        created_by: Option<u64>,
+    ) -> Result<Option<(ApiKeyInfo, [u8; 32])>, AccountError> {
+        self.check_up()?;
+        let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(old) = inner.keys.get(&key_id) else {
+            return Ok(None);
+        };
+        if old.workspace != workspace || old.revoked {
+            return Ok(None);
+        }
+        let (name, permission, old_hash) = (old.name.clone(), old.permission, old.hash);
+        inner
+            .keys
+            .get_mut(&key_id)
+            .unwrap_or_else(|| panic!("key {key_id}"))
+            .revoked = true;
+        let id = self.next_key.fetch_add(1, Ordering::Relaxed);
+        let public_id = uuid::Uuid::now_v7();
+        inner.keys.insert(
+            id,
+            KeyRow {
+                workspace,
+                public_id,
+                name: name.clone(),
+                hash: *new_key_hash,
+                prefix: new_prefix.to_string(),
+                permission,
+                revoked: false,
+                last_used_at_ms: None,
+                created_by,
+            },
+        );
+        let info = inner
+            .keys
+            .get(&id)
+            .map(|row| row.info(id, &inner))
+            .unwrap_or_else(|| panic!("key {id}"));
+        Ok(Some((info, old_hash)))
+    }
+
+    async fn touch_keys(&self, touches: &[crate::KeyTouch]) -> Result<(), AccountError> {
+        self.check_up()?;
+        let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        for t in touches {
+            if let Some(row) = inner
+                .keys
+                .values_mut()
+                .find(|r| !r.revoked && r.hash == t.key_hash)
+            {
+                row.last_used_at_ms =
+                    Some(row.last_used_at_ms.map_or(t.seen_ms, |m| m.max(t.seen_ms)));
+            }
+        }
+        Ok(())
     }
 
     async fn list_handlers(
@@ -1391,7 +1488,7 @@ mod tests {
             .await
             .unwrap_or_else(|e| panic!("create: {e}"));
         let info = store
-            .create_key(ws.id, "ci", Permission::Write, &hash(7), "dr_ci")
+            .create_key(ws.id, "ci", Permission::Write, &hash(7), "dr_ci", None)
             .await
             .unwrap_or_else(|e| panic!("key: {e}"));
         let grant = store

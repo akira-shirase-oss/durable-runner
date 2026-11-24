@@ -21,7 +21,9 @@ use axum::{
 };
 use base64::Engine as _;
 use clap::Parser;
-use durable_accounts::{AccountError, AccountStore, Mail, Mailer, Permission, Pg, Role};
+use durable_accounts::{
+    AccountError, AccountStore, ApiKeyInfo, Mail, Mailer, Permission, Pg, Role,
+};
 use durable_domain::{JobSpec, Millis, OperationKey, RunId, RunState, StepSpec};
 use durable_engine::observe::{self, Observer, Window};
 use durable_engine::shell::{
@@ -1380,14 +1382,20 @@ enum Cached {
     Denied,
 }
 
-/// The only shape a store key can have (`new_key_secret`): `dr_` plus
-/// 48 lowercase hex — 51 chars. Non-conforming bearers deny cheaply.
+/// The only shapes a store key can have (`new_key_secret`): `drk_` plus
+/// 48 lowercase hex — 52 chars (legacy `dr_` keys, 51 chars, keep
+/// verifying until their owners rotate them). Non-conforming bearers
+/// deny cheaply.
 fn store_key_shape(bearer: &str) -> bool {
-    bearer.len() == 51
-        && bearer.starts_with("dr_")
-        && bearer[3..]
-            .bytes()
-            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+    let hex = if bearer.len() == 52 && bearer.starts_with("drk_") {
+        &bearer[4..]
+    } else if bearer.len() == 51 && bearer.starts_with("dr_") {
+        &bearer[3..]
+    } else {
+        return false;
+    };
+    hex.bytes()
+        .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
 }
 
 /// Resolves bearers to `Auth`. Env keys always grant workspace 0 — the
@@ -1400,6 +1408,10 @@ struct Keyring {
     read_key: Option<ApiKey>,
     store: Option<Arc<dyn AccountStore>>,
     cache: Mutex<HashMap<[u8; 32], CacheEntry>>,
+    /// key_hash → last-seen unix ms, coalesced between flushes (D-071):
+    /// N verifies in a tick land as ONE `last_used_at` UPDATE, so the
+    /// hot verify path writes to the store zero times.
+    touches: Mutex<HashMap<[u8; 32], i64>>,
 }
 
 impl Keyring {
@@ -1413,7 +1425,26 @@ impl Keyring {
             read_key,
             store,
             cache: Mutex::new(HashMap::new()),
+            touches: Mutex::new(HashMap::new()),
         }
+    }
+
+    /// Mark a store key used — cheap, coalesced, flushed by the tick.
+    fn touch_key(&self, hash: [u8; 32]) {
+        let mut touches = self.touches.lock().unwrap_or_else(|e| e.into_inner());
+        if touches.len() >= TOUCH_CAP {
+            touches.clear();
+        }
+        touches.insert(hash, unix_ms());
+    }
+
+    /// Drain the pending key touches for the flush task.
+    fn drain_key_touches(&self) -> Vec<durable_accounts::KeyTouch> {
+        let mut touches = self.touches.lock().unwrap_or_else(|e| e.into_inner());
+        std::mem::take(&mut *touches)
+            .into_iter()
+            .map(|(key_hash, seen_ms)| durable_accounts::KeyTouch { key_hash, seen_ms })
+            .collect()
     }
 
     async fn verify(&self, bearer: &str) -> Verified {
@@ -1432,6 +1463,9 @@ impl Keyring {
         }
         let hash = sha256(bearer.as_bytes());
         if let Some(outcome) = self.cached(hash) {
+            if matches!(outcome, Verified::Granted(Principal::StoreKey { .. })) {
+                self.touch_key(hash);
+            }
             return outcome;
         }
         let Some(store) = &self.store else {
@@ -1446,6 +1480,9 @@ impl Keyring {
             Err(_) => Verified::Unavailable,
         };
         self.remember(hash, &verified);
+        if matches!(verified, Verified::Granted(Principal::StoreKey { .. })) {
+            self.touch_key(hash);
+        }
         verified
     }
 
@@ -2201,10 +2238,13 @@ async fn flush_session_touches(app: &App) {
         return;
     };
     let touches = app.sessions.drain_touches();
-    if touches.is_empty() {
-        return;
+    if !touches.is_empty() {
+        let _ = store.touch_sessions(&touches).await;
     }
-    let _ = store.touch_sessions(&touches).await;
+    let key_touches = app.keyring.drain_key_touches();
+    if !key_touches.is_empty() {
+        let _ = store.touch_keys(&key_touches).await;
+    }
 }
 
 fn spawn_session_flush(app: App) {
@@ -4223,6 +4263,188 @@ async fn ws_invite_revoke(
     Ok(no_store(StatusCode::NO_CONTENT.into_response()))
 }
 
+// ---- S3-5: member-facing API keys -----------------------------------
+
+/// A key as the member API shows it: `public_id` is the only id (the
+/// sequential `id` never leaves the process), the secret never appears —
+/// only its stored prefix.
+fn key_json(k: &ApiKeyInfo) -> serde_json::Value {
+    serde_json::json!({
+        "public_id": k.public_id,
+        "name": k.name,
+        "prefix": k.prefix,
+        "permission": k.permission.api_str(),
+        "revoked": k.revoked,
+        "last_used_at_ms": k.last_used_at_ms,
+        "created_by": k.created_by,
+    })
+}
+
+/// `GET /workspaces/{pid}/keys` — every member may list; the response
+/// carries prefix + metadata only, never secret material.
+async fn ws_keys(
+    SessionAuth(grant): SessionAuth,
+    State(app): State<App>,
+    axum::extract::Path(pid): axum::extract::Path<uuid::Uuid>,
+    parts: Parts,
+) -> Result<Response, ApiError> {
+    let (ws, _) = member_access(&app, &grant, pid, &parts, Role::Viewer).await?;
+    let keys = accounts(&app)?.list_keys(ws.id).await.map_err(store_err)?;
+    let keys: Vec<serde_json::Value> = keys.iter().map(key_json).collect();
+    Ok(no_store(
+        Json(serde_json::json!({ "keys": keys })).into_response(),
+    ))
+}
+
+#[derive(Deserialize)]
+struct WsKeyReq {
+    name: String,
+    /// `write` (submit + cancel + read) or `read`.
+    permission: String,
+}
+
+fn key_permission(raw: &str) -> Result<Permission, ApiError> {
+    match raw {
+        "admin" | "write" => Ok(Permission::Write),
+        "read" => Ok(Permission::Read),
+        other => Err(ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "bad_input",
+            format!("permission must be write or read, not {other:?}"),
+        )),
+    }
+}
+
+/// `POST /workspaces/{pid}/keys` — admin+; mints a `drk_` secret shown
+/// exactly once in this response.
+async fn ws_key_create(
+    SessionWrite(grant): SessionWrite,
+    State(app): State<App>,
+    axum::extract::Path(pid): axum::extract::Path<uuid::Uuid>,
+    parts: Parts,
+    J(req): J<WsKeyReq>,
+) -> Result<Response, ApiError> {
+    let (ws, _) = member_access(&app, &grant, pid, &parts, Role::Admin).await?;
+    let permission = key_permission(&req.permission)?;
+    if req.name.trim().is_empty() || req.name.len() > 128 {
+        return Err(ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "bad_input",
+            "name must be 1..=128 characters",
+        ));
+    }
+    let secret = new_key_secret();
+    if secret.is_empty() {
+        return Err(ApiError::new(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "internal",
+            "could not draw a key secret",
+        ));
+    }
+    let prefix = &secret[..secret.len().min(11)];
+    let info = accounts(&app)?
+        .create_key(
+            ws.id,
+            req.name.trim(),
+            permission,
+            &sha256(secret.as_bytes()),
+            prefix,
+            Some(grant.account.id),
+        )
+        .await
+        .map_err(store_err)?;
+    let mut out = key_json(&info);
+    out["key"] = serde_json::Value::String(secret);
+    Ok(no_store(Json(out).into_response()))
+}
+
+/// `DELETE /workspaces/{pid}/keys/{key_pid}` — admin+; a foreign or
+/// already-dead key answers 404 and the store row stays untouched.
+async fn ws_key_delete(
+    SessionWrite(grant): SessionWrite,
+    State(app): State<App>,
+    axum::extract::Path((pid, key_pid)): axum::extract::Path<(uuid::Uuid, uuid::Uuid)>,
+    parts: Parts,
+) -> Result<Response, ApiError> {
+    let (ws, _) = member_access(&app, &grant, pid, &parts, Role::Admin).await?;
+    let store = accounts(&app)?;
+    let Some(info) = store
+        .key_by_public_id(ws.id, key_pid)
+        .await
+        .map_err(store_err)?
+    else {
+        return Err(ApiError::new(
+            StatusCode::NOT_FOUND,
+            "not_found",
+            "no such key",
+        ));
+    };
+    let Some(hash) = store.revoke_key(ws.id, info.id).await.map_err(store_err)? else {
+        return Err(ApiError::new(
+            StatusCode::NOT_FOUND,
+            "not_found",
+            "no such key",
+        ));
+    };
+    app.keyring.invalidate(hash);
+    Ok(no_store(StatusCode::NO_CONTENT.into_response()))
+}
+
+/// `POST /workspaces/{pid}/keys/{key_pid}/rotate` — admin+; the store
+/// retires the old key and mints its replacement (same name + scope) in
+/// one transaction, then the old hash is invalidated write-through so
+/// it 401s on the very next call.
+async fn ws_key_rotate(
+    SessionWrite(grant): SessionWrite,
+    State(app): State<App>,
+    axum::extract::Path((pid, key_pid)): axum::extract::Path<(uuid::Uuid, uuid::Uuid)>,
+    parts: Parts,
+) -> Result<Response, ApiError> {
+    let (ws, _) = member_access(&app, &grant, pid, &parts, Role::Admin).await?;
+    let secret = new_key_secret();
+    if secret.is_empty() {
+        return Err(ApiError::new(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "internal",
+            "could not draw a key secret",
+        ));
+    }
+    let prefix = &secret[..secret.len().min(11)];
+    let store = accounts(&app)?;
+    let Some(info) = store
+        .key_by_public_id(ws.id, key_pid)
+        .await
+        .map_err(store_err)?
+    else {
+        return Err(ApiError::new(
+            StatusCode::NOT_FOUND,
+            "not_found",
+            "no such key",
+        ));
+    };
+    let Some((new_info, old_hash)) = store
+        .rotate_key(
+            ws.id,
+            info.id,
+            &sha256(secret.as_bytes()),
+            prefix,
+            Some(grant.account.id),
+        )
+        .await
+        .map_err(store_err)?
+    else {
+        return Err(ApiError::new(
+            StatusCode::NOT_FOUND,
+            "not_found",
+            "no such key",
+        ));
+    };
+    app.keyring.invalidate(old_hash);
+    let mut out = key_json(&new_info);
+    out["key"] = serde_json::Value::String(secret);
+    Ok(no_store(Json(out).into_response()))
+}
+
 /// `POST /invites/accept` — any verified session whose email matches
 /// the invite's bound address; a mismatch is 403 `invite_email_mismatch`
 /// before the token is consumed (the row is only revealed to the
@@ -5201,7 +5423,7 @@ fn new_key_secret() -> String {
     // SystemRandom::fill only fails on catastrophic RNG loss; map it to a
     // zeroed buffer refusal rather than issuing a weak key.
     match ring::rand::SystemRandom::new().fill(&mut b) {
-        Ok(()) => format!("dr_{}", hex(&b)),
+        Ok(()) => format!("drk_{}", hex(&b)),
         Err(_) => String::new(),
     }
 }
@@ -5372,6 +5594,7 @@ async fn create_workspace_key(
             permission,
             &sha256(secret.as_bytes()),
             prefix,
+            None,
         )
         .await
         .map_err(store_err)?;
@@ -5822,6 +6045,17 @@ fn router(app: App, ui_dir: Option<&Path>) -> Router {
         .route(
             "/workspaces/{pid}/invites/{iid}",
             axum::routing::delete(ws_invite_revoke),
+        )
+        // S3-5: members manage their own workspace's keys — list shows
+        // prefix + metadata only, secrets are shown once at mint/rotate.
+        .route("/workspaces/{pid}/keys", get(ws_keys).post(ws_key_create))
+        .route(
+            "/workspaces/{pid}/keys/{key_pid}",
+            axum::routing::delete(ws_key_delete),
+        )
+        .route(
+            "/workspaces/{pid}/keys/{key_pid}/rotate",
+            post(ws_key_rotate),
         )
         .route("/invites/accept", post(invite_accept))
         .route("/invites/decline", post(invite_decline))
@@ -7981,7 +8215,7 @@ mod tests {
             (b.id, OBS_KEY_B, Permission::Write),
         ] {
             store
-                .create_key(ws, "k", perm, &sha256(key.as_bytes()), &key[..6])
+                .create_key(ws, "k", perm, &sha256(key.as_bytes()), &key[..6], None)
                 .await
                 .unwrap_or_else(|e| panic!("key: {e}"));
         }
@@ -8531,6 +8765,7 @@ mod tests {
                 Permission::Write,
                 &sha256(token.as_bytes()),
                 "dr_al",
+                None,
             )
             .await
             .unwrap_or_else(|e| panic!("key: {e}"));
@@ -8601,6 +8836,7 @@ mod tests {
                 Permission::Write,
                 &sha256(token.as_bytes()),
                 "dr_be",
+                None,
             )
             .await
             .unwrap_or_else(|e| panic!("key: {e}"));
@@ -8661,6 +8897,7 @@ mod tests {
                 Permission::Write,
                 &sha256(token.as_bytes()),
                 "dr_ga",
+                None,
             )
             .await
             .unwrap_or_else(|e| panic!("key: {e}"));
@@ -8742,6 +8979,7 @@ mod tests {
                 Permission::Write,
                 &sha256(key_a.as_bytes()),
                 "dr_a",
+                None,
             )
             .await
             .unwrap_or_else(|e| panic!("ka: {e}"));
@@ -8752,6 +8990,7 @@ mod tests {
                 Permission::Write,
                 &sha256(key_b.as_bytes()),
                 "dr_b",
+                None,
             )
             .await
             .unwrap_or_else(|e| panic!("kb: {e}"));
@@ -8860,7 +9099,14 @@ mod tests {
         let key_b = "dr_1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d";
         for (ws, k) in [(a.id, key_a), (b.id, key_b)] {
             store
-                .create_key(ws, "k", Permission::Write, &sha256(k.as_bytes()), "dr_t")
+                .create_key(
+                    ws,
+                    "k",
+                    Permission::Write,
+                    &sha256(k.as_bytes()),
+                    "dr_t",
+                    None,
+                )
                 .await
                 .unwrap_or_else(|e| panic!("{e}"));
         }
@@ -8957,6 +9203,7 @@ mod tests {
                 Permission::Write,
                 &sha256(token.as_bytes()),
                 "dr_s",
+                None,
             )
             .await
             .unwrap_or_else(|e| panic!("{e}"));
@@ -9054,6 +9301,7 @@ mod tests {
                 Permission::Read,
                 &sha256(token.as_bytes()),
                 "dr_w",
+                None,
             )
             .await
             .unwrap_or_else(|e| panic!("{e}"));
@@ -9179,6 +9427,7 @@ mod tests {
                 Permission::Write,
                 &sha256(token.as_bytes()),
                 "dr_t",
+                None,
             )
             .await
             .unwrap_or_else(|e| panic!("{e}"));
@@ -9264,6 +9513,7 @@ mod tests {
                 Permission::Write,
                 &sha256(key_a.as_bytes()),
                 "dr_a",
+                None,
             )
             .await
             .unwrap_or_else(|e| panic!("{e}"));
@@ -9274,6 +9524,7 @@ mod tests {
                 Permission::Write,
                 &sha256(key_b.as_bytes()),
                 "dr_b",
+                None,
             )
             .await
             .unwrap_or_else(|e| panic!("{e}"));
@@ -9374,6 +9625,7 @@ mod tests {
                 Permission::Write,
                 &sha256(key_a.as_bytes()),
                 "dr_a",
+                None,
             )
             .await
             .unwrap_or_else(|e| panic!("{e}"));
@@ -9456,6 +9708,7 @@ mod tests {
                 Permission::Write,
                 &sha256(key_a.as_bytes()),
                 "dr_a",
+                None,
             )
             .await
             .unwrap_or_else(|e| panic!("{e}"));
@@ -9510,6 +9763,7 @@ mod tests {
                 Permission::Write,
                 &sha256(key_a.as_bytes()),
                 "dr_c",
+                None,
             )
             .await
             .unwrap_or_else(|e| panic!("{e}"));
@@ -9560,6 +9814,7 @@ mod tests {
                 Permission::Write,
                 &sha256(key.as_bytes()),
                 "dr_9",
+                None,
             )
             .await
             .unwrap_or_else(|e| panic!("{e}"));
@@ -9673,6 +9928,7 @@ mod tests {
                 Permission::Write,
                 &sha256(key_a.as_bytes()),
                 "dr_a",
+                None,
             )
             .await
             .unwrap_or_else(|e| panic!("{e}"));
@@ -9852,10 +10108,36 @@ mod tests {
             permission: Permission,
             key_hash: &[u8; 32],
             prefix: &str,
+            created_by: Option<u64>,
         ) -> Result<ApiKeyInfo, AccountError> {
             self.inner
-                .create_key(workspace, name, permission, key_hash, prefix)
+                .create_key(workspace, name, permission, key_hash, prefix, created_by)
                 .await
+        }
+        async fn key_by_public_id(
+            &self,
+            workspace: u64,
+            public_id: uuid::Uuid,
+        ) -> Result<Option<ApiKeyInfo>, AccountError> {
+            self.inner.key_by_public_id(workspace, public_id).await
+        }
+        async fn rotate_key(
+            &self,
+            workspace: u64,
+            key_id: u64,
+            new_key_hash: &[u8; 32],
+            new_prefix: &str,
+            created_by: Option<u64>,
+        ) -> Result<Option<(ApiKeyInfo, [u8; 32])>, AccountError> {
+            self.inner
+                .rotate_key(workspace, key_id, new_key_hash, new_prefix, created_by)
+                .await
+        }
+        async fn touch_keys(
+            &self,
+            touches: &[durable_accounts::KeyTouch],
+        ) -> Result<(), AccountError> {
+            self.inner.touch_keys(touches).await
         }
         async fn revoke_key(
             &self,
@@ -10193,10 +10475,36 @@ mod tests {
             permission: Permission,
             key_hash: &[u8; 32],
             prefix: &str,
+            created_by: Option<u64>,
         ) -> Result<ApiKeyInfo, AccountError> {
             self.inner
-                .create_key(workspace, name, permission, key_hash, prefix)
+                .create_key(workspace, name, permission, key_hash, prefix, created_by)
                 .await
+        }
+        async fn key_by_public_id(
+            &self,
+            workspace: u64,
+            public_id: uuid::Uuid,
+        ) -> Result<Option<ApiKeyInfo>, AccountError> {
+            self.inner.key_by_public_id(workspace, public_id).await
+        }
+        async fn rotate_key(
+            &self,
+            workspace: u64,
+            key_id: u64,
+            new_key_hash: &[u8; 32],
+            new_prefix: &str,
+            created_by: Option<u64>,
+        ) -> Result<Option<(ApiKeyInfo, [u8; 32])>, AccountError> {
+            self.inner
+                .rotate_key(workspace, key_id, new_key_hash, new_prefix, created_by)
+                .await
+        }
+        async fn touch_keys(
+            &self,
+            touches: &[durable_accounts::KeyTouch],
+        ) -> Result<(), AccountError> {
+            self.inner.touch_keys(touches).await
         }
         async fn revoke_key(
             &self,
@@ -10500,6 +10808,7 @@ mod tests {
                     Permission::Write,
                     &sha256(key.as_bytes()),
                     "dr_3",
+                    None,
                 )
                 .await
                 .unwrap_or_else(|e| panic!("{e}"));
@@ -10916,6 +11225,7 @@ mod tests {
                 Permission::Write,
                 &sha256(key_a.as_bytes()),
                 "dr_c",
+                None,
             )
             .await
             .unwrap_or_else(|e| panic!("{e}"));
@@ -11054,6 +11364,7 @@ mod tests {
                 Permission::Write,
                 &sha256(key.as_bytes()),
                 "dr_a",
+                None,
             )
             .await
             .unwrap_or_else(|e| panic!("{e}"));
@@ -11426,6 +11737,7 @@ mod tests {
                 Permission::Write,
                 &sha256(key_a.as_bytes()),
                 "dr_a",
+                None,
             )
             .await
             .unwrap_or_else(|e| panic!("{e}"));
@@ -14162,6 +14474,7 @@ mod tests {
                 Permission::Write,
                 &sha256(key_a.as_bytes()),
                 "dr_a",
+                None,
             )
             .await
             .unwrap_or_else(|e| panic!("{e}"));
@@ -14392,6 +14705,7 @@ mod tests {
                 Permission::Write,
                 &sha256(key_a.as_bytes()),
                 "dr_a",
+                None,
             )
             .await
             .unwrap_or_else(|e| panic!("{e}"));
@@ -14674,6 +14988,7 @@ mod tests {
                 Permission::Write,
                 &sha256(token.as_bytes()),
                 "dr_te",
+                None,
             )
             .await
             .unwrap_or_else(|e| panic!("key: {e}"));
@@ -17159,6 +17474,7 @@ mod tests {
                 Permission::Write,
                 &sha256(key.as_bytes()),
                 "dr_f",
+                None,
             )
             .await
             .unwrap_or_else(|e| panic!("{e}"));
@@ -17202,5 +17518,257 @@ mod tests {
         .await;
         assert_eq!(st, StatusCode::OK);
         assert_eq!(v["workspaces"].as_array().map(|w| w.len()), Some(0), "{v}");
+    }
+
+    // ---- S3-5: member-facing keys -----------------------------------
+
+    /// Create a `write` key in `pid` as `cookie`; returns `(public_id,
+    /// plaintext)` — the plaintext appears in exactly this response.
+    async fn make_key(
+        router: &Router,
+        cookie: &str,
+        csrf: &str,
+        pid: &str,
+        perm: &str,
+    ) -> (String, String) {
+        let (st, _, v) = raw(
+            router,
+            "POST",
+            &format!("/workspaces/{pid}/keys"),
+            &session_headers(cookie, csrf),
+            Some(json!({"name": "cli", "permission": perm})),
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK, "{v}");
+        let key = v["key"].as_str().unwrap_or_default().to_string();
+        assert!(key.starts_with("drk_"), "new keys are tagged: {key}");
+        (v["public_id"].as_str().unwrap_or_default().to_string(), key)
+    }
+
+    /// Lifecycle: mint shows `drk_` once, the list carries prefix but
+    /// never secret material, rotate kills the old key on the next call
+    /// and DELETE does the same to the new one.
+    #[tokio::test]
+    async fn s35_key_lifecycle() {
+        let store = Arc::new(Memory::new());
+        let h = harness_store(false, None, Some(store.clone()));
+        signup_and_verify(&h.router, &store, "o@o.co", "a-long-enough-passphrase").await;
+        let (oc, ocsrf) = login_only(&h.router, "o@o.co", "a-long-enough-passphrase").await;
+        let pid = make_ws(&h.router, &oc, "alpha").await;
+        let (key_pid, key) = make_key(&h.router, &oc, &ocsrf, &pid, "write").await;
+        // The list shows prefix, never the secret.
+        let (st, _, v) = raw(
+            &h.router,
+            "GET",
+            &format!("/workspaces/{pid}/keys"),
+            &[("cookie", oc.clone())],
+            None,
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK);
+        assert_eq!(v["keys"][0]["prefix"], &key[..11]);
+        let body = serde_json::to_string(&v).unwrap_or_default();
+        assert!(
+            !body.contains(&key[4..]),
+            "list leaked key material: {body}"
+        );
+        // The key works on the data plane.
+        let (st, _) = call(&h.router, "GET", "/jobs", Some(&key), None).await;
+        assert_eq!(st, StatusCode::OK);
+        // Rotate: new secret once; the OLD key 401s on the next call.
+        let (st, _, v) = raw(
+            &h.router,
+            "POST",
+            &format!("/workspaces/{pid}/keys/{key_pid}/rotate"),
+            &session_headers(&oc, &ocsrf),
+            None,
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK, "{v}");
+        let key2 = v["key"].as_str().unwrap_or_default().to_string();
+        let new_pid = v["public_id"].as_str().unwrap_or_default().to_string();
+        assert!(key2.starts_with("drk_") && key2 != key);
+        assert_ne!(new_pid, key_pid, "rotate mints a fresh row");
+        let (st, _) = call(&h.router, "GET", "/jobs", Some(&key), None).await;
+        assert_eq!(
+            st,
+            StatusCode::UNAUTHORIZED,
+            "rotated-out key must 401 at once"
+        );
+        let (st, _) = call(&h.router, "GET", "/jobs", Some(&key2), None).await;
+        assert_eq!(st, StatusCode::OK);
+        // Delete: the new key 401s on its next call too.
+        let (st, _, _) = raw(
+            &h.router,
+            "DELETE",
+            &format!("/workspaces/{pid}/keys/{new_pid}"),
+            &session_headers(&oc, &ocsrf),
+            None,
+        )
+        .await;
+        assert_eq!(st, StatusCode::NO_CONTENT);
+        let (st, _) = call(&h.router, "GET", "/jobs", Some(&key2), None).await;
+        assert_eq!(st, StatusCode::UNAUTHORIZED, "deleted key must 401 at once");
+        // And a second delete is a 404 indistinguishable from IDOR.
+        let (st, _, _) = raw(
+            &h.router,
+            "DELETE",
+            &format!("/workspaces/{pid}/keys/{new_pid}"),
+            &session_headers(&oc, &ocsrf),
+            None,
+        )
+        .await;
+        assert_eq!(st, StatusCode::NOT_FOUND);
+    }
+
+    /// key-self-escalation: a data-plane key — even write — cannot reach
+    /// any member route; those need a session cookie.
+    #[tokio::test]
+    async fn s35_key_self_escalation() {
+        let store = Arc::new(Memory::new());
+        let h = harness_store(false, None, Some(store.clone()));
+        signup_and_verify(&h.router, &store, "o@o.co", "a-long-enough-passphrase").await;
+        let (oc, ocsrf) = login_only(&h.router, "o@o.co", "a-long-enough-passphrase").await;
+        let pid = make_ws(&h.router, &oc, "alpha").await;
+        let (_, key) = make_key(&h.router, &oc, &ocsrf, &pid, "write").await;
+        for (method, uri) in [
+            ("GET", "/workspaces".to_string()),
+            ("POST", "/workspaces".to_string()),
+            ("GET", format!("/workspaces/{pid}/keys")),
+            ("POST", format!("/workspaces/{pid}/keys")),
+            ("GET", format!("/workspaces/{pid}/members")),
+            ("DELETE", format!("/workspaces/{pid}")),
+            ("GET", "/auth/session".to_string()),
+            ("GET", "/me".to_string()),
+        ] {
+            let (st, _) = call(&h.router, method, &uri, Some(&key), None).await;
+            assert_eq!(
+                st,
+                StatusCode::UNAUTHORIZED,
+                "{method} {uri} answered {st} to a bare API key"
+            );
+        }
+    }
+
+    /// cross-ws-key-create: a member of A POSTing a key under B's pid
+    /// answers 404 — B's existence is not confirmed.
+    #[tokio::test]
+    async fn s35_cross_ws_key_create() {
+        let store = Arc::new(Memory::new());
+        let h = harness_store(false, None, Some(store.clone()));
+        signup_and_verify(&h.router, &store, "a@a.co", "a-long-enough-passphrase").await;
+        signup_and_verify(&h.router, &store, "b@b.co", "a-long-enough-passphrase").await;
+        let (ac, acsrf) = login_only(&h.router, "a@a.co", "a-long-enough-passphrase").await;
+        let (bc, _) = login_only(&h.router, "b@b.co", "a-long-enough-passphrase").await;
+        make_ws(&h.router, &ac, "aspace").await;
+        let pid_b = make_ws(&h.router, &bc, "bspace").await;
+        let (st, _, _) = raw(
+            &h.router,
+            "POST",
+            &format!("/workspaces/{pid_b}/keys"),
+            &session_headers(&ac, &acsrf),
+            Some(json!({"name": "stolen", "permission": "write"})),
+        )
+        .await;
+        assert_eq!(st, StatusCode::NOT_FOUND);
+        // B's key list is untouched.
+        let (st, _, v) = raw(
+            &h.router,
+            "GET",
+            &format!("/workspaces/{pid_b}/keys"),
+            &[("cookie", bc)],
+            None,
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK);
+        assert_eq!(v["keys"].as_array().map(|k| k.len()), Some(0));
+    }
+
+    /// Roles on the key routes: a viewer may list but POSTs/DELETEs are
+    /// 403; a member (non-admin) is refused the same way.
+    #[tokio::test]
+    async fn s35_key_roles() {
+        let store = Arc::new(Memory::new());
+        let h = harness_store(false, None, Some(store.clone()));
+        signup_and_verify(&h.router, &store, "o@o.co", "a-long-enough-passphrase").await;
+        signup_and_verify(&h.router, &store, "v@v.co", "a-long-enough-passphrase").await;
+        let (oc, ocsrf) = login_only(&h.router, "o@o.co", "a-long-enough-passphrase").await;
+        let pid = make_ws(&h.router, &oc, "alpha").await;
+        let (key_pid_owner, _) = make_key(&h.router, &oc, &ocsrf, &pid, "write").await;
+        // Seat v@v.co as a viewer via a real invite.
+        let (ist, _, token) = make_invite(&h.router, &oc, &ocsrf, &pid, "v@v.co", "viewer").await;
+        assert_eq!(ist, StatusCode::OK);
+        let (vc, vcsrf) = login_only(&h.router, "v@v.co", "a-long-enough-passphrase").await;
+        let (st, _, _) = raw(
+            &h.router,
+            "POST",
+            "/invites/accept",
+            &session_headers(&vc, &vcsrf),
+            Some(json!({"token": token})),
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK);
+        // Viewer lists.
+        let (st, _, _) = raw(
+            &h.router,
+            "GET",
+            &format!("/workspaces/{pid}/keys"),
+            &[("cookie", vc.clone())],
+            None,
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK);
+        // Viewer cannot mint or revoke.
+        let (st, _, _) = raw(
+            &h.router,
+            "POST",
+            &format!("/workspaces/{pid}/keys"),
+            &session_headers(&vc, &vcsrf),
+            Some(json!({"name": "esc", "permission": "write"})),
+        )
+        .await;
+        assert_eq!(st, StatusCode::FORBIDDEN);
+        let (st, _, _) = raw(
+            &h.router,
+            "DELETE",
+            &format!("/workspaces/{pid}/keys/{key_pid_owner}"),
+            &session_headers(&vc, &vcsrf),
+            None,
+        )
+        .await;
+        assert_eq!(st, StatusCode::FORBIDDEN);
+    }
+
+    /// last-used-amplification: N verifies through the hot path coalesce
+    /// to at most one last_used UPDATE per key per flush (D-071).
+    #[tokio::test]
+    async fn s35_last_used_amplification() {
+        let store = Arc::new(Memory::new());
+        let h = harness_store(false, None, Some(store.clone()));
+        signup_and_verify(&h.router, &store, "o@o.co", "a-long-enough-passphrase").await;
+        let (oc, ocsrf) = login_only(&h.router, "o@o.co", "a-long-enough-passphrase").await;
+        let pid = make_ws(&h.router, &oc, "alpha").await;
+        let (_, key) = make_key(&h.router, &oc, &ocsrf, &pid, "write").await;
+        // N verifies — cached or not, each lands <=1 pending touch.
+        for _ in 0..8 {
+            let (st, _) = call(&h.router, "GET", "/jobs", Some(&key), None).await;
+            assert_eq!(st, StatusCode::OK);
+        }
+        let pending = h.app.keyring.drain_key_touches();
+        assert_eq!(pending.len(), 1, "8 verifies coalesce to one touch");
+        store
+            .touch_keys(&pending)
+            .await
+            .unwrap_or_else(|e| panic!("{e}"));
+        let ws = store
+            .workspace_by_public_id(uuid::Uuid::parse_str(&pid).unwrap_or_else(|e| panic!("{e}")))
+            .await
+            .unwrap_or_else(|e| panic!("{e}"))
+            .unwrap_or_else(|| panic!("ws"));
+        let keys = store
+            .list_keys(ws.id)
+            .await
+            .unwrap_or_else(|e| panic!("{e}"));
+        assert!(keys[0].last_used_at_ms.is_some(), "the flush landed");
     }
 }

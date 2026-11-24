@@ -114,10 +114,17 @@ pub enum MemberChange {
 #[derive(Debug, Clone)]
 pub struct ApiKeyInfo {
     pub id: u64,
+    /// Opaque external id — `id` never leaves the process (S3-5).
+    pub public_id: uuid::Uuid,
     pub name: String,
     pub prefix: String,
     pub permission: Permission,
     pub revoked: bool,
+    /// unix millis; `None` until the first flush lands a use.
+    pub last_used_at_ms: Option<i64>,
+    /// The member account that issued it (its public id — internal
+    /// account ids never leave the store), when self-service created it.
+    pub created_by: Option<uuid::Uuid>,
 }
 
 /// One handler registered for a workspace.
@@ -202,6 +209,15 @@ pub struct SessionTouch {
     pub seen_ms: i64,
     /// The new idle deadline (`seen_ms` + the server's idle window).
     pub idle_expires_at_ms: i64,
+}
+
+/// A batched api-key "used" marker (D-071): key verifies coalesce in
+/// memory and land as at most one `last_used_at` UPDATE per key per
+/// flush tick — zero per-request store writes on the hot path.
+pub struct KeyTouch {
+    pub key_hash: [u8; 32],
+    /// unix millis.
+    pub seen_ms: i64,
 }
 
 /// What `signup` decided — the three outcomes the API deliberately
@@ -358,6 +374,8 @@ pub trait AccountStore: Send + Sync {
 
     /// Record a newly issued key. `key_hash` is sha256 of the secret the
     /// caller shows once; the store never sees the plaintext.
+    /// `created_by` is the issuing member account on self-service
+    /// creates (`None` on the ops path).
     async fn create_key(
         &self,
         workspace: u64,
@@ -365,6 +383,7 @@ pub trait AccountStore: Send + Sync {
         permission: Permission,
         key_hash: &[u8; 32],
         prefix: &str,
+        created_by: Option<u64>,
     ) -> Result<ApiKeyInfo, AccountError>;
 
     /// Revoke a key. Returns its hash so the caller can invalidate a
@@ -377,6 +396,35 @@ pub trait AccountStore: Send + Sync {
     ) -> Result<Option<[u8; 32]>, AccountError>;
 
     async fn list_keys(&self, workspace: u64) -> Result<Vec<ApiKeyInfo>, AccountError>;
+
+    /// A live key of the workspace addressed by its opaque public id —
+    /// the member-plane resolution step (S3-5). `None` covers both "not
+    /// in this workspace" and "already revoked" so callers cannot
+    /// distinguish them.
+    async fn key_by_public_id(
+        &self,
+        workspace: u64,
+        public_id: uuid::Uuid,
+    ) -> Result<Option<ApiKeyInfo>, AccountError>;
+
+    /// Atomically retire `key_id` and mint its replacement with the same
+    /// name and permission — the rotate contract is "old key 401s on
+    /// the next call", which a non-atomic create-then-revoke cannot
+    /// promise. Returns the new key's info and the old hash (for
+    /// write-through cache invalidation); `None` when no live key of
+    /// that id exists in the workspace.
+    async fn rotate_key(
+        &self,
+        workspace: u64,
+        key_id: u64,
+        new_key_hash: &[u8; 32],
+        new_prefix: &str,
+        created_by: Option<u64>,
+    ) -> Result<Option<(ApiKeyInfo, [u8; 32])>, AccountError>;
+
+    /// Apply a batch of coalesced "used" markers — one UPDATE per key
+    /// per flush, never one per request (D-071).
+    async fn touch_keys(&self, touches: &[KeyTouch]) -> Result<(), AccountError>;
 
     async fn list_handlers(&self, workspace: u64)
         -> Result<Vec<HandlerRegistration>, AccountError>;
