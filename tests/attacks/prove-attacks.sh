@@ -53,6 +53,7 @@ mutations=(
   "obs-run-scope|crates/durable-server/src/main.rs|unit:durable-server|run_events_answer_only_the_callers_workspace|Some\(run\) if run\.ws == auth\.ws => run,~~>Some(run) => run,"
   "obs-feed-scope|crates/durable-server/src/main.rs|unit:durable-server|the_feed_answers_only_the_callers_workspace|app\.obs\.feed\(auth\.ws, limit\)~~>app.obs.feed(0, limit)"
   "obs-record-scope|crates/durable-engine/src/observe.rs|unit:durable-engine|a_workspace_view_holds_only_its_own_records|self\.ws\(o\.ws, o\.at\)~~>self.ws(0, o.at)"
+  "parked-untrack|crates/durable-engine/src/shell.rs|unit:durable-engine|a_cancel_through_the_actor_drops_the_runs_scheduler_entries|exec!\(\)\.untrack\(w, run\);~~>let _ = w;"
   "obs-call-scope|crates/durable-engine/src/observe.rs|unit:durable-server|metrics_answer_only_the_callers_workspace|obs\.ws\(ws, wall_ms\(\)\)~~>obs.ws(0, wall_ms())"
 )
 

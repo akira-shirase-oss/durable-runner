@@ -245,6 +245,12 @@ enum Read {
         scope: Scope,
         reply: oneshot::Sender<MetricsIndex>,
     },
+    /// Test probe: the actor's scheduler memory per run —
+    /// `(parked entries, dead_since markers, dead_retry tuples)`.
+    #[cfg(test)]
+    SchedCounts {
+        reply: oneshot::Sender<(usize, usize, usize)>,
+    },
 }
 
 /// Handle to the running engine. Cheap to clone; the channel capacities
@@ -663,6 +669,15 @@ impl Engine {
     /// The observer: metrics, run timelines and the activity feed (D-058).
     pub fn observer(&self) -> &Arc<Observer> {
         &self.obs
+    }
+
+    /// Test probe: the actor's scheduler memory (parked entries,
+    /// dead_since markers, dead_retry tuples).
+    #[cfg(test)]
+    async fn sched_counts(&self) -> Result<(usize, usize, usize), EngineError> {
+        let (reply, rx) = oneshot::channel();
+        self.send_read(Read::SchedCounts { reply })?;
+        answer(rx, self.reply_timeout).await
     }
 }
 
@@ -1469,6 +1484,7 @@ async fn actor(
                     let ws = core.run(run).map(|r| r.ws);
                     let r = core.cancel(run, wall_ms()).map(|_| ());
                     if let Some(w) = ws {
+                        // ATTACK(parked-untrack)
                         exec!().untrack(w, run);
                     }
                     if let Err(e) = &r {
@@ -1543,6 +1559,11 @@ async fn actor(
                 }
                 Some(Read::Counts { reply }) => {
                     pipe.answer_read(core.last_index(), reply, core.index_counts());
+                }
+                #[cfg(test)]
+                Some(Read::SchedCounts { reply }) => {
+                    let parked_n = parked.values().map(Vec::len).sum();
+                    let _ = reply.send((parked_n, dead_since.len(), dead_retry.len()));
                 }
                 Some(Read::MetricsIndex { scope, reply }) => {
                     let m = match scope {
@@ -4184,6 +4205,56 @@ mod tests {
             sched.parked.get(&0).is_none_or(Vec::is_empty),
             "unpark kept a cancelled run's entry"
         );
+    }
+
+    /// S2 re-review N2, the wiring: a cancel that goes THROUGH THE ACTOR
+    /// drops the run's scheduler memory at once — the parked entry (past
+    /// grace) and, in grace, the dead_since marker and its dead_retry
+    /// tuple. The unit test above calls `untrack` itself, so it stays
+    /// green if the actor's cancel arm stops calling it; this one does not.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_cancel_through_the_actor_drops_the_runs_scheduler_entries() {
+        for (grace_ms, want_before) in [(0, (1, 0, 0)), (60_000, (0, 1, 1))] {
+            let d = tempfile::tempdir().unwrap_or_else(|e| panic!("{e}"));
+            let mut reg = Registry::default();
+            reg.register("gone", Arc::new(Echo));
+            let eng = spawn(
+                d.path(),
+                reg,
+                ShellConfig {
+                    tick_ms: 5,
+                    dead_handler_grace_ms: grace_ms,
+                    ..Default::default()
+                },
+            )
+            .unwrap_or_else(|e| panic!("{e}"));
+            // Admitted while the handler exists, due once it is gone.
+            let run = eng
+                .submit_at(OperationKey("ghost".into()), spec1("gone"), wall_ms() + 50)
+                .await
+                .unwrap_or_else(|e| panic!("{e}"));
+            eng.delete_handler(0, "gone")
+                .unwrap_or_else(|e| panic!("{e}"));
+            let deadline = std::time::Instant::now() + Duration::from_secs(10);
+            loop {
+                let c = eng.sched_counts().await.unwrap_or_else(|e| panic!("{e}"));
+                if c == want_before {
+                    break;
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "grace {grace_ms}: never reached {want_before:?}, at {c:?}"
+                );
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+            eng.cancel(run).await.unwrap_or_else(|e| panic!("{e}"));
+            // The cancel's answer comes after its arm ran: no wait needed.
+            assert_eq!(
+                eng.sched_counts().await.unwrap_or_else(|e| panic!("{e}")),
+                (0, 0, 0),
+                "grace {grace_ms}: the cancelled run's scheduler entries survived"
+            );
+        }
     }
 
     /// Never answers; its probe reports the effect landed.
