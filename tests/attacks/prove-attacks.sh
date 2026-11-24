@@ -78,7 +78,7 @@ mutations=(
   "numeric-id-ws0|crates/durable-server/src/main.rs|cross_tenant|a_tenant_cannot_address_its_own_run_by_its_internal_number|if ws == 0 && ~~>if true && "
   "keys-scope|crates/durable-engine/src/shell.rs|unit:durable-engine|shell::tests::keys_never_answer_another_workspaces_run|\.filter\(\|r\| r\.ws == ws\)~~>"
   "list-scope|crates/durable-server/src/main.rs|unit:durable-server|tests::workspaces_are_isolated_end_to_end|\.list_in\(auth\.ws\(\),~~>.list_in(0,"
-  "diag-scope|crates/durable-server/src/main.rs|unit:durable-server|tests::a_tenant_admin_key_never_reaches_the_ops_routes|flat_access\(&app, &parts, Permission::Write, Role::Viewer, false\)\.await~~>Ok::<u64, ApiError>(0)"
+  "diag-scope|crates/durable-server/src/main.rs|unit:durable-server|tests::a_tenant_admin_key_never_reaches_the_ops_routes|diag_ws\(auth\.ws\(\)\)~~>diag_ws(0)"
   "v6-agg-first|crates/durable-server/src/addr_limits.rs|unit:durable-server|addr_limits::tests::a_slash48_spray_leaves_room_for_new_clients|self\.wait\(LimitKey::V6Aggregate\(p\), now\)~~>Duration::ZERO"
   "v6-per-agg-cap|crates/durable-server/src/addr_limits.rs|unit:durable-server|addr_limits::tests::a_slash48_holds_at_most_its_cap_of_slash64_entries|if at_cap\(self\) \{~~>if false {"
   "v6-agg-idle-reclaim|crates/durable-server/src/addr_limits.rs|unit:durable-server|addr_limits::tests::a_slash48_cap_frees_once_its_slash64s_go_idle|self\.reclaim_agg\(p, now\);~~>let _ = (p, now);"

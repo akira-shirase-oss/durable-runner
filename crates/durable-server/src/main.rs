@@ -3705,10 +3705,16 @@ async fn auth_session(
 ) -> Result<Response, ApiError> {
     // The dashboard boots off this call — the account's workspaces in
     // the same shape GET /workspaces returns them.
-    let rows = accounts(&app)?
-        .workspaces_for_account(grant.account.id)
-        .await
-        .map_err(store_err)?;
+    // A store flap must not kill the session read itself — the cached
+    // grant already proved who this is; the workspace list degrades to
+    // empty and the dashboard re-fetches.
+    let rows = match accounts(&app) {
+        Ok(store) => store
+            .workspaces_for_account(grant.account.id)
+            .await
+            .unwrap_or_default(),
+        Err(_) => Vec::new(),
+    };
     let workspaces: Vec<serde_json::Value> = rows
         .iter()
         .map(|(ws, role)| {
@@ -4175,6 +4181,43 @@ async fn tenant_read(app: &App, parts: &Parts) -> Result<u64, ApiError> {
         return Ok(0);
     }
     flat_access(app, parts, Permission::Read, Role::Viewer, false).await
+}
+
+/// Extractor over `flat_access`/`tenant_read` for the run-plane
+/// routes — declared FIRST in each handler so auth refuses before any
+/// body byte is pulled (the `unauthenticated_body` proof: `J` must
+/// never see an unauthenticated payload).
+struct TenantRead(FlatWs);
+impl FromRequestParts<App> for TenantRead {
+    type Rejection = ApiError;
+    async fn from_request_parts(parts: &mut Parts, app: &App) -> Result<Self, Self::Rejection> {
+        Ok(TenantRead(FlatWs(tenant_read(app, parts).await?)))
+    }
+}
+
+/// Writes (submit/cancel): bearer write-or-ops keys exactly as
+/// `Authorized` gave, sessions member+ with CSRF + Origin.
+struct TenantWrite(FlatWs);
+impl FromRequestParts<App> for TenantWrite {
+    type Rejection = ApiError;
+    async fn from_request_parts(parts: &mut Parts, app: &App) -> Result<Self, Self::Rejection> {
+        Ok(TenantWrite(FlatWs(
+            flat_access(app, parts, Permission::Write, Role::Member, true).await?,
+        )))
+    }
+}
+
+/// Reads that keep a write-key gate for bearers (`Authorized`'s old
+/// shape) while a session reads at viewer+ — /jobs/{id}/spec and
+/// /diagnostics.
+struct TenantMemberRead(FlatWs);
+impl FromRequestParts<App> for TenantMemberRead {
+    type Rejection = ApiError;
+    async fn from_request_parts(parts: &mut Parts, app: &App) -> Result<Self, Self::Rejection> {
+        Ok(TenantMemberRead(FlatWs(
+            flat_access(app, parts, Permission::Write, Role::Viewer, false).await?,
+        )))
+    }
 }
 
 /// Tiny shim: the flat handlers below were written against
@@ -5283,11 +5326,10 @@ impl ApiError {
 }
 
 async fn submit(
-    parts: Parts,
+    TenantWrite(auth): TenantWrite,
     State(app): State<App>,
     J(req): J<SubmitReq>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let auth = FlatWs(flat_access(&app, &parts, Permission::Write, Role::Member, true).await?);
     let input = base64_decode(&req.spec.input_b64)
         .map_err(|m| ApiError::new(StatusCode::BAD_REQUEST, "bad_input", m))?;
     let spec = JobSpec {
@@ -5373,11 +5415,10 @@ fn metrics_scope(ws: u64) -> observe::Scope {
 /// window, totals, current state counts and per-handler stats — for the
 /// caller's scope ([`metrics_scope`]).
 async fn metrics(
-    parts: Parts,
+    TenantRead(auth): TenantRead,
     State(app): State<App>,
     Q(pairs): Q<Vec<(String, String)>>,
 ) -> Result<Json<observe::MetricsOut>, ApiError> {
-    let auth = FlatWs(tenant_read(&app, &parts).await?);
     let invalid = || {
         ApiError::new(
             StatusCode::BAD_REQUEST,
@@ -5403,11 +5444,10 @@ async fn metrics(
 /// `GET /jobs/{id}/events` (D-058): the run's timeline. 404 exactly when
 /// `GET /jobs/{id}` is — another workspace's run is 404 (D-060).
 async fn run_events(
-    parts: Parts,
+    TenantRead(auth): TenantRead,
     State(app): State<App>,
     P(id): P<String>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let auth = FlatWs(tenant_read(&app, &parts).await?);
     let id = RunId(decode_id(&app, auth.ws(), &id)?);
     let run = match app.engine.summary(id).await? {
         // ATTACK(obs-run-scope)
@@ -5441,11 +5481,10 @@ struct FeedItem<'a> {
 /// `GET /events?limit=1..200` (D-058): the caller's workspace's activity
 /// feed, newest first — only its own runs (D-060).
 async fn feed(
-    parts: Parts,
+    TenantRead(auth): TenantRead,
     State(app): State<App>,
     Q(pairs): Q<Vec<(String, String)>>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let auth = FlatWs(tenant_read(&app, &parts).await?);
     let invalid = || {
         ApiError::new(
             StatusCode::BAD_REQUEST,
@@ -5553,11 +5592,10 @@ async fn scoped_run(app: &App, ws: u64, id: u64) -> Result<durable_domain::Run, 
 }
 
 async fn inspect(
-    parts: Parts,
+    TenantRead(auth): TenantRead,
     State(app): State<App>,
     P(id): P<String>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let auth = FlatWs(tenant_read(&app, &parts).await?);
     let run = scoped_run(&app, auth.ws(), decode_id(&app, auth.ws(), &id)?).await?;
     Ok(Json(serde_json::json!({
         "id": app.pubid.encode(run.id),
@@ -5572,13 +5610,10 @@ async fn inspect(
 /// (D-051): a controller that resubmits the same work under a new op_key needs it, and
 /// the input may be customer content, so the read key does not reveal it.
 async fn spec(
-    parts: Parts,
+    TenantMemberRead(auth): TenantMemberRead,
     State(app): State<App>,
     P(id): P<String>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    // Bearer stays write-gated (its old `Authorized`); a session
-    // reads its workspace's spec at viewer+ like every other GET.
-    let auth = FlatWs(flat_access(&app, &parts, Permission::Write, Role::Viewer, false).await?);
     use base64::Engine as _;
     let run = scoped_run(&app, auth.ws(), decode_id(&app, auth.ws(), &id)?).await?;
     Ok(Json(serde_json::json!({
@@ -5593,11 +5628,10 @@ async fn spec(
 }
 
 async fn cancel(
-    parts: Parts,
+    TenantWrite(auth): TenantWrite,
     State(app): State<App>,
     P(id): P<String>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let auth = FlatWs(flat_access(&app, &parts, Permission::Write, Role::Member, true).await?);
     // The scope check happens before the cancel: a run's workspace is
     // fixed at acceptance, so inspecting first cannot race.
     let internal = decode_id(&app, auth.ws(), &id)?;
@@ -5620,11 +5654,10 @@ struct ListQuery {
 }
 
 async fn list(
-    parts: Parts,
+    TenantRead(auth): TenantRead,
     State(app): State<App>,
     Q(q): Q<ListQuery>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let auth = FlatWs(tenant_read(&app, &parts).await?);
     let newest = match q.order.as_deref() {
         None | Some("asc") => false,
         Some("desc") => true,
@@ -5737,14 +5770,13 @@ fn ops_admin(auth: &Auth) -> Result<(), ApiError> {
 /// totals (S1 review: diagnostics leaks tenant volume across the
 /// boundary, so the global view is ops-only).
 async fn workspace_diagnostics(
-    parts: Parts,
+    TenantMemberRead(auth): TenantMemberRead,
     State(app): State<App>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     // Bearer stays write-gated (its old `Authorized`); a session sees
     // only its own workspace's counts at viewer+ — never the ops view.
     // ATTACK(diag-scope)
-    let ws = flat_access(&app, &parts, Permission::Write, Role::Viewer, false).await?;
-    let d = app.engine.diag_ws(ws).await?;
+    let d = app.engine.diag_ws(auth.ws()).await?;
     Ok(Json(serde_json::to_value(d).unwrap_or_default()))
 }
 
