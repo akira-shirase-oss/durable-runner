@@ -49,6 +49,11 @@ mutations=(
   "liveness-flood|crates/durable-server/src/main.rs|unit:durable-server|health_survives_a_pinned_connection_pool|ready_pool\\.max\\(1\\)~~>ready_pool.min(0)"
   "slot-camp|crates/durable-server/src/main.rs|unit:durable-server|a_fresh_head_gets_a_one_second_grace_then_dies_under_pressure|served_n == 0~~>false"
   "overload-lane|crates/durable-server/src/main.rs|unit:durable-server|the_overload_lane_answers_conns_from_four_buckets|lane_answer\([^)]*\)~~>{ let _ = (lane_guard, lane_permit); drop(stream); }"
+  "obs-metrics-scope|crates/durable-server/src/main.rs|unit:durable-server|metrics_answer_only_the_callers_workspace|auth\.ws == 0~~>true"
+  "obs-run-scope|crates/durable-server/src/main.rs|unit:durable-server|run_events_answer_only_the_callers_workspace|Some\(run\) if run\.ws == auth\.ws => run,~~>Some(run) => run,"
+  "obs-feed-scope|crates/durable-server/src/main.rs|unit:durable-server|the_feed_answers_only_the_callers_workspace|app\.obs\.feed\(auth\.ws, limit\)~~>app.obs.feed(0, limit)"
+  "obs-record-scope|crates/durable-engine/src/observe.rs|unit:durable-engine|a_workspace_view_holds_only_its_own_records|self\.ws\(o\.ws, o\.at\)~~>self.ws(0, o.at)"
+  "obs-call-scope|crates/durable-engine/src/observe.rs|unit:durable-server|metrics_answer_only_the_callers_workspace|obs\.ws\(ws, wall_ms\(\)\)~~>obs.ws(0, wall_ms())"
 )
 
 # Every marker in the source has exactly one mutation, and every mutation

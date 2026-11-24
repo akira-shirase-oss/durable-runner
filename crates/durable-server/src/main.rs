@@ -21,11 +21,12 @@ use axum::{
 use clap::Parser;
 use durable_accounts::{AccountError, AccountStore, Permission, Pg};
 use durable_domain::{JobSpec, Millis, OperationKey, RunId, RunState, StepSpec};
+use durable_engine::observe::{self, Observer, Window};
 use durable_engine::shell::{
     spawn, Call, Engine, Order, Outcome, Registry, ShellConfig, StepHandler, MAX_HANDLERS_PER_WS,
 };
 use durable_engine::EngineError;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -1238,6 +1239,8 @@ struct App {
     /// through this keyed permutation, so no response reveals the
     /// global sequence or another workspace's volume.
     pubid: pubid::PubId,
+    /// The engine's observer (D-058, scoped per workspace by D-060).
+    obs: Arc<Observer>,
 }
 
 /// Test constructor: the registry plumbing (`handlers.json`, factory,
@@ -1257,6 +1260,7 @@ fn test_app(
         Arc::from(journal_dir.join("handlers.json").as_path()),
         Arc::clone(&registry_epoch),
     );
+    let obs = engine.observer().clone();
     App {
         engine,
         keyring,
@@ -1276,6 +1280,7 @@ fn test_app(
         registry_epoch,
         registry_locks: Arc::new(RegistryLocks::default()),
         pubid,
+        obs,
     }
 }
 
@@ -1625,12 +1630,205 @@ async fn submit(
         input,
     };
     let key = OperationKey(req.op_key);
-    let run = match req.not_before {
-        Some(at) => app.engine.submit_at_scoped(auth.ws, key, spec, at).await,
-        None => app.engine.submit_scoped(auth.ws, key, spec).await,
-    }?;
+    let submitted = match app
+        .engine
+        .submit_in(auth.ws, key, spec, req.not_before)
+        .await
+    {
+        Ok(s) => s,
+        Err(e) => {
+            if admission_refusal(&e) {
+                app.obs.refused(Some(auth.ws), observe::wall_ms());
+            }
+            return Err(e.into());
+        }
+    };
+    if submitted.deduplicated {
+        app.obs.deduplicated(auth.ws, observe::wall_ms());
+    }
     // The id leaves only in its opaque form (S2 #7).
-    Ok(Json(serde_json::json!({ "run_id": app.pubid.encode(run) })))
+    Ok(Json(
+        serde_json::json!({ "run_id": app.pubid.encode(submitted.run) }),
+    ))
+}
+
+/// A submit refused at admission — what `/metrics` counts as `refused`
+/// with the 429s: at capacity, the command queue full (busy), over the
+/// limits, an unregistered handler, or below the free-space reserve. A
+/// malformed request, a missing key, or a timeout (the submit may still
+/// commit) is not one.
+fn admission_refusal(e: &EngineError) -> bool {
+    use durable_domain::Refusal;
+    matches!(
+        e,
+        EngineError::Refused(
+            Refusal::AtCapacity
+                | Refusal::ReserveExhausted
+                | Refusal::OverLimits
+                | Refusal::WorkspaceQuota
+        ) | EngineError::UnregisteredHandler(_)
+            | EngineError::Journal(durable_journal::JournalError::NoSpace { .. })
+    )
+}
+
+/// Whether a request is a submit (a 429 for it counts as `refused`).
+fn is_submit<B>(req: &hyper::Request<B>) -> bool {
+    req.method() == axum::http::Method::POST && req.uri().path() == "/jobs"
+}
+
+/// The value of query parameter `name`: `Ok(None)` when absent, `Err`
+/// when it is given more than once.
+fn single_param<'a>(pairs: &'a [(String, String)], name: &str) -> Result<Option<&'a str>, ()> {
+    let mut found = pairs
+        .iter()
+        .filter(|(k, _)| k == name)
+        .map(|(_, v)| v.as_str());
+    match (found.next(), found.next()) {
+        (v, None) => Ok(v),
+        (Some(_), Some(_)) => Err(()),
+        (None, Some(_)) => Err(()),
+    }
+}
+
+/// The metrics a key may see (D-060): a workspace-0 key (the operator's
+/// env keys, the loopback `--open-reads`) sees every workspace; any other
+/// key sees its own workspace only — its counters, latencies, gauges,
+/// states and handlers, never another tenant's or the totals.
+fn metrics_scope(auth: &Auth) -> observe::Scope {
+    // ATTACK(obs-metrics-scope)
+    if auth.ws == 0 {
+        observe::Scope::All
+    } else {
+        observe::Scope::Ws(auth.ws)
+    }
+}
+
+/// `GET /metrics?window=15m|1h|6h|24h` (D-058): the metrics ring for the
+/// window, totals, current state counts and per-handler stats — for the
+/// caller's scope ([`metrics_scope`]).
+async fn metrics(
+    ReadAuthorized(auth): ReadAuthorized,
+    State(app): State<App>,
+    Q(pairs): Q<Vec<(String, String)>>,
+) -> Result<Json<observe::MetricsOut>, ApiError> {
+    let invalid = || {
+        ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "invalid_window",
+            "window must be one of 15m, 1h, 6h, 24h",
+        )
+    };
+    let window = match single_param(&pairs, "window").map_err(|()| invalid())? {
+        None => Window::H1,
+        Some(w) => Window::parse(w).ok_or_else(invalid)?,
+    };
+    let scope = metrics_scope(&auth);
+    let index = app.engine.metrics_index(scope).await?;
+    Ok(Json(app.obs.metrics(
+        scope,
+        window,
+        observe::wall_ms(),
+        index.counts,
+        &index.handlers,
+    )))
+}
+
+/// `GET /jobs/{id}/events` (D-058): the run's timeline. 404 exactly when
+/// `GET /jobs/{id}` is — another workspace's run is 404 (D-060).
+async fn run_events(
+    ReadAuthorized(auth): ReadAuthorized,
+    State(app): State<App>,
+    P(id): P<String>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let id = RunId(decode_id(&app, auth.ws, &id)?);
+    let run = match app.engine.summary(id).await? {
+        // ATTACK(obs-run-scope)
+        Some(run) if run.ws == auth.ws => run,
+        _ => return Err(not_found()),
+    };
+    let t = app.obs.timeline(id);
+    Ok(Json(serde_json::json!({
+        "run": app.pubid.encode(id),
+        "key": run.key.0,
+        "state": state_name(&run.state),
+        "complete": t.complete,
+        "reason": t.reason,
+        "events": t.events,
+    })))
+}
+
+/// One activity-feed entry: the timeline event plus its run (the opaque
+/// public id) and key.
+#[derive(Serialize)]
+struct FeedItem<'a> {
+    at: Millis,
+    run: String,
+    /// `None` only for a run that has since left the index (expired by a
+    /// compaction seven days after it finished).
+    key: Option<&'a str>,
+    #[serde(flatten)]
+    kind: observe::Kind,
+}
+
+/// `GET /events?limit=1..200` (D-058): the caller's workspace's activity
+/// feed, newest first — only its own runs (D-060).
+async fn feed(
+    ReadAuthorized(auth): ReadAuthorized,
+    State(app): State<App>,
+    Q(pairs): Q<Vec<(String, String)>>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let invalid = || {
+        ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "invalid_limit",
+            "limit must be an integer from 1 to 200",
+        )
+    };
+    let limit = match single_param(&pairs, "limit").map_err(|()| invalid())? {
+        None => 50,
+        Some(v) => v
+            .parse::<usize>()
+            .ok()
+            .filter(|n| (1..=observe::MAX_FEED_PAGE).contains(n))
+            .ok_or_else(invalid)?,
+    };
+    // ATTACK(obs-feed-scope)
+    let (since, events) = app.obs.feed(auth.ws, limit);
+    // Keys come from the index at read time: the observer holds no keys,
+    // so its memory stays fixed per event (D-058).
+    let mut runs: Vec<RunId> = events.iter().map(|(r, _)| *r).collect();
+    runs.sort_unstable();
+    runs.dedup();
+    let keys = app.engine.keys(auth.ws, runs.clone()).await?;
+    let key_of = |run: RunId| {
+        runs.binary_search(&run)
+            .ok()
+            .and_then(|i| keys.get(i))
+            .and_then(|k| k.as_ref())
+            .map(|k| k.0.as_str())
+    };
+    let items: Vec<FeedItem<'_>> = events
+        .iter()
+        .map(|(run, ev)| FeedItem {
+            at: ev.at,
+            run: app.pubid.encode(*run),
+            key: key_of(*run),
+            kind: ev.kind,
+        })
+        .collect();
+    Ok(Json(serde_json::json!({
+        "since": since,
+        "events": items,
+    })))
+}
+
+/// The observability routes answer `Cache-Control: no-store`, errors too.
+async fn no_store(mut res: Response) -> Response {
+    res.headers_mut().insert(
+        header::CACHE_CONTROL,
+        header::HeaderValue::from_static("no-store"),
+    );
+    res
 }
 
 fn state_name(s: &RunState) -> String {
@@ -2497,6 +2695,12 @@ fn base64_decode(s: &str) -> Result<Vec<u8>, String> {
 /// admin handler takes `Authorized`, so it is unreachable without the API
 /// key.
 fn router(app: App, ui_dir: Option<&Path>) -> Router {
+    // Read-only observability (D-058): `ReadAuthorized`, never cached.
+    let observability = Router::new()
+        .route("/metrics", get(metrics))
+        .route("/events", get(feed))
+        .route("/jobs/{id}/events", get(run_events))
+        .layer(axum::middleware::map_response(no_store));
     let mut router = Router::new()
         .route("/health", get(health))
         .route("/ready", get(ready))
@@ -2533,6 +2737,7 @@ fn router(app: App, ui_dir: Option<&Path>) -> Router {
             "/handlers/{name}",
             axum::routing::put(put_handler).delete(delete_handler),
         )
+        .merge(observability)
         // A submit is at most 64 KiB of input (base64: ~88 KiB) plus its
         // spec; nothing legitimate comes near this.
         // ATTACK(body-limit)
@@ -2883,6 +3088,7 @@ async fn main() -> Result<()> {
     let registry_stale = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let registry_epoch = Arc::new(std::sync::atomic::AtomicU64::new(0));
     let registry_tx = spawn_registry_writer(registry_file.clone(), Arc::clone(&registry_epoch));
+    let obs = engine.observer().clone();
     let app = App {
         engine,
         keyring: Arc::new(Keyring::new(api_key, read_key, store.clone())),
@@ -2896,6 +3102,7 @@ async fn main() -> Result<()> {
         registry_epoch,
         registry_locks: Arc::new(RegistryLocks::default()),
         pubid,
+        obs: obs.clone(),
     };
     if let Some(store) = &store {
         spawn_registry_reconcile(store.clone(), &app, registry_stale);
@@ -2926,7 +3133,7 @@ async fn main() -> Result<()> {
             eprintln!("durable-server liveness listening on {addr}");
             Some((
                 hs_stop,
-                tokio::spawn(serve_http(l, r, health_limits(), hs_rx)),
+                tokio::spawn(serve_http(l, r, health_limits(), None, hs_rx)),
             ))
         }
         None => None,
@@ -2945,7 +3152,7 @@ async fn main() -> Result<()> {
         trusted_proxies: TrustedProxies(args.trusted_proxies),
         ..HttpLimits::default()
     };
-    let serve = serve_http(listener, router, limits, http_stopped);
+    let serve = serve_http(listener, router, limits, Some(obs), http_stopped);
     tokio::pin!(serve);
     tokio::select! {
         r = &mut serve => return r.context("serve"),
@@ -3247,6 +3454,7 @@ async fn serve_http(
     listener: tokio::net::TcpListener,
     router: Router,
     limits: HttpLimits,
+    obs: Option<Arc<Observer>>,
     mut stop: tokio::sync::oneshot::Receiver<()>,
 ) -> std::io::Result<()> {
     use hyper_util::rt::{TokioIo, TokioTimer};
@@ -3552,11 +3760,13 @@ async fn serve_http(
         let peer_ip = peer.ip();
         let rate_limiter = rate_limiter.clone();
         let trusted = trusted.clone();
+        let obs = obs.clone();
         let handler =
             hyper::service::service_fn(move |req: hyper::Request<hyper::body::Incoming>| {
                 let per_conn = per_conn.clone();
                 let rate_limiter = rate_limiter.clone();
                 let trusted = trusted.clone();
+                let obs = obs.clone();
                 async move {
                     // A refused request is still a SERVED request (F2):
                     // the 429 path used to return before `served` moved,
@@ -3584,6 +3794,12 @@ async fn serve_http(
                             .err();
                         match refused {
                             Some(retry) => {
+                                // A refused submit counts in `/metrics`
+                                // (D-058) — the operator's view only: no
+                                // workspace is known before the key is.
+                                if let Some(o) = obs.as_ref().filter(|_| is_submit(&req)) {
+                                    o.refused(None, observe::wall_ms());
+                                }
                                 let mut res = Response::builder()
                                     .status(StatusCode::TOO_MANY_REQUESTS)
                                     .header(header::CONTENT_TYPE, "application/json")
@@ -3994,11 +4210,23 @@ mod tests {
         }
     }
 
+    /// Answers with an output no observability response may contain.
+    struct Secret;
+    #[async_trait::async_trait]
+    impl StepHandler for Secret {
+        async fn execute(&self, _s: &StepSpec, _i: &[u8], _k: &str) -> Outcome {
+            Outcome::Checkpoint(SECRET_OUTPUT.to_vec())
+        }
+    }
+    const SECRET_OUTPUT: &[u8] = b"SECRET-OUTPUT-7f3a";
+    const SECRET_INPUT: &[u8] = b"SECRET-INPUT-91c2";
+
     struct Harness {
         router: Router,
         keyring: Arc<Keyring>,
         app: App,
         backups: tempfile::TempDir,
+        obs: Arc<Observer>,
         _journal: tempfile::TempDir,
     }
 
@@ -4024,6 +4252,7 @@ mod tests {
         let backups = tempfile::tempdir().unwrap_or_else(|e| panic!("{e}"));
         let mut reg = Registry::default();
         reg.register("step", Arc::new(Echo));
+        reg.register("secret", Arc::new(Secret));
         let mut opts = durable_journal::JournalOptions::default();
         if let Some(free) = free {
             opts.reserve_bytes = 4096;
@@ -4056,6 +4285,7 @@ mod tests {
         Harness {
             router: router(app.clone(), None),
             keyring,
+            obs: app.obs.clone(),
             app,
             backups,
             _journal: journal,
@@ -4074,6 +4304,757 @@ mod tests {
         eng.put_handler(ws, "step", Arc::new(Echo))
             .await
             .unwrap_or_else(|e| panic!("{e}"));
+    }
+
+    /// `call`, keeping the headers and the raw body text.
+    async fn call_raw(
+        router: &Router,
+        uri: &str,
+        key: Option<&str>,
+    ) -> (StatusCode, axum::http::HeaderMap, String) {
+        let mut req = Request::builder().method("GET").uri(uri);
+        if let Some(k) = key {
+            req = req.header("authorization", format!("Bearer {k}"));
+        }
+        let res = router
+            .clone()
+            .oneshot(req.body(Body::empty()).unwrap_or_else(|e| panic!("{e}")))
+            .await
+            .unwrap_or_else(|e| panic!("{e}"));
+        let (status, headers) = (res.status(), res.headers().clone());
+        let bytes = res
+            .into_body()
+            .collect()
+            .await
+            .unwrap_or_else(|e| panic!("{e}"))
+            .to_bytes();
+        (
+            status,
+            headers,
+            String::from_utf8_lossy(&bytes).into_owned(),
+        )
+    }
+
+    /// Poll `GET /jobs/{id}` until the run's state is `want`, against a
+    /// wall-clock deadline (never a count of sleeps).
+    async fn until_state(router: &Router, id: u64, want: &str) {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        while tokio::time::Instant::now() < deadline {
+            let (_, v) = call(router, "GET", &format!("/jobs/{id}"), Some(KEY), None).await;
+            if v["state"] == want {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        panic!("run {id} never reached {want}");
+    }
+
+    const OBS_ROUTES: [&str; 3] = ["/metrics", "/events", "/jobs/1/events"];
+
+    /// D-058: the three observability reads take `ReadAuthorized`: the
+    /// read key or the API key, never nothing — unless `--open-reads`,
+    /// and then only for a loopback Host.
+    #[tokio::test]
+    async fn observability_reads_need_a_read_key() {
+        let h = harness(false);
+        let (status, _) = call(
+            &h.router,
+            "POST",
+            "/jobs",
+            Some(KEY),
+            Some(submit_body("o")),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        for uri in OBS_ROUTES {
+            for key in [None, Some("wrong"), Some(&KEY[..KEY.len() - 1])] {
+                let (status, v) = call(&h.router, "GET", uri, key, None).await;
+                assert_eq!(
+                    (status, v["code"].clone()),
+                    (StatusCode::UNAUTHORIZED, json!("unauthorized")),
+                    "GET {uri} key={key:?}"
+                );
+            }
+            for key in [KEY, READ_KEY] {
+                let (status, v) = call(&h.router, "GET", uri, Some(key), None).await;
+                assert_eq!(status, StatusCode::OK, "GET {uri}: {v}");
+            }
+        }
+        // --open-reads: a loopback Host reads without a key; any other is 401.
+        let journal = tempfile::tempdir().unwrap_or_else(|e| panic!("{e}"));
+        let mut reg = Registry::default();
+        reg.register("step", Arc::new(Echo));
+        let engine =
+            spawn(journal.path(), reg, ShellConfig::default()).unwrap_or_else(|e| panic!("{e}"));
+        let r = router(
+            test_app(
+                engine,
+                Arc::new(Keyring::new(ApiKey::new(KEY), None, None)),
+                true,
+                None,
+                journal.path(),
+                true,
+            ),
+            None,
+        );
+        for uri in ["/metrics", "/events"] {
+            for (host, want) in [
+                ("127.0.0.1:58300", StatusCode::OK),
+                ("attacker.example", StatusCode::UNAUTHORIZED),
+            ] {
+                let req = Request::builder()
+                    .uri(uri)
+                    .header("host", host)
+                    .body(Body::empty())
+                    .unwrap_or_else(|e| panic!("{e}"));
+                let status = r
+                    .clone()
+                    .oneshot(req)
+                    .await
+                    .unwrap_or_else(|e| panic!("{e}"))
+                    .status();
+                assert_eq!(status, want, "GET {uri} Host {host}");
+            }
+        }
+    }
+
+    /// Every observability answer — success or refusal — says
+    /// `Cache-Control: no-store`.
+    #[tokio::test]
+    async fn observability_answers_are_never_cached() {
+        let h = harness(false);
+        call(
+            &h.router,
+            "POST",
+            "/jobs",
+            Some(KEY),
+            Some(submit_body("c")),
+        )
+        .await;
+        for (uri, key, want) in [
+            ("/metrics", Some(READ_KEY), StatusCode::OK),
+            ("/events", Some(READ_KEY), StatusCode::OK),
+            ("/jobs/1/events", Some(READ_KEY), StatusCode::OK),
+            ("/metrics", None, StatusCode::UNAUTHORIZED),
+            (
+                "/metrics?window=2h",
+                Some(READ_KEY),
+                StatusCode::BAD_REQUEST,
+            ),
+            ("/events?limit=0", Some(READ_KEY), StatusCode::BAD_REQUEST),
+            ("/jobs/999/events", Some(READ_KEY), StatusCode::NOT_FOUND),
+        ] {
+            let (status, headers, _) = call_raw(&h.router, uri, key).await;
+            assert_eq!(status, want, "{uri}");
+            assert_eq!(
+                headers
+                    .get(header::CACHE_CONTROL)
+                    .and_then(|v| v.to_str().ok()),
+                Some("no-store"),
+                "{uri}"
+            );
+        }
+        // Other reads are unchanged.
+        let (_, headers, _) = call_raw(&h.router, "/jobs/1", Some(KEY)).await;
+        assert!(headers.get(header::CACHE_CONTROL).is_none());
+    }
+
+    /// `window` selects the ring and bucket size; every bucket is present;
+    /// anything else is 400 `invalid_window` in the error envelope.
+    #[tokio::test]
+    async fn metrics_windows_and_their_refusals() {
+        let h = harness(false);
+        for (q, window, bucket, points) in [
+            ("", 3_600_000u64, 10_000u64, 360usize),
+            ("?window=1h", 3_600_000, 10_000, 360),
+            ("?window=15m", 900_000, 10_000, 90),
+            ("?window=6h", 21_600_000, 60_000, 360),
+            ("?window=24h", 86_400_000, 60_000, 1440),
+            ("?window=15m&other=x", 900_000, 10_000, 90),
+        ] {
+            let (status, v) = call(
+                &h.router,
+                "GET",
+                &format!("/metrics{q}"),
+                Some(READ_KEY),
+                None,
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "{q}: {v}");
+            assert_eq!(v["window_ms"], window, "{q}");
+            assert_eq!(v["bucket_ms"], bucket, "{q}");
+            let pts = v["points"].as_array().map_or(0, Vec::len);
+            assert_eq!(pts, points, "{q}");
+            assert_eq!(v["states"].as_object().map_or(0, |o| o.len()), 7, "{q}");
+            assert!(v["now"].as_u64() >= v["since"].as_u64(), "{q}");
+        }
+        for q in [
+            "window=2h",
+            "window=",
+            "window=1H",
+            "window=60m",
+            "window=1h&window=1h",
+            "window=%31h%00",
+        ] {
+            let (status, v) = call(
+                &h.router,
+                "GET",
+                &format!("/metrics?{q}"),
+                Some(READ_KEY),
+                None,
+            )
+            .await;
+            assert_eq!(
+                (status, v["code"].clone()),
+                (StatusCode::BAD_REQUEST, json!("invalid_window")),
+                "{q}"
+            );
+            assert!(v["error"].is_string(), "{q}: the error envelope");
+        }
+    }
+
+    /// `limit` is 1–200 (default 50); anything else is 400 `invalid_limit`.
+    #[tokio::test]
+    async fn the_feed_limit_is_bounded() {
+        let h = harness(false);
+        for i in 0..60 {
+            let mut b = submit_body(&format!("f-{i}"));
+            b["not_before"] = json!(9_999_999_999_999u64); // one event each
+            let (status, _) = call(&h.router, "POST", "/jobs", Some(KEY), Some(b)).await;
+            assert_eq!(status, StatusCode::OK);
+        }
+        for (q, n) in [
+            ("", 50usize),
+            ("?limit=1", 1),
+            ("?limit=200", 60),
+            ("?limit=60", 60),
+        ] {
+            let (status, v) = call(
+                &h.router,
+                "GET",
+                &format!("/events{q}"),
+                Some(READ_KEY),
+                None,
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "{q}: {v}");
+            assert_eq!(v["events"].as_array().map_or(0, Vec::len), n, "{q}");
+        }
+        let (_, v) = call(&h.router, "GET", "/events?limit=2", Some(READ_KEY), None).await;
+        let id = |n| json!(h.app.pubid.encode(RunId(n)));
+        assert_eq!(v["events"][0]["run"], id(60), "newest first: {v}");
+        assert_eq!(v["events"][0]["key"], "f-59");
+        assert_eq!(v["events"][0]["kind"], "accepted");
+        assert_eq!(v["events"][1]["run"], id(59));
+        for q in [
+            "limit=0",
+            "limit=201",
+            "limit=abc",
+            "limit=-1",
+            "limit=",
+            "limit=1.5",
+            "limit=5&limit=5",
+        ] {
+            let (status, v) = call(
+                &h.router,
+                "GET",
+                &format!("/events?{q}"),
+                Some(READ_KEY),
+                None,
+            )
+            .await;
+            assert_eq!(
+                (status, v["code"].clone()),
+                (StatusCode::BAD_REQUEST, json!("invalid_limit")),
+                "{q}"
+            );
+        }
+    }
+
+    /// `GET /jobs/{id}/events` is 404 exactly where `GET /jobs/{id}` is,
+    /// and a malformed id is the same 400 for both.
+    #[tokio::test]
+    async fn run_events_404_exactly_like_inspect() {
+        let h = harness(false);
+        call(
+            &h.router,
+            "POST",
+            "/jobs",
+            Some(KEY),
+            Some(submit_body("n")),
+        )
+        .await;
+        for (id, want) in [
+            ("1", StatusCode::OK),
+            ("2", StatusCode::NOT_FOUND),
+            ("0", StatusCode::NOT_FOUND),
+        ] {
+            let (a, va) = call(&h.router, "GET", &format!("/jobs/{id}"), Some(KEY), None).await;
+            let (b, vb) = call(
+                &h.router,
+                "GET",
+                &format!("/jobs/{id}/events"),
+                Some(KEY),
+                None,
+            )
+            .await;
+            assert_eq!((a, b), (want, want), "{id}");
+            assert_eq!(va["code"], vb["code"], "{id}");
+        }
+        // An id that decodes to nothing is 404 for both (S2: no oracle).
+        let (a, va) = call(&h.router, "GET", "/jobs/abc", Some(KEY), None).await;
+        let (b, vb) = call(&h.router, "GET", "/jobs/abc/events", Some(KEY), None).await;
+        assert_eq!((a, b), (StatusCode::NOT_FOUND, StatusCode::NOT_FOUND));
+        assert_eq!(
+            (va["code"].clone(), vb["code"].clone()),
+            (json!("not_found"), json!("not_found"))
+        );
+        // The opaque id the submit returned works for both.
+        let pid = h.app.pubid.encode(RunId(1));
+        let (a, _) = call(&h.router, "GET", &format!("/jobs/{pid}"), Some(KEY), None).await;
+        let (b, _) = call(
+            &h.router,
+            "GET",
+            &format!("/jobs/{pid}/events"),
+            Some(KEY),
+            None,
+        )
+        .await;
+        assert_eq!((a, b), (StatusCode::OK, StatusCode::OK));
+        let (_, v) = call(&h.router, "GET", "/jobs/404/events", Some(KEY), None).await;
+        assert_eq!(v["code"], "not_found");
+    }
+
+    /// A run through a handler, then both event views: the timeline in
+    /// commit order with the derived events, and neither view carries the
+    /// job's input or the checkpointed output in any encoding.
+    #[tokio::test]
+    async fn event_views_never_show_inputs_or_outputs() {
+        use base64::Engine as _;
+        let b64 = base64::engine::general_purpose::STANDARD;
+        let h = harness(false);
+        let body = json!({
+            "op_key": "secret-run",
+            "spec": {
+                "version": 1,
+                "steps": [{ "name": "a", "handler": "secret" }, { "name": "b", "handler": "secret" }],
+                "input_b64": b64.encode(SECRET_INPUT),
+            },
+        });
+        let (status, v) = call(&h.router, "POST", "/jobs", Some(KEY), Some(body)).await;
+        assert_eq!(status, StatusCode::OK, "{v}");
+        until_state(&h.router, 1, "done").await;
+
+        let (status, _, timeline) = call_raw(&h.router, "/jobs/1/events", Some(READ_KEY)).await;
+        assert_eq!(status, StatusCode::OK);
+        let (_, _, feed) = call_raw(&h.router, "/events?limit=200", Some(READ_KEY)).await;
+        let as_numbers = |b: &[u8]| b.iter().map(u8::to_string).collect::<Vec<_>>().join(",");
+        for text in [&timeline, &feed] {
+            for needle in [
+                "SECRET".to_string(),
+                b64.encode(SECRET_INPUT),
+                b64.encode(SECRET_OUTPUT),
+                as_numbers(SECRET_INPUT),
+                as_numbers(SECRET_OUTPUT),
+            ] {
+                assert!(!text.contains(&needle), "{needle} leaked: {text}");
+            }
+        }
+        let t: Value = serde_json::from_str(&timeline).unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(
+            (t["run"].clone(), t["key"].clone(), t["state"].clone()),
+            (
+                json!(h.app.pubid.encode(RunId(1))),
+                json!("secret-run"),
+                json!("done")
+            )
+        );
+        assert_eq!(
+            (t["complete"].clone(), t["reason"].clone()),
+            (json!(true), Value::Null)
+        );
+        let kinds: Vec<&str> = t["events"]
+            .as_array()
+            .map(|a| a.iter().filter_map(|e| e["kind"].as_str()).collect())
+            .unwrap_or_default();
+        assert_eq!(
+            kinds,
+            [
+                "accepted",
+                "dispatched",
+                "checkpointed",
+                "dispatched",
+                "checkpointed",
+                "finished"
+            ]
+        );
+        assert_eq!(t["events"][5]["outcome"], "done");
+        assert_eq!(t["events"][1]["attempt"], 1);
+        assert!(t["events"][1]["deadline"].as_u64() > t["events"][1]["at"].as_u64());
+        let f: Value = serde_json::from_str(&feed).unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(f["events"][0]["kind"], "finished");
+        assert_eq!(f["events"][0]["key"], "secret-run");
+        assert_eq!(f["events"].as_array().map_or(0, Vec::len), 6);
+        assert_eq!(f["since"], h.obs.since());
+
+        // The metrics see the same run.
+        let (_, m) = call(
+            &h.router,
+            "GET",
+            "/metrics?window=15m",
+            Some(READ_KEY),
+            None,
+        )
+        .await;
+        let t = &m["totals"];
+        assert_eq!(
+            (
+                t["accepted"].clone(),
+                t["completed"].clone(),
+                t["steps_ok"].clone()
+            ),
+            (json!(1), json!(1), json!(2))
+        );
+        assert_eq!(m["states"]["done"], 1);
+        let secret = m["handlers"]
+            .as_array()
+            .and_then(|a| a.iter().find(|x| x["name"] == "secret"))
+            .cloned()
+            .unwrap_or_default();
+        assert_eq!(
+            (secret["calls"].clone(), secret["ok"].clone()),
+            (json!(2), json!(2))
+        );
+        let names: Vec<&str> = m["handlers"]
+            .as_array()
+            .map(|a| a.iter().filter_map(|x| x["name"].as_str()).collect())
+            .unwrap_or_default();
+        assert_eq!(names, ["secret", "step"], "every handler, by name");
+    }
+
+    /// Deduplicated and refused submits are counted where they are
+    /// answered.
+    #[tokio::test]
+    async fn submits_count_as_deduplicated_or_refused() {
+        let h = harness(false);
+        let mut later = submit_body("same");
+        later["not_before"] = json!(9_999_999_999_999u64);
+        for _ in 0..3 {
+            let (status, v) =
+                call(&h.router, "POST", "/jobs", Some(KEY), Some(later.clone())).await;
+            assert_eq!(
+                (status, v["run_id"].clone()),
+                (StatusCode::OK, json!(h.app.pubid.encode(RunId(1))))
+            );
+        }
+        let mut unknown = submit_body("u");
+        unknown["spec"]["steps"][0]["handler"] = json!("nope");
+        let (status, _) = call(&h.router, "POST", "/jobs", Some(KEY), Some(unknown)).await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        let (status, _) = call(
+            &h.router,
+            "POST",
+            "/jobs",
+            Some(KEY),
+            Some(submit_body(&"k".repeat(300))),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        // Not refusals: a malformed body, no key.
+        let mut bad = submit_body("b");
+        bad["spec"]["input_b64"] = json!("***");
+        let (status, _) = call(&h.router, "POST", "/jobs", Some(KEY), Some(bad)).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        let (status, _) = call(&h.router, "POST", "/jobs", None, Some(submit_body("x"))).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        let (_, m) = call(
+            &h.router,
+            "GET",
+            "/metrics?window=15m",
+            Some(READ_KEY),
+            None,
+        )
+        .await;
+        let t = &m["totals"];
+        assert_eq!(
+            (
+                t["accepted"].clone(),
+                t["deduplicated"].clone(),
+                t["refused"].clone()
+            ),
+            (json!(1), json!(2), json!(2)),
+            "{t}"
+        );
+    }
+
+    // --- D-060: the observability reads answer the caller's workspace ----
+
+    const OBS_KEY_A: &str = "dr_0b5a0b5a0b5a0b5a0b5a0b5a0b5a0b5a0b5a0b5a0b5a0b5a";
+    const OBS_READ_A: &str = "dr_0b5e0b5e0b5e0b5e0b5e0b5e0b5e0b5e0b5e0b5e0b5e0b5e";
+    const OBS_KEY_B: &str = "dr_0b5b0b5b0b5b0b5b0b5b0b5b0b5b0b5b0b5b0b5b0b5b0b5b";
+
+    /// Two tenant workspaces beside workspace 0, each with `step`; A also
+    /// has `a-only`. Runs to done: A two, B one, workspace 0 one (the env
+    /// key's). Returns the harness and each workspace's run ids.
+    async fn observed_tenants() -> (Harness, Vec<String>, Vec<String>, Vec<String>) {
+        use durable_accounts::Memory;
+        let store = Arc::new(Memory::new());
+        let a = store
+            .create_workspace("obs-a")
+            .await
+            .unwrap_or_else(|e| panic!("a: {e}"));
+        let b = store
+            .create_workspace("obs-b")
+            .await
+            .unwrap_or_else(|e| panic!("b: {e}"));
+        for (ws, key, perm) in [
+            (a.id, OBS_KEY_A, Permission::Admin),
+            (a.id, OBS_READ_A, Permission::Read),
+            (b.id, OBS_KEY_B, Permission::Admin),
+        ] {
+            store
+                .create_key(ws, "k", perm, &sha256(key.as_bytes()), &key[..6])
+                .await
+                .unwrap_or_else(|e| panic!("key: {e}"));
+        }
+        let h = harness_store(false, None, Some(store.clone()));
+        register_step(&store, a.id, &h.app.engine).await;
+        register_step(&store, b.id, &h.app.engine).await;
+        h.app
+            .engine
+            .put_handler(a.id, "a-only", Arc::new(Echo))
+            .await
+            .unwrap_or_else(|e| panic!("{e}"));
+        let mut ids = Vec::new();
+        for (key, n) in [(OBS_KEY_A, 2), (OBS_KEY_B, 1), (KEY, 1)] {
+            let mut mine = Vec::new();
+            for i in 0..n {
+                let (status, v) = call(
+                    &h.router,
+                    "POST",
+                    "/jobs",
+                    Some(key),
+                    Some(submit_body(&format!("obs-{i}"))),
+                )
+                .await;
+                assert_eq!(status, StatusCode::OK, "{v}");
+                let id = v["run_id"].as_str().unwrap_or_else(|| panic!("{v}"));
+                mine.push(id.to_string());
+            }
+            for id in &mine {
+                until_state_as(&h.router, key, id, "done").await;
+            }
+            ids.push(mine);
+        }
+        let ws0 = ids.pop().unwrap_or_default();
+        let b_ids = ids.pop().unwrap_or_default();
+        let a_ids = ids.pop().unwrap_or_default();
+        (h, a_ids, b_ids, ws0)
+    }
+
+    /// `until_state` with a tenant's key and the opaque id.
+    async fn until_state_as(router: &Router, key: &str, id: &str, want: &str) {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        while tokio::time::Instant::now() < deadline {
+            let (_, v) = call(router, "GET", &format!("/jobs/{id}"), Some(key), None).await;
+            if v["state"] == want {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        panic!("run {id} never reached {want}");
+    }
+
+    /// D-060: a tenant key's `/metrics` is its own workspace's — counters,
+    /// latencies, states and handler stats; another tenant's (and the
+    /// totals) never show. A workspace-0 key keeps the global view, with
+    /// workspace 0's handlers.
+    #[tokio::test]
+    async fn metrics_answer_only_the_callers_workspace() {
+        let (h, _, _, _) = observed_tenants().await;
+        let m = |key: &'static str| {
+            let r = h.router.clone();
+            async move {
+                let (status, v) = call(&r, "GET", "/metrics?window=15m", Some(key), None).await;
+                assert_eq!(status, StatusCode::OK, "{v}");
+                v
+            }
+        };
+        let names = |v: &Value| -> Vec<String> {
+            v["handlers"]
+                .as_array()
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|x| x["name"].as_str().map(String::from))
+                        .collect()
+                })
+                .unwrap_or_default()
+        };
+        let calls = |v: &Value, name: &str| {
+            v["handlers"]
+                .as_array()
+                .and_then(|a| a.iter().find(|x| x["name"] == name))
+                .map(|x| x["calls"].clone())
+                .unwrap_or(Value::Null)
+        };
+        let (a, ar, b, ops) = (
+            m(OBS_KEY_A).await,
+            m(OBS_READ_A).await,
+            m(OBS_KEY_B).await,
+            m(KEY).await,
+        );
+        let t = |v: &Value| {
+            (
+                v["totals"]["accepted"].clone(),
+                v["totals"]["completed"].clone(),
+                v["states"]["done"].clone(),
+            )
+        };
+        assert_eq!(t(&a), (json!(2), json!(2), json!(2)), "A: {a}");
+        assert_eq!(t(&ar), t(&a), "A's read key sees A's view, not more");
+        assert_eq!(t(&b), (json!(1), json!(1), json!(1)), "B: {b}");
+        assert_eq!(t(&ops), (json!(4), json!(4), json!(4)), "ops: {ops}");
+        // Handlers: each workspace lists its own registrations only.
+        assert_eq!(names(&a), ["a-only", "step"]);
+        assert_eq!(names(&b), ["step"], "B never learns A's handler names");
+        assert_eq!(
+            names(&ops),
+            ["secret", "step"],
+            "the operator's: workspace 0's"
+        );
+        assert_eq!(calls(&a, "step"), json!(2));
+        assert_eq!(calls(&b, "step"), json!(1), "B's step is not A's step");
+        assert_eq!(calls(&ops, "step"), json!(1), "workspace 0's step");
+        // The gauge series and the points carry no other tenant's numbers.
+        let accepted_in_points = |v: &Value| -> u64 {
+            v["points"]
+                .as_array()
+                .map(|p| p.iter().filter_map(|x| x["accepted"].as_u64()).sum())
+                .unwrap_or(0)
+        };
+        assert_eq!(accepted_in_points(&b), 1);
+        assert_eq!(accepted_in_points(&a), 2);
+    }
+
+    /// D-060: `GET /jobs/{id}/events` for another workspace's run is the
+    /// same 404 a missing run gets — for a tenant key and for the
+    /// workspace-0 env key alike, exactly like `GET /jobs/{id}`.
+    #[tokio::test]
+    async fn run_events_answer_only_the_callers_workspace() {
+        let (h, a_ids, b_ids, ws0) = observed_tenants().await;
+        let get = |key: &'static str, id: String| {
+            let r = h.router.clone();
+            async move { call(&r, "GET", &format!("/jobs/{id}/events"), Some(key), None).await }
+        };
+        let (status, v) = get(OBS_KEY_A, a_ids[0].clone()).await;
+        assert_eq!(status, StatusCode::OK, "{v}");
+        assert_eq!(v["run"], json!(a_ids[0]), "the opaque id, never a number");
+        assert_eq!(v["events"][0]["kind"], "accepted");
+        let (missing_status, missing) = get(OBS_KEY_B, "AAAAAAAAAAA".into()).await;
+        assert_eq!(missing_status, StatusCode::NOT_FOUND);
+        for (key, foreign) in [
+            (OBS_KEY_B, a_ids[0].clone()),
+            (OBS_READ_A, b_ids[0].clone()),
+            (OBS_KEY_A, ws0[0].clone()),
+            (KEY, a_ids[1].clone()),
+            (KEY, b_ids[0].clone()),
+        ] {
+            let (status, v) = get(key, foreign.clone()).await;
+            assert_eq!(
+                (status, &v),
+                (StatusCode::NOT_FOUND, &missing),
+                "{key} reading {foreign}: identical to a missing run"
+            );
+            let (inspect, _) = call(
+                &h.router,
+                "GET",
+                &format!("/jobs/{foreign}"),
+                Some(key),
+                None,
+            )
+            .await;
+            assert_eq!(
+                inspect,
+                StatusCode::NOT_FOUND,
+                "exactly like GET /jobs/{{id}}"
+            );
+        }
+    }
+
+    /// D-060: `GET /events` is the caller's workspace's feed: every event
+    /// is one of its own runs, by opaque id; none of another workspace's.
+    #[tokio::test]
+    async fn the_feed_answers_only_the_callers_workspace() {
+        let (h, a_ids, b_ids, ws0) = observed_tenants().await;
+        let runs = |key: &'static str| {
+            let r = h.router.clone();
+            async move {
+                let (status, v) = call(&r, "GET", "/events?limit=200", Some(key), None).await;
+                assert_eq!(status, StatusCode::OK, "{v}");
+                let mut ids: Vec<String> = v["events"]
+                    .as_array()
+                    .map(|e| {
+                        e.iter()
+                            .map(|x| {
+                                x["run"]
+                                    .as_str()
+                                    .unwrap_or_else(|| panic!("an opaque string id: {x}"))
+                                    .to_string()
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                ids.sort();
+                ids.dedup();
+                ids
+            }
+        };
+        let sorted = |mut v: Vec<String>| {
+            v.sort();
+            v
+        };
+        assert_eq!(runs(OBS_KEY_A).await, sorted(a_ids.clone()));
+        assert_eq!(runs(OBS_READ_A).await, sorted(a_ids));
+        assert_eq!(runs(OBS_KEY_B).await, sorted(b_ids));
+        assert_eq!(runs(KEY).await, sorted(ws0), "env keys: workspace 0's only");
+    }
+
+    /// A submit refused 429 by the per-address limit counts as refused; a
+    /// limited read does not.
+    #[tokio::test]
+    async fn a_rate_limited_submit_counts_as_refused() {
+        // One request, then one token per 1000 s: deterministic refusals.
+        let limits = HttpLimits {
+            rate_per_addr: 0.001,
+            ..HttpLimits::default()
+        };
+        let (addr, _stop, h) = serving(limits).await;
+        let client = reqwest::Client::new();
+        let post = || {
+            client
+                .post(format!("http://{addr}/jobs"))
+                .bearer_auth(KEY)
+                .json(&submit_body("rl"))
+                .send()
+        };
+        let first = post().await.unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(first.status().as_u16(), 200);
+        let second = post().await.unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(second.status().as_u16(), 429);
+        let read = client
+            .get(format!("http://{addr}/health"))
+            .send()
+            .await
+            .unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(read.status().as_u16(), 429);
+        let m = h.obs.metrics(
+            observe::Scope::All,
+            Window::M15,
+            observe::wall_ms(),
+            Default::default(),
+            &[],
+        );
+        assert_eq!(m.totals.counters.refused, 1);
     }
 
     async fn call(
@@ -6813,7 +7794,13 @@ mod tests {
             .unwrap_or_else(|e| panic!("{e}"));
         let addr = listener.local_addr().unwrap_or_else(|e| panic!("{e}"));
         let (stop, stopped) = tokio::sync::oneshot::channel();
-        tokio::spawn(serve_http(listener, h.router.clone(), limits, stopped));
+        tokio::spawn(serve_http(
+            listener,
+            h.router.clone(),
+            limits,
+            Some(h.obs.clone()),
+            stopped,
+        ));
         (addr, stop, h)
     }
 
@@ -7367,27 +8354,65 @@ mod tests {
         };
         let (addr, _stop, _h) = serving_on(limits, "0.0.0.0:0").await;
         // Find at least four distinct local source addresses — each is
-        // its own bucket. 127/8 works on Linux; this macOS host answers
-        // for 127.0.2.x plus its LAN address.
-        let candidates = [
+        // its own bucket. 127/8 works on Linux; a macOS host answers for
+        // 127.0.0.1, any lo0 aliases, and its own interface address —
+        // found by asking the kernel which source it would use for a
+        // few destinations (a UDP connect sends no packet; a VPN may own
+        // the default route, so the private ranges are asked too), never
+        // a hard-coded LAN address that changes with the network.
+        let primary = [
+            "192.0.2.1:9",
+            "192.168.0.1:9",
+            "192.168.1.1:9",
+            "10.0.0.1:9",
+            "172.16.0.1:9",
+        ]
+        .into_iter()
+        .filter_map(|dst| {
+            let u = std::net::UdpSocket::bind("0.0.0.0:0").ok()?;
+            u.connect(dst).ok()?;
+            Some(u.local_addr().ok()?.ip().to_string())
+        })
+        .collect::<Vec<_>>();
+        let mut candidates: Vec<String> = [
             "127.0.0.1",
             "127.0.0.2",
             "127.0.0.3",
             "127.0.0.4",
             "127.0.2.2",
             "127.0.2.3",
-            "192.168.5.22",
-        ];
-        let connect_from = |src: String| async move {
+        ]
+        .map(String::from)
+        .to_vec();
+        for a in primary {
+            if !candidates.contains(&a) {
+                candidates.push(a);
+            }
+        }
+        let connect_to = |src: String, dst: std::net::SocketAddr| async move {
             let local =
                 std::net::SocketAddr::new(src.parse().unwrap_or_else(|_| panic!("{src}")), 0);
             let sock = tokio::net::TcpSocket::new_v4().ok()?;
             sock.bind(local).ok()?;
-            sock.connect(addr).await.ok()
+            // A source the host cannot route from (a VPN tunnel's
+            // address) must not stall the search.
+            tokio::time::timeout(Duration::from_secs(1), sock.connect(dst))
+                .await
+                .ok()?
+                .ok()
         };
+        let connect_from = |src: String| connect_to(src, addr);
+        // Probe the candidates against a throwaway listener, never the
+        // server under test: a probe conn it is still serving would hold
+        // a slot (or its address's reserve share) when the real conns
+        // arrive, and the scenario below would race it.
+        let scout = tokio::net::TcpListener::bind("0.0.0.0:0")
+            .await
+            .unwrap_or_else(|e| panic!("{e}"));
+        let scout_addr = scout.local_addr().unwrap_or_else(|e| panic!("{e}"));
         let mut addrs = Vec::new();
         for src in candidates {
-            if let Some(c) = connect_from(src.to_string()).await {
+            if let Some(c) = connect_to(src.clone(), scout_addr).await {
                 drop(c);
                 addrs.push(src);
                 if addrs.len() == 4 {
@@ -7395,6 +8420,7 @@ mod tests {
                 }
             }
         }
+        drop(scout);
         assert!(
             addrs.len() >= 4,
             "need >= 4 distinct local source addresses, found {addrs:?}"

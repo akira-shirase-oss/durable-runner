@@ -144,7 +144,7 @@ contract + reference verifier ship in `docs/HANDLERS.md`.
   `<journal>/public_id.key` (mode 0600, generated on first boot);
   losing it orphans every public id — never the runs.
 - **Backups carry the journal-dir flats** (`journal.shape`,
-  `public_id.key`), checksummed and owner-only (D-058): a restore
+  `public_id.key`), checksummed and owner-only (D-057): a restore
   keeps the sidecar's forward claims and decodes every public id the
   install issued — without the key they all orphaned to 404. The file
   set is one agreed contract across versions — v1.0.2's restore
@@ -182,6 +182,41 @@ contract + reference verifier ship in `docs/HANDLERS.md`.
 - `ssrf.rs` overhead test: 200 real resolve+validate passes plus a
   10k-iteration `is_local` scan — the guard costs one OS lookup per new
   connection and nanoseconds per check (keep-alive calls pay nothing).
+
+### Added
+
+- **Observability reads for the dashboard** (D-058), each taking the read
+  key or the API key and answered `Cache-Control: no-store`:
+  `GET /metrics?window=15m|1h|6h|24h` (counters, sampled gauges and
+  step-latency percentiles per 10 s or 60 s bucket, window totals, state
+  counts, per-handler call stats), `GET /jobs/{id}/events` (one run's
+  timeline in commit order, with a derived `finished` event and an honest
+  `complete`/`reason` when compaction, eviction or the per-run cap
+  shortened it), and `GET /events?limit=` (the activity feed across runs,
+  newest first). Everything is derived in memory with fixed caps;
+  timelines and the feed are rebuilt from journal replay at startup,
+  metrics start empty. Nothing shown is ever a job's input, a
+  checkpoint's output, or a record whose fsync has not returned.
+- **The observability reads answer the caller's workspace** (D-060). A
+  tenant key's `/jobs/{id}/events` shows only its own runs (another
+  workspace's run is the same 404 as `GET /jobs/{id}`), its `/events` is
+  its own activity feed, and its `/metrics` carries only its own
+  counters, latencies, gauges, state counts and registered handlers. A
+  workspace-0 key (the operator's env keys) keeps the global `/metrics`,
+  with workspace 0's handlers; its event views show workspace 0's runs.
+  Run ids in both event views are the opaque public ids. Per-workspace
+  views are kept for workspace 0 and the 16 most recently active tenants
+  (LRU; an evicted tenant's view restarts with a later `since`), each
+  tenant with stats for its 8 most recently called handlers. Memory at
+  every cap: about 124 MiB, plus 0.4 MiB per workspace-0 handler.
+- `durable-cli metrics` and `durable-cli events [--run N]`.
+
+### Changed
+
+- Diagnostics' `states` counts are kept incrementally instead of by a scan
+  of every run per request (same output).
+- The activity feed keeps 200 events per workspace (one full page) instead
+  of 1,000 across runs: no page could ever read past 200.
 
 ## [1.0.2] - 2026-11-20
 

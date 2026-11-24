@@ -50,6 +50,12 @@ target/release/durable-server \
   size, as the review saw on the HTTP server. The 512 MiB default keeps
   that within 1.5 GiB of a 2 GB host. On a bigger host raise
   `--max-index-bytes` in proportion, and leave the OS at least 0.5 GiB.
+  The observability layer (D-058, D-060) adds at most about 124 MiB plus
+  0.4 MiB per workspace-0 handler on top, whatever the traffic — see
+  "Observability" below. In compat mode (workspace 0 only) the tenant
+  views never allocate and it stays at about 61 MiB, inside the 100 MiB
+  term; with tenants, plan for the larger figure (it exceeds that term
+  by ~25 MiB once 16 tenants are each busy in every bucket).
 
   *Capacity arithmetic.* A run is charged `160 + key + Σ(48 + step name +
   handler name) + input` bytes while it is live. When it finishes its
@@ -109,7 +115,9 @@ target/release/durable-server \
   `POST /admin/compact`, `POST /admin/backup`, `GET /admin/diagnostics` —
   needs `Authorization: Bearer $DURABLE_API_KEY`, else `401
   {"code":"unauthorized"}`.
-- **Reads need a key too** (D-037): `GET /jobs` and `GET /jobs/{id}` take
+- **Reads need a key too** (D-037): `GET /jobs`, `GET /jobs/{id}` and the
+  observability reads (`GET /metrics`, `GET /jobs/{id}/events`,
+  `GET /events`, D-058) take
   the API key or the optional read-only `DURABLE_READ_KEY` (at least 32
   characters, different from the API key; it gets `403 forbidden` on
   every other route). Give the inspector or a dashboard the read key, not
@@ -210,6 +218,9 @@ $CLI list --newest --limit 50         # newest first; continue with --before <ne
 $CLI cancel --run 1
 $CLI compact
 $CLI backup --name nightly-1          # -> data/backups/nightly-1
+$CLI metrics --window 15m             # GET /metrics (15m, 1h, 6h, 24h)
+$CLI events --limit 20                # GET /events: the activity feed
+$CLI events --run 1                   # GET /jobs/1/events: one run's timeline
 ```
 
 Bounds a submit must respect (refused `409 {"code":"over_limits"}`
@@ -230,6 +241,102 @@ the next attempt or the next server start removes.
 `--op-key` is the dedup contract: resubmitting the same key returns the
 same run id, nothing re-executes. Cancel stops scheduling — it never
 undoes a remote effect already attempted.
+
+## Observability (D-058, D-060)
+
+Three reads, each taking the read key or the API key (or nothing under
+`--open-reads`, loopback Host only), rate-limited per address like every
+request, and answered with `Cache-Control: no-store`. Each answers the
+caller's workspace (D-060): a tenant key (admin or read) sees only its
+own runs' timelines, its own feed and its own metrics — counters,
+latency, gauges, state counts and registered handlers; another
+workspace's run is `404` exactly like `GET /jobs/{id}`. A workspace-0 key
+(the env keys, `--open-reads`) gets the global `/metrics` — every
+workspace's counts with workspace 0's handlers — and workspace 0's runs
+in the two event views. Run ids are the opaque public ids. All of it is derived
+in memory from the journal and bounded; nothing here is authority, and
+nothing shows a job's input, a checkpoint's output, or a record before
+its fsync returned.
+
+- `GET /metrics?window=15m|1h|6h|24h` (default `1h`; anything else, or
+  the parameter twice, is `400 invalid_window`). 15m and 1h are 10-second
+  buckets from a 360-bucket ring, 6h and 24h 60-second buckets from a
+  1,440-bucket ring. `points` holds every bucket of the window, oldest
+  first, the last being the one in progress (`t` is a bucket's start);
+  idle buckets are zeros. Counters: `accepted` (new runs committed),
+  `deduplicated` (a submit answered with its op_key's existing run),
+  `refused` (submits refused `429 rate_limited`, `503 at_capacity`,
+  `503 busy`, `503 no_space`, `409 over_limits` or `409
+  unregistered_handler` — not malformed bodies, missing keys or
+  timeouts), `completed`/`failed`/`cancelled` (runs that reached that
+  state), `dispatched` (attempts started, a chained step's checkpoint
+  included), `steps_ok`, `steps_failed`, `replies_lost`, `reconciled` —
+  each counted from its durable journal record. Gauges (`live_runs` =
+  retained runs, `active_runs` = non-terminal, `in_flight` = handler
+  calls) are sampled every second, the last sample in a bucket winning,
+  and are `null` for a bucket never sampled (before `since`, the
+  server's start: metrics do not survive a restart). `step_ms` is the
+  dispatch-to-answer latency of the attempts that ended in the bucket:
+  `p50`/`p95` are the upper bound of the 47-bucket log histogram's bucket
+  that holds them (1, 2, 3, 4, 5, 6, 8, 10, 12, 15, 20 … 60,000 ms, then
+  overflow), capped at the exact `max` — so they over-report by at most
+  one bucket width (a third, above 4 ms). `states` are the current
+  counts by state (the same as `/admin/diagnostics`, all seven keys).
+  `handlers` lists every handler registered in the scope (workspace 0's
+  for the global view) by name with its calls, `ok`, `failed`,
+  `replies_lost` (a reply that vanished, a timeout, or a call cut off at
+  its deadline) and `step_ms` over the window, its latest `last_ok_at` /
+  `last_failure_at`, and `since`: when its counting began — later than
+  the view's `since` when a tenant's handler stats were dropped for the
+  cap (its 8 most recently called handlers are kept) and started again.
+  A tenant view's `since` is likewise when that workspace's counting
+  began: the server's start, or later if the workspace was evicted from
+  the 16 tracked tenants and came back.
+- `GET /jobs/{id}/events`: one run's timeline in commit order — kinds
+  `accepted`, `dispatched`, `checkpointed`, `step_failed`, `reply_lost`,
+  `reconciled`, `cancel_requested`, and the derived `finished` (`outcome`
+  done/failed/cancelled, at the time of the record that ended the run).
+  `404 not_found` exactly when `GET /jobs/{id}` is. `complete: false`
+  says why the history is short: `compacted` (the server started from a
+  snapshot that folded the earlier events; a run accepted after it is
+  complete), `evicted` (the timeline store dropped the run; what came
+  after is shown), or `truncated` (over 96 events: the first 16 and the
+  last 80 are kept).
+- `GET /events?limit=N` (1-200, default 50; else `400 invalid_limit`):
+  the caller's workspace's activity feed, newest first, the same events
+  with `run` and `key` added (`key` is `null` only for a run that has
+  since left the index). Each workspace keeps its own last 200 events.
+  The feeds and the timelines are rebuilt from replay at startup;
+  `since` is as in that workspace's `/metrics`.
+
+**Caps and memory** (constants in `durable-engine/src/observe.rs`):
+
+| Structure | Cap | Memory |
+|---|---|---|
+| Metrics rings (global view) | 360 × 10 s + 1,440 × 60 s buckets | 1,800 × 328 B ≈ 0.6 MiB |
+| Workspace views | workspace 0 + at most 16 tenants (LRU on the last record or call); rings allocated at a workspace's first live record, call or gauge sample | ≈ 0.6 MiB of rings + a 200-event feed (8 KiB) each |
+| Per-handler stats | the same rings per handler, kept for workspace 0's registered handlers (≤ 256) and each tenant's 8 most recently called | 1,800 × 240 B ≈ 0.4 MiB each; at most 16 × 8 tenant handlers ≈ 53 MiB |
+| Run timelines | 20,000 runs (LRU on the last event) × 96 events | 32 B per event + 90 B per run; at most ≈ 60 MiB (every run past 96 events), ≈ 4-12 MiB when runs carry 3-10 events |
+| Activity feeds | 200 events per workspace view (one full page) | 8 KiB each |
+| Not-yet-durable observations | one per record not yet fsynced: the actor's outbox (16,384 records before it stops taking commands) plus the writer's queue (8 × 1,024) | 72 B each, about 1.7 MiB at the default bounds (and a reused hand-over buffer of about the same size) |
+
+So the worst case is about **124 MiB + 0.4 MiB per workspace-0 handler**
+(`observe::memory_bound`: ~61 MiB of timelines and the global rings, plus
+16 tenant views at ~3.9 MiB each with all 8 handler slots filled), reached
+only when 20,000 runs each have more than 96 events and 16 tenants are
+active with 8 busy handlers each; it does not grow with traffic, uptime or
+the number of workspaces. A compat install (workspace 0 only) never
+allocates a tenant view: about 61 MiB. Before D-060 the bound was about
+65 MiB; the measured probe then grew about 66 MiB and feeding the observer
+cost about 66 ns per event (development laptop observations, not
+capacity). After D-060 the size-based bound with 10 workspace-0 handlers
+is 130,518 KiB; the probe in a debug build grew 86,800 KiB filling every
+structure (2026-11-24, a busy laptop; the per-event cost was not
+re-measured):
+
+```sh
+cargo test --release -p durable-engine --test observe_probe -- --ignored --nocapture
+```
 
 ## Crash drills
 
@@ -273,7 +380,7 @@ interrupted restore leaves generations without a manifest; a server
 refuses to start there, so remove the directory and restore again.
 
 The file set a backup may list is one agreed contract across versions
-(D-058; D-057 on the v1.0.2 line): the generation files, plus the
+(D-057): the generation files, plus the
 journal-dir flats `journal.shape` and `public_id.key`. This build
 writes both flats — the sidecar preserves forward claims a replay
 cannot reconstruct, and the key keeps every issued public id

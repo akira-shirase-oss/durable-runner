@@ -43,7 +43,7 @@ Invariants this plan must not break:
 
 ---
 
-## D-057 — Account records in Neon Postgres; the journal remains sole job authority
+## D-059 — Account records in Neon Postgres; the journal remains sole job authority
 
 *(proposed; lands in DECISIONS.md with the implementing change)*
 

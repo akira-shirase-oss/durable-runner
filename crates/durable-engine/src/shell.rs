@@ -7,8 +7,9 @@
 //! carries the same key `{operation_key}/{step}`, so a repeating remote call
 //! can be de-duplicated on the far side (contract §04, at-least-once).
 
+use crate::observe::{CallGuard, CallResult, IndexCounts, Observer, Scope};
 use crate::writer::{self, GroupCommit, Writer, WriterMsg};
-use crate::{EngineCore, EngineError};
+use crate::{EngineCore, EngineError, RunSummary, Submitted};
 use durable_domain::{
     Effect, JobSpec, Limits, Millis, OperationKey, Run, RunId, RunState, StepIndex, StepSpec,
 };
@@ -19,7 +20,7 @@ use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{SyncSender, TrySendError};
 use std::sync::Arc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 use tokio::sync::{mpsc, oneshot, watch, OwnedSemaphorePermit, Semaphore};
 use tokio::task::{AbortHandle, JoinSet};
 
@@ -86,34 +87,43 @@ pub const MAX_HANDLERS_PER_WS: usize = 256;
 /// borrows another workspace's registration.
 #[derive(Default, Clone)]
 pub struct Registry {
-    handlers: HashMap<(u64, String), Arc<dyn StepHandler>>,
+    /// Workspace → its own name → handler: a lookup, a count and a
+    /// listing cost O(that workspace's registrations), never a walk of
+    /// every tenant's (a `/metrics` read lists one workspace's names).
+    handlers: HashMap<u64, HashMap<String, Arc<dyn StepHandler>>>,
 }
 
 impl Registry {
     /// Compat registration: `--handler` flags land in workspace 0.
     pub fn register(&mut self, name: &str, h: Arc<dyn StepHandler>) {
-        self.handlers.insert((0, name.to_string()), h);
+        self.handlers
+            .entry(0)
+            .or_default()
+            .insert(name.to_string(), h);
     }
     fn get(&self, ws: u64, name: &str) -> Option<Arc<dyn StepHandler>> {
-        self.handlers.get(&(ws, name.to_string())).cloned()
+        self.handlers.get(&ws)?.get(name).cloned()
     }
     pub fn contains(&self, ws: u64, name: &str) -> bool {
-        self.handlers.contains_key(&(ws, name.to_string()))
+        self.handlers.get(&ws).is_some_and(|m| m.contains_key(name))
     }
     /// Insert or replace one registration. Refuses past the per-workspace
     /// bound — the account store also bounds, this is the engine's own.
     fn put(&mut self, ws: u64, name: &str, h: Arc<dyn StepHandler>) -> Result<(), EngineError> {
-        let key = (ws, name.to_string());
-        if !self.handlers.contains_key(&key)
-            && self.handlers.keys().filter(|(w, _)| *w == ws).count() >= MAX_HANDLERS_PER_WS
-        {
+        let m = self.handlers.entry(ws).or_default();
+        if !m.contains_key(name) && m.len() >= MAX_HANDLERS_PER_WS {
             return Err(EngineError::RegistryFull);
         }
-        self.handlers.insert(key, h);
+        m.insert(name.to_string(), h);
         Ok(())
     }
     fn remove(&mut self, ws: u64, name: &str) {
-        self.handlers.remove(&(ws, name.to_string()));
+        if let Some(m) = self.handlers.get_mut(&ws) {
+            m.remove(name);
+            if m.is_empty() {
+                self.handlers.remove(&ws);
+            }
+        }
     }
     /// Replace a workspace's whole set — how the store reconciler syncs.
     /// Refuses past the bound; an oversized store answer is refused whole.
@@ -125,19 +135,28 @@ impl Registry {
         if handlers.len() > MAX_HANDLERS_PER_WS {
             return Err(EngineError::RegistryFull);
         }
-        self.handlers.retain(|(w, _), _| *w != ws);
-        for (name, h) in handlers {
-            self.handlers.insert((ws, name), h);
+        if handlers.is_empty() {
+            self.handlers.remove(&ws);
+            return Ok(());
         }
+        self.handlers.insert(ws, handlers.into_iter().collect());
         Ok(())
+    }
+    /// The names registered in one workspace, sorted (what its `/metrics`
+    /// lists; never another workspace's).
+    pub fn names(&self, ws: u64) -> Vec<String> {
+        let mut n: Vec<String> = self
+            .handlers
+            .get(&ws)
+            .map(|m| m.keys().cloned().collect())
+            .unwrap_or_default();
+        n.sort();
+        n
     }
 }
 
 fn wall_ms() -> Millis {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_millis() as Millis)
-        .unwrap_or(0)
+    crate::observe::wall_ms()
 }
 
 /// The business idempotency key for a step: constant across its attempts.
@@ -151,7 +170,7 @@ enum Cmd {
         key: OperationKey,
         spec: JobSpec,
         not_before: Option<Millis>,
-        reply: oneshot::Sender<Result<RunId, EngineError>>,
+        reply: oneshot::Sender<Result<Submitted, EngineError>>,
     },
     Cancel {
         run: RunId,
@@ -207,6 +226,25 @@ enum Read {
         ws: u64,
         reply: oneshot::Sender<crate::WorkspaceDiagnostics>,
     },
+    /// A run's list fields, never its spec or input.
+    Summary {
+        run: RunId,
+        reply: oneshot::Sender<Option<RunSummary>>,
+    },
+    /// The operation keys of up to `MAX_PAGE` runs of workspace `ws`
+    /// (`None`: not in the index, or another workspace's run).
+    Keys {
+        ws: u64,
+        runs: Vec<RunId>,
+        reply: oneshot::Sender<Vec<Option<OperationKey>>>,
+    },
+    /// State counts and index sizes, O(1).
+    Counts { reply: oneshot::Sender<IndexCounts> },
+    /// One scope's counts and registered handler names (`/metrics`).
+    MetricsIndex {
+        scope: Scope,
+        reply: oneshot::Sender<MetricsIndex>,
+    },
 }
 
 /// Handle to the running engine. Cheap to clone; the channel capacities
@@ -224,6 +262,8 @@ pub struct Engine {
     drain: Arc<watch::Sender<bool>>,
     reply_timeout: Duration,
     admin_timeout: Duration,
+    /// Metrics, timelines and the activity feed (D-058).
+    obs: Arc<Observer>,
 }
 
 /// Why the engine stopped.
@@ -327,6 +367,28 @@ impl Engine {
         self.submit_scoped(0, key, spec).await
     }
 
+    /// Submit into workspace 0 (delayed if `not_before` is set), saying
+    /// whether the key named an existing run.
+    pub async fn submit_with(
+        &self,
+        key: OperationKey,
+        spec: JobSpec,
+        not_before: Option<Millis>,
+    ) -> Result<Submitted, EngineError> {
+        self.submit_in(0, key, spec, not_before).await
+    }
+
+    /// `submit_with` into workspace `ws` (dedup per `(ws, key)`).
+    pub async fn submit_in(
+        &self,
+        ws: u64,
+        key: OperationKey,
+        spec: JobSpec,
+        not_before: Option<Millis>,
+    ) -> Result<Submitted, EngineError> {
+        self.submit_inner(ws, key, spec, not_before).await
+    }
+
     /// Submit with a delayed start: the run queues until `not_before`.
     pub async fn submit_at(
         &self,
@@ -345,7 +407,7 @@ impl Engine {
         key: OperationKey,
         spec: JobSpec,
     ) -> Result<RunId, EngineError> {
-        self.submit_inner(ws, key, spec, None).await
+        self.submit_inner(ws, key, spec, None).await.map(|s| s.run)
     }
 
     /// `submit_at` scoped to a workspace.
@@ -356,7 +418,9 @@ impl Engine {
         spec: JobSpec,
         not_before: Millis,
     ) -> Result<RunId, EngineError> {
-        self.submit_inner(ws, key, spec, Some(not_before)).await
+        self.submit_inner(ws, key, spec, Some(not_before))
+            .await
+            .map(|s| s.run)
     }
 
     async fn submit_inner(
@@ -365,7 +429,7 @@ impl Engine {
         key: OperationKey,
         spec: JobSpec,
         not_before: Option<Millis>,
-    ) -> Result<RunId, EngineError> {
+    ) -> Result<Submitted, EngineError> {
         let (reply, rx) = oneshot::channel();
         self.send(Cmd::Submit {
             ws,
@@ -557,6 +621,57 @@ impl Engine {
         self.send_read(Read::Inspect { run, reply })?;
         answer(rx, self.reply_timeout).await
     }
+
+    /// A run's key, state and step count — `None` exactly when `inspect`
+    /// is — without copying its spec or input.
+    pub async fn summary(&self, run: RunId) -> Result<Option<RunSummary>, EngineError> {
+        let (reply, rx) = oneshot::channel();
+        self.send_read(Read::Summary { run, reply })?;
+        answer(rx, self.reply_timeout).await
+    }
+
+    /// The operation keys of `runs` (at most `MAX_PAGE`; more are cut),
+    /// in order; `None` for a run no longer in the index or not in `ws`
+    /// (a workspace never learns another's keys).
+    pub async fn keys(
+        &self,
+        ws: u64,
+        mut runs: Vec<RunId>,
+    ) -> Result<Vec<Option<OperationKey>>, EngineError> {
+        runs.truncate(MAX_PAGE);
+        let (reply, rx) = oneshot::channel();
+        self.send_read(Read::Keys { ws, runs, reply })?;
+        answer(rx, self.reply_timeout).await
+    }
+
+    /// One scope's state counts, index sizes and registered handler names
+    /// ([`Scope::All`]: every workspace's counts, workspace 0's names), in
+    /// O(that workspace's handlers) on the actor.
+    pub async fn metrics_index(&self, scope: Scope) -> Result<MetricsIndex, EngineError> {
+        let (reply, rx) = oneshot::channel();
+        self.send_read(Read::MetricsIndex { scope, reply })?;
+        answer(rx, self.reply_timeout).await
+    }
+
+    /// Runs by state kind and the index sizes (O(1) on the actor).
+    pub async fn index_counts(&self) -> Result<IndexCounts, EngineError> {
+        let (reply, rx) = oneshot::channel();
+        self.send_read(Read::Counts { reply })?;
+        answer(rx, self.reply_timeout).await
+    }
+
+    /// The observer: metrics, run timelines and the activity feed (D-058).
+    pub fn observer(&self) -> &Arc<Observer> {
+        &self.obs
+    }
+}
+
+/// What `/metrics` needs from the actor for one scope.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct MetricsIndex {
+    pub counts: IndexCounts,
+    /// The scope's registered handler names, sorted.
+    pub handlers: Vec<String>,
 }
 
 /// Runtime knobs, all bounded.
@@ -658,8 +773,12 @@ impl Default for ShellConfig {
 pub fn spawn(dir: &Path, registry: Registry, mut cfg: ShellConfig) -> Result<Engine, EngineError> {
     cfg.group_commit = cfg.group_commit.clamped();
     cfg.limits.validate().map_err(EngineError::Config)?;
-    let mut core = EngineCore::open_with(dir, cfg.journal.clone())?;
+    // Replay feeds the observer's timelines and feed; its metrics begin now.
+    let obs = Arc::new(Observer::new(wall_ms()));
+    let mut core = EngineCore::open_observed(dir, cfg.journal.clone(), Some(obs.clone()))?;
     core.limits = cfg.limits;
+    let counts = core.index_counts();
+    obs.set_index_gauges(counts.live_runs, counts.active_runs);
     let discarded_tail = core.discarded_tail();
     let (core, journal) = core.into_piped();
     let journal = journal.ok_or(EngineError::Piped)?;
@@ -676,11 +795,22 @@ pub fn spawn(dir: &Path, registry: Registry, mut cfg: ShellConfig) -> Result<Eng
     let (stopped_tx, stopped) = watch::channel(None);
     let (drain, drain_rx) = watch::channel(false);
     let (reply_timeout, admin_timeout) = (cfg.reply_timeout, cfg.admin_timeout);
+    let actor_obs = obs.clone();
     tokio::spawn(async move {
         // Every return path of the actor joins the writer first.
-        let reason = actor(core, registry, cfg, (rx, read_rx, drain_rx), mon, writer).await;
+        let reason = actor(
+            core,
+            registry,
+            cfg,
+            (rx, read_rx, drain_rx),
+            mon,
+            writer,
+            actor_obs,
+        )
+        .await;
         stopped_tx.send_replace(Some(reason));
     });
+    tokio::spawn(sample_gauges(obs.clone(), stopped.clone()));
     Ok(Engine {
         tx,
         read_tx,
@@ -690,7 +820,22 @@ pub fn spawn(dir: &Path, registry: Registry, mut cfg: ShellConfig) -> Result<Eng
         drain: Arc::new(drain),
         reply_timeout,
         admin_timeout,
+        obs,
     })
+}
+
+/// The gauge sampler (D-058): once a second, the gauges go into the
+/// buckets holding now — the last sample in a bucket is its value at the
+/// bucket's end. Stops with the engine.
+async fn sample_gauges(obs: Arc<Observer>, mut stopped: watch::Receiver<Option<StopReason>>) {
+    let mut every = tokio::time::interval(Duration::from_millis(crate::observe::SAMPLE_EVERY_MS));
+    every.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    loop {
+        tokio::select! {
+            _ = every.tick() => obs.sample(wall_ms()),
+            _ = stopped.wait_for(Option::is_some) => return,
+        }
+    }
 }
 
 /// Errors the runtime handles itself — a handler outcome or a deadline
@@ -1134,6 +1279,7 @@ async fn drain(
                     let st = status.borrow_and_update().clone();
                     core.observe(&st);
                     pipe.durable = st.durable;
+                    core.flush_observed(pipe.durable);
                 }
                 Err(_) => {
                     pipe.fail_held(&Arc::new(JournalError::Poisoned));
@@ -1175,6 +1321,7 @@ async fn actor(
     ),
     mut mon: Monitor,
     writer: Writer,
+    obs: Arc<Observer>,
 ) -> StopReason {
     let mut ticker = tokio::time::interval(Duration::from_millis(cfg.tick_ms));
     let mut attempts: JoinSet<AttemptJoin> = JoinSet::new();
@@ -1239,6 +1386,7 @@ async fn actor(
                 examined: 0,
                 mon: &mut mon,
                 pipe: &mut pipe,
+                obs: &obs,
             }
         };
     }
@@ -1264,6 +1412,7 @@ async fn actor(
     // is read once and only a slow arm or slow tick phase is logged.
     let trace = actor_trace();
     let mut arm_ms: std::collections::BTreeMap<&'static str, (u64, u128)> = Default::default();
+    let mut ws_gauges_at: Millis = 0;
 
     loop {
         if core.is_poisoned() || writer_lost {
@@ -1304,7 +1453,7 @@ async fn actor(
                         .map(|s| s.handler.clone());
                     let r = match missing {
                         Some(name) => Err(EngineError::UnregisteredHandler(name)),
-                        None => core.submit_at(ws, key, spec, not_before.unwrap_or(now), now),
+                        None => core.submit_checked(ws, key, spec, not_before.unwrap_or(now), now),
                     };
                     if let Err(e) = &r {
                         mon.returned(e);
@@ -1380,6 +1529,33 @@ async fn actor(
                 }
                 Some(Read::DiagWs { ws, reply }) => {
                     pipe.answer_read(core.last_index(), reply, core.diagnostics_for(ws));
+                }
+                Some(Read::Summary { run, reply }) => {
+                    let s = core.run(run).map(RunSummary::of);
+                    pipe.answer_read(core.last_index(), reply, s);
+                }
+                Some(Read::Keys { ws, runs, reply }) => {
+                    let keys = runs
+                        .iter()
+                        .map(|r| core.run(*r).filter(|r| r.ws == ws).map(|r| r.key.clone()))
+                        .collect();
+                    pipe.answer_read(core.last_index(), reply, keys);
+                }
+                Some(Read::Counts { reply }) => {
+                    pipe.answer_read(core.last_index(), reply, core.index_counts());
+                }
+                Some(Read::MetricsIndex { scope, reply }) => {
+                    let m = match scope {
+                        Scope::All => MetricsIndex {
+                            counts: core.index_counts(),
+                            handlers: registry.names(0),
+                        },
+                        Scope::Ws(ws) => MetricsIndex {
+                            counts: core.index_counts_for(ws),
+                            handlers: registry.names(ws),
+                        },
+                    };
+                    pipe.answer_read(core.last_index(), reply, m);
                 }
                 // Every handle is gone (the command channel closes with it).
                 None => {
@@ -1473,6 +1649,9 @@ async fn actor(
                     let st = status.borrow_and_update().clone();
                     core.observe(&st);
                     pipe.durable = st.durable;
+                    // The observer first: a read released below must find
+                    // what the records it waited for contributed.
+                    core.flush_observed(pipe.durable);
                     let mut ex = exec!();
                     release(&mut core, &mut ex);
                 }
@@ -1536,6 +1715,18 @@ async fn actor(
                         .join(" ")
                 );
             }
+        }
+        let counts = core.index_counts();
+        obs.set_index_gauges(counts.live_runs, counts.active_runs);
+        // Per-workspace gauges: O(tracked workspaces), so at most once per
+        // sample period, not every iteration.
+        let now = wall_ms();
+        if now.saturating_sub(ws_gauges_at) >= crate::observe::SAMPLE_EVERY_MS {
+            ws_gauges_at = now;
+            obs.set_ws_index_gauges(|ws| {
+                let c = core.index_counts_for(ws);
+                (c.live_runs, c.active_runs)
+            });
         }
     }
 }
@@ -1691,6 +1882,7 @@ struct Exec<'a> {
     examined: usize,
     mon: &'a mut Monitor,
     pipe: &'a mut Pipeline,
+    obs: &'a Arc<Observer>,
 }
 
 impl Exec<'_> {
@@ -1749,8 +1941,16 @@ impl Exec<'_> {
         let idem = idem_key(&r.key, step);
         let input = r.spec.input.clone();
         let call = Call { run, step, attempt };
+        // Counts the call in flight; records its latency and result, or —
+        // dropped by an abort at its deadline — a lost reply.
+        let guard = CallGuard::start(self.obs, r.ws, Some(&sspec.handler));
         let handle = self.attempts.spawn(async move {
             let outcome = handler.execute_call(call, &sspec, &input, &idem).await;
+            guard.finish(match &outcome {
+                Outcome::Checkpoint(_) => CallResult::Ok,
+                Outcome::Failed => CallResult::Failed,
+                Outcome::Lost => CallResult::Lost,
+            });
             // The slot returns WITH the outcome so the run's next step
             // can inherit it like the permit: dropping it here freed the
             // share to a backlog run before the effect pass, and the
@@ -1842,8 +2042,10 @@ impl Exec<'_> {
         };
         let idem = idem_key(&r.key, step);
         let call = Call { run, step, attempt };
+        let guard = CallGuard::start(self.obs, r.ws, None); // in flight only
         let handle = self.probes.spawn(async move {
             let found = handler.probe_call(call, &sspec, &idem).await;
+            drop(guard);
             // Same rule as an attempt: the slot rides home with the
             // verdict so a DispatchStep the reconcile produces keeps
             // the share the probe was run under.
@@ -2855,6 +3057,155 @@ mod tests {
         );
     }
 
+    // --- D-058: the observer, fed by the actor and the executor ----------
+
+    fn echo_engine(dir: &Path) -> Engine {
+        let mut reg = Registry::default();
+        reg.register("echo", Arc::new(Echo));
+        reg.register("flaky", Arc::new(FlakyLost));
+        spawn(
+            dir,
+            reg,
+            ShellConfig {
+                tick_ms: 5,
+                ..Default::default()
+            },
+        )
+        .unwrap_or_else(|e| panic!("{e}"))
+    }
+
+    fn totals(eng: &Engine) -> crate::observe::MetricsOut {
+        eng.observer().metrics(
+            Scope::All,
+            crate::observe::Window::M15,
+            wall_ms(),
+            IndexCounts::default(),
+            &["echo".to_string(), "flaky".to_string()],
+        )
+    }
+
+    /// A two-step run through the real executor: the commit path counts
+    /// it, the executor times both calls under their handler, a lost reply
+    /// reconciles, a resubmitted key is reported as deduplicated, and
+    /// nothing is left in flight.
+    #[tokio::test(flavor = "current_thread")]
+    async fn the_observer_counts_runs_through_the_executor() {
+        let d = tempfile::tempdir().unwrap_or_else(|e| panic!("{e}"));
+        let eng = echo_engine(d.path());
+        let first = eng
+            .submit_with(OperationKey("obs-1".into()), spec("echo"), None)
+            .await
+            .unwrap_or_else(|e| panic!("{e}"));
+        assert!(!first.deduplicated);
+        assert!(matches!(until_done(&eng, first.run).await, RunState::Done));
+        let again = eng
+            .submit_with(OperationKey("obs-1".into()), spec("echo"), None)
+            .await
+            .unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!((again.run, again.deduplicated), (first.run, true));
+        let lost = eng
+            .submit(OperationKey("obs-2".into()), spec1("flaky"))
+            .await
+            .unwrap_or_else(|e| panic!("{e}"));
+        assert!(matches!(until_done(&eng, lost).await, RunState::Done));
+
+        let m = totals(&eng);
+        let c = m.totals.counters;
+        assert_eq!(c.accepted, 2, "{c:?}");
+        assert_eq!(c.completed, 2);
+        assert_eq!(c.dispatched, 3, "two steps + one");
+        assert_eq!(c.steps_ok, 2);
+        assert_eq!((c.replies_lost, c.reconciled), (1, 1));
+        let by = |n: &str| {
+            m.handlers
+                .iter()
+                .find(|h| h.name == n)
+                .cloned()
+                .unwrap_or_else(|| panic!("{n}"))
+        };
+        let echo = by("echo");
+        assert_eq!((echo.calls, echo.ok), (2, 2));
+        assert!(echo.step_ms.max.is_some() && echo.last_ok_at.is_some());
+        let flaky = by("flaky");
+        assert_eq!((flaky.calls, flaky.replies_lost), (1, 1));
+        assert!(flaky.last_failure_at.is_some());
+        assert_eq!(eng.observer().in_flight(), 0);
+        // The actor's own counts, through the read path.
+        let counts = eng.index_counts().await.unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(
+            (counts.states.done, counts.live_runs, counts.active_runs),
+            (2, 2, 0)
+        );
+        let t = eng.observer().timeline(first.run);
+        assert!(t.complete);
+        assert_eq!(t.events.len(), 6, "{t:?}");
+    }
+
+    /// A record's observation waits for its fsync like everything else it
+    /// decided: while the covering fsync is held, the observer has nothing.
+    #[tokio::test(flavor = "current_thread")]
+    async fn the_observer_sees_nothing_before_the_covering_fsync() {
+        let d = tempfile::tempdir().unwrap_or_else(|e| panic!("{e}"));
+        let faults = Arc::new(Faults::default());
+        let eng = spawn(
+            d.path(),
+            echo_registry(),
+            piped(&faults, GroupCommit::default()),
+        )
+        .unwrap_or_else(|e| panic!("{e}"));
+        faults.hold_syncs();
+        let e = eng.clone();
+        let submit = tokio::spawn(async move {
+            e.submit_at(OperationKey("held".into()), spec("echo"), FAR)
+                .await
+        });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(!submit.is_finished());
+        assert!(
+            eng.observer().feed(0, 50).1.is_empty(),
+            "nothing before the fsync"
+        );
+        assert_eq!(totals(&eng).totals.counters.accepted, 0);
+        faults.release_syncs();
+        let run = bounded(submit)
+            .await
+            .unwrap_or_else(|e| panic!("{e}"))
+            .unwrap_or_else(|e| panic!("{e}"));
+        // The ack is released only after the observer has the record.
+        let t = eng.observer().timeline(run);
+        assert!(t.complete);
+        assert_eq!(t.events.len(), 1);
+        assert_eq!(totals(&eng).totals.counters.accepted, 1);
+    }
+
+    /// The shell's restart path: a new engine on the same journal rebuilds
+    /// the timeline from replay; its metrics start empty.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_restarted_engine_rebuilds_timelines_from_replay() {
+        let d = tempfile::tempdir().unwrap_or_else(|e| panic!("{e}"));
+        let run;
+        {
+            let eng = echo_engine(d.path());
+            run = eng
+                .submit(OperationKey("replayed".into()), spec("echo"))
+                .await
+                .unwrap_or_else(|e| panic!("{e}"));
+            assert!(matches!(until_done(&eng, run).await, RunState::Done));
+            bounded(eng.shutdown(Duration::from_secs(5)))
+                .await
+                .unwrap_or_else(|e| panic!("{e}"));
+        }
+        let eng = echo_engine(d.path());
+        let t = eng.observer().timeline(run);
+        assert!(t.complete, "{t:?}");
+        assert_eq!(t.events.len(), 6);
+        assert_eq!(eng.observer().feed(0, 1).1[0].0, run);
+        assert_eq!(
+            totals(&eng).totals.counters,
+            crate::observe::Counters::default()
+        );
+    }
+
     /// Counts handler invocations — the evidence a parked run made none.
     struct Counting {
         calls: Arc<std::sync::atomic::AtomicUsize>,
@@ -3101,6 +3452,7 @@ mod tests {
             errors: BTreeMap::new(),
         };
         let mut pipe = Pipeline::new(None, 1024, usize::MAX);
+        let obs = Arc::new(Observer::new(0));
         macro_rules! ex {
             () => {
                 Exec {
@@ -3123,6 +3475,7 @@ mod tests {
                     examined: 0,
                     mon: &mut mon,
                     pipe: &mut pipe,
+                    obs: &obs,
                 }
             };
         }
@@ -3225,6 +3578,7 @@ mod tests {
         };
         // Direct-mode core: every commit is durable when it returns.
         let mut pipe = Pipeline::new(None, 1024, usize::MAX);
+        let obs = Arc::new(Observer::new(0));
         let mut ex = Exec {
             registry: &reg,
             sem: sem.clone(),
@@ -3245,6 +3599,7 @@ mod tests {
             examined: 0,
             mon: &mut mon,
             pipe: &mut pipe,
+            obs: &obs,
         };
         let running = |c: &EngineCore| {
             c.runs()
@@ -3280,6 +3635,7 @@ mod tests {
         dead_retry: BinaryHeap<Reverse<(u64, u64, u32, u32)>>,
         mon: Monitor,
         pipe: Pipeline,
+        obs: Arc<Observer>,
     }
     impl Sched {
         fn new(sem_permits: usize) -> Self {
@@ -3301,6 +3657,7 @@ mod tests {
                     errors: BTreeMap::new(),
                 },
                 pipe: Pipeline::new(None, 1024, usize::MAX),
+                obs: Arc::new(Observer::new(0)),
             }
         }
         fn exec<'a>(
@@ -3330,6 +3687,7 @@ mod tests {
                 examined: 0,
                 mon: &mut self.mon,
                 pipe: &mut self.pipe,
+                obs: &self.obs,
             }
         }
     }
