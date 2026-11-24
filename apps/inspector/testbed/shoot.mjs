@@ -414,7 +414,7 @@ try {
         // no keys
         const nk = await context({ theme, width, keys: false });
         await go(nk.page, '#/');
-        await nk.page.waitForSelector('.banner.hint');
+        await nk.page.waitForSelector('.start');
         await snap(nk.page, `${tag}-nokeys`, { full: false, width });
         await health(nk.page, `${tag}-nokeys`);
         await nk.ctx.close();
