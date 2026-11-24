@@ -2095,6 +2095,15 @@ fn email_token_hash(token: &str) -> Option<[u8; 32]> {
     (raw.len() == 32).then(|| sha256(token.as_bytes()))
 }
 
+/// Shape-check + lookup hash for a presented `dri_` invite token — the
+/// sign-up gate parses the INVITE kind, not the `drt_` mail kind
+/// (first-deploy bug: a live invite never passed the gate).
+fn invite_token_hash(token: &str) -> Option<[u8; 32]> {
+    let body = token.strip_prefix(INVITE_PREFIX)?;
+    let raw = unhex(body)?;
+    (raw.len() == 32).then(|| sha256(token.as_bytes()))
+}
+
 /// The lockout's client key: the /24 (v4) or /64 (v6) holding the
 /// socket address — a single host can't dodge its own counter.
 fn client_prefix(addr: std::net::IpAddr) -> std::net::IpAddr {
@@ -3233,7 +3242,7 @@ async fn auth_signup(
         ));
     };
     if app.invite_only {
-        let ok = match req.invite_token.as_deref().and_then(email_token_hash) {
+        let ok = match req.invite_token.as_deref().and_then(invite_token_hash) {
             Some(hash) => store
                 .invite_grant(&hash, unix_ms())
                 .await
@@ -16944,6 +16953,8 @@ mod tests {
         // DECISIVE(invite-required)
         assert_eq!(st, StatusCode::FORBIDDEN, "{v}");
         assert_eq!(v["code"], "invite_required");
+        // A drt_-kind mail token can never open the gate — the parser
+        // is the dri_ kind, not the email-token kind (first-deploy bug).
         let (st, _, _) = raw(&r, "POST", "/auth/signup", &[], body(Some("drt_bogus"))).await;
         assert_eq!(st, StatusCode::FORBIDDEN);
         // A live invite for a DIFFERENT email is not a grant for this one.
@@ -16951,23 +16962,34 @@ mod tests {
             .create_workspace("w")
             .await
             .unwrap_or_else(|e| panic!("{e}"));
-        let other = mint_email_token();
+        let other = mint_invite_token();
         store.add_invite(
             ws.id,
             "other@o.co",
             durable_accounts::Role::Member,
-            email_token_hash(&other).unwrap_or_else(|| panic!("shape")),
+            invite_token_hash(&other).unwrap_or_else(|| panic!("shape")),
             unix_ms() + 86_400_000,
         );
         let (st, _, _) = raw(&r, "POST", "/auth/signup", &[], body(Some(&other))).await;
         assert_eq!(st, StatusCode::FORBIDDEN, "the invite binds its email");
-        // A live invite for THIS email opens the gate.
-        let tok = mint_email_token();
+        // An expired invite is dead even for its own email.
+        let dead = mint_invite_token();
         store.add_invite(
             ws.id,
             "inv@i.co",
             durable_accounts::Role::Member,
-            email_token_hash(&tok).unwrap_or_else(|| panic!("shape")),
+            invite_token_hash(&dead).unwrap_or_else(|| panic!("shape")),
+            unix_ms() - 1,
+        );
+        let (st, _, _) = raw(&r, "POST", "/auth/signup", &[], body(Some(&dead))).await;
+        assert_eq!(st, StatusCode::FORBIDDEN, "expired invite");
+        // A live invite for THIS email opens the gate.
+        let tok = mint_invite_token();
+        store.add_invite(
+            ws.id,
+            "inv@i.co",
+            durable_accounts::Role::Member,
+            invite_token_hash(&tok).unwrap_or_else(|| panic!("shape")),
             unix_ms() + 86_400_000,
         );
         let (st, _, v) = raw(&r, "POST", "/auth/signup", &[], body(Some(&tok))).await;
