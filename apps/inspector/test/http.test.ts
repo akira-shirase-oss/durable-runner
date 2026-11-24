@@ -42,10 +42,12 @@ test('copy: known codes read as sentences; unknown ones keep the server message'
 test('plan_limit copy names the limit, the cap and the way out', () => {
 	assert.equal(
 		planLimitCopy({ limit: 'api_keys', plan: 'free', used: 10, cap: 10 }, null),
-		'The Free plan allows 10 API keys. Revoke one you no longer need, or wait for a paid plan: every limit is already in the plan table.',
+		'The Free plan allows 10 API keys. Revoke one you no longer need.',
 	);
 	assert.match(planLimitCopy({ limit: 'jobs_per_min', plan: 'free', cap: 60 }, 7_200), /allows 60 jobs per minute\..*Retry in 8 s\.$/);
 	assert.match(planLimitCopy({ limit: 'members', cap: 1 }, null), /allows 1 member\./);
-	assert.match(planLimitCopy({ limit: 'mystery' }, null), /^The Free plan's mystery limit is reached\./);
+	assert.match(planLimitCopy({ limit: 'mystery' }, null), /^The Free plan's limit on mystery is reached\./);
+	assert.equal(planLimitCopy({ limit: 'workspaces' }, null), "The Free plan's limit on workspaces you own is reached. Delete one you no longer need.");
+	assert.equal(planLimitCopy({ limit: 'invites' }, null), "The Free plan's limit on invites per day is reached. Revoke a pending invite or try again tomorrow.");
 	assert.match(planLimitCopy({}, 0), /^The Free plan's limit is reached\. Free up room/);
 });

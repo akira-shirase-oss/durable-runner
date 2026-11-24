@@ -71,6 +71,7 @@ const COPY: Record<string, string> = {
 	invite_email_mismatch: 'This invite was sent to a different address than the one you are signed in with.',
 	invite_required: 'Sign-up is invite-only right now. Use the link in your invite.',
 	token_gone: 'This link is no longer valid. Request a fresh one.',
+	not_before_too_far: 'A run can be scheduled at most 30 days ahead.',
 	invalid_or_expired_token: 'This link is no longer valid. Request a fresh one.',
 	name_taken: 'That name is already used in this workspace.',
 	already_member: 'That address already belongs to a member of this workspace.',
@@ -98,6 +99,8 @@ const LIMIT_NAMES: Record<string, [one: string, many: string, fix: string]> = {
 	handlers: ['handler', 'handlers', 'Remove one you no longer use'],
 	workflows: ['workflow', 'workflows', 'Archive one you no longer run'],
 	workspaces_per_account: ['workspace per account', 'workspaces per account', 'Delete one you no longer need'],
+	workspaces: ['workspace you own', 'workspaces you own', 'Delete one you no longer need'],
+	invites: ['invite per day', 'invites per day', 'Revoke a pending invite or try again tomorrow'],
 	jobs_per_min: ['job per minute', 'jobs per minute', 'Wait for the minute to roll over'],
 	test_calls_per_hour: ['test call per hour', 'test calls per hour', 'Wait for the hour to roll over'],
 	live_runs: ['unfinished run', 'unfinished runs', 'Let some finish or cancel them'],
@@ -113,9 +116,12 @@ export function planLimitCopy(extra: Record<string, unknown>, retryAfterMs: numb
 	const names = limit ? LIMIT_NAMES[limit] : undefined;
 	const allows =
 		cap === null || !names
-			? `The ${planName} plan's ${limit ? `${limit.replaceAll('_', ' ')} ` : ''}limit is reached`
+			? (() => {
+					const what = names ? names[1] : limit ? limit.replaceAll('_', ' ') : null;
+					return what ? `The ${planName} plan's limit on ${what} is reached` : `The ${planName} plan's limit is reached`;
+				})()
 			: `The ${planName} plan allows ${cap.toLocaleString('en-US')} ${cap === 1 ? names[0] : names[1]}`;
 	const fix = names?.[2] ?? 'Free up room';
 	const retry = retryAfterMs !== null && retryAfterMs > 0 ? ` Retry in ${Math.ceil(retryAfterMs / 1000)} s.` : '';
-	return `${allows}. ${fix}, or wait for a paid plan: every limit is already in the plan table.${retry}`;
+	return `${allows}. ${fix}.${retry}`;
 }
