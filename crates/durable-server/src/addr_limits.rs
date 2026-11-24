@@ -19,10 +19,14 @@
 //! `--max-conns-per-addr`. The per-address request rate still bounds
 //! each real client behind the proxy.
 //!
-//! Residual: an address space far wider than the table — a spray of
-//! distinct /48s — can still push new real clients into the shared
-//! overflow bucket. That is what the /48 aggregate is for: one /48
-//! cannot also mint the whole table of /64s.
+//! IPv6 sprays (re-review S2-2): the /48 aggregate is judged before any
+//! /64 bucket is created, so a refusing /48 fills nothing; one /48 holds
+//! at most `MAX_V6_PER_AGG` /64 entries (its further /64s share one
+//! bucket); idleness counts only admitted requests (a refused flood ages
+//! out); and the full table is scanned for idle entries at most once per
+//! second. Residual: a spray of distinct /48s — about 256 of them, a /40,
+//! to fill the default table — can still push new real clients into the
+//! shared overflow bucket; past that the edge (Cloudflare) carries it.
 
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv6Addr};
@@ -46,6 +50,16 @@ const V6_AGG_MULT: f64 = 10.0;
 
 /// Idle this long with a full bucket and the entry is reclaimable.
 const IDLE_EVICT: Duration = Duration::from_secs(60);
+
+/// At most this many `/64` entries per `/48` (re-review S2-2): past it,
+/// the /48's further /64s share ONE bucket at the address rate, so one
+/// /48 holds at most this many + 2 entries of the table.
+pub const MAX_V6_PER_AGG: usize = 256;
+
+/// A full table is scanned for idle entries at most this often: a miss
+/// flood must not run the O(table) scan under the limiter's lock per
+/// request (re-review S2-2: 259 µs per miss).
+const RECLAIM_EVERY: Duration = Duration::from_secs(1);
 
 /// An `ip/prefix` range (IPv4 or IPv6) a proxy address may come from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -119,7 +133,8 @@ pub fn client_addr(
     // ATTACK(cf-header)
     if trusted.trusts(peer) {
         if let Some(ip) = cf_connecting_ip.and_then(|v| v.trim().parse::<IpAddr>().ok()) {
-            return ip;
+            // A mapped `::ffff:a.b.c.d` names an IPv4 client: key it as one.
+            return ip.to_canonical();
         }
     }
     peer
@@ -129,7 +144,12 @@ pub fn client_addr(
 #[derive(Debug, Clone, Copy)]
 struct Bucket {
     tokens: f64,
+    /// When the tokens were last refilled (the refill clock).
     updated: Instant,
+    /// When a request last proceeded on this bucket — the idleness clock.
+    /// A refusal never refreshes it (re-review S2-2: a refused flood kept
+    /// its entries forever young and the table full).
+    active: Instant,
 }
 
 impl Bucket {
@@ -137,6 +157,7 @@ impl Bucket {
         Self {
             tokens: burst,
             updated: now,
+            active: now,
         }
     }
 
@@ -157,6 +178,9 @@ enum LimitKey {
     /// An IPv6 /48 aggregate, so one /48 cannot spray through a fresh
     /// /64 bucket per request.
     V6Aggregate(u128),
+    /// The one address bucket a /48's /64s share once it holds
+    /// `MAX_V6_PER_AGG` of its own.
+    V6Shared(u128),
 }
 
 /// A bounded token-bucket table: one bucket per normalized client
@@ -170,6 +194,13 @@ pub struct RateLimit {
     v6_prefix: u8,
     max_addrs: usize,
     addrs: HashMap<LimitKey, Bucket>,
+    /// How many `Addr` (/64) entries each /48 holds now.
+    per_agg: HashMap<u128, usize>,
+    /// When the full table was last scanned for idle entries.
+    last_reclaim: Option<Instant>,
+    /// Scans run so far (tests: the scan is rate-limited).
+    #[cfg(test)]
+    reclaims: u64,
     /// Every key that cannot get its own entry shares this one: a spray
     /// of distinct addresses limits itself, never evicts hot entries.
     overflow: Bucket,
@@ -189,6 +220,10 @@ impl RateLimit {
             v6_prefix: v6_prefix.min(128),
             max_addrs,
             addrs: HashMap::new(),
+            per_agg: HashMap::new(),
+            last_reclaim: None,
+            #[cfg(test)]
+            reclaims: 0,
             overflow: Bucket::full(rate.max(1.0), Instant::now()),
         }
     }
@@ -202,37 +237,84 @@ impl RateLimit {
     /// The `/48` aggregate for a real v6 address — only when it is
     /// strictly coarser than the address key (a `v6_prefix` of /48 or
     /// wider would make the aggregate the same bucket: charge once).
-    fn agg_key(&self, addr: IpAddr) -> Option<LimitKey> {
+    /// The /48 prefix of a real v6 address, when the aggregate applies —
+    /// only when it is strictly coarser than the address key (a
+    /// `v6_prefix` of /48 or wider would make it the same bucket).
+    fn agg_prefix(&self, addr: IpAddr) -> Option<u128> {
         if self.v6_prefix <= V6_AGG_PREFIX {
             return None;
         }
         match addr {
-            IpAddr::V6(a) if a.to_ipv4_mapped().is_none() => Some(LimitKey::V6Aggregate(
-                a.to_bits() & (!0u128 << (128 - V6_AGG_PREFIX)),
-            )),
+            IpAddr::V6(a) if a.to_ipv4_mapped().is_none() => {
+                Some(a.to_bits() & (!0u128 << (128 - V6_AGG_PREFIX)))
+            }
             _ => None,
         }
     }
 
     fn params(&self, key: LimitKey) -> (f64, f64) {
         match key {
-            LimitKey::Addr(_) => (self.rate, self.burst),
+            LimitKey::Addr(_) | LimitKey::V6Shared(_) => (self.rate, self.burst),
             LimitKey::V6Aggregate(_) => (self.agg_rate, self.agg_burst),
         }
     }
 
-    /// The bucket for `key`, creating it while there is room (reclaiming
-    /// minute-idle entries on a full table first) — otherwise the shared
-    /// overflow bucket.
+    /// The /48 an `Addr` key's /64 belongs to (for the per-/48 count).
+    fn agg_of_key(key: &LimitKey, v6_prefix: u8) -> Option<u128> {
+        match key {
+            LimitKey::Addr(IpAddr::V6(a)) if v6_prefix > V6_AGG_PREFIX => {
+                Some(a.to_bits() & (!0u128 << (128 - V6_AGG_PREFIX)))
+            }
+            _ => None,
+        }
+    }
+
+    /// On a full table, drop minute-idle entries — at most once per
+    /// `RECLAIM_EVERY`, never per request.
+    fn reclaim(&mut self, now: Instant) {
+        if self.addrs.len() < self.max_addrs
+            || self
+                .last_reclaim
+                .is_some_and(|t| now.saturating_duration_since(t) < RECLAIM_EVERY)
+        {
+            return;
+        }
+        self.last_reclaim = Some(now);
+        #[cfg(test)]
+        {
+            self.reclaims += 1;
+        }
+        let idle = now.checked_sub(IDLE_EVICT);
+        let v6_prefix = self.v6_prefix;
+        let per_agg = &mut self.per_agg;
+        self.addrs.retain(|k, b| {
+            // ATTACK(limiter-idle-clock)
+            let keep = idle.is_none_or(|i| b.active > i);
+            if !keep {
+                if let Some(agg) = Self::agg_of_key(k, v6_prefix) {
+                    if let Some(n) = per_agg.get_mut(&agg) {
+                        *n = n.saturating_sub(1);
+                        if *n == 0 {
+                            per_agg.remove(&agg);
+                        }
+                    }
+                }
+            }
+            keep
+        });
+    }
+
+    /// The bucket for `key`, creating it while there is room — otherwise
+    /// the shared overflow bucket.
     fn bucket(&mut self, key: LimitKey, now: Instant) -> &mut Bucket {
         let (_, burst) = self.params(key);
         if !self.addrs.contains_key(&key) {
-            if self.addrs.len() >= self.max_addrs {
-                let idle = now - IDLE_EVICT;
-                self.addrs.retain(|_, b| b.updated > idle);
-            }
+            self.reclaim(now);
             if self.addrs.len() < self.max_addrs {
                 self.addrs.insert(key, Bucket::full(burst, now));
+                if let Some(agg) = Self::agg_of_key(&key, self.v6_prefix) {
+                    *self.per_agg.entry(agg).or_default() += 1;
+                }
             }
         }
         match self.addrs.get_mut(&key) {
@@ -242,6 +324,7 @@ impl RateLimit {
     }
 
     /// How long until `key`'s bucket holds a token (zero if it does now).
+    /// A refusal refills the tokens but never refreshes `active`.
     fn wait(&mut self, key: LimitKey, now: Instant) -> Duration {
         let (rate, burst) = self.params(key);
         let b = self.bucket(key, now);
@@ -258,25 +341,42 @@ impl RateLimit {
         let b = self.bucket(key, now);
         b.refill(now, rate, burst);
         b.tokens -= 1.0;
+        b.active = now;
     }
 
     /// Ok: this request may proceed. Err: refuse with that Retry-After —
     /// the longer wait of the address and aggregate buckets.
+    ///
+    /// The /48 aggregate is judged FIRST (re-review S2-2): a /48 that is
+    /// refusing never creates a /64 entry, so a spray of fresh /64s fills
+    /// nothing; and a /48 already holding `MAX_V6_PER_AGG` /64 entries
+    /// keys its further /64s at one shared bucket instead of new entries.
     pub fn check(&mut self, addr: IpAddr, now: Instant) -> Result<(), Duration> {
-        let addr_key = self.addr_key(addr);
-        let agg_key = self.agg_key(addr);
-        let wait = self.wait(addr_key, now);
-        let agg_wait = match agg_key {
-            Some(k) => self.wait(k, now),
-            None => Duration::ZERO,
-        };
-        let needed = wait.max(agg_wait);
-        if needed > Duration::ZERO {
-            return Err(needed);
+        let agg = self.agg_prefix(addr);
+        let mut agg_wait = Duration::ZERO;
+        if let Some(p) = agg {
+            // ATTACK(v6-agg-first)
+            agg_wait = self.wait(LimitKey::V6Aggregate(p), now);
+            if agg_wait > Duration::ZERO {
+                return Err(agg_wait);
+            }
+        }
+        let mut addr_key = self.addr_key(addr);
+        if let Some(p) = agg {
+            if !self.addrs.contains_key(&addr_key)
+                // ATTACK(v6-per-agg-cap)
+                && self.per_agg.get(&p).copied().unwrap_or(0) >= MAX_V6_PER_AGG
+            {
+                addr_key = LimitKey::V6Shared(p);
+            }
+        }
+        let wait = self.wait(addr_key, now).max(agg_wait);
+        if wait > Duration::ZERO {
+            return Err(wait);
         }
         self.spend(addr_key, now);
-        if let Some(k) = agg_key {
-            self.spend(k, now);
+        if let Some(p) = agg {
+            self.spend(LimitKey::V6Aggregate(p), now);
         }
         Ok(())
     }
@@ -634,6 +734,140 @@ mod tests {
         }
         assert_eq!(ok, 5, "the overflow holds a one-second burst");
         assert_eq!(refused, 15);
+    }
+
+    /// `2001:db8:0:<n>::1` — the n-th /64 of one /48.
+    fn slash64(n: u32) -> IpAddr {
+        let n = (n % 65_536) as u16;
+        IpAddr::V6(Ipv6Addr::new(0x2001, 0xdb8, 0, n, 0, 0, 0, 1))
+    }
+
+    /// Re-review S2-2: 70,000 requests from distinct /64s of ONE /48 used
+    /// to insert a /64 entry before the aggregate refused — the table
+    /// filled (65,536/65,536) and new real clients shared the overflow.
+    /// Judged aggregate-first with a per-/48 cap, the flood leaves the
+    /// table almost empty and 200 new clients each get their own bucket.
+    #[test]
+    fn a_slash48_spray_leaves_room_for_new_clients() {
+        let mut lim = RateLimit::new(5.0, MAX_LIMITED_ADDRS, 64);
+        let t0 = Instant::now();
+        let mut admitted = 0;
+        for i in 0..70_000u32 {
+            if lim
+                .check(slash64(i), t0 + Duration::from_micros(u64::from(i)))
+                .is_ok()
+            {
+                admitted += 1;
+            }
+        }
+        // DECISIVE(v6-agg-first)
+        assert!(admitted <= 60, "the /48 aggregate held: {admitted}");
+        assert!(
+            lim.tracked() <= MAX_V6_PER_AGG + 2,
+            "one /48 filled the table: {} entries",
+            lim.tracked()
+        );
+        let t1 = t0 + Duration::from_millis(100);
+        let passed = (0..200u32)
+            .filter(|i| {
+                let a = IpAddr::from([198, 51, (100 + i / 200) as u8, (i % 200) as u8]);
+                lim.check(a, t1).is_ok()
+            })
+            .count();
+        assert_eq!(passed, 200, "new clients must not share an overflow bucket");
+    }
+
+    /// Past `MAX_V6_PER_AGG` /64 entries a /48's further /64s share one
+    /// bucket — admitted at the address rate, never new entries.
+    #[test]
+    fn a_slash48_holds_at_most_its_cap_of_slash64_entries() {
+        // A generous aggregate so the per-/48 cap is what binds.
+        let mut lim = RateLimit::new(1_000.0, MAX_LIMITED_ADDRS, 64);
+        let t0 = Instant::now();
+        for i in 0..(MAX_V6_PER_AGG as u32 + 500) {
+            let _ = lim.check(slash64(i), t0 + Duration::from_millis(u64::from(i)));
+        }
+        // DECISIVE(v6-per-agg-cap)
+        assert_eq!(lim.per_agg.values().copied().max(), Some(MAX_V6_PER_AGG));
+        assert!(lim.tracked() <= MAX_V6_PER_AGG + 2, "{}", lim.tracked());
+    }
+
+    /// A refused flood never keeps its entry young: past a minute of only
+    /// refusals the entry is reclaimable, and a new client takes its slot.
+    /// The scan itself runs at most once per `RECLAIM_EVERY`.
+    #[test]
+    fn refusals_do_not_refresh_idleness_and_the_scan_is_rate_limited() {
+        // One token per 1000 s: after its first request the flooder is
+        // refused for the whole minute.
+        let mut lim = RateLimit::new(0.001, 2, 64);
+        let t0 = Instant::now();
+        let flooder = ip("192.0.2.1");
+        let other = ip("192.0.2.2");
+        assert!(lim.check(flooder, t0).is_ok());
+        assert!(lim.check(other, t0).is_ok());
+        for ms in (1..61_000u64).step_by(5) {
+            assert!(lim.check(flooder, t0 + Duration::from_millis(ms)).is_err());
+        }
+        // Both entries are a minute idle: the refused one included.
+        let t1 = t0 + Duration::from_secs(62);
+        let new = ip("192.0.2.3");
+        assert!(lim.check(new, t1).is_ok());
+        assert!(
+            lim.addrs.contains_key(&lim.addr_key(new)),
+            "new took a slot"
+        );
+        // DECISIVE(limiter-idle-clock)
+        assert!(
+            !lim.addrs.contains_key(&lim.addr_key(flooder)),
+            "the refused flooder kept its slot by being refused"
+        );
+        // A thousand more misses inside the same second: one scan, not 1,000.
+        let before = lim.reclaims;
+        for i in 0..1000u32 {
+            let a = IpAddr::from([203, 0, (i >> 8) as u8, i as u8]);
+            let _ = lim.check(a, t1 + Duration::from_micros(u64::from(i)));
+        }
+        assert!(
+            lim.reclaims - before <= 1,
+            "{} scans",
+            lim.reclaims - before
+        );
+    }
+
+    /// Probe (release, ignored): the per-check cost of the re-review S2-2
+    /// flood — 70k distinct /64s of one /48 into a full-size table, then
+    /// 100k misses from fresh IPv4 addresses into a table full of active
+    /// entries (before the fix each miss scanned the whole table).
+    ///   cargo test --release -p durable-server --bin durable-server -- --ignored --nocapture limiter_cost
+    #[test]
+    #[ignore = "probe: run in release with --nocapture"]
+    fn limiter_cost_under_a_slash48_flood_and_a_miss_flood() {
+        let mut lim = RateLimit::new(5.0, MAX_LIMITED_ADDRS, 64);
+        let t0 = Instant::now();
+        let start = std::time::Instant::now();
+        for i in 0..70_000u32 {
+            let _ = lim.check(slash64(i), t0 + Duration::from_micros(u64::from(i)));
+        }
+        let flood = start.elapsed().as_nanos() as f64 / 70_000.0;
+        // Fill the table with active entries, then miss.
+        let mut full = RateLimit::new(1_000.0, MAX_LIMITED_ADDRS, 64);
+        for i in 0..MAX_LIMITED_ADDRS as u32 {
+            let _ = full.check(
+                IpAddr::from([10, (i >> 16) as u8, (i >> 8) as u8, i as u8]),
+                t0,
+            );
+        }
+        let start = std::time::Instant::now();
+        for i in 0..100_000u32 {
+            let a = IpAddr::from([11, (i >> 16) as u8, (i >> 8) as u8, i as u8]);
+            let _ = full.check(a, t0 + Duration::from_micros(u64::from(i)));
+        }
+        let miss = start.elapsed().as_nanos() as f64 / 100_000.0;
+        println!(
+            "limiter: {flood:.0} ns/check in the /48 flood ({} entries after), \
+             {miss:.0} ns/check per miss on a full table",
+            lim.tracked()
+        );
     }
 
     /// Idle entries are reclaimed when the table fills; a hot entry is not.

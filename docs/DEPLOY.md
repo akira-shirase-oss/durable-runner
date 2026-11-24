@@ -97,9 +97,11 @@ apt-get update && apt-get install -y caddy
 
 umask 077; cat >/etc/caddy/origin.pem        # paste, Ctrl-D
 cat >/etc/caddy/origin.key                    # paste, Ctrl-D
-# Cloudflare's Authenticated-Origin-Pulls CA (CREATE.md 3):
-cat >/etc/caddy/cloudflare-origin-pull-ca.pem # paste, Ctrl-D
-chown root:caddy /etc/caddy/origin.* && chmod 0640 /etc/caddy/origin.* /etc/caddy/cloudflare-origin-pull-ca.pem
+# OUR zone-level Authenticated-Origin-Pulls CA certificate (CREATE.md 3) —
+# public, but only its holder's client certificate gets in:
+cat >/etc/caddy/aop-zone-ca.pem # paste, Ctrl-D
+chown root:caddy /etc/caddy/origin.* /etc/caddy/aop-zone-ca.pem
+chmod 0640 /etc/caddy/origin.* /etc/caddy/aop-zone-ca.pem
 
 install -m 0644 $CHECKOUT/deploy/Caddyfile /etc/caddy/Caddyfile
 $CHECKOUT/deploy/cloudflare-ips.sh          # CF ranges → Caddy + trusted-proxies + ufw
@@ -107,13 +109,69 @@ caddy validate --config /etc/caddy/Caddyfile && systemctl reload caddy
 systemctl restart durable-server            # pick up trusted-proxies
 ```
 
-`cloudflare-ips.sh` writes the CF ranges into both trust boundaries:
-Caddy's `trusted_proxies` (so it appends the real client to
-`X-Forwarded-For`) and `/etc/durable/trusted-proxies` (so `--trusted-proxy`
-lets `CF-Connecting-IP` key the D-052 rate limit by the real client).
-**smoke.sh fails if that file is missing** — without it the rate key is
-the edge's address. Only Cloudflare can reach 443 at two layers: ufw
-ranges *and* Authenticated Origin Pulls' client-cert check.
+`cloudflare-ips.sh` writes the CF ranges into Caddy's `trusted_proxies`
+and `/etc/durable/trusted-proxies`. Caddy is the one that judges them:
+from a Cloudflare peer it takes the client from `CF-Connecting-IP`
+(`client_ip_headers`), from anyone else the TCP peer, and it **overwrites**
+`CF-Connecting-IP` with that address before proxying (`header_up
+CF-Connecting-IP {client_ip}`). durable-server only ever sees Caddy over
+loopback, so `durable-run` trusts that hop (`--trusted-proxy 127.0.0.1/32
+--trusted-proxy ::1/128`, added for a loopback `DURABLE_LISTEN`) and keys
+the D-052 rate limit by the header Caddy wrote (D-061). Without the hop
+every visitor shares 127.0.0.1's bucket; without the overwrite a visitor
+could pick its own. **smoke.sh fails if the CF ranges file is missing, if
+the installed Caddyfile does not overwrite the header, or if the running
+server does not trust the hop.** Only Cloudflare can reach 443 at two
+layers: ufw ranges *and* Authenticated Origin Pulls' client-cert check.
+
+### Handler egress: deny-cidrs and the firewall
+
+The SSRF guard already refuses the local blocks and every address on the
+droplet's interfaces (D-061). List what reaches the droplet *without*
+being on an interface — the reserved IP, if one is assigned — one per
+line in `/etc/durable/deny-cidrs` (`ADDR[/PREFIX]`, `#` comments), then
+`systemctl restart durable-server`:
+
+```sh
+echo '<reserved-ip>/32   # reserved IP' >>/etc/durable/deny-cidrs
+```
+
+Recommended as the second layer: an egress firewall for the server's
+user, so even a guard bug cannot reach the host itself or the private
+network. With nftables (`durable` is the unit's user):
+
+```sh
+nft add table inet durable_egress
+nft add chain inet durable_egress out '{ type filter hook output priority 0; policy accept; }'
+# replies on connections Caddy opened to the server, and on the server's own calls
+nft add rule inet durable_egress out meta skuid durable ct state established,related accept
+# the local DNS stub (systemd-resolved): the one local destination the server needs
+nft add rule inet durable_egress out meta skuid durable ip daddr 127.0.0.53 meta l4proto '{ tcp, udp }' th dport 53 accept
+# never this host itself: every local address, the public ones included
+nft add rule inet durable_egress out meta skuid durable fib daddr type local drop
+# never the metadata service or the private ranges (the VPC)
+nft add rule inet durable_egress out meta skuid durable ip daddr '{ 169.254.0.0/16, 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, 100.64.0.0/10 }' drop
+nft add rule inet durable_egress out meta skuid durable ip6 daddr '{ fc00::/7, fe80::/10 }' drop
+# handler calls on 80/443; Neon on 5432 when DATABASE_URL is set
+nft add rule inet durable_egress out meta skuid durable tcp dport '{ 80, 443, 5432 }' accept
+nft add rule inet durable_egress out meta skuid durable drop
+```
+
+(`fib daddr type local` matches every address of this host, the public
+ones included. Order matters: the drops come before the port accept, or
+port 80 would reach the metadata service. A handler on another port needs
+its own accept, and a `--handler` flag on this host needs
+`--allow-local-handlers` *and* its own rule. That flag opens the
+operator's own `--handler` flags (workspace 0) only: a handler registered
+through the API — any tenant, and workspace 0's store rows too — is always
+checked against the full SSRF policy (local blocks, this host's addresses,
+`/etc/durable/deny-cidrs`), whatever the flag says. A same-host handler is
+therefore a `--handler` line in `/etc/durable/handlers`, never an API
+registration. The backup unit uploads to
+R2 over 443. This is deploy guidance, not applied by `install.sh`, and it
+was not exercised on a droplet when written: after applying it, check
+`nft list ruleset`, a handler call, and that
+`curl --max-time 5 http://<droplet-public-ip>:22` run as `durable` fails.)
 
 ## 3. Verify it's sealed, from your laptop
 
@@ -212,8 +270,8 @@ version replays under the current binary.
 |---|---|
 | `durable-server` won't start | `journalctl -u durable-server -n 100` — a corrupt journal or a second writer names itself |
 | `/ready` stuck | replay still running on a big journal (see table); `DURABLE_PROFILE_OPEN=1` logs the phases |
-| Cloudflare 52x | `systemctl status caddy`, origin.pem/origin-pull CA, `ufw status` |
-| Every visitor shares one rate limit | `/etc/durable/trusted-proxies` missing — rerun `cloudflare-ips.sh` |
+| Cloudflare 52x | `systemctl status caddy`, origin.pem, `aop-zone-ca.pem` matches the client certificate uploaded to the zone (and zone-level AOP is on), `ufw status` |
+| Every visitor shares one rate limit | the server does not trust the loopback hop (an old `durable-run`, or a non-loopback `DURABLE_LISTEN`), or Caddy does not overwrite `CF-Connecting-IP` — reinstall `deploy/durable-run.sh` and `deploy/Caddyfile`; `smoke.sh` names which |
 | `durable-backup` fails | `journalctl -u durable-backup`: `backups_disabled` → `--backup-root` unset; rclone remote `r2` misnamed |
 | Second writer refused | expected — the lock worked; find the stray process |
 | `format-guard: REFUSED` | the binary reads an older record version than the journal holds (D-056) — install a newer binary or replay under the old one from a backup |

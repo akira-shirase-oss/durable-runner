@@ -1383,7 +1383,7 @@ impl Journal {
                 File::open(&gd)?.sync_data()?;
             }
         }
-        // The flat sidecars travel too (D-058 — S2 writes both):
+        // The flat sidecars travel too (D-057 — S2 writes both):
         // `journal.shape` preserves claims a replay alone cannot
         // reconstruct (a ws scope claim survives the compaction that
         // deleted its records), and `public_id.key` is install identity —
@@ -3496,7 +3496,7 @@ mod tests {
         );
     }
 
-    /// The agreed backup set (S2 re-review finding 7, D-058): an S2
+    /// The agreed backup set (S2 re-review finding 7, D-057): an S2
     /// backup lists the journal-dir flats `journal.shape` and
     /// `public_id.key` beside the generations — this build writes them
     /// (`the_flat_sidecars_ride_the_backup`), and restore must ACCEPT

@@ -25,6 +25,7 @@ async fn the_bucket_refuses_after_its_tokens() {
             retry_seen |= r.headers().get("retry-after").is_some();
         }
     }
+    // DECISIVE(rate-limit)
     assert!(refusals >= 20, "the bucket never refused ({refusals}/40)");
     assert!(retry_seen, "a 429 without Retry-After");
 }

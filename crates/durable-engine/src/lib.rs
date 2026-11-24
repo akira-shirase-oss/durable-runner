@@ -26,6 +26,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use thiserror::Error;
 
+pub mod observe;
 pub mod shell;
 pub mod snapshot;
 pub mod writer;
@@ -287,6 +288,8 @@ impl Pipe {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RunSummary {
     pub id: RunId,
+    /// The owning workspace (internal: never put in a response).
+    pub ws: u64,
     pub key: OperationKey,
     pub state: RunState,
     pub steps: usize,
@@ -294,9 +297,10 @@ pub struct RunSummary {
 }
 
 impl RunSummary {
-    fn of(r: &Run) -> Self {
+    pub(crate) fn of(r: &Run) -> Self {
         Self {
             id: r.id,
+            ws: r.ws,
             key: r.key.clone(),
             state: r.state.clone(),
             steps: r.spec.steps.len(),
@@ -304,6 +308,17 @@ impl RunSummary {
         }
     }
 }
+
+/// What a submit did: a new run, or the existing run its key already names.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Submitted {
+    pub run: RunId,
+    /// The key was known: no record was written; this is the original run.
+    pub deduplicated: bool,
+}
+
+/// Replayed records handed to the observer at a time (bounds the batch).
+const OBS_REPLAY_BATCH: usize = 1024;
 
 /// Records handed to the writer together, with their payload bytes and
 /// the commit index of the last one.
@@ -390,6 +405,14 @@ pub struct EngineCore {
     /// format-guard reads with the server down. Written BEFORE the
     /// journal change it describes and only ever upward.
     persisted: durable_journal::Shape,
+    /// Where committed records are reported (D-058); `None` = nowhere.
+    obs: Option<Arc<observe::Observer>>,
+    /// Piped mode: what each queued record contributes, by commit index,
+    /// until the writer reports it durable. Bounded by the records queued
+    /// for (and in flight at) the writer, which the shell bounds.
+    obs_pending: VecDeque<(u64, observe::Observed)>,
+    /// Scratch for handing records to the observer in one lock.
+    obs_batch: Vec<observe::Observed>,
     pub limits: Limits,
     pub retry: RetryPolicy,
 }
@@ -432,6 +455,17 @@ impl EngineCore {
 
     /// `open` with explicit journal options.
     pub fn open_with(dir: &Path, opts: JournalOptions) -> Result<Self, EngineError> {
+        Self::open_observed(dir, opts, None)
+    }
+
+    /// `open_with`, reporting every replayed record — and, from then on,
+    /// every committed one — to `obs` (D-058: timelines and the activity
+    /// feed survive a restart; metrics do not backfill).
+    pub fn open_observed(
+        dir: &Path,
+        opts: JournalOptions,
+        obs: Option<Arc<observe::Observer>>,
+    ) -> Result<Self, EngineError> {
         let t_open = std::time::Instant::now();
         let journal = Journal::open_with(dir, opts)?;
         let t_journal_open = t_open.elapsed();
@@ -464,6 +498,9 @@ impl EngineCore {
                 snapshots: 0,
                 max_ws: 0,
             },
+            obs,
+            obs_pending: VecDeque::new(),
+            obs_batch: Vec::new(),
             limits: Limits::default(),
             retry: RetryPolicy::default(),
         };
@@ -477,6 +514,7 @@ impl EngineCore {
                 r.finish()?;
                 core.snapshot_version_max = core.snapshot_version_max.max(ver);
                 core.install(next_run, runs);
+                core.note_snapshot();
             }
             Some(durable_journal::SnapshotSource::Legacy(snap)) => {
                 if snap.payload.starts_with(snapshot::MAGIC) {
@@ -484,6 +522,7 @@ impl EngineCore {
                         snapshot::decode(&snap.payload).map_err(JournalError::CorruptSnapshot)?;
                     core.snapshot_version_max = core.snapshot_version_max.max(ver);
                     core.install(next_run, runs);
+                    core.note_snapshot();
                 } else {
                     let idx: LegacyIndex = serde_json::from_slice(&snap.payload)?;
                     // No checksum here: hold every run to the stored bounds
@@ -502,6 +541,7 @@ impl EngineCore {
                         .collect();
                     core.by_op = idx.by_op.into_iter().map(|(k, v)| ((0, k), v)).collect();
                     core.next_run = idx.next_run;
+                    core.note_snapshot();
                 }
             }
             // Only compaction makes a generation above 1, and it writes the
@@ -541,11 +581,13 @@ impl EngineCore {
                     core.journal_record_version_max = core.journal_record_version_max.max(env.v);
                     core.journal_max_ws = core.journal_max_ws.max(env.ws);
                     let t = std::time::Instant::now();
-                    core.apply_committed(env.ws, RunId(env.run), env.event, env.at)?;
+                    let (_, o) = core.apply_committed(env.ws, RunId(env.run), env.event, env.at)?;
+                    core.observe_replayed(o);
                     t_apply += t.elapsed();
                     n_records += 1;
                 }
             }
+            core.flush_replayed();
             let t_replay = t_journal.elapsed();
             let t = std::time::Instant::now();
             core.next_run = max_run + 1;
@@ -564,9 +606,11 @@ impl EngineCore {
                 max_run = max_run.max(env.run);
                 core.journal_record_version_max = core.journal_record_version_max.max(env.v);
                 core.journal_max_ws = core.journal_max_ws.max(env.ws);
-                core.apply_committed(env.ws, RunId(env.run), env.event, env.at)?;
+                let (_, o) = core.apply_committed(env.ws, RunId(env.run), env.event, env.at)?;
+                core.observe_replayed(o);
             }
         }
+        core.flush_replayed();
         core.next_run = max_run + 1;
         core.recount();
         core.finish_open(dir)
@@ -923,13 +967,16 @@ impl EngineCore {
         }
     }
 
+    /// Apply a committed (or replayed) record to the index. Also returns
+    /// what the record contributes to observability (D-058), derived from
+    /// the run's state before and after.
     fn apply_committed(
         &mut self,
         ws: u64,
         run_id: RunId,
         event: Event,
         now: Millis,
-    ) -> Result<Vec<Effect>, EngineError> {
+    ) -> Result<(Vec<Effect>, observe::Observed), EngineError> {
         // Acceptance constructs the run; every later event reduces onto it.
         if let Event::Accepted {
             key,
@@ -962,7 +1009,14 @@ impl EngineCore {
                 self.due_index.insert((at, run_id), (ws, step, attempt));
             }
             self.runs.insert(run_id, run);
-            return Ok(vec![]);
+            let o = observe::Observed {
+                ws,
+                run: run_id,
+                at: now,
+                first: observe::Kind::Accepted { not_before },
+                then: None,
+            };
+            return Ok((vec![], o));
         }
         let run = self.runs.get(&run_id).ok_or(Refusal::StaleReply)?;
         // A record that attributes an event to a workspace other than the
@@ -976,6 +1030,7 @@ impl EngineCore {
         }
         let old_kind = run.state.kind();
         let (state, effects) = reduce(run, &event, now, &self.limits, &self.retry)?;
+        let o = observe::Observed::derive(ws, run_id, now, &event, Some(&run.state), &state);
         // Copies the run only if a compaction's view still shares it.
         let run = Arc::make_mut(self.runs.get_mut(&run_id).ok_or(Refusal::StaleReply)?);
         if state.is_terminal() && run.finished_at.is_none() {
@@ -1038,7 +1093,83 @@ impl EngineCore {
             self.deadline_index.insert((d, run_id), step);
         }
         run.state = state;
-        Ok(effects)
+        Ok((effects, o))
+    }
+
+    /// The opened journal's snapshot covers every run below `next_run`.
+    fn note_snapshot(&self) {
+        if let Some(obs) = &self.obs {
+            obs.set_compacted_below(self.next_run);
+        }
+    }
+
+    /// A replayed record: timelines and the feed, in batches.
+    fn observe_replayed(&mut self, o: observe::Observed) {
+        if self.obs.is_some() {
+            self.obs_batch.push(o);
+            if self.obs_batch.len() >= OBS_REPLAY_BATCH {
+                self.flush_replayed();
+            }
+        }
+    }
+
+    fn flush_replayed(&mut self) {
+        if let Some(obs) = &self.obs {
+            obs.committed(&self.obs_batch, false);
+        }
+        self.obs_batch.clear();
+    }
+
+    /// A live record: reported at once when it is already durable (direct
+    /// mode), else held until the writer reports its fsync — the observer
+    /// never shows what a crash could take back.
+    fn observe_live(&mut self, o: observe::Observed) {
+        let Some(obs) = &self.obs else {
+            return;
+        };
+        match &self.log {
+            Log::Direct(_) => obs.committed(&[o], true),
+            Log::Piped(p) => self.obs_pending.push_back((p.last_index, o)),
+        }
+    }
+
+    /// The writer reports everything up to commit index `durable` on
+    /// disk: hand what those records contribute to the observer. The shell
+    /// calls this before it releases anything else they decided.
+    pub fn flush_observed(&mut self, durable: u64) {
+        let Some(obs) = &self.obs else {
+            return;
+        };
+        while self.obs_pending.front().is_some_and(|(i, _)| *i <= durable) {
+            if let Some((_, o)) = self.obs_pending.pop_front() {
+                self.obs_batch.push(o);
+            }
+        }
+        obs.committed(&self.obs_batch, true);
+        self.obs_batch.clear();
+    }
+
+    /// Runs by state kind and the index sizes, O(1).
+    pub fn index_counts(&self) -> observe::IndexCounts {
+        observe::IndexCounts {
+            states: observe::StateCounts::from_kinds(&self.state_counts),
+            live_runs: self.runs.len() as u64,
+            active_runs: self.live as u64,
+        }
+    }
+
+    /// One workspace's state counts and index sizes, O(1): what a tenant's
+    /// `GET /metrics` reports (never another workspace's counts).
+    pub fn index_counts_for(&self, ws: u64) -> observe::IndexCounts {
+        observe::IndexCounts {
+            states: self
+                .ws_state_counts
+                .get(&ws)
+                .map(observe::StateCounts::from_kinds)
+                .unwrap_or_default(),
+            live_runs: self.ws_index.get(&ws).map_or(0, |s| s.len() as u64),
+            active_runs: self.ws_live.get(&ws).copied().unwrap_or(0) as u64,
+        }
     }
 
     /// Journal first, then fold — the only path by which state may change.
@@ -1086,7 +1217,9 @@ impl EngineCore {
             // durable.
             Log::Piped(p) => p.enqueue(payload)?,
         }
-        self.apply_committed(ws, run, event, now)
+        let (effects, o) = self.apply_committed(ws, run, event, now)?;
+        self.observe_live(o);
+        Ok(effects)
     }
 
     /// Commit a run-scoped event: the record carries the run's own
@@ -1126,11 +1259,28 @@ impl EngineCore {
         not_before: Millis,
         now: Millis,
     ) -> Result<RunId, EngineError> {
+        self.submit_checked(ws, key, spec, not_before, now)
+            .map(|s| s.run)
+    }
+
+    /// `submit_at`, saying whether the key was already known.
+    pub fn submit_checked(
+        &mut self,
+        ws: u64,
+        key: OperationKey,
+        spec: JobSpec,
+        not_before: Millis,
+        now: Millis,
+    ) -> Result<Submitted, EngineError> {
         // Dedup first: a run accepted under an older (larger) key bound
         // must still return itself. The bound refuses new keys only.
         // ATTACK(submit-dedup)
         if let Some(existing) = self.by_op.get(&(ws, key.clone())) {
-            return Ok(*existing); // duplicate: hand back the original run
+            // duplicate: hand back the original run
+            return Ok(Submitted {
+                run: *existing,
+                deduplicated: true,
+            });
         }
         self.limits.admits_key(&key)?;
         self.limits.admits(&spec)?; // limits refuse before anything is written
@@ -1173,7 +1323,10 @@ impl EngineCore {
             now,
         )?;
         self.next_run += 1; // only a committed acceptance consumes an id
-        Ok(run)
+        Ok(Submitted {
+            run,
+            deduplicated: false,
+        })
     }
 
     /// Pop every run whose wait expired at `now` as
@@ -1308,7 +1461,14 @@ impl EngineCore {
             index_bytes: self.index_bytes,
             dedup_keys: self.by_op.len() as u64,
             workspaces_active: self.ws_index.len() as u64,
-            states: self.state_counts.clone(),
+            // The same counts `GET /metrics` reports, kept incrementally;
+            // as before, a kind with no runs is absent here.
+            states: self
+                .state_counts
+                .iter()
+                .filter(|(_, n)| **n > 0)
+                .map(|(k, n)| (*k, *n))
+                .collect(),
             space_ok: self.space_ok(),
             errors: std::collections::BTreeMap::new(),
             journal_batches,
@@ -2910,6 +3070,259 @@ mod tests {
             e2.run(run).unwrap_or_else(|| panic!("run")).state,
             RunState::Queued { .. }
         ));
+    }
+
+    // --- D-058: observability is derived from the journal -----------------
+
+    fn observed(dir: &Path) -> (EngineCore, Arc<observe::Observer>) {
+        let obs = Arc::new(observe::Observer::new(1_000));
+        let core = EngineCore::open_observed(dir, JournalOptions::default(), Some(obs.clone()))
+            .unwrap_or_else(|e| panic!("{e}"));
+        (core, obs)
+    }
+
+    fn kinds(t: &observe::TimelineView) -> Vec<String> {
+        t.events
+            .iter()
+            .map(|e| {
+                serde_json::to_value(e).unwrap_or_else(|e| panic!("{e}"))["kind"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .to_string()
+            })
+            .collect()
+    }
+
+    /// Drive one two-step run to done and cancel a second; the timeline is
+    /// the commit order with the derived events, and a restart rebuilds
+    /// it (and the feed) from replay — but never the metrics.
+    #[test]
+    fn replay_rebuilds_timelines_and_the_feed_but_not_metrics() {
+        let d = tempfile::tempdir().unwrap_or_else(|e| panic!("{e}"));
+        let (done, gone);
+        {
+            let (mut e, obs) = observed(d.path());
+            done = e
+                .submit(OperationKey("two".into()), spec(), 1_000)
+                .unwrap_or_else(|e| panic!("{e}"));
+            gone = e
+                .submit(OperationKey("cancel-me".into()), spec(), 1_001)
+                .unwrap_or_else(|e| panic!("{e}"));
+            e.dispatch(done, StepIndex(0), 1, 1_002)
+                .unwrap_or_else(|e| panic!("{e}"));
+            e.step_finished(done, StepIndex(0), Some(b"OUT-0".to_vec()), None, 1_003)
+                .unwrap_or_else(|e| panic!("{e}"));
+            e.step_finished(done, StepIndex(1), Some(b"OUT-1".to_vec()), None, 1_004)
+                .unwrap_or_else(|e| panic!("{e}"));
+            e.cancel(gone, 1_005).unwrap_or_else(|e| panic!("{e}"));
+            let t = obs.timeline(done);
+            assert!(t.complete);
+            assert_eq!(
+                kinds(&t),
+                [
+                    "accepted",
+                    "dispatched",
+                    "checkpointed",
+                    "dispatched",
+                    "checkpointed",
+                    "finished"
+                ]
+            );
+            // The chained dispatch is the checkpoint record's: same time.
+            assert_eq!(t.events[3].at, 1_003);
+            assert_eq!(
+                t.events[5].kind,
+                observe::Kind::Finished {
+                    outcome: observe::RunOutcome::Done
+                }
+            );
+            let m = obs.metrics(
+                observe::Scope::All,
+                observe::Window::M15,
+                1_010,
+                e.index_counts(),
+                &[],
+            );
+            let c = m.totals.counters;
+            assert_eq!(
+                (
+                    c.accepted,
+                    c.dispatched,
+                    c.steps_ok,
+                    c.completed,
+                    c.cancelled
+                ),
+                (2, 2, 2, 1, 1)
+            );
+            assert_eq!(m.states.done, 1);
+            assert_eq!(m.states.cancelled, 1);
+        }
+        let (e, obs) = observed(d.path());
+        let t = obs.timeline(done);
+        assert!(t.complete, "{t:?}");
+        assert_eq!(kinds(&t).len(), 6);
+        assert_eq!(
+            kinds(&obs.timeline(gone)),
+            ["accepted", "cancel_requested", "finished"]
+        );
+        let feed = obs.feed(0, 50, 0).1;
+        assert_eq!(feed.len(), 9);
+        assert_eq!(feed[0].0, gone, "newest first");
+        assert_eq!(feed[0].1.at, 1_005);
+        // Metrics begin at the new observer's start: nothing backfilled.
+        let m = obs.metrics(
+            observe::Scope::All,
+            observe::Window::M15,
+            1_010,
+            e.index_counts(),
+            &[],
+        );
+        assert_eq!(m.totals.counters, observe::Counters::default());
+        // …while the state counts are the index's.
+        assert_eq!((m.states.done, m.states.cancelled), (1, 1));
+    }
+
+    /// A restart from a compacted generation cannot know what the
+    /// snapshot folded away: those runs say `compacted`; runs accepted
+    /// after the snapshot are complete. A live compaction loses nothing
+    /// from memory, so before the restart the timeline stays complete.
+    #[test]
+    fn a_snapshot_marks_its_runs_timelines_compacted_after_restart() {
+        let d = tempfile::tempdir().unwrap_or_else(|e| panic!("{e}"));
+        let (old, new);
+        {
+            let (mut e, obs) = observed(d.path());
+            old = e
+                .submit(OperationKey("old".into()), spec(), 1_000)
+                .unwrap_or_else(|e| panic!("{e}"));
+            e.compact(1_001).unwrap_or_else(|e| panic!("{e}"));
+            new = e
+                .submit(OperationKey("new".into()), spec(), 1_002)
+                .unwrap_or_else(|e| panic!("{e}"));
+            assert!(obs.timeline(old).complete, "memory kept it");
+        }
+        let (mut e, obs) = observed(d.path());
+        let t = obs.timeline(old);
+        assert_eq!(
+            (t.complete, t.reason, t.events.len()),
+            (false, Some("compacted"), 0)
+        );
+        assert!(obs.timeline(new).complete);
+        // What happens to the snapshot run next is shown, still marked.
+        e.cancel(old, 1_003).unwrap_or_else(|e| panic!("{e}"));
+        let t = obs.timeline(old);
+        assert_eq!((t.complete, t.reason), (false, Some("compacted")));
+        assert_eq!(kinds(&t), ["cancel_requested", "finished"]);
+    }
+
+    /// Retries, reply loss and reconciliation show up as the journal has
+    /// them, and outputs never reach the observer.
+    #[test]
+    fn failures_and_reconciles_are_timelined_without_payloads() {
+        let d = tempfile::tempdir().unwrap_or_else(|e| panic!("{e}"));
+        let (mut e, obs) = observed(d.path());
+        let mut one = spec();
+        one.steps.truncate(1);
+        one.input = b"SECRET-INPUT".to_vec();
+        let run = e
+            .submit(OperationKey("retry".into()), one, 1_000)
+            .unwrap_or_else(|e| panic!("{e}"));
+        e.dispatch(run, StepIndex(0), 1, 1_001)
+            .unwrap_or_else(|e| panic!("{e}"));
+        e.step_finished(run, StepIndex(0), None, Some("boom".into()), 1_002)
+            .unwrap_or_else(|e| panic!("{e}"));
+        e.dispatch(run, StepIndex(0), 2, 5_000)
+            .unwrap_or_else(|e| panic!("{e}"));
+        e.step_finished(run, StepIndex(0), None, None, 5_001)
+            .unwrap_or_else(|e| panic!("{e}"));
+        e.reconciled(run, StepIndex(0), true, 5_002)
+            .unwrap_or_else(|e| panic!("{e}"));
+        let t = obs.timeline(run);
+        assert_eq!(
+            kinds(&t),
+            [
+                "accepted",
+                "dispatched",
+                "step_failed",
+                "dispatched",
+                "reply_lost",
+                "reconciled",
+                "finished"
+            ]
+        );
+        let body = serde_json::to_string(&t.events).unwrap_or_else(|e| panic!("{e}"));
+        assert!(!body.contains("SECRET"), "{body}");
+        let m = obs.metrics(
+            observe::Scope::All,
+            observe::Window::M15,
+            5_010,
+            e.index_counts(),
+            &[],
+        );
+        let c = m.totals.counters;
+        assert_eq!(
+            (c.steps_failed, c.replies_lost, c.reconciled, c.completed),
+            (1, 1, 1, 1)
+        );
+    }
+
+    /// The incremental state counts equal a full recount after every kind
+    /// of transition, a compaction's expiry, and a replay.
+    #[test]
+    fn state_counts_track_every_transition() {
+        let recount = |e: &EngineCore| {
+            let mut s = observe::StateCounts::default();
+            for r in e.runs() {
+                s.add(&r.state);
+            }
+            s
+        };
+        let (d, mut e) = open();
+        let mut ids = Vec::new();
+        for i in 0..6 {
+            ids.push(
+                e.submit(OperationKey(format!("s-{i}")), spec(), 0)
+                    .unwrap_or_else(|e| panic!("{e}")),
+            );
+        }
+        e.dispatch(ids[0], StepIndex(0), 1, 1)
+            .unwrap_or_else(|e| panic!("{e}"));
+        e.dispatch(ids[1], StepIndex(0), 1, 1)
+            .unwrap_or_else(|e| panic!("{e}"));
+        e.step_finished(ids[1], StepIndex(0), None, Some("x".into()), 2)
+            .unwrap_or_else(|e| panic!("{e}"));
+        e.dispatch(ids[2], StepIndex(0), 1, 1)
+            .unwrap_or_else(|e| panic!("{e}"));
+        e.step_finished(ids[2], StepIndex(0), None, None, 2)
+            .unwrap_or_else(|e| panic!("{e}"));
+        e.cancel(ids[3], 3).unwrap_or_else(|e| panic!("{e}"));
+        e.cancel(ids[4], 3).unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(e.index_counts().states, recount(&e));
+        let s = e.index_counts().states;
+        assert_eq!(
+            (
+                s.queued,
+                s.running,
+                s.retry_waiting,
+                s.reconciling,
+                s.cancelled
+            ),
+            (1, 1, 1, 1, 2)
+        );
+        // A compaction eight days on expires the cancelled runs.
+        e.compact(8 * 24 * 60 * 60 * 1000)
+            .unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(e.index_counts().states, recount(&e));
+        assert_eq!(e.index_counts().states.cancelled, 0);
+        let d1 = e.diagnostics();
+        drop(e);
+        let e = EngineCore::open(d.path()).unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(e.index_counts().states, recount(&e));
+        assert_eq!(e.diagnostics().states, d1.states);
+        assert!(
+            !d1.states.contains_key("cancelled"),
+            "zero kinds stay absent"
+        );
     }
 
     #[test]

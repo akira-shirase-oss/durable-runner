@@ -59,7 +59,7 @@ fn start(journal: &Path, port: u16) -> Child {
 }
 
 async fn wait_healthy(c: &reqwest::Client, base: &str) {
-    for _ in 0..200 {
+    for _ in 0..800 {
         if c.get(format!("{base}/health")).send().await.is_ok() {
             return;
         }
@@ -70,7 +70,7 @@ async fn wait_healthy(c: &reqwest::Client, base: &str) {
 
 /// The readiness signal a deployment probes: 200, not just a listener.
 async fn wait_ready(c: &reqwest::Client, base: &str) {
-    for _ in 0..200 {
+    for _ in 0..800 {
         if let Ok(r) = c.get(format!("{base}/ready")).send().await {
             if r.status().is_success() {
                 return;

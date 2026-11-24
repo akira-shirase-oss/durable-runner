@@ -1,4 +1,4 @@
-//! Mailer selection at boot (D-064): `RESEND_API_KEY` wires the Resend
+//! Mailer selection at boot (D-067): `RESEND_API_KEY` wires the Resend
 //! provider, `DURABLE_MAILER=log` the dev body-printing LogMailer, and
 //! the default is the metadata-only LogMailer. The Resend mailer is
 //! deploy-only — tests drive `MemoryMailer` and `drain_outbox_once`,

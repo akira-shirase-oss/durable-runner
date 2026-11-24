@@ -41,6 +41,7 @@ async fn a_second_workspace_cannot_read_anothers_run() {
         let r = req.send().await.unwrap_or_else(|e| panic!("{name}: {e}"));
         let (status, code) = code(r).await;
         // 404, never 403: a foreign id must leak nothing (S2-2).
+        // DECISIVE(tenant-scope)
         assert_eq!(
             (status, code.as_str()),
             (404, "not_found"),
@@ -106,6 +107,7 @@ async fn a_tenant_admin_cannot_reach_ops_routes() {
     ] {
         let r = req.send().await.unwrap_or_else(|e| panic!("{name}: {e}"));
         let (status, code) = code(r).await;
+        // DECISIVE(ops-scope)
         assert_eq!(
             (status, code.as_str()),
             (403, "forbidden"),
@@ -136,4 +138,54 @@ async fn a_numeric_run_id_is_no_oracle_for_other_tenants() {
         .unwrap_or_else(|e| panic!("{e}"));
     let (status, code) = code(r).await;
     assert_eq!((status, code.as_str()), (404, "not_found"));
+}
+
+/// Prove-test for `ATTACK(numeric-id-ws0)` (re-review #10): only workspace 0
+/// keeps v1.0.1's bare numeric run ids. A tenant addressing even its OWN run
+/// by its internal number must get 404 — else probing numbers finds the
+/// internal sequence position of its run, i.e. everyone else's volume.
+#[tokio::test]
+async fn a_tenant_cannot_address_its_own_run_by_its_internal_number() {
+    let s = spawn(&[]).await;
+    let c = http();
+    let (status, _) = submit(&c, &s.base, OPS_KEY, "ws0-first").await;
+    assert_eq!(status, 200);
+    let ws_b = create_workspace(&c, &s.base, "tenant-b").await;
+    let key_b = create_key(&c, &s.base, &ws_b, "admin").await;
+    // B needs a handler named `step` to admit.
+    let r = c
+        .put(format!("{}/handlers/step", s.base))
+        .bearer_auth(&key_b)
+        .json(&serde_json::json!({ "url": "http://8.8.8.8/unused" }))
+        .send()
+        .await
+        .unwrap_or_else(|e| panic!("{e}"));
+    assert_eq!(r.status().as_u16(), 200, "setup: B's handler");
+    let (status, run) = submit(&c, &s.base, &key_b, "b-run").await;
+    assert_eq!(status, 200);
+    let run = run.unwrap_or_else(|| panic!("setup submit failed"));
+    // B reads its run by the opaque id it was given...
+    let r = c
+        .get(format!("{}/jobs/{run}", s.base))
+        .bearer_auth(&key_b)
+        .send()
+        .await
+        .unwrap_or_else(|e| panic!("{e}"));
+    assert_eq!(r.status().as_u16(), 200, "control: the opaque id works");
+    // ...and never by an internal number (its run is internal id 2).
+    for n in 1..=5 {
+        let r = c
+            .get(format!("{}/jobs/{n}", s.base))
+            .bearer_auth(&key_b)
+            .send()
+            .await
+            .unwrap_or_else(|e| panic!("{e}"));
+        let (status, code) = code(r).await;
+        // DECISIVE(numeric-id-ws0)
+        assert_eq!(
+            (status, code.as_str()),
+            (404, "not_found"),
+            "a tenant addressed run {n} by its internal number"
+        );
+    }
 }

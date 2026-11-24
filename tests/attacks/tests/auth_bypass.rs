@@ -22,6 +22,7 @@ async fn a_garbage_bearer_is_refused_and_nothing_is_recorded() {
         .send()
         .await
         .unwrap_or_else(|e| panic!("{e}"));
+    // DECISIVE(auth)
     assert_eq!(r.status().as_u16(), 401, "forged bearer must be denied");
     let (_, code) = code(r).await;
     assert_eq!(code, "unauthorized");

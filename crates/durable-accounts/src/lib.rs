@@ -120,7 +120,7 @@ pub struct SessionGrant {
     pub csrf_seed: [u8; 32],
     /// Absolute expiry (`sessions.expires_at`) — never slides.
     pub expires_at_ms: i64,
-    /// Idle expiry — slid forward on use (the flush task, D-067).
+    /// Idle expiry — slid forward on use (the flush task, D-070).
     pub idle_expires_at_ms: i64,
     pub account: Account,
 }
@@ -160,7 +160,7 @@ pub struct SessionInfo {
     pub ip: Option<String>,
 }
 
-/// A pending idle slide (D-067): use of a session is recorded in memory
+/// A pending idle slide (D-070): use of a session is recorded in memory
 /// and flushed on an interval rather than written per request — the
 /// store row lags by at most the flush interval.
 #[derive(Debug, Clone)]
@@ -294,7 +294,7 @@ pub const MAX_HANDLERS_PER_WS: usize = 256;
 
 /// Live sessions one account may hold. Past it, sign-in evicts the
 /// least-idle live session in the same transaction — a cap that evicts
-/// is honest; a cap that refuses is a self-DoS (D-060).
+/// is honest; a cap that refuses is a self-DoS (D-063).
 pub const MAX_SESSIONS_PER_ACCOUNT: usize = 20;
 
 /// The account graph. Implemented by `Pg` (Neon) and `Memory` (tests and
@@ -454,7 +454,7 @@ pub trait AccountStore: Send + Sync {
         new_password_hash: &str,
     ) -> Result<(), AccountError>;
 
-    /// Flush pending idle slides (D-067): each touch stamps
+    /// Flush pending idle slides (D-070): each touch stamps
     /// `last_seen_at` and slides `idle_expires_at` on its live session
     /// — never backward, and never onto a revoked row.
     async fn touch_sessions(&self, touches: &[SessionTouch]) -> Result<(), AccountError>;

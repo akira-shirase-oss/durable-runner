@@ -17,6 +17,9 @@ durable-accounts = { path = "../durable-accounts" }
 durable-domain = { path = "../durable-domain" }
 durable-engine = { path = "../durable-engine" }
 durable-journal = { path = "../durable-journal" }
+# getifaddrs behind a safe API (this workspace forbids `unsafe`): the SSRF
+# guard refuses this host's own interface addresses (white-hat finding A).
+if-addrs = "0.15"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 ring = "0.17"
 serde = { version = "1", features = ["derive"] }
@@ -31,6 +34,12 @@ uuid = { version = "1", features = ["serde"] }
 hyper = { version = "1", features = ["server", "http1"] }
 hyper-util = { version = "0.1", features = ["server", "http1", "tokio"] }
 tower = { version = "0.5", default-features = false, features = ["util"] }
+
+[features]
+# Lab builds only: adds --allow-local-tenant-handlers so the workspace load
+# scenario and pilot can register loopback fixtures through the API.
+# check.sh refuses a shipped build with it (re-review S1-1).
+lab = []
 
 [dev-dependencies]
 durable-journal = { path = "../durable-journal", features = ["fault-injection"] }

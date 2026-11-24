@@ -129,15 +129,13 @@ const HEAVY_LOCK = process.env.DR_HEAVY_LOCK ??
     const fd9 = fs.fstatSync(9);
     const lock = fs.statSync(HEAVY_LOCK);
     // The fd is the proof, and the proof is the LOCK — an fd open on a
-    // world-writable file anyone can open proves nothing on its own.
-    // flock(9, LOCK_EX|LOCK_NB) on the inherited description succeeds
-    // only because this description already holds it (relock on the
-    // same description never contends); a merely-open fd to a contended
-    // lock fails (S2 re-review N5).
+    // world-writable file anyone can open proves nothing on its own, and
+    // flock(9) alone TAKES an unheld lock (re-review #12). heavy-held.sh
+    // proves the lock is held and that fd 9 is the holding description.
     if (fd9.ino === lock.ino && fd9.dev === lock.dev) {
-      const r = spawnSync('python3',
-        ['-c', 'import fcntl; fcntl.flock(9, fcntl.LOCK_EX | fcntl.LOCK_NB)'],
-        { stdio: ['ignore','ignore','inherit','ignore','ignore','ignore','ignore','ignore','ignore', 9] });
+      const r = spawnSync(path.join(ROOT, 'perf', 'heavy-held.sh'), [],
+        { stdio: ['ignore','ignore','inherit','ignore','ignore','ignore','ignore','ignore','ignore', 9],
+          env: { ...process.env, DR_HEAVY_LOCK: HEAVY_LOCK } });
       held = r.status === 0;
     }
   } catch { held = false; }
@@ -479,6 +477,20 @@ function startHandler(mode, stallMs = 0) {
   return p;
 }
 
+// Whether SRV is a lab build (it has --allow-local-tenant-handlers): asked
+// once, of the binary itself.
+let labTenantsMemo;
+function labTenants() {
+  if (labTenantsMemo === undefined) {
+    try {
+      labTenantsMemo = /--allow-local-tenant-handlers/.test(execFileSync(SRV, ['--help'], { encoding: 'utf8' }));
+    } catch {
+      labTenantsMemo = false;
+    }
+  }
+  return labTenantsMemo;
+}
+
 async function startServer(journalDir, extra = [], listen = `127.0.0.1:${PORT}`, connsPerAddr = 0) {
   // The battery measures the engine's bounds, not the per-address
   // limiter's (that has its own tests): the request-rate path stays on at
@@ -489,11 +501,15 @@ async function startServer(journalDir, extra = [], listen = `127.0.0.1:${PORT}`,
   const argv = ['--journal', journalDir, '--listen', listen,
     '--handler', `step=http://127.0.0.1:${HPORT}/step`,
     // The fixture handler lives on loopback — the S2-5 opt-out, always
-    // visible in argv.
+    // visible in argv. It opens the --handler flags only; the workspaces
+    // scenario's tenants register the same fixture through the API, which
+    // only a LAB build allows (`cargo build --release --features lab`,
+    // re-review S1-1).
     '--allow-local-handlers',
     // Required whenever an account backend is configured (S3-0); unused
     // under compat mode, so every scenario passes it unconditionally.
     '--public-origin', `http://127.0.0.1:${PORT}`,
+    ...(labTenants() ? ['--allow-local-tenant-handlers'] : []),
     '--rate-limit-per-addr', '100000', '--max-conns-per-addr', String(connsPerAddr), ...extra];
   const p = track(
     // DR_LOAD_SRV_STDIO=inherit surfaces the server's stderr (e.g. the
@@ -1234,6 +1250,9 @@ async function runWorkspaces() {
         await put.arrayBuffer();
         const del = await fetch(`${API}/handlers/churn`, { method: 'DELETE', headers: keys[0].auth });
         await del.arrayBuffer();
+        // Registry mutations are limited per workspace (2/s, burst 20 —
+        // re-review S2-4): a 429 is the limit working, so wait it out.
+        if (put.status === 429 || del.status === 429) { await sleep(1000); continue; }
         if (put.status !== 200 || del.status !== 200) {
           console.error(`churn broke: put=${put.status} del=${del.status}`); return;
         }
@@ -1241,7 +1260,7 @@ async function runWorkspaces() {
       } catch {
         if (++churnErrors > 200) { console.error('churn abandoned: server unreachable'); return; }
       }
-      await sleep(5);
+      await sleep(1000); // one PUT + one DELETE per second: inside the limit
     }
   })();
   // Submit `per` runs per workspace, same op_key prefix in each — dedup is

@@ -34,7 +34,7 @@ ALTER TABLE accounts
 
 -- Sessions become real: opaque token hashed at rest, idle + absolute
 -- expiry, revocation, rotation linkage, the CSRF seed (its derived
--- token is never stored — D-061), and the bookkeeping the sessions
+-- token is never stored — D-064), and the bookkeeping the sessions
 -- page shows.
 ALTER TABLE sessions
     ADD COLUMN public_id UUID NOT NULL DEFAULT gen_random_uuid(),
@@ -57,7 +57,7 @@ CREATE INDEX sessions_account_live ON sessions (account_id)
     WHERE revoked_at IS NULL;
 
 -- One plans row ("Free") — limits are data, not constants, so a plan
--- change is a row write, never a deploy (D-059).
+-- change is a row write, never a deploy (D-062).
 CREATE TABLE plans (
     id TEXT PRIMARY KEY,                    -- 'free'
     name TEXT NOT NULL,
@@ -149,7 +149,7 @@ UPDATE api_keys SET public_id = gen_random_uuid() WHERE public_id IS NULL;
 ALTER TABLE api_keys ALTER COLUMN public_id SET NOT NULL;
 CREATE UNIQUE INDEX api_keys_public_id ON api_keys (public_id);
 
--- The mail outbox (D-064): every mail is a row written in the same
+-- The mail outbox (D-067): every mail is a row written in the same
 -- transaction as the fact that needs it, so a lost send is a pending
 -- row, never a lost mail. The claim transition pending -> sending is
 -- the dedupe; attempts and next_attempt_at bound retries. 'dropped'

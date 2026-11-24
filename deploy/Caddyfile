@@ -1,28 +1,41 @@
 # Caddy for the Durable Runner droplet (deploy/CREATE.md + docs/DEPLOY.md).
 # Cloudflare terminates visitor TLS and connects here with "Full (strict)"
-# and Authenticated Origin Pulls, so Caddy serves Cloudflare's Origin
-# Certificate AND requires a client certificate signed by Cloudflare's
-# origin-pull CA — a direct hit on the droplet's 443 fails the handshake
-# even before ufw's range check (which allows only Cloudflare anyway).
+# and ZONE-LEVEL Authenticated Origin Pulls: Caddy serves Cloudflare's
+# Origin Certificate AND requires a client certificate signed by OUR
+# origin-pull CA (deploy/CREATE.md 3) — not Cloudflare's shared global one,
+# which every Cloudflare zone presents, so any Cloudflare customer could
+# point a zone at this droplet and pass. A direct hit on 443 fails the
+# handshake even before ufw's range check (which allows only Cloudflare).
 {
 	auto_https off
 	servers {
 		# Written by deploy/cloudflare-ips.sh from Cloudflare's ranges.
 		import /etc/caddy/cloudflare-trusted.caddy
+		# From a trusted (Cloudflare) peer, the client is the address
+		# Cloudflare put in CF-Connecting-IP; from anyone else it is the
+		# TCP peer. That resolved address is {client_ip} below.
+		client_ip_headers CF-Connecting-IP
 	}
 }
 
 durable.404human.dev:443 {
 	tls /etc/caddy/origin.pem /etc/caddy/origin.key {
-		# Authenticated Origin Pulls: only connections presenting a cert
-		# signed by Cloudflare's origin-pull CA are let in.
+		# Zone-level Authenticated Origin Pulls: only connections
+		# presenting the client certificate we uploaded to THIS zone
+		# (signed by our own CA) are let in.
 		client_auth {
 			mode require_and_verify
-			trusted_ca_cert_file /etc/caddy/cloudflare-origin-pull-ca.pem
+			trusted_ca_cert_file /etc/caddy/aop-zone-ca.pem
 		}
 	}
 	encode zstd gzip
 	reverse_proxy 127.0.0.1:58300 {
+		# durable-server trusts only this loopback hop for the header
+		# (deploy/durable-run.sh) and keys its per-address limits by it:
+		# overwrite whatever the request carried with the client Caddy
+		# resolved, so no visitor can pick its own rate bucket — and so
+		# visitors are not all keyed as 127.0.0.1 (white-hat finding B).
+		header_up CF-Connecting-IP {client_ip}
 		# An upgrade is a restart plus a replay: while the unit is down
 		# the dial fails, and Caddy keeps the request and retries the
 		# upstream for up to 15s. Nothing reached the old process, so

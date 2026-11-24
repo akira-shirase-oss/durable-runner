@@ -52,6 +52,7 @@ async fn local_handler_urls_are_refused_at_registration() {
             .await
             .unwrap_or_else(|e| panic!("{url}: {e}"));
         let (status, code) = code(r).await;
+        // DECISIVE(ssrf-register)
         assert_eq!(
             (status, code.as_str()),
             if *want == "bad_handler_url" {
@@ -167,6 +168,7 @@ async fn a_domain_that_resolves_local_never_gets_a_packet() {
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
+    // DECISIVE(ssrf-resolve)
     assert!(
         state.starts_with("retry_waiting") || state.starts_with("failed"),
         "the refused call should park the run, got state {state:?}"
@@ -175,5 +177,117 @@ async fn a_domain_that_resolves_local_never_gets_a_packet() {
         hits.load(Ordering::SeqCst),
         0,
         "the resolver let a packet reach the local listener"
+    );
+}
+
+/// Prove-test for `ATTACK(tenant-strict-ssrf)` (re-review S1-1): the
+/// operator's `--allow-local-handlers` opens their own `--handler` flags
+/// only. With it set, a tenant still cannot register a local target —
+/// literal forms refuse at PUT — and a name resolving local, accepted at
+/// PUT, never sends a packet at call time. Workspace 0's API
+/// registrations are store rows too: strict as well.
+#[tokio::test]
+async fn the_operators_local_opt_out_never_reaches_a_tenant() {
+    let victim = StdListener::bind("127.0.0.1:0").unwrap_or_else(|e| panic!("{e}"));
+    victim
+        .set_nonblocking(true)
+        .unwrap_or_else(|e| panic!("{e}"));
+    let lport = victim.local_addr().unwrap_or_else(|e| panic!("{e}")).port();
+    let hits = Arc::new(AtomicUsize::new(0));
+    {
+        let hits = hits.clone();
+        std::thread::spawn(move || {
+            for mut conn in victim.incoming().flatten() {
+                hits.fetch_add(1, Ordering::SeqCst);
+                let _ = conn.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok");
+            }
+        });
+    }
+    // The operator follows the deploy guide for a same-host handler.
+    let s = spawn(&["--allow-local-handlers"]).await;
+    let c = http();
+    let ws = create_workspace(&c, &s.base, "tenant").await;
+    let tenant = create_key(&c, &s.base, &ws, "admin").await;
+    let put = |key: String, url: String| {
+        let c = c.clone();
+        let base = s.base.clone();
+        async move {
+            let r = c
+                .put(format!("{base}/handlers/evil"))
+                .bearer_auth(key)
+                .json(&serde_json::json!({ "url": url }))
+                .send()
+                .await
+                .unwrap_or_else(|e| panic!("{e}"));
+            code(r).await
+        }
+    };
+    for url in [
+        format!("http://127.0.0.1:{lport}/step"),
+        "http://169.254.169.254/latest/meta-data".to_string(),
+        "http://10.0.0.7/h".to_string(),
+        "http://[::1]:22/".to_string(),
+    ] {
+        for key in [tenant.clone(), OPS_KEY.to_string()] {
+            let (status, code) = put(key, url.clone()).await;
+            // DECISIVE(tenant-register-policy) DECISIVE(tenant-strict-ssrf)
+            assert_eq!(
+                (status, code.as_str()),
+                (422, "local_target_forbidden"),
+                "{url}: an API registration used the operator's local opt-out"
+            );
+        }
+    }
+    // A name resolving local registers (names resolve at dial) — and the
+    // tenant's call must still be refused before a packet leaves.
+    let (status, _) = put(tenant.clone(), format!("http://localhost:{lport}/step")).await;
+    assert_eq!(status, 200, "a domain registers; the dial decides");
+    let body = serde_json::json!({
+        "op_key": "tenant-local",
+        "spec": {
+            "version": 1,
+            "steps": [{ "name": "a", "handler": "evil" }],
+            "input_b64": "aGk="
+        },
+    });
+    let r = c
+        .post(format!("{}/jobs", s.base))
+        .bearer_auth(&tenant)
+        .json(&body)
+        .send()
+        .await
+        .unwrap_or_else(|e| panic!("{e}"));
+    assert_eq!(r.status().as_u16(), 200, "setup submit failed");
+    let v: serde_json::Value = r.json().await.unwrap_or_else(|e| panic!("{e}"));
+    let run = v["run_id"]
+        .as_str()
+        .unwrap_or_else(|| panic!("{v}"))
+        .to_string();
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    let mut state = String::new();
+    while std::time::Instant::now() < deadline {
+        if let Ok(r) = c
+            .get(format!("{}/jobs/{run}", s.base))
+            .bearer_auth(&tenant)
+            .send()
+            .await
+        {
+            let v: serde_json::Value = r.json().await.unwrap_or_default();
+            state = v["state"].as_str().unwrap_or("").to_string();
+            if state.starts_with("retry_waiting") || state.starts_with("failed") || state == "done"
+            {
+                break;
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(
+        state.starts_with("retry_waiting") || state.starts_with("failed"),
+        "the tenant's local call should be refused, got state {state:?}"
+    );
+    assert_eq!(
+        hits.load(Ordering::SeqCst),
+        0,
+        "a tenant handler reached a local listener through the operator's opt-out"
     );
 }

@@ -87,7 +87,10 @@ jobs:
         run: perf/check-clean-imports.sh
 
       - name: Build the release server the harness spawns
-        run: cargo build --release --locked -p durable-server
+        # `lab` adds only --allow-local-tenant-handlers (the workspaces
+        # scenario's tenants register the loopback fixture; a shipped
+        # build refuses that, re-review S1-1). Same code paths otherwise.
+        run: cargo build --release --locked -p durable-server --features lab
 
       - name: Battery (${{ matrix.group }})
         run: perf/battery.sh "--$BATTERY" "$GROUP"

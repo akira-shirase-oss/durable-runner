@@ -1,4 +1,4 @@
-//! Transactional mail (D-064). The outbox row is the source of truth —
+//! Transactional mail (D-067). The outbox row is the source of truth —
 //! a mailer only ever *sends* what a row already holds, so a crash or a
 //! provider outage is a pending row, never a lost mail.
 //!

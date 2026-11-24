@@ -23,11 +23,12 @@ use base64::Engine as _;
 use clap::Parser;
 use durable_accounts::{AccountError, AccountStore, Mail, Mailer, Permission, Pg, Role};
 use durable_domain::{JobSpec, Millis, OperationKey, RunId, RunState, StepSpec};
+use durable_engine::observe::{self, Observer, Window};
 use durable_engine::shell::{
     spawn, Call, Engine, Order, Outcome, Registry, ShellConfig, StepHandler, MAX_HANDLERS_PER_WS,
 };
 use durable_engine::EngineError;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -55,12 +56,30 @@ struct Args {
     /// HTTP handler registrations: name=URL (repeatable).
     #[arg(long = "handler", value_parser = parse_handler)]
     handlers: Vec<(String, String)>,
-    /// Permit handler URLs that target loopback/private/link-local
-    /// addresses — development and fixtures only. Without it, literal
-    /// local targets are refused at registration and any name that
-    /// resolves to one is refused before a packet leaves (S2-5).
+    /// Permit the operator's own `--handler` flag URLs (workspace 0) to
+    /// target loopback/private/link-local addresses — a handler on this
+    /// host, development and fixtures. It never applies to handlers
+    /// registered through the API (any workspace, the store): those are
+    /// always checked against the full policy, whatever this flag says
+    /// (re-review S1-1). Without it, literal local targets are refused at
+    /// startup and any name that resolves to one is refused before a
+    /// packet leaves (S2-5).
     #[arg(long)]
     allow_local_handlers: bool,
+    /// LAB BUILDS ONLY (`--features lab`; shipped binaries have no such
+    /// flag): let API-registered (tenant) handlers target local addresses,
+    /// so the workspace load scenario and pilot can use loopback fixtures.
+    #[cfg(feature = "lab")]
+    #[arg(long)]
+    allow_local_tenant_handlers: bool,
+    /// Address range (repeatable, `ADDR/PREFIX` or one address) a handler
+    /// call never dials, on top of the local blocks and this host's own
+    /// interface addresses (which are refused automatically). List the
+    /// droplet's reserved/floating IP and any other address that reaches
+    /// this host without being on one of its interfaces. Refused even
+    /// with --allow-local-handlers.
+    #[arg(long = "deny-cidr", value_parser = ssrf::parse_cidr)]
+    deny_cidrs: Vec<(std::net::IpAddr, u8)>,
     /// Attempt timeout per step call, ms (bounded by domain limits).
     #[arg(long, default_value_t = 20_000)]
     step_timeout_ms: u64,
@@ -239,7 +258,7 @@ fn parse_v6_prefix(s: &str) -> std::result::Result<u8, String> {
 /// input and idempotency key go only to the registered URL), it ignores
 /// the proxy environment variables (nothing outside the allowlist can
 /// route calls), and it gives up connecting after 5 s.
-fn handler_client(allow_local: bool) -> Result<reqwest::Client> {
+fn handler_client(policy: &ssrf::Policy) -> Result<reqwest::Client> {
     reqwest::Client::builder()
         .redirect(reqwest::redirect::Policy::none())
         .no_proxy()
@@ -248,7 +267,7 @@ fn handler_client(allow_local: bool) -> Result<reqwest::Client> {
         // told it exists — the check is the resolution, so a DNS answer
         // that flips local between registration and dispatch sends zero
         // packets. No TOCTOU by construction.
-        .dns_resolver(ssrf::resolver(allow_local))
+        .dns_resolver(ssrf::resolver(policy))
         .connect_timeout(Duration::from_secs(5))
         .build()
         .context("build the handler HTTP client")
@@ -273,9 +292,9 @@ struct HttpHandler {
     /// here, at the last point before the wire. `None` = unparseable,
     /// refused like any local target.
     policy_url: Option<reqwest::Url>,
-    /// The `--allow-local-handlers` opt-out the check shares with
-    /// registration and the resolver.
-    allow_local: bool,
+    /// The SSRF policy the check shares with registration and the
+    /// resolver (local blocks, this host's own addresses, --deny-cidr).
+    policy: ssrf::Policy,
     /// `x-durable-run-id` carries the opaque public id, never the
     /// global sequence — a raw one would tell the tenant how much work
     /// every other workspace submitted between two of its calls.
@@ -288,7 +307,8 @@ impl HttpHandler {
     /// nothing sent — mirroring `ssrf::refused`'s classification.
     fn policy_ok(&self) -> bool {
         match &self.policy_url {
-            Some(u) => ssrf::check_url(u, self.allow_local).is_ok(),
+            // ATTACK(call-time-literal)
+            Some(u) => ssrf::check_url(u, &self.policy).is_ok(),
             None => false,
         }
     }
@@ -551,29 +571,67 @@ struct HandlerFactory {
     client: reqwest::Client,
     timeout: Duration,
     max_output: usize,
-    /// `--allow-local-handlers` — dev/test opt-out shared by the
-    /// registration check and the client's resolver.
-    allow_local: bool,
+    /// The SSRF policy for API-registered handlers (every workspace, the
+    /// store): the registration check, each built handler's call-time
+    /// check, and `client`'s resolver. Strict in every shipped build —
+    /// `--allow-local-handlers` never reaches it (re-review S1-1).
+    store_policy: ssrf::Policy,
+    /// The operator's `--handler` flags (workspace 0): `--allow-local-handlers`
+    /// applies here only, with its own client and resolver.
+    flag_policy: ssrf::Policy,
+    flag_client: reqwest::Client,
     /// The run-id encoder every built handler signs its headers with.
     pubid: pubid::PubId,
 }
 
 impl HandlerFactory {
-    /// Compat-mode and flag registrations — unsigned.
-    fn make(&self, url: &str) -> Arc<HttpHandler> {
-        self.make_signed(url, None)
+    /// The factory with one client per policy (each client's resolver
+    /// enforces its own policy at dial time).
+    fn new(
+        store_policy: ssrf::Policy,
+        flag_policy: ssrf::Policy,
+        timeout: Duration,
+        max_output: usize,
+        pubid: pubid::PubId,
+    ) -> Result<Self> {
+        Ok(Self {
+            client: handler_client(&store_policy)?,
+            flag_client: handler_client(&flag_policy)?,
+            timeout,
+            max_output,
+            store_policy,
+            flag_policy,
+            pubid,
+        })
     }
 
-    /// A registered handler that signs with the workspace's secret.
+    /// A `--handler` flag registration (workspace 0) — unsigned, under the
+    /// flag policy.
+    fn make(&self, url: &str) -> Arc<HttpHandler> {
+        self.build(url, None, &self.flag_client, &self.flag_policy)
+    }
+
+    /// An API-registered handler that signs with the workspace's secret,
+    /// under the store policy.
     fn make_signed(&self, url: &str, secret: Option<Arc<[u8; 32]>>) -> Arc<HttpHandler> {
+        self.build(url, secret, &self.client, &self.store_policy)
+    }
+
+    fn build(
+        &self,
+        url: &str,
+        secret: Option<Arc<[u8; 32]>>,
+        client: &reqwest::Client,
+        policy: &ssrf::Policy,
+    ) -> Arc<HttpHandler> {
         Arc::new(HttpHandler {
-            client: self.client.clone(),
+            client: client.clone(),
             url: url.to_string(),
             timeout: self.timeout,
             max_output: self.max_output,
             secret,
             policy_url: reqwest::Url::parse(url).ok(),
-            allow_local: self.allow_local,
+            policy: policy.clone(),
             pubid: self.pubid.clone(),
         })
     }
@@ -582,7 +640,7 @@ impl HandlerFactory {
 /// The admission rule for a registered URL: http(s) with a host, and a
 /// literal local target refused unless `--allow-local-handlers` (S2-5's
 /// registration layer — domains are judged at dial by the resolver).
-fn valid_handler_url(url: &str, allow_local: bool) -> Result<String, ApiError> {
+fn valid_handler_url(url: &str, policy: &ssrf::Policy) -> Result<String, ApiError> {
     // Bounded like everything else (S2 review #6): an unbounded URL is
     // an unbounded registry row, snapshot line, and dial string.
     if url.len() > 2048 {
@@ -607,7 +665,7 @@ fn valid_handler_url(url: &str, allow_local: bool) -> Result<String, ApiError> {
         ));
     }
     // ATTACK(ssrf-register)
-    ssrf::check_url(&parsed, allow_local).map_err(|why| {
+    ssrf::check_url(&parsed, policy).map_err(|why| {
         ApiError::new(
             StatusCode::UNPROCESSABLE_ENTITY,
             "local_target_forbidden",
@@ -714,76 +772,140 @@ enum RegistryWrite {
     },
 }
 
+/// The most queued writes one save covers.
+const REGISTRY_BATCH: usize = 512;
+
 /// The single writer of `handlers.json`. Mutations apply in send order;
 /// a reconcile snapshot lands only while the epoch it read still holds —
 /// the check is inside the serialization, so an overtaken pass can never
 /// overwrite a mutation that already won.
+///
+/// Re-review S2-4: the file is read once and kept in memory; each wake
+/// drains everything queued (up to `REGISTRY_BATCH`), applies it in order,
+/// and saves ONCE if anything changed — one tmp-write and two fsyncs per
+/// batch, none for a batch that changed nothing. A failed save answers
+/// every changing write in the batch with the error and keeps the last
+/// saved state, so memory never runs ahead of the disk.
 fn registry_writer(
     path: PathBuf,
     epoch: Arc<std::sync::atomic::AtomicU64>,
     rx: std::sync::mpsc::Receiver<RegistryWrite>,
+    saves: Arc<std::sync::atomic::AtomicU64>,
 ) {
-    while let Ok(op) = rx.recv() {
-        let mut all = match load_registry_file(&path) {
-            Ok(v) => v,
-            Err(e) => {
-                // Unreadable or corrupt last-known-good: never merge
-                // onto an empty view — the write would erase every
-                // workspace's rows. Report it; the caller's 503 is the
-                // honest answer (re-review #8).
-                eprintln!("durable-server: {e}");
-                let ack = match op {
-                    RegistryWrite::Upsert { ack, .. }
-                    | RegistryWrite::Remove { ack, .. }
-                    | RegistryWrite::ReplaceWs { ack, .. }
-                    | RegistryWrite::Snapshot { ack, .. } => ack,
-                };
-                let _ = ack.send(Err(e));
-                continue;
+    let mut saved: Option<Vec<RegistryEntry>> = None;
+    while let Ok(first) = rx.recv() {
+        let mut batch = vec![first];
+        // ATTACK(registry-batch)
+        while batch.len() < REGISTRY_BATCH {
+            match rx.try_recv() {
+                Ok(op) => batch.push(op),
+                Err(_) => break,
             }
-        };
-        let ack = match op {
-            RegistryWrite::Upsert { entry, ack } => {
-                all.retain(|e| !(e.ws == entry.ws && e.name == entry.name));
-                all.push(entry);
-                ack
-            }
-            RegistryWrite::Remove { ws, name, ack } => {
-                all.retain(|e| !(e.ws == ws && e.name == name));
-                ack
-            }
-            RegistryWrite::ReplaceWs { ws, entries, ack } => {
-                all.retain(|e| e.ws != ws);
-                all.extend(entries);
-                ack
-            }
-            RegistryWrite::Snapshot {
-                entries,
-                preserve_ws,
-                epoch_seen,
-                ack,
-            } => {
-                let r = if epoch.load(std::sync::atomic::Ordering::Acquire) == epoch_seen {
-                    all.retain(|e| preserve_ws.contains(&e.ws));
-                    all.extend(entries);
-                    save_registry_file(&path, &all)
-                        .map_err(|e| anyhow::anyhow!("cannot write {path:?}: {e}"))
-                } else {
-                    eprintln!(
-                        "durable-server: registry reconcile discarded a pass overtaken by a mutation"
-                    );
-                    Ok(())
-                };
-                let _ = ack.send(r);
-                continue;
-            }
-        };
-        let r = save_registry_file(&path, &all)
-            .map_err(|e| anyhow::anyhow!("cannot write {path:?}: {e}"));
-        if let Err(e) = &r {
-            eprintln!("durable-server: {e}");
         }
-        let _ = ack.send(r);
+        if saved.is_none() {
+            match load_registry_file(&path) {
+                Ok(v) => saved = Some(v),
+                Err(e) => {
+                    // Unreadable or corrupt last-known-good: never merge
+                    // onto an empty view — the write would erase every
+                    // workspace's rows. Report it; the caller's 503 is the
+                    // honest answer (re-review #8).
+                    eprintln!("durable-server: {e}");
+                    let msg = e.to_string();
+                    for op in batch {
+                        let _ = op.into_ack().send(Err(anyhow::anyhow!("{msg}")));
+                    }
+                    continue;
+                }
+            }
+        }
+        let Some(current) = saved.as_ref() else {
+            continue;
+        };
+        let mut all = current.clone();
+        // (ack, whether this write changed the file)
+        let mut acks = Vec::with_capacity(batch.len());
+        for op in batch {
+            let before = all.len();
+            let changed = match op {
+                RegistryWrite::Upsert { entry, ack } => {
+                    let same = all.iter().any(|e| {
+                        e.ws == entry.ws
+                            && e.name == entry.name
+                            && e.url == entry.url
+                            && e.secret == entry.secret
+                    });
+                    if !same {
+                        all.retain(|e| !(e.ws == entry.ws && e.name == entry.name));
+                        all.push(entry);
+                    }
+                    acks.push((ack, !same));
+                    continue;
+                }
+                RegistryWrite::Remove { ws, name, ack } => {
+                    all.retain(|e| !(e.ws == ws && e.name == name));
+                    acks.push((ack, all.len() != before));
+                    continue;
+                }
+                RegistryWrite::ReplaceWs { ws, entries, ack } => {
+                    all.retain(|e| e.ws != ws);
+                    all.extend(entries);
+                    acks.push((ack, true));
+                    continue;
+                }
+                RegistryWrite::Snapshot {
+                    entries,
+                    preserve_ws,
+                    epoch_seen,
+                    ack,
+                } => {
+                    if epoch.load(std::sync::atomic::Ordering::Acquire) == epoch_seen {
+                        all.retain(|e| preserve_ws.contains(&e.ws));
+                        all.extend(entries);
+                        (ack, true)
+                    } else {
+                        eprintln!(
+                            "durable-server: registry reconcile discarded a pass overtaken by a mutation"
+                        );
+                        (ack, false)
+                    }
+                }
+            };
+            acks.push(changed);
+        }
+        let any_change = acks.iter().any(|(_, c)| *c) && all != *current;
+        let result = if any_change {
+            let r = save_registry_file(&path, &all)
+                .map_err(|e| anyhow::anyhow!("cannot write {path:?}: {e}"));
+            match &r {
+                Ok(()) => {
+                    saves.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    saved = Some(all);
+                }
+                Err(e) => eprintln!("durable-server: {e}"),
+            }
+            r.map_err(|e| e.to_string())
+        } else {
+            Ok(())
+        };
+        for (ack, changed) in acks {
+            let r = match (&result, changed) {
+                (Err(msg), true) => Err(anyhow::anyhow!("{msg}")),
+                _ => Ok(()),
+            };
+            let _ = ack.send(r);
+        }
+    }
+}
+
+impl RegistryWrite {
+    fn into_ack(self) -> tokio::sync::oneshot::Sender<Result<()>> {
+        match self {
+            RegistryWrite::Upsert { ack, .. }
+            | RegistryWrite::Remove { ack, .. }
+            | RegistryWrite::ReplaceWs { ack, .. }
+            | RegistryWrite::Snapshot { ack, .. } => ack,
+        }
     }
 }
 
@@ -811,23 +933,134 @@ impl Default for RegistryLocks {
     }
 }
 
-/// Spawn the registry writer thread; the sender goes in `App`.
+/// Spawn the registry writer thread; the sender goes in `App`. `saves`
+/// counts the file saves it makes.
 fn spawn_registry_writer(
     path: Arc<Path>,
     epoch: Arc<std::sync::atomic::AtomicU64>,
+    saves: Arc<std::sync::atomic::AtomicU64>,
 ) -> std::sync::mpsc::SyncSender<RegistryWrite> {
     let (tx, rx) = std::sync::mpsc::sync_channel::<RegistryWrite>(512);
     let path = path.to_path_buf();
     std::thread::Builder::new()
         .name("registry-writer".into())
-        .spawn(move || registry_writer(path, epoch, rx))
+        .spawn(move || registry_writer(path, epoch, rx, saves))
         .unwrap_or_else(|e| panic!("registry writer thread: {e}"));
     tx
+}
+
+/// API registry mutations (PUT/DELETE a handler, rotate the secret) a
+/// workspace may make per second, and its burst (re-review S2-4: one
+/// tenant at 100/s cost 200 fsyncs/s on the journal's disk and three
+/// store queries each).
+const REGISTRY_MUTATIONS_PER_SEC: f64 = 2.0;
+const REGISTRY_MUTATION_BURST: f64 = 20.0;
+/// Workspaces whose mutation buckets are kept at once (full, idle ones
+/// are dropped first; past it every newcomer waits a second).
+const REGISTRY_RATE_TABLE: usize = 4096;
+
+/// The registry's per-process state beside the writer thread.
+#[derive(Debug, Default)]
+struct RegistryState {
+    /// What this process has armed from the API (store rows, not
+    /// `--handler` flags): ws → name → url. A PUT of exactly what is
+    /// armed is a no-op (re-review S2-4). Kept by every mutation, the
+    /// reconcile pass and the startup snapshot.
+    view: std::sync::Mutex<HashMap<u64, HashMap<String, String>>>,
+    /// Per-workspace mutation buckets: (tokens, refilled at).
+    rate: std::sync::Mutex<HashMap<u64, (f64, Instant)>>,
+    /// File saves the writer has made (tests and diagnostics).
+    saves: Arc<std::sync::atomic::AtomicU64>,
+}
+
+impl RegistryState {
+    fn armed(&self, ws: u64, name: &str) -> Option<String> {
+        self.view
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&ws)
+            .and_then(|m| m.get(name).cloned())
+    }
+
+    fn set(&self, ws: u64, name: &str, url: &str) {
+        self.view
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .entry(ws)
+            .or_default()
+            .insert(name.to_string(), url.to_string());
+    }
+
+    fn remove(&self, ws: u64, name: &str) {
+        let mut v = self.view.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(m) = v.get_mut(&ws) {
+            m.remove(name);
+            if m.is_empty() {
+                v.remove(&ws);
+            }
+        }
+    }
+
+    fn replace_ws(&self, ws: u64, rows: impl IntoIterator<Item = (String, String)>) {
+        let m: HashMap<String, String> = rows.into_iter().collect();
+        let mut v = self.view.lock().unwrap_or_else(|e| e.into_inner());
+        if m.is_empty() {
+            v.remove(&ws);
+        } else {
+            v.insert(ws, m);
+        }
+    }
+
+    /// Ok: `ws` may mutate its registry now. Err: refuse, retry after.
+    fn admit(&self, ws: u64, now: Instant) -> Result<(), Duration> {
+        let mut m = self.rate.lock().unwrap_or_else(|e| e.into_inner());
+        if !m.contains_key(&ws) && m.len() >= REGISTRY_RATE_TABLE {
+            m.retain(|_, (tokens, at)| {
+                let refill =
+                    now.saturating_duration_since(*at).as_secs_f64() * REGISTRY_MUTATIONS_PER_SEC;
+                *tokens + refill < REGISTRY_MUTATION_BURST
+            });
+            if m.len() >= REGISTRY_RATE_TABLE {
+                return Err(Duration::from_secs(1));
+            }
+        }
+        let (tokens, at) = m.entry(ws).or_insert((REGISTRY_MUTATION_BURST, now));
+        let refill = now.saturating_duration_since(*at).as_secs_f64() * REGISTRY_MUTATIONS_PER_SEC;
+        *tokens = (*tokens + refill).min(REGISTRY_MUTATION_BURST);
+        *at = now;
+        if *tokens >= 1.0 {
+            *tokens -= 1.0;
+            Ok(())
+        } else {
+            Err(Duration::from_secs_f64(
+                (1.0 - *tokens) / REGISTRY_MUTATIONS_PER_SEC,
+            ))
+        }
+    }
+}
+
+/// The per-workspace registry-mutation limit, as the API's refusal.
+fn registry_rate(app: &App, ws: u64) -> Result<(), ApiError> {
+    // ATTACK(registry-rate)
+    app.registry.admit(ws, Instant::now()).map_err(|wait| {
+        ApiError::new(
+            StatusCode::TOO_MANY_REQUESTS,
+            "registry_rate_limited",
+            format!(
+                "this workspace changes its handler registry too often; retry in {} s",
+                wait.as_secs().max(1)
+            ),
+        )
+    })
 }
 
 /// One reconcile pass: store truth → engine registry + snapshot file.
 /// `flags` are the ws-0 `--handler` registrations — they union with the
 /// store's ws-0 rows (a store row shadows a flag on a name conflict).
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the pass's collaborators are App's registry fields; tests drive it with each one"
+)]
 async fn registry_sync(
     store: &Arc<dyn AccountStore>,
     engine: &Engine,
@@ -836,6 +1069,7 @@ async fn registry_sync(
     tx: &std::sync::mpsc::SyncSender<RegistryWrite>,
     epoch: &std::sync::atomic::AtomicU64,
     locks: &RegistryLocks,
+    view: &RegistryState,
 ) -> Result<(), AccountError> {
     // A mutation anywhere in the pass's read window makes its applies
     // stale — bail out; the mutation applied itself and the next pass
@@ -895,8 +1129,9 @@ async fn registry_sync(
             // --allow-local-handlers process or a direct store edit
             // never reaches the registry (call-time policy still
             // refuses it; dropping it here refuses it *honestly*).
+            // ATTACK(reconcile-recheck)
             let ok = reqwest::Url::parse(&r.url)
-                .map(|u| ssrf::check_url(&u, factory.allow_local).is_ok())
+                .map(|u| ssrf::check_url(&u, &factory.store_policy).is_ok())
                 .unwrap_or(false);
             if !ok {
                 refused += 1;
@@ -921,8 +1156,13 @@ async fn registry_sync(
             preserve_ws.push(ws.id);
             continue;
         }
-        // The snapshot file mirrors what the engine actually armed — a
-        // refused set (over the per-ws bound, dead channel) never lands.
+        // The snapshot file and the armed view mirror what the engine
+        // actually armed — a refused set (over the per-ws bound, dead
+        // channel) never lands.
+        view.replace_ws(
+            ws.id,
+            accepted.iter().map(|e| (e.name.clone(), e.url.clone())),
+        );
         all.extend(accepted);
     }
     if refused > 0 {
@@ -982,9 +1222,14 @@ fn spawn_registry_reconcile(
     let tx = app.registry_tx.clone();
     let epoch = Arc::clone(&app.registry_epoch);
     let locks = Arc::clone(&app.registry_locks);
+    let view = Arc::clone(&app.registry);
     tokio::spawn(async move {
         loop {
-            match registry_sync(&store, &engine, &factory, &flags, &tx, &epoch, &locks).await {
+            match registry_sync(
+                &store, &engine, &factory, &flags, &tx, &epoch, &locks, &view,
+            )
+            .await
+            {
                 Ok(()) => stale.store(false, std::sync::atomic::Ordering::Relaxed),
                 Err(e) => {
                     stale.store(true, std::sync::atomic::Ordering::Relaxed);
@@ -1270,6 +1515,8 @@ struct App {
     /// Per-workspace stripes serializing route mutations against the
     /// reconciler's read+apply of the same workspace (finding 4).
     registry_locks: Arc<RegistryLocks>,
+    /// The armed view, the per-workspace mutation limit, the save count.
+    registry: Arc<RegistryState>,
     /// Opaque public run ids (S2 #7): every run id crosses the API
     /// through this keyed permutation, so no response reveals the
     /// global sequence or another workspace's volume.
@@ -1299,6 +1546,8 @@ struct App {
     /// clock-injected): 0 = wall clock. Only the session-expiry and
     /// session-mint paths consult it; lockouts keep wall time.
     now_override_ms: std::sync::Arc<std::sync::atomic::AtomicI64>,
+    /// The engine's observer (D-058, scoped per workspace by D-060).
+    obs: Arc<Observer>,
 }
 
 impl App {
@@ -1315,6 +1564,79 @@ impl App {
     }
 }
 
+/// Arm the last-known-good snapshot rows at startup (before the first
+/// reconcile). Every row is re-checked against the store policy — the file
+/// may have been written by another build or edited offline, so a local
+/// target never enters the registry — and a tenant row with no usable
+/// secret is refused rather than armed unsigned. Returns how many armed.
+async fn arm_snapshot(
+    entries: Vec<RegistryEntry>,
+    factory: &HandlerFactory,
+    engine: &Engine,
+) -> Vec<(u64, String, String)> {
+    let mut armed = Vec::new();
+    for entry in entries {
+        // ATTACK(startup-recheck)
+        let ok = reqwest::Url::parse(&entry.url)
+            .map(|u| ssrf::check_url(&u, &factory.store_policy).is_ok())
+            .unwrap_or(false);
+        if !ok {
+            eprintln!(
+                "durable-server: snapshot handler {:?} ({:?}) refused by the \
+                 SSRF policy at startup",
+                entry.name, entry.url
+            );
+            continue;
+        }
+        let secret = entry.secret.as_deref().and_then(unhex).map(Arc::new);
+        // A tenant handler with no usable secret must not arm
+        // *unsigned* — that is the S3 hole (a corrupt entry would
+        // silently downgrade to trust-anyone). ws 0 stays honest:
+        // its flag handlers are unsigned by design.
+        if entry.ws != 0 && secret.is_none() {
+            eprintln!(
+                "durable-server: snapshot handler {:?} (ws {}) has no usable \
+                 secret; refusing it rather than arming unsigned",
+                entry.name, entry.ws
+            );
+            continue;
+        }
+        let h = factory.make_signed(&entry.url, secret);
+        match engine.put_handler(entry.ws, &entry.name, h).await {
+            Ok(()) => armed.push((entry.ws, entry.name, entry.url)),
+            Err(e) => eprintln!(
+                "durable-server: snapshot handler {:?} refused at startup: {e}",
+                entry.name
+            ),
+        }
+    }
+    armed
+}
+
+/// `--allow-local-tenant-handlers`, which exists only in a lab build.
+fn lab_local_tenant_handlers(args: &Args) -> bool {
+    #[cfg(feature = "lab")]
+    {
+        args.allow_local_tenant_handlers
+    }
+    #[cfg(not(feature = "lab"))]
+    {
+        let _ = args;
+        false
+    }
+}
+
+/// Tests' SSRF policy: open for fixtures, else the IANA blocks only (a
+/// test that needs this host's addresses builds `Policy::boot` itself).
+#[cfg(test)]
+fn test_policy(allow_local: bool) -> ssrf::Policy {
+    if allow_local {
+        ssrf::Policy::open()
+    } else {
+        ssrf::Policy::strict()
+    }
+}
+
 /// Test constructor: the registry plumbing (`handlers.json`, factory,
 /// flags) points inside the test's journal dir like the real wiring.
 #[cfg(test)]
@@ -1328,20 +1650,26 @@ fn test_app(
 ) -> App {
     let pubid = pubid::PubId::load_or_generate(journal_dir).unwrap_or_else(|e| panic!("{e}"));
     let registry_epoch = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let registry = Arc::new(RegistryState::default());
     let registry_tx = spawn_registry_writer(
         Arc::from(journal_dir.join("handlers.json").as_path()),
         Arc::clone(&registry_epoch),
+        Arc::clone(&registry.saves),
     );
+    let obs = engine.observer().clone();
     App {
         engine,
         keyring,
         open_reads,
         backup_root,
         handler_factory: Arc::new(HandlerFactory {
-            client: handler_client(allow_local).unwrap_or_else(|e| panic!("{e}")),
+            client: handler_client(&test_policy(allow_local)).unwrap_or_else(|e| panic!("{e}")),
+            flag_client: handler_client(&test_policy(allow_local))
+                .unwrap_or_else(|e| panic!("{e}")),
             timeout: Duration::from_secs(2),
             max_output: 1024 * 1024,
-            allow_local,
+            store_policy: test_policy(allow_local),
+            flag_policy: test_policy(allow_local),
             pubid: pubid.clone(),
         }),
         flag_handlers: Arc::new(Vec::new()),
@@ -1350,6 +1678,7 @@ fn test_app(
         registry_tx,
         registry_epoch,
         registry_locks: Arc::new(RegistryLocks::default()),
+        registry,
         session_key: std::sync::Arc::new(pubid.derive_key(b"session-token-v1")),
         sessions: std::sync::Arc::new(SessionCache::new()),
         argon: std::sync::Arc::new(ArgonQueue::new()),
@@ -1361,6 +1690,7 @@ fn test_app(
         public_origin: None,
         now_override_ms: std::sync::Arc::new(std::sync::atomic::AtomicI64::new(0)),
         pubid,
+        obs,
     }
 }
 
@@ -1501,7 +1831,7 @@ const LOCKOUT_FAILS: u32 = 10;
 const LOCKOUT_WINDOW_MS: i64 = 10 * 60 * 1000;
 const LOCKOUT_COOLOFF_MS: i64 = 15 * 60 * 1000;
 const LOCKOUT_CAP: usize = 10_000;
-/// Outbox drain (D-064): bounded batch, per-send deadline, claim
+/// Outbox drain (D-067): bounded batch, per-send deadline, claim
 /// deadline that makes a worker crash reclaimable.
 const OUTBOX_BATCH: u32 = 25;
 const OUTBOX_SEND_DEADLINE: Duration = Duration::from_secs(10);
@@ -1744,7 +2074,7 @@ impl MailBudget {
     }
 }
 
-/// Drain one bounded batch (D-064): sweep dead rows, claim due rows,
+/// Drain one bounded batch (D-067): sweep dead rows, claim due rows,
 /// send each under its deadline, mark the outcome. `failed` and
 /// `dropped` are terminal states the sweep owns — a mail is never
 /// lost, only dead-lettered or intentionally dropped.
@@ -1815,7 +2145,7 @@ fn spawn_mail_drain(app: App) {
     });
 }
 
-/// Idle-expiry sliding (D-067): requests record touches in memory; one
+/// Idle-expiry sliding (D-070): requests record touches in memory; one
 /// batched monotonic store update per tick keeps `idle_expires_at`
 /// moving without a write per request. A missed flush only slides
 /// less — never serves a dead session.
@@ -1848,13 +2178,13 @@ fn spawn_session_flush(app: App) {
 /// and its account (revoke-all, verify, reset, password change) — so an
 /// account-wide revocation dies in cache too, not just in the store.
 /// The bump maps are bounded; overflow clears the grants — a safe
-/// global invalidation. `touches` is the pending idle slide (D-067).
+/// global invalidation. `touches` is the pending idle slide (D-070).
 struct SessionCache {
     grants: Mutex<HashMap<[u8; 32], SessionEntry>>,
     bumps: Mutex<HashMap<[u8; 32], Instant>>,
     account_bumps: Mutex<HashMap<u64, Instant>>,
     /// token_hash → last-seen unix ms, flushed to the store on the
-    /// D-067 interval; bounded — overflow clears (a lost touch slides
+    /// D-070 interval; bounded — overflow clears (a lost touch slides
     /// less, never serves a dead session).
     touches: Mutex<HashMap<[u8; 32], i64>>,
 }
@@ -2109,13 +2439,13 @@ impl ArgonQueue {
 /// `RateLimit` couples burst to the per-second rate, which makes
 /// "5/hour" mean "~1 request": low-frequency auth limits want real
 /// windows instead.
-struct Window {
+struct SlidingWindow {
     cap: usize,
     span: Duration,
     hits: HashMap<std::net::IpAddr, std::collections::VecDeque<Instant>>,
 }
 
-impl Window {
+impl SlidingWindow {
     fn new(cap: usize, span: Duration) -> Self {
         Self {
             cap,
@@ -2152,30 +2482,30 @@ impl Window {
 /// Per-address limits for the open auth surface (per finding-6's
 /// `client_addr` — the untrusted socket address unless a trusted proxy).
 struct AuthLimits {
-    signup_hour: Mutex<Window>,
-    signup_day: Mutex<Window>,
-    login: Mutex<Window>,
+    signup_hour: Mutex<SlidingWindow>,
+    signup_day: Mutex<SlidingWindow>,
+    login: Mutex<SlidingWindow>,
     /// verify/reset redemption: 20/min per address.
-    redeem: Mutex<Window>,
+    redeem: Mutex<SlidingWindow>,
     /// forgot/resend-verification: 5/hour per address.
-    mail_req: Mutex<Window>,
+    mail_req: Mutex<SlidingWindow>,
 }
 
 impl AuthLimits {
     fn new() -> Self {
         Self {
-            signup_hour: Mutex::new(Window::new(5, Duration::from_secs(3600))),
-            signup_day: Mutex::new(Window::new(20, Duration::from_secs(86400))),
+            signup_hour: Mutex::new(SlidingWindow::new(5, Duration::from_secs(3600))),
+            signup_day: Mutex::new(SlidingWindow::new(20, Duration::from_secs(86400))),
             // Coarser than the (email, prefix) lockout so the lockout's
             // precise 429 — not this flood bound — answers the tripped
             // pair; this one only stops an address spraying many emails.
-            login: Mutex::new(Window::new(30, Duration::from_secs(60))),
-            redeem: Mutex::new(Window::new(20, Duration::from_secs(60))),
-            mail_req: Mutex::new(Window::new(5, Duration::from_secs(3600))),
+            login: Mutex::new(SlidingWindow::new(30, Duration::from_secs(60))),
+            redeem: Mutex::new(SlidingWindow::new(20, Duration::from_secs(60))),
+            mail_req: Mutex::new(SlidingWindow::new(5, Duration::from_secs(3600))),
         }
     }
 
-    fn check(lim: &Mutex<Window>, addr: std::net::IpAddr) -> Result<(), ApiError> {
+    fn check(lim: &Mutex<SlidingWindow>, addr: std::net::IpAddr) -> Result<(), ApiError> {
         lim.lock()
             .unwrap_or_else(|e| e.into_inner())
             .check(addr, Instant::now())
@@ -2302,7 +2632,7 @@ impl FromRequestParts<App> for SessionAuth {
             Err(_) => return Err(accounts_unavailable()),
         };
         // The idle check takes the pending-touch floor too — a slide
-        // queued but not yet flushed still counts as use (D-067).
+        // queued but not yet flushed still counts as use (D-070).
         let idle = grant.idle_expires_at_ms.max(app.sessions.touch_idle(&hash));
         // ATTACK(idle-timeout)
         if grant.expires_at_ms <= now || idle <= now {
@@ -3432,6 +3762,11 @@ impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
         let body = Json(serde_json::json!({ "error": self.message, "code": self.code }));
         let mut res = (self.status, body).into_response();
+        if self.status == StatusCode::TOO_MANY_REQUESTS {
+            // A refusal the server chooses carries Retry-After (S2 N4).
+            res.headers_mut()
+                .insert(header::RETRY_AFTER, header::HeaderValue::from_static("1"));
+        }
         if self.status == StatusCode::UNAUTHORIZED {
             res.headers_mut().insert(
                 header::WWW_AUTHENTICATE,
@@ -3589,12 +3924,205 @@ async fn submit(
         input,
     };
     let key = OperationKey(req.op_key);
-    let run = match req.not_before {
-        Some(at) => app.engine.submit_at_scoped(auth.ws(), key, spec, at).await,
-        None => app.engine.submit_scoped(auth.ws(), key, spec).await,
-    }?;
+    let submitted = match app
+        .engine
+        .submit_in(auth.ws(), key, spec, req.not_before)
+        .await
+    {
+        Ok(s) => s,
+        Err(e) => {
+            if admission_refusal(&e) {
+                app.obs.refused(Some(auth.ws()), observe::wall_ms());
+            }
+            return Err(e.into());
+        }
+    };
+    if submitted.deduplicated {
+        app.obs.deduplicated(auth.ws(), observe::wall_ms());
+    }
     // The id leaves only in its opaque form (S2 #7).
-    Ok(Json(serde_json::json!({ "run_id": app.pubid.encode(run) })))
+    Ok(Json(
+        serde_json::json!({ "run_id": app.pubid.encode(submitted.run) }),
+    ))
+}
+
+/// A submit refused at admission — what `/metrics` counts as `refused`
+/// with the 429s: at capacity, the command queue full (busy), over the
+/// limits, an unregistered handler, or below the free-space reserve. A
+/// malformed request, a missing key, or a timeout (the submit may still
+/// commit) is not one.
+fn admission_refusal(e: &EngineError) -> bool {
+    use durable_domain::Refusal;
+    matches!(
+        e,
+        EngineError::Refused(
+            Refusal::AtCapacity
+                | Refusal::ReserveExhausted
+                | Refusal::OverLimits
+                | Refusal::WorkspaceQuota
+        ) | EngineError::UnregisteredHandler(_)
+            | EngineError::Journal(durable_journal::JournalError::NoSpace { .. })
+    )
+}
+
+/// Whether a request is a submit (a 429 for it counts as `refused`).
+fn is_submit<B>(req: &hyper::Request<B>) -> bool {
+    req.method() == axum::http::Method::POST && req.uri().path() == "/jobs"
+}
+
+/// The value of query parameter `name`: `Ok(None)` when absent, `Err`
+/// when it is given more than once.
+fn single_param<'a>(pairs: &'a [(String, String)], name: &str) -> Result<Option<&'a str>, ()> {
+    let mut found = pairs
+        .iter()
+        .filter(|(k, _)| k == name)
+        .map(|(_, v)| v.as_str());
+    match (found.next(), found.next()) {
+        (v, None) => Ok(v),
+        (Some(_), Some(_)) => Err(()),
+        (None, Some(_)) => Err(()),
+    }
+}
+
+/// The metrics a key may see (D-060): a workspace-0 key (the operator's
+/// env keys, the loopback `--open-reads`) sees every workspace; any other
+/// key sees its own workspace only — its counters, latencies, gauges,
+/// states and handlers, never another tenant's or the totals.
+fn metrics_scope(auth: &Auth) -> observe::Scope {
+    // ATTACK(obs-metrics-scope)
+    if auth.ws() == 0 {
+        observe::Scope::All
+    } else {
+        observe::Scope::Ws(auth.ws())
+    }
+}
+
+/// `GET /metrics?window=15m|1h|6h|24h` (D-058): the metrics ring for the
+/// window, totals, current state counts and per-handler stats — for the
+/// caller's scope ([`metrics_scope`]).
+async fn metrics(
+    ReadAuthorized(auth): ReadAuthorized,
+    State(app): State<App>,
+    Q(pairs): Q<Vec<(String, String)>>,
+) -> Result<Json<observe::MetricsOut>, ApiError> {
+    let invalid = || {
+        ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "invalid_window",
+            "window must be one of 15m, 1h, 6h, 24h",
+        )
+    };
+    let window = match single_param(&pairs, "window").map_err(|()| invalid())? {
+        None => Window::H1,
+        Some(w) => Window::parse(w).ok_or_else(invalid)?,
+    };
+    let scope = metrics_scope(&auth);
+    let index = app.engine.metrics_index(scope).await?;
+    Ok(Json(app.obs.metrics(
+        scope,
+        window,
+        observe::wall_ms(),
+        index.counts,
+        &index.handlers,
+    )))
+}
+
+/// `GET /jobs/{id}/events` (D-058): the run's timeline. 404 exactly when
+/// `GET /jobs/{id}` is — another workspace's run is 404 (D-060).
+async fn run_events(
+    ReadAuthorized(auth): ReadAuthorized,
+    State(app): State<App>,
+    P(id): P<String>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let id = RunId(decode_id(&app, auth.ws(), &id)?);
+    let run = match app.engine.summary(id).await? {
+        // ATTACK(obs-run-scope)
+        Some(run) if run.ws == auth.ws() => run,
+        _ => return Err(not_found()),
+    };
+    let t = app.obs.timeline(id);
+    Ok(Json(serde_json::json!({
+        "run": app.pubid.encode(id),
+        "key": run.key.0,
+        "state": state_name(&run.state),
+        "complete": t.complete,
+        "reason": t.reason,
+        "events": t.events,
+    })))
+}
+
+/// One activity-feed entry: the timeline event plus its run (the opaque
+/// public id) and key.
+#[derive(Serialize)]
+struct FeedItem<'a> {
+    at: Millis,
+    run: String,
+    /// `None` only for a run that has since left the index (expired by a
+    /// compaction seven days after it finished).
+    key: Option<&'a str>,
+    #[serde(flatten)]
+    kind: observe::Kind,
+}
+
+/// `GET /events?limit=1..200` (D-058): the caller's workspace's activity
+/// feed, newest first — only its own runs (D-060).
+async fn feed(
+    ReadAuthorized(auth): ReadAuthorized,
+    State(app): State<App>,
+    Q(pairs): Q<Vec<(String, String)>>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let invalid = || {
+        ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "invalid_limit",
+            "limit must be an integer from 1 to 200",
+        )
+    };
+    let limit = match single_param(&pairs, "limit").map_err(|()| invalid())? {
+        None => 50,
+        Some(v) => v
+            .parse::<usize>()
+            .ok()
+            .filter(|n| (1..=observe::MAX_FEED_PAGE).contains(n))
+            .ok_or_else(invalid)?,
+    };
+    // ATTACK(obs-feed-scope)
+    let (since, events) = app.obs.feed(auth.ws(), limit, observe::wall_ms());
+    // Keys come from the index at read time: the observer holds no keys,
+    // so its memory stays fixed per event (D-058).
+    let mut runs: Vec<RunId> = events.iter().map(|(r, _)| *r).collect();
+    runs.sort_unstable();
+    runs.dedup();
+    let keys = app.engine.keys(auth.ws(), runs.clone()).await?;
+    let key_of = |run: RunId| {
+        runs.binary_search(&run)
+            .ok()
+            .and_then(|i| keys.get(i))
+            .and_then(|k| k.as_ref())
+            .map(|k| k.0.as_str())
+    };
+    let items: Vec<FeedItem<'_>> = events
+        .iter()
+        .map(|(run, ev)| FeedItem {
+            at: ev.at,
+            run: app.pubid.encode(*run),
+            key: key_of(*run),
+            kind: ev.kind,
+        })
+        .collect();
+    Ok(Json(serde_json::json!({
+        "since": since,
+        "events": items,
+    })))
+}
+
+/// The observability routes answer `Cache-Control: no-store`, errors too.
+async fn obs_no_store(mut res: Response) -> Response {
+    res.headers_mut().insert(
+        header::CACHE_CONTROL,
+        header::HeaderValue::from_static("no-store"),
+    );
+    res
 }
 
 fn state_name(s: &RunState) -> String {
@@ -3631,6 +4159,7 @@ fn decode_id(app: &App, ws: u64, s: &str) -> Result<u64, ApiError> {
     // internal numbers. A short digit string never decodes as an opaque
     // id (wrong byte count), so every realistic legacy id reaches here;
     // every other workspace's ids stay opaque-only.
+    // ATTACK(numeric-id-ws0)
     if ws == 0 && !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit()) {
         return s.parse::<u64>().map_err(|_| not_found());
     }
@@ -3744,6 +4273,7 @@ async fn list(
     };
     let page = app
         .engine
+        // ATTACK(list-scope)
         .list_in(auth.ws(), order, q.limit.unwrap_or(100))
         .await?;
     let items: Vec<serde_json::Value> = page
@@ -3829,6 +4359,7 @@ async fn workspace_diagnostics(
     Authorized(auth): Authorized,
     State(app): State<App>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
+    // ATTACK(diag-scope)
     let d = app.engine.diag_ws(auth.ws()).await?;
     Ok(Json(serde_json::to_value(d).unwrap_or_default()))
 }
@@ -4240,11 +4771,21 @@ async fn put_handler(
             "handler name must be 1-128 chars with no control characters",
         ));
     }
-    let url = valid_handler_url(body.url.trim(), app.handler_factory.allow_local)?;
+    // ATTACK(tenant-register-policy)
+    let url = valid_handler_url(body.url.trim(), &app.handler_factory.store_policy)?;
+    registry_rate(&app, auth.ws())?;
     // Finding 4: the bound check, the store write, the engine update and
     // the snapshot send are one critical section per workspace — a
     // reconcile's list+apply cannot interleave between them.
     let _ws_guard = app.registry_locks.stripe(auth.ws()).lock().await;
+    // Re-review S2-4: exactly what is armed is a no-op — no store query,
+    // no epoch bump, no engine update, no file write.
+    // ATTACK(registry-noop-skip)
+    if app.registry.armed(auth.ws(), name).as_deref() == Some(url.as_str()) {
+        return Ok(Json(
+            serde_json::json!({ "name": name, "url": url, "unchanged": true }),
+        ));
+    }
     // The 256 bound lives in the engine, but the store must never hold a
     // row the engine refuses: one over-limit row would poison every
     // later reconcile of this workspace's set. Check before writing —
@@ -4293,6 +4834,7 @@ async fn put_handler(
             app.handler_factory.make_signed(&url, secret.clone()),
         )
         .await?;
+    app.registry.set(auth.ws(), name, &url);
     registry_file_upsert(
         &app,
         RegistryEntry {
@@ -4316,6 +4858,7 @@ async fn rotate_handler_secret(
     State(app): State<App>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let store = accounts(&app)?;
+    registry_rate(&app, auth.ws())?;
     // Bump before the store write — same epoch ordering as PUT (S3).
     app.registry_epoch
         .fetch_add(1, std::sync::atomic::Ordering::Release);
@@ -4356,6 +4899,10 @@ async fn rotate_handler_secret(
         });
     }
     app.engine.set_workspace_handlers(auth.ws(), set).await?;
+    app.registry.replace_ws(
+        auth.ws(),
+        entries.iter().map(|e| (e.name.clone(), e.url.clone())),
+    );
     registry_file_replace_ws(&app, auth.ws(), entries).await?;
     Ok(Json(serde_json::json!({ "secret": hex(&secret) })))
 }
@@ -4366,6 +4913,7 @@ async fn delete_handler(
     P(name): P<String>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let store = accounts(&app)?;
+    registry_rate(&app, auth.ws())?;
     // Bump before the store write — same epoch ordering as PUT (S3).
     app.registry_epoch
         .fetch_add(1, std::sync::atomic::Ordering::Release);
@@ -4384,6 +4932,7 @@ async fn delete_handler(
         ));
     }
     app.engine.delete_handler(auth.ws(), &name)?;
+    app.registry.remove(auth.ws(), &name);
     registry_file_remove(&app, auth.ws(), &name).await?;
     Ok(Json(serde_json::json!({ "deleted": name })))
 }
@@ -4466,6 +5015,12 @@ fn base64_decode(s: &str) -> Result<Vec<u8>, String> {
 /// admin handler takes `Authorized`, so it is unreachable without the API
 /// key.
 fn router(app: App, ui_dir: Option<&Path>) -> Router {
+    // Read-only observability (D-058): `ReadAuthorized`, never cached.
+    let observability = Router::new()
+        .route("/metrics", get(metrics))
+        .route("/events", get(feed))
+        .route("/jobs/{id}/events", get(run_events))
+        .layer(axum::middleware::map_response(obs_no_store));
     let mut router = Router::new()
         .route("/health", get(health))
         .route("/ready", get(ready))
@@ -4514,6 +5069,7 @@ fn router(app: App, ui_dir: Option<&Path>) -> Router {
             "/handlers/{name}",
             axum::routing::put(put_handler).delete(delete_handler),
         )
+        .merge(observability)
         // A submit is at most 64 KiB of input (base64: ~88 KiB) plus its
         // spec; nothing legitimate comes near this.
         // ATTACK(body-limit)
@@ -4784,20 +5340,32 @@ async fn main() -> Result<()> {
         ..Default::default()
     };
     let mut registry = Registry::default();
-    let client = handler_client(args.allow_local_handlers)?;
+    // The SSRF policy (S2-5 + white-hat A): this host's own interface
+    // addresses join the refused set — a handler URL naming the droplet's
+    // public address would otherwise be delivered over lo to anything
+    // listening on 0.0.0.0. Listing them fails closed: no start.
+    let policy = ssrf::Policy::boot(false, args.deny_cidrs.clone())
+        .context("list this host's interface addresses for the SSRF guard")?;
+    // Two policies (re-review S1-1): `--allow-local-handlers` opens the
+    // operator's own `--handler` flags only. Every API-registered handler
+    // — any workspace — is checked against the full policy whatever that
+    // flag says; only a lab build can open it, with its own flag.
+    // ATTACK(tenant-strict-ssrf)
+    let store_policy = policy.with_allow_local(lab_local_tenant_handlers(&args));
+    let flag_policy = policy.with_allow_local(args.allow_local_handlers);
     let pubid =
         pubid::PubId::load_or_generate(&args.journal).with_context(|| "load public-id key")?;
-    let factory = Arc::new(HandlerFactory {
-        client,
-        timeout: Duration::from_millis(args.step_timeout_ms),
-        max_output: cfg.limits.max_output_bytes,
-        allow_local: args.allow_local_handlers,
-        pubid: pubid.clone(),
-    });
-    // A `--handler` flag URL obeys the same registration rule as the
-    // route: literal-local refused unless --allow-local-handlers.
+    let factory = Arc::new(HandlerFactory::new(
+        store_policy.clone(),
+        flag_policy.clone(),
+        Duration::from_millis(args.step_timeout_ms),
+        cfg.limits.max_output_bytes,
+        pubid.clone(),
+    )?);
+    // A `--handler` flag URL: literal-local refused unless
+    // --allow-local-handlers.
     for (_, url) in &args.handlers {
-        valid_handler_url(url, args.allow_local_handlers)
+        valid_handler_url(url, &flag_policy)
             .map_err(|e| anyhow::anyhow!("--handler {url}: {}", e.message))?;
     }
     let mut flag_handlers: Vec<(String, Arc<dyn StepHandler>)> = Vec::new();
@@ -4827,51 +5395,24 @@ async fn main() -> Result<()> {
             );
         }
     }
+    let registry = Arc::new(RegistryState::default());
     if store.is_some() {
-        for entry in load_registry_file(&registry_file)
-            .with_context(|| format!("loading {registry_file:?}"))?
-        {
-            // Re-check the snapshot URL: the file may have been written
-            // under --allow-local-handlers or edited offline — a literal
-            // local target never enters the registry.
-            let ok = reqwest::Url::parse(&entry.url)
-                .map(|u| ssrf::check_url(&u, args.allow_local_handlers).is_ok())
-                .unwrap_or(false);
-            if !ok {
-                eprintln!(
-                    "durable-server: snapshot handler {:?} ({:?}) refused by the \
-                     SSRF policy at startup",
-                    entry.name, entry.url
-                );
-                continue;
-            }
-            let secret = entry.secret.as_deref().and_then(unhex).map(Arc::new);
-            // A tenant handler with no usable secret must not arm
-            // *unsigned* — that is the S3 hole (a corrupt entry would
-            // silently downgrade to trust-anyone). ws 0 stays honest:
-            // its flag handlers are unsigned by design.
-            if entry.ws != 0 && secret.is_none() {
-                eprintln!(
-                    "durable-server: snapshot handler {:?} (ws {}) has no usable \
-                     secret; refusing it rather than arming unsigned",
-                    entry.name, entry.ws
-                );
-                continue;
-            }
-            let h = factory.make_signed(&entry.url, secret);
-            if let Err(e) = engine.put_handler(entry.ws, &entry.name, h).await {
-                eprintln!(
-                    "durable-server: snapshot handler {:?} refused at startup: {e}",
-                    entry.name
-                );
-            }
+        let entries = load_registry_file(&registry_file)
+            .with_context(|| format!("loading {registry_file:?}"))?;
+        for (ws, name, url) in arm_snapshot(entries, &factory, &engine).await {
+            registry.set(ws, &name, &url);
         }
     }
     let mailer = mailout::mailer_from_env()?;
     let stopped = engine.clone();
     let registry_stale = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let registry_epoch = Arc::new(std::sync::atomic::AtomicU64::new(0));
-    let registry_tx = spawn_registry_writer(registry_file.clone(), Arc::clone(&registry_epoch));
+    let registry_tx = spawn_registry_writer(
+        registry_file.clone(),
+        Arc::clone(&registry_epoch),
+        Arc::clone(&registry.saves),
+    );
+    let obs = engine.observer().clone();
     let app = App {
         engine,
         keyring: Arc::new(Keyring::new(api_key, read_key, store.clone())),
@@ -4884,6 +5425,7 @@ async fn main() -> Result<()> {
         registry_tx,
         registry_epoch,
         registry_locks: Arc::new(RegistryLocks::default()),
+        registry,
         session_key: std::sync::Arc::new(pubid.derive_key(b"session-token-v1")),
         sessions: std::sync::Arc::new(SessionCache::new()),
         argon: std::sync::Arc::new(ArgonQueue::new()),
@@ -4897,13 +5439,14 @@ async fn main() -> Result<()> {
         public_origin: args.public_origin.clone(),
         now_override_ms: std::sync::Arc::new(std::sync::atomic::AtomicI64::new(0)),
         pubid,
+        obs: obs.clone(),
     };
     if let Some(store) = &store {
         spawn_registry_reconcile(store.clone(), &app, registry_stale);
         // The outbox drain owns every send — the mail row committed in
-        // the same transaction as its fact is the only truth (D-064).
+        // the same transaction as its fact is the only truth (D-067).
         spawn_mail_drain(app.clone());
-        // Idle-expiry slides in one batched store write per tick (D-067).
+        // Idle-expiry slides in one batched store write per tick (D-070).
         spawn_session_flush(app.clone());
     }
     let router = router(app.clone(), args.ui_dir.as_deref());
@@ -4913,10 +5456,22 @@ async fn main() -> Result<()> {
     if args.allow_local_handlers {
         // A visible opt-out must be visible at startup too.
         eprintln!(
-            "durable-server: --allow-local-handlers set — handler URLs may \
-             target local/private addresses"
+            "durable-server: --allow-local-handlers set — the --handler flag \
+             URLs may target local/private addresses; API-registered handlers \
+             stay under the full SSRF policy"
         );
     }
+    if lab_local_tenant_handlers(&args) {
+        eprintln!(
+            "durable-server: LAB BUILD with --allow-local-tenant-handlers — \
+             API-registered handlers may target local addresses; never deploy this"
+        );
+    }
+    let (own, denied) = policy.sizes();
+    eprintln!(
+        "durable-server: SSRF guard refuses this host's {own} interface addresses \
+         and {denied} --deny-cidr range(s) besides the local blocks"
+    );
     eprintln!("durable-server listening on {}", args.listen);
     let (stop_http, http_stopped) = tokio::sync::oneshot::channel::<()>();
     let health_serve = match &args.health_listen {
@@ -4932,7 +5487,7 @@ async fn main() -> Result<()> {
             eprintln!("durable-server liveness listening on {addr}");
             Some((
                 hs_stop,
-                tokio::spawn(serve_http(l, r, health_limits(), hs_rx)),
+                tokio::spawn(serve_http(l, r, health_limits(), None, hs_rx)),
             ))
         }
         None => None,
@@ -4951,7 +5506,7 @@ async fn main() -> Result<()> {
         trusted_proxies: TrustedProxies(args.trusted_proxies),
         ..HttpLimits::default()
     };
-    let serve = serve_http(listener, router, limits, http_stopped);
+    let serve = serve_http(listener, router, limits, Some(obs), http_stopped);
     tokio::pin!(serve);
     tokio::select! {
         r = &mut serve => return r.context("serve"),
@@ -5253,6 +5808,7 @@ async fn serve_http(
     listener: tokio::net::TcpListener,
     router: Router,
     limits: HttpLimits,
+    obs: Option<Arc<Observer>>,
     mut stop: tokio::sync::oneshot::Receiver<()>,
 ) -> std::io::Result<()> {
     use hyper_util::rt::{TokioIo, TokioTimer};
@@ -5371,6 +5927,12 @@ async fn serve_http(
             },
             _ = &mut stop => break,
         };
+        // A dual-stack listener reports an IPv4 client as `::ffff:a.b.c.d`:
+        // judged as IPv6, the loopback proxy hop (127.0.0.1/32) would not
+        // be trusted and every IPv4 client would share one /64 bucket
+        // (white-hat finding B). Every limit below sees the canonical form.
+        // ATTACK(peer-canonical)
+        let peer = std::net::SocketAddr::new(peer.ip().to_canonical(), peer.port());
         if let Slot::Lane(lane_permit) = slot {
             // The work pool is dry and this conn is waiting — real
             // demand may reclaim one idle served slot (N3).
@@ -5558,11 +6120,13 @@ async fn serve_http(
         let peer_ip = peer.ip();
         let rate_limiter = rate_limiter.clone();
         let trusted = trusted.clone();
+        let obs = obs.clone();
         let handler =
             hyper::service::service_fn(move |req: hyper::Request<hyper::body::Incoming>| {
                 let per_conn = per_conn.clone();
                 let rate_limiter = rate_limiter.clone();
                 let trusted = trusted.clone();
+                let obs = obs.clone();
                 async move {
                     // A refused request is still a SERVED request (F2):
                     // the 429 path used to return before `served` moved,
@@ -5595,6 +6159,12 @@ async fn serve_http(
                             .err();
                         match refused {
                             Some(retry) => {
+                                // A refused submit counts in `/metrics`
+                                // (D-058) — the operator's view only: no
+                                // workspace is known before the key is.
+                                if let Some(o) = obs.as_ref().filter(|_| is_submit(&req)) {
+                                    o.refused(None, observe::wall_ms());
+                                }
                                 let mut res = Response::builder()
                                     .status(StatusCode::TOO_MANY_REQUESTS)
                                     .header(header::CONTENT_TYPE, "application/json")
@@ -6005,11 +6575,23 @@ mod tests {
         }
     }
 
+    /// Answers with an output no observability response may contain.
+    struct Secret;
+    #[async_trait::async_trait]
+    impl StepHandler for Secret {
+        async fn execute(&self, _s: &StepSpec, _i: &[u8], _k: &str) -> Outcome {
+            Outcome::Checkpoint(SECRET_OUTPUT.to_vec())
+        }
+    }
+    const SECRET_OUTPUT: &[u8] = b"SECRET-OUTPUT-7f3a";
+    const SECRET_INPUT: &[u8] = b"SECRET-INPUT-91c2";
+
     struct Harness {
         router: Router,
         keyring: Arc<Keyring>,
         app: App,
         backups: tempfile::TempDir,
+        obs: Arc<Observer>,
         _journal: tempfile::TempDir,
     }
 
@@ -6035,6 +6617,7 @@ mod tests {
         let backups = tempfile::tempdir().unwrap_or_else(|e| panic!("{e}"));
         let mut reg = Registry::default();
         reg.register("step", Arc::new(Echo));
+        reg.register("secret", Arc::new(Secret));
         let mut opts = durable_journal::JournalOptions::default();
         if let Some(free) = free {
             opts.reserve_bytes = 4096;
@@ -6067,6 +6650,7 @@ mod tests {
         Harness {
             router: router(app.clone(), None),
             keyring,
+            obs: app.obs.clone(),
             app,
             backups,
             _journal: journal,
@@ -6085,6 +6669,833 @@ mod tests {
         eng.put_handler(ws, "step", Arc::new(Echo))
             .await
             .unwrap_or_else(|e| panic!("{e}"));
+    }
+
+    /// `call`, keeping the headers and the raw body text.
+    async fn call_raw(
+        router: &Router,
+        uri: &str,
+        key: Option<&str>,
+    ) -> (StatusCode, axum::http::HeaderMap, String) {
+        let mut req = Request::builder().method("GET").uri(uri);
+        if let Some(k) = key {
+            req = req.header("authorization", format!("Bearer {k}"));
+        }
+        let res = router
+            .clone()
+            .oneshot(req.body(Body::empty()).unwrap_or_else(|e| panic!("{e}")))
+            .await
+            .unwrap_or_else(|e| panic!("{e}"));
+        let (status, headers) = (res.status(), res.headers().clone());
+        let bytes = res
+            .into_body()
+            .collect()
+            .await
+            .unwrap_or_else(|e| panic!("{e}"))
+            .to_bytes();
+        (
+            status,
+            headers,
+            String::from_utf8_lossy(&bytes).into_owned(),
+        )
+    }
+
+    /// Poll `GET /jobs/{id}` until the run's state is `want`, against a
+    /// wall-clock deadline (never a count of sleeps).
+    async fn until_state(router: &Router, id: u64, want: &str) {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        while tokio::time::Instant::now() < deadline {
+            let (_, v) = call(router, "GET", &format!("/jobs/{id}"), Some(KEY), None).await;
+            if v["state"] == want {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        panic!("run {id} never reached {want}");
+    }
+
+    const OBS_ROUTES: [&str; 3] = ["/metrics", "/events", "/jobs/1/events"];
+
+    /// D-058: the three observability reads take `ReadAuthorized`: the
+    /// read key or the API key, never nothing — unless `--open-reads`,
+    /// and then only for a loopback Host.
+    #[tokio::test]
+    async fn observability_reads_need_a_read_key() {
+        let h = harness(false);
+        let (status, _) = call(
+            &h.router,
+            "POST",
+            "/jobs",
+            Some(KEY),
+            Some(submit_body("o")),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        for uri in OBS_ROUTES {
+            for key in [None, Some("wrong"), Some(&KEY[..KEY.len() - 1])] {
+                let (status, v) = call(&h.router, "GET", uri, key, None).await;
+                assert_eq!(
+                    (status, v["code"].clone()),
+                    (StatusCode::UNAUTHORIZED, json!("unauthorized")),
+                    "GET {uri} key={key:?}"
+                );
+            }
+            for key in [KEY, READ_KEY] {
+                let (status, v) = call(&h.router, "GET", uri, Some(key), None).await;
+                assert_eq!(status, StatusCode::OK, "GET {uri}: {v}");
+            }
+        }
+        // --open-reads: a loopback Host reads without a key; any other is 401.
+        let journal = tempfile::tempdir().unwrap_or_else(|e| panic!("{e}"));
+        let mut reg = Registry::default();
+        reg.register("step", Arc::new(Echo));
+        let engine =
+            spawn(journal.path(), reg, ShellConfig::default()).unwrap_or_else(|e| panic!("{e}"));
+        let r = router(
+            test_app(
+                engine,
+                Arc::new(Keyring::new(ApiKey::new(KEY), None, None)),
+                true,
+                None,
+                journal.path(),
+                true,
+            ),
+            None,
+        );
+        for uri in ["/metrics", "/events"] {
+            for (host, want) in [
+                ("127.0.0.1:58300", StatusCode::OK),
+                ("attacker.example", StatusCode::UNAUTHORIZED),
+            ] {
+                let req = Request::builder()
+                    .uri(uri)
+                    .header("host", host)
+                    .body(Body::empty())
+                    .unwrap_or_else(|e| panic!("{e}"));
+                let status = r
+                    .clone()
+                    .oneshot(req)
+                    .await
+                    .unwrap_or_else(|e| panic!("{e}"))
+                    .status();
+                assert_eq!(status, want, "GET {uri} Host {host}");
+            }
+        }
+    }
+
+    /// Every observability answer — success or refusal — says
+    /// `Cache-Control: no-store`.
+    #[tokio::test]
+    async fn observability_answers_are_never_cached() {
+        let h = harness(false);
+        call(
+            &h.router,
+            "POST",
+            "/jobs",
+            Some(KEY),
+            Some(submit_body("c")),
+        )
+        .await;
+        for (uri, key, want) in [
+            ("/metrics", Some(READ_KEY), StatusCode::OK),
+            ("/events", Some(READ_KEY), StatusCode::OK),
+            ("/jobs/1/events", Some(READ_KEY), StatusCode::OK),
+            ("/metrics", None, StatusCode::UNAUTHORIZED),
+            (
+                "/metrics?window=2h",
+                Some(READ_KEY),
+                StatusCode::BAD_REQUEST,
+            ),
+            ("/events?limit=0", Some(READ_KEY), StatusCode::BAD_REQUEST),
+            ("/jobs/999/events", Some(READ_KEY), StatusCode::NOT_FOUND),
+        ] {
+            let (status, headers, _) = call_raw(&h.router, uri, key).await;
+            assert_eq!(status, want, "{uri}");
+            assert_eq!(
+                headers
+                    .get(header::CACHE_CONTROL)
+                    .and_then(|v| v.to_str().ok()),
+                Some("no-store"),
+                "{uri}"
+            );
+        }
+        // Other reads are unchanged.
+        let (_, headers, _) = call_raw(&h.router, "/jobs/1", Some(KEY)).await;
+        assert!(headers.get(header::CACHE_CONTROL).is_none());
+    }
+
+    /// `window` selects the ring and bucket size; every bucket is present;
+    /// anything else is 400 `invalid_window` in the error envelope.
+    #[tokio::test]
+    async fn metrics_windows_and_their_refusals() {
+        let h = harness(false);
+        for (q, window, bucket, points) in [
+            ("", 3_600_000u64, 10_000u64, 360usize),
+            ("?window=1h", 3_600_000, 10_000, 360),
+            ("?window=15m", 900_000, 10_000, 90),
+            ("?window=6h", 21_600_000, 60_000, 360),
+            ("?window=24h", 86_400_000, 60_000, 1440),
+            ("?window=15m&other=x", 900_000, 10_000, 90),
+        ] {
+            let (status, v) = call(
+                &h.router,
+                "GET",
+                &format!("/metrics{q}"),
+                Some(READ_KEY),
+                None,
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "{q}: {v}");
+            assert_eq!(v["window_ms"], window, "{q}");
+            assert_eq!(v["bucket_ms"], bucket, "{q}");
+            let pts = v["points"].as_array().map_or(0, Vec::len);
+            assert_eq!(pts, points, "{q}");
+            assert_eq!(v["states"].as_object().map_or(0, |o| o.len()), 7, "{q}");
+            assert!(v["now"].as_u64() >= v["since"].as_u64(), "{q}");
+        }
+        for q in [
+            "window=2h",
+            "window=",
+            "window=1H",
+            "window=60m",
+            "window=1h&window=1h",
+            "window=%31h%00",
+        ] {
+            let (status, v) = call(
+                &h.router,
+                "GET",
+                &format!("/metrics?{q}"),
+                Some(READ_KEY),
+                None,
+            )
+            .await;
+            assert_eq!(
+                (status, v["code"].clone()),
+                (StatusCode::BAD_REQUEST, json!("invalid_window")),
+                "{q}"
+            );
+            assert!(v["error"].is_string(), "{q}: the error envelope");
+        }
+    }
+
+    /// `limit` is 1–200 (default 50); anything else is 400 `invalid_limit`.
+    #[tokio::test]
+    async fn the_feed_limit_is_bounded() {
+        let h = harness(false);
+        for i in 0..60 {
+            let mut b = submit_body(&format!("f-{i}"));
+            b["not_before"] = json!(9_999_999_999_999u64); // one event each
+            let (status, _) = call(&h.router, "POST", "/jobs", Some(KEY), Some(b)).await;
+            assert_eq!(status, StatusCode::OK);
+        }
+        for (q, n) in [
+            ("", 50usize),
+            ("?limit=1", 1),
+            ("?limit=200", 60),
+            ("?limit=60", 60),
+        ] {
+            let (status, v) = call(
+                &h.router,
+                "GET",
+                &format!("/events{q}"),
+                Some(READ_KEY),
+                None,
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "{q}: {v}");
+            assert_eq!(v["events"].as_array().map_or(0, Vec::len), n, "{q}");
+        }
+        let (_, v) = call(&h.router, "GET", "/events?limit=2", Some(READ_KEY), None).await;
+        let id = |n| json!(h.app.pubid.encode(RunId(n)));
+        assert_eq!(v["events"][0]["run"], id(60), "newest first: {v}");
+        assert_eq!(v["events"][0]["key"], "f-59");
+        assert_eq!(v["events"][0]["kind"], "accepted");
+        assert_eq!(v["events"][1]["run"], id(59));
+        for q in [
+            "limit=0",
+            "limit=201",
+            "limit=abc",
+            "limit=-1",
+            "limit=",
+            "limit=1.5",
+            "limit=5&limit=5",
+        ] {
+            let (status, v) = call(
+                &h.router,
+                "GET",
+                &format!("/events?{q}"),
+                Some(READ_KEY),
+                None,
+            )
+            .await;
+            assert_eq!(
+                (status, v["code"].clone()),
+                (StatusCode::BAD_REQUEST, json!("invalid_limit")),
+                "{q}"
+            );
+        }
+    }
+
+    /// `GET /jobs/{id}/events` is 404 exactly where `GET /jobs/{id}` is,
+    /// and a malformed id is the same 400 for both.
+    #[tokio::test]
+    async fn run_events_404_exactly_like_inspect() {
+        let h = harness(false);
+        call(
+            &h.router,
+            "POST",
+            "/jobs",
+            Some(KEY),
+            Some(submit_body("n")),
+        )
+        .await;
+        for (id, want) in [
+            ("1", StatusCode::OK),
+            ("2", StatusCode::NOT_FOUND),
+            ("0", StatusCode::NOT_FOUND),
+        ] {
+            let (a, va) = call(&h.router, "GET", &format!("/jobs/{id}"), Some(KEY), None).await;
+            let (b, vb) = call(
+                &h.router,
+                "GET",
+                &format!("/jobs/{id}/events"),
+                Some(KEY),
+                None,
+            )
+            .await;
+            assert_eq!((a, b), (want, want), "{id}");
+            assert_eq!(va["code"], vb["code"], "{id}");
+        }
+        // An id that decodes to nothing is 404 for both (S2: no oracle).
+        let (a, va) = call(&h.router, "GET", "/jobs/abc", Some(KEY), None).await;
+        let (b, vb) = call(&h.router, "GET", "/jobs/abc/events", Some(KEY), None).await;
+        assert_eq!((a, b), (StatusCode::NOT_FOUND, StatusCode::NOT_FOUND));
+        assert_eq!(
+            (va["code"].clone(), vb["code"].clone()),
+            (json!("not_found"), json!("not_found"))
+        );
+        // The opaque id the submit returned works for both.
+        let pid = h.app.pubid.encode(RunId(1));
+        let (a, _) = call(&h.router, "GET", &format!("/jobs/{pid}"), Some(KEY), None).await;
+        let (b, _) = call(
+            &h.router,
+            "GET",
+            &format!("/jobs/{pid}/events"),
+            Some(KEY),
+            None,
+        )
+        .await;
+        assert_eq!((a, b), (StatusCode::OK, StatusCode::OK));
+        let (_, v) = call(&h.router, "GET", "/jobs/404/events", Some(KEY), None).await;
+        assert_eq!(v["code"], "not_found");
+    }
+
+    /// A run through a handler, then both event views: the timeline in
+    /// commit order with the derived events, and neither view carries the
+    /// job's input or the checkpointed output in any encoding.
+    #[tokio::test]
+    async fn event_views_never_show_inputs_or_outputs() {
+        use base64::Engine as _;
+        let b64 = base64::engine::general_purpose::STANDARD;
+        let h = harness(false);
+        let body = json!({
+            "op_key": "secret-run",
+            "spec": {
+                "version": 1,
+                "steps": [{ "name": "a", "handler": "secret" }, { "name": "b", "handler": "secret" }],
+                "input_b64": b64.encode(SECRET_INPUT),
+            },
+        });
+        let (status, v) = call(&h.router, "POST", "/jobs", Some(KEY), Some(body)).await;
+        assert_eq!(status, StatusCode::OK, "{v}");
+        until_state(&h.router, 1, "done").await;
+
+        let (status, _, timeline) = call_raw(&h.router, "/jobs/1/events", Some(READ_KEY)).await;
+        assert_eq!(status, StatusCode::OK);
+        let (_, _, feed) = call_raw(&h.router, "/events?limit=200", Some(READ_KEY)).await;
+        let as_numbers = |b: &[u8]| b.iter().map(u8::to_string).collect::<Vec<_>>().join(",");
+        for text in [&timeline, &feed] {
+            for needle in [
+                "SECRET".to_string(),
+                b64.encode(SECRET_INPUT),
+                b64.encode(SECRET_OUTPUT),
+                as_numbers(SECRET_INPUT),
+                as_numbers(SECRET_OUTPUT),
+            ] {
+                assert!(!text.contains(&needle), "{needle} leaked: {text}");
+            }
+        }
+        let t: Value = serde_json::from_str(&timeline).unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(
+            (t["run"].clone(), t["key"].clone(), t["state"].clone()),
+            (
+                json!(h.app.pubid.encode(RunId(1))),
+                json!("secret-run"),
+                json!("done")
+            )
+        );
+        assert_eq!(
+            (t["complete"].clone(), t["reason"].clone()),
+            (json!(true), Value::Null)
+        );
+        let kinds: Vec<&str> = t["events"]
+            .as_array()
+            .map(|a| a.iter().filter_map(|e| e["kind"].as_str()).collect())
+            .unwrap_or_default();
+        assert_eq!(
+            kinds,
+            [
+                "accepted",
+                "dispatched",
+                "checkpointed",
+                "dispatched",
+                "checkpointed",
+                "finished"
+            ]
+        );
+        assert_eq!(t["events"][5]["outcome"], "done");
+        assert_eq!(t["events"][1]["attempt"], 1);
+        assert!(t["events"][1]["deadline"].as_u64() > t["events"][1]["at"].as_u64());
+        let f: Value = serde_json::from_str(&feed).unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(f["events"][0]["kind"], "finished");
+        assert_eq!(f["events"][0]["key"], "secret-run");
+        assert_eq!(f["events"].as_array().map_or(0, Vec::len), 6);
+        assert_eq!(f["since"], h.obs.since());
+
+        // The metrics see the same run.
+        let (_, m) = call(
+            &h.router,
+            "GET",
+            "/metrics?window=15m",
+            Some(READ_KEY),
+            None,
+        )
+        .await;
+        let t = &m["totals"];
+        assert_eq!(
+            (
+                t["accepted"].clone(),
+                t["completed"].clone(),
+                t["steps_ok"].clone()
+            ),
+            (json!(1), json!(1), json!(2))
+        );
+        assert_eq!(m["states"]["done"], 1);
+        let secret = m["handlers"]
+            .as_array()
+            .and_then(|a| a.iter().find(|x| x["name"] == "secret"))
+            .cloned()
+            .unwrap_or_default();
+        assert_eq!(
+            (secret["calls"].clone(), secret["ok"].clone()),
+            (json!(2), json!(2))
+        );
+        let names: Vec<&str> = m["handlers"]
+            .as_array()
+            .map(|a| a.iter().filter_map(|x| x["name"].as_str()).collect())
+            .unwrap_or_default();
+        assert_eq!(names, ["secret", "step"], "every handler, by name");
+    }
+
+    /// Deduplicated and refused submits are counted where they are
+    /// answered.
+    #[tokio::test]
+    async fn submits_count_as_deduplicated_or_refused() {
+        let h = harness(false);
+        let mut later = submit_body("same");
+        later["not_before"] = json!(9_999_999_999_999u64);
+        for _ in 0..3 {
+            let (status, v) =
+                call(&h.router, "POST", "/jobs", Some(KEY), Some(later.clone())).await;
+            assert_eq!(
+                (status, v["run_id"].clone()),
+                (StatusCode::OK, json!(h.app.pubid.encode(RunId(1))))
+            );
+        }
+        let mut unknown = submit_body("u");
+        unknown["spec"]["steps"][0]["handler"] = json!("nope");
+        let (status, _) = call(&h.router, "POST", "/jobs", Some(KEY), Some(unknown)).await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        let (status, _) = call(
+            &h.router,
+            "POST",
+            "/jobs",
+            Some(KEY),
+            Some(submit_body(&"k".repeat(300))),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        // Not refusals: a malformed body, no key.
+        let mut bad = submit_body("b");
+        bad["spec"]["input_b64"] = json!("***");
+        let (status, _) = call(&h.router, "POST", "/jobs", Some(KEY), Some(bad)).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        let (status, _) = call(&h.router, "POST", "/jobs", None, Some(submit_body("x"))).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        let (_, m) = call(
+            &h.router,
+            "GET",
+            "/metrics?window=15m",
+            Some(READ_KEY),
+            None,
+        )
+        .await;
+        let t = &m["totals"];
+        assert_eq!(
+            (
+                t["accepted"].clone(),
+                t["deduplicated"].clone(),
+                t["refused"].clone()
+            ),
+            (json!(1), json!(2), json!(2)),
+            "{t}"
+        );
+    }
+
+    // --- D-060: the observability reads answer the caller's workspace ----
+
+    const OBS_KEY_A: &str = "dr_0b5a0b5a0b5a0b5a0b5a0b5a0b5a0b5a0b5a0b5a0b5a0b5a";
+    const OBS_READ_A: &str = "dr_0b5e0b5e0b5e0b5e0b5e0b5e0b5e0b5e0b5e0b5e0b5e0b5e";
+    const OBS_KEY_B: &str = "dr_0b5b0b5b0b5b0b5b0b5b0b5b0b5b0b5b0b5b0b5b0b5b0b5b";
+
+    /// Two tenant workspaces beside workspace 0, each with `step`; A also
+    /// has `a-only`. Runs to done: A two, B one, workspace 0 one (the env
+    /// key's). Returns the harness and each workspace's run ids.
+    async fn observed_tenants() -> (Harness, Vec<String>, Vec<String>, Vec<String>) {
+        use durable_accounts::Memory;
+        let store = Arc::new(Memory::new());
+        let a = store
+            .create_workspace("obs-a")
+            .await
+            .unwrap_or_else(|e| panic!("a: {e}"));
+        let b = store
+            .create_workspace("obs-b")
+            .await
+            .unwrap_or_else(|e| panic!("b: {e}"));
+        for (ws, key, perm) in [
+            (a.id, OBS_KEY_A, Permission::Write),
+            (a.id, OBS_READ_A, Permission::Read),
+            (b.id, OBS_KEY_B, Permission::Write),
+        ] {
+            store
+                .create_key(ws, "k", perm, &sha256(key.as_bytes()), &key[..6])
+                .await
+                .unwrap_or_else(|e| panic!("key: {e}"));
+        }
+        let h = harness_store(false, None, Some(store.clone()));
+        register_step(&store, a.id, &h.app.engine).await;
+        register_step(&store, b.id, &h.app.engine).await;
+        h.app
+            .engine
+            .put_handler(a.id, "a-only", Arc::new(Echo))
+            .await
+            .unwrap_or_else(|e| panic!("{e}"));
+        let mut ids = Vec::new();
+        for (key, n) in [(OBS_KEY_A, 2), (OBS_KEY_B, 1), (KEY, 1)] {
+            let mut mine = Vec::new();
+            for i in 0..n {
+                let (status, v) = call(
+                    &h.router,
+                    "POST",
+                    "/jobs",
+                    Some(key),
+                    Some(submit_body(&format!("obs-{i}"))),
+                )
+                .await;
+                assert_eq!(status, StatusCode::OK, "{v}");
+                let id = v["run_id"].as_str().unwrap_or_else(|| panic!("{v}"));
+                mine.push(id.to_string());
+            }
+            for id in &mine {
+                until_state_as(&h.router, key, id, "done").await;
+            }
+            ids.push(mine);
+        }
+        let ws0 = ids.pop().unwrap_or_default();
+        let b_ids = ids.pop().unwrap_or_default();
+        let a_ids = ids.pop().unwrap_or_default();
+        (h, a_ids, b_ids, ws0)
+    }
+
+    /// `until_state` with a tenant's key and the opaque id.
+    async fn until_state_as(router: &Router, key: &str, id: &str, want: &str) {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        while tokio::time::Instant::now() < deadline {
+            let (_, v) = call(router, "GET", &format!("/jobs/{id}"), Some(key), None).await;
+            if v["state"] == want {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        panic!("run {id} never reached {want}");
+    }
+
+    /// D-060: a tenant key's `/metrics` is its own workspace's — counters,
+    /// latencies, states and handler stats; another tenant's (and the
+    /// totals) never show. A workspace-0 key keeps the global view, with
+    /// workspace 0's handlers.
+    #[tokio::test]
+    async fn metrics_answer_only_the_callers_workspace() {
+        let (h, _, _, _) = observed_tenants().await;
+        let m = |key: &'static str| {
+            let r = h.router.clone();
+            async move {
+                let (status, v) = call(&r, "GET", "/metrics?window=15m", Some(key), None).await;
+                assert_eq!(status, StatusCode::OK, "{v}");
+                v
+            }
+        };
+        let names = |v: &Value| -> Vec<String> {
+            v["handlers"]
+                .as_array()
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|x| x["name"].as_str().map(String::from))
+                        .collect()
+                })
+                .unwrap_or_default()
+        };
+        let calls = |v: &Value, name: &str| {
+            v["handlers"]
+                .as_array()
+                .and_then(|a| a.iter().find(|x| x["name"] == name))
+                .map(|x| x["calls"].clone())
+                .unwrap_or(Value::Null)
+        };
+        let (a, ar, b, ops) = (
+            m(OBS_KEY_A).await,
+            m(OBS_READ_A).await,
+            m(OBS_KEY_B).await,
+            m(KEY).await,
+        );
+        let t = |v: &Value| {
+            (
+                v["totals"]["accepted"].clone(),
+                v["totals"]["completed"].clone(),
+                v["states"]["done"].clone(),
+            )
+        };
+        // DECISIVE(obs-metrics-scope)
+        assert_eq!(t(&a), (json!(2), json!(2), json!(2)), "A: {a}");
+        assert_eq!(t(&ar), t(&a), "A's read key sees A's view, not more");
+        assert_eq!(t(&b), (json!(1), json!(1), json!(1)), "B: {b}");
+        assert_eq!(t(&ops), (json!(4), json!(4), json!(4)), "ops: {ops}");
+        // Handlers: each workspace lists its own registrations only.
+        assert_eq!(names(&a), ["a-only", "step"]);
+        assert_eq!(names(&b), ["step"], "B never learns A's handler names");
+        assert_eq!(
+            names(&ops),
+            ["secret", "step"],
+            "the operator's: workspace 0's"
+        );
+        // DECISIVE(obs-call-scope)
+        assert_eq!(calls(&a, "step"), json!(2));
+        assert_eq!(calls(&b, "step"), json!(1), "B's step is not A's step");
+        assert_eq!(calls(&ops, "step"), json!(1), "workspace 0's step");
+        // The gauge series and the points carry no other tenant's numbers.
+        let accepted_in_points = |v: &Value| -> u64 {
+            v["points"]
+                .as_array()
+                .map(|p| p.iter().filter_map(|x| x["accepted"].as_u64()).sum())
+                .unwrap_or(0)
+        };
+        assert_eq!(accepted_in_points(&b), 1);
+        assert_eq!(accepted_in_points(&a), 2);
+    }
+
+    /// D-060: `GET /jobs/{id}/events` for another workspace's run is the
+    /// same 404 a missing run gets — for a tenant key and for the
+    /// workspace-0 env key alike, exactly like `GET /jobs/{id}`.
+    #[tokio::test]
+    async fn run_events_answer_only_the_callers_workspace() {
+        let (h, a_ids, b_ids, ws0) = observed_tenants().await;
+        let get = |key: &'static str, id: String| {
+            let r = h.router.clone();
+            async move { call(&r, "GET", &format!("/jobs/{id}/events"), Some(key), None).await }
+        };
+        let (status, v) = get(OBS_KEY_A, a_ids[0].clone()).await;
+        assert_eq!(status, StatusCode::OK, "{v}");
+        assert_eq!(v["run"], json!(a_ids[0]), "the opaque id, never a number");
+        assert_eq!(v["events"][0]["kind"], "accepted");
+        let (missing_status, missing) = get(OBS_KEY_B, "AAAAAAAAAAA".into()).await;
+        assert_eq!(missing_status, StatusCode::NOT_FOUND);
+        for (key, foreign) in [
+            (OBS_KEY_B, a_ids[0].clone()),
+            (OBS_READ_A, b_ids[0].clone()),
+            (OBS_KEY_A, ws0[0].clone()),
+            (KEY, a_ids[1].clone()),
+            (KEY, b_ids[0].clone()),
+        ] {
+            let (status, v) = get(key, foreign.clone()).await;
+            // DECISIVE(obs-run-scope)
+            assert_eq!(
+                (status, &v),
+                (StatusCode::NOT_FOUND, &missing),
+                "{key} reading {foreign}: identical to a missing run"
+            );
+            let (inspect, _) = call(
+                &h.router,
+                "GET",
+                &format!("/jobs/{foreign}"),
+                Some(key),
+                None,
+            )
+            .await;
+            assert_eq!(
+                inspect,
+                StatusCode::NOT_FOUND,
+                "exactly like GET /jobs/{{id}}"
+            );
+        }
+    }
+
+    /// D-060: `GET /events` is the caller's workspace's feed: every event
+    /// is one of its own runs, by opaque id; none of another workspace's.
+    #[tokio::test]
+    async fn the_feed_answers_only_the_callers_workspace() {
+        let (h, a_ids, b_ids, ws0) = observed_tenants().await;
+        let runs = |key: &'static str| {
+            let r = h.router.clone();
+            async move {
+                let (status, v) = call(&r, "GET", "/events?limit=200", Some(key), None).await;
+                assert_eq!(status, StatusCode::OK, "{v}");
+                let mut ids: Vec<String> = v["events"]
+                    .as_array()
+                    .map(|e| {
+                        e.iter()
+                            .map(|x| {
+                                x["run"]
+                                    .as_str()
+                                    .unwrap_or_else(|| panic!("an opaque string id: {x}"))
+                                    .to_string()
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                ids.sort();
+                ids.dedup();
+                ids
+            }
+        };
+        let sorted = |mut v: Vec<String>| {
+            v.sort();
+            v
+        };
+        // DECISIVE(obs-feed-scope)
+        assert_eq!(runs(OBS_KEY_A).await, sorted(a_ids.clone()));
+        assert_eq!(runs(OBS_READ_A).await, sorted(a_ids));
+        assert_eq!(runs(OBS_KEY_B).await, sorted(b_ids));
+        assert_eq!(runs(KEY).await, sorted(ws0), "env keys: workspace 0's only");
+    }
+
+    /// White-hat finding B: behind Caddy every TCP peer is the loopback
+    /// hop, so the deploy trusts 127.0.0.1/32 and ::1/128 as the proxy
+    /// (deploy/durable-run.sh) and Caddy overwrites `CF-Connecting-IP`
+    /// with the client it resolved. Then each visitor gets its own bucket
+    /// (IPv6 by /64), a header from an untrusted peer is ignored, and a
+    /// dual-stack listener — which sees `::ffff:127.0.0.1` — still trusts
+    /// the hop. One token per 1000 s makes every refusal deterministic.
+    #[tokio::test]
+    async fn visitors_behind_the_loopback_proxy_hop_get_their_own_buckets() {
+        let hop = |nets: &[&str]| HttpLimits {
+            rate_per_addr: 0.001,
+            trusted_proxies: TrustedProxies(
+                nets.iter()
+                    .map(|n| IpNet::parse(n).unwrap_or_else(|e| panic!("{e}")))
+                    .collect(),
+            ),
+            ..HttpLimits::default()
+        };
+        let client = reqwest::Client::new();
+        let get = |base: String, visitor: &'static str| {
+            let c = client.clone();
+            async move {
+                c.get(format!("{base}/health"))
+                    .header("cf-connecting-ip", visitor)
+                    .send()
+                    .await
+                    .unwrap_or_else(|e| panic!("{e}"))
+                    .status()
+                    .as_u16()
+            }
+        };
+        // The deploy's trust: the loopback hop, both families.
+        let (addr, _stop, _h) = serving(hop(&["127.0.0.1/32", "::1/128"])).await;
+        let base = format!("http://{addr}");
+        for (visitor, want) in [
+            ("198.51.100.1", 200),
+            ("198.51.100.1", 429), // its own bucket is spent…
+            ("198.51.100.2", 200), // …another visitor's is not
+            ("2001:db8:1:1::1", 200),
+            ("2001:db8:1:1::2", 429), // the same /64: one bucket
+            // (another /64 in the same /48 is charged to the /48's
+            // aggregate too — the F3 bound — so the next visitor is a
+            // different /48)
+            ("2001:db8:2::1", 200),
+            ("::ffff:198.51.100.3", 200),
+            ("198.51.100.3", 429), // a mapped form is the same IPv4 client
+        ] {
+            assert_eq!(get(base.clone(), visitor).await, want, "{visitor}");
+        }
+        // A peer outside the trusted hop: its header is ignored, so every
+        // "visitor" it claims shares the peer's one bucket.
+        let (addr, _stop2, _h2) = serving(hop(&["::1/128"])).await;
+        let base = format!("http://{addr}");
+        assert_eq!(get(base.clone(), "198.51.100.10").await, 200);
+        assert_eq!(
+            get(base.clone(), "198.51.100.11").await,
+            429,
+            "spoofed header believed"
+        );
+        // Dual-stack: the IPv4 hop arrives as ::ffff:127.0.0.1 and must
+        // still be the trusted 127.0.0.1.
+        let (addr, _stop3, _h3) = serving_on(hop(&["127.0.0.1/32"]), "[::]:0").await;
+        let base = format!("http://127.0.0.1:{}", addr.port());
+        assert_eq!(get(base.clone(), "198.51.100.20").await, 200);
+        // DECISIVE(peer-canonical)
+        assert_eq!(
+            get(base.clone(), "198.51.100.21").await,
+            200,
+            "a dual-stack listener must canonicalize the mapped peer"
+        );
+    }
+
+    /// A submit refused 429 by the per-address limit counts as refused; a
+    /// limited read does not.
+    #[tokio::test]
+    async fn a_rate_limited_submit_counts_as_refused() {
+        // One request, then one token per 1000 s: deterministic refusals.
+        let limits = HttpLimits {
+            rate_per_addr: 0.001,
+            ..HttpLimits::default()
+        };
+        let (addr, _stop, h) = serving(limits).await;
+        let client = reqwest::Client::new();
+        let post = || {
+            client
+                .post(format!("http://{addr}/jobs"))
+                .bearer_auth(KEY)
+                .json(&submit_body("rl"))
+                .send()
+        };
+        let first = post().await.unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(first.status().as_u16(), 200);
+        let second = post().await.unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(second.status().as_u16(), 429);
+        let read = client
+            .get(format!("http://{addr}/health"))
+            .send()
+            .await
+            .unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(read.status().as_u16(), 429);
+        let m = h.obs.metrics(
+            observe::Scope::All,
+            Window::M15,
+            observe::wall_ms(),
+            Default::default(),
+            &[],
+        );
+        assert_eq!(m.totals.counters.refused, 1);
     }
 
     async fn call(
@@ -6615,6 +8026,7 @@ mod tests {
             !ids.contains(&run_a),
             "B's list must not show A's run: {ids:?}"
         );
+        // DECISIVE(list-scope)
         assert_eq!(ids.len(), 1, "B sees exactly its own run");
 
         // A sees A.
@@ -7320,6 +8732,125 @@ mod tests {
         assert_eq!(epoch() - e0, 3, "PUT + DELETE + rotate each bump once");
     }
 
+    /// A strict app over a Memory store holding one tenant whose store rows
+    /// were planted directly (no route check): `evil` names a local
+    /// target, `good` a public one. Returns the app, the router, the
+    /// tenant's key and its workspace.
+    async fn planted_rows_app() -> (
+        App,
+        Router,
+        &'static str,
+        durable_accounts::Workspace,
+        tempfile::TempDir,
+    ) {
+        use durable_accounts::Memory;
+        let store = Arc::new(Memory::new());
+        let a = store
+            .create_workspace("planted")
+            .await
+            .unwrap_or_else(|e| panic!("{e}"));
+        let key = "dr_9ab19ab19ab19ab19ab19ab19ab19ab19ab19ab19ab19ab1";
+        store
+            .create_key(
+                a.id,
+                "k",
+                Permission::Write,
+                &sha256(key.as_bytes()),
+                "dr_9",
+            )
+            .await
+            .unwrap_or_else(|e| panic!("{e}"));
+        for (name, url) in [
+            ("evil", "http://127.0.0.1:9/h"),
+            ("good", "http://8.8.8.8/h"),
+        ] {
+            store
+                .put_handler(a.id, name, url)
+                .await
+                .unwrap_or_else(|e| panic!("{e}"));
+        }
+        let journal = tempfile::tempdir().unwrap_or_else(|e| panic!("{e}"));
+        let engine = spawn(
+            journal.path(),
+            Registry::default(),
+            ShellConfig {
+                tick_ms: 5,
+                ..Default::default()
+            },
+        )
+        .unwrap_or_else(|e| panic!("{e}"));
+        let keyring = Arc::new(Keyring::new(ApiKey::new(KEY), None, Some(store)));
+        // The shipped store policy: strict.
+        let app = test_app(engine, keyring, false, None, journal.path(), false);
+        (app.clone(), router(app, None), key, a, journal)
+    }
+
+    /// Submit `handler` as the tenant (a far `not_before`: admission only).
+    async fn admits(r: &Router, key: &str, handler: &str) -> StatusCode {
+        let mut b = submit_body(&format!("admit-{handler}"));
+        b["spec"]["steps"][0]["handler"] = json!(handler);
+        b["not_before"] = json!(9_999_999_999_999u64);
+        call(r, "POST", "/jobs", Some(key), Some(b)).await.0
+    }
+
+    /// Re-review #10: the reconcile pass re-checks every stored URL — a
+    /// row planted past the route (a direct store edit, another build)
+    /// never arms; a public row does.
+    #[tokio::test]
+    async fn reconcile_never_arms_a_planted_local_row() {
+        let (app, r, key, _ws, _j) = planted_rows_app().await;
+        registry_sync(
+            &app.keyring.store.clone().unwrap_or_else(|| panic!("store")),
+            &app.engine,
+            &app.handler_factory,
+            &app.flag_handlers,
+            &app.registry_tx,
+            &app.registry_epoch,
+            &app.registry_locks,
+            &app.registry,
+        )
+        .await
+        .unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(admits(&r, key, "good").await, StatusCode::OK, "control");
+        // DECISIVE(reconcile-recheck)
+        assert_eq!(
+            admits(&r, key, "evil").await,
+            StatusCode::CONFLICT,
+            "a planted local row was armed by the reconcile pass"
+        );
+    }
+
+    /// Re-review #10: the startup snapshot is re-checked the same way —
+    /// handlers.json may come from another build or an offline edit.
+    #[tokio::test]
+    async fn the_startup_snapshot_never_arms_a_planted_local_row() {
+        let (app, r, key, ws, _j) = planted_rows_app().await;
+        let secret = Some(hex(&ws.handler_secret));
+        let entry = |name: &str, url: &str| RegistryEntry {
+            ws: ws.id,
+            name: name.to_string(),
+            url: url.to_string(),
+            secret: secret.clone(),
+        };
+        let armed = arm_snapshot(
+            vec![
+                entry("evil", "http://169.254.169.254/latest"),
+                entry("good", "http://8.8.8.8/h"),
+            ],
+            &app.handler_factory,
+            &app.engine,
+        )
+        .await;
+        assert_eq!(admits(&r, key, "good").await, StatusCode::OK, "control");
+        // DECISIVE(startup-recheck)
+        assert_eq!(
+            admits(&r, key, "evil").await,
+            StatusCode::CONFLICT,
+            "a planted local snapshot row was armed at startup"
+        );
+        assert_eq!(armed.len(), 1);
+    }
+
     /// The reconciler's outage path: with the store down the engine keeps
     /// the last-known-good set — submits still admit and diagnostics says
     /// `registry_stale` (the loop sets the flag on the same error).
@@ -7361,6 +8892,7 @@ mod tests {
             &h.app.registry_tx,
             &h.app.registry_epoch,
             &h.app.registry_locks,
+            &h.app.registry,
         )
         .await
         .unwrap_or_else(|e| panic!("{e}"));
@@ -7392,6 +8924,7 @@ mod tests {
                 &h.app.registry_tx,
                 &h.app.registry_epoch,
                 &h.app.registry_locks,
+                &h.app.registry,
             )
             .await
             .is_err(),
@@ -7714,6 +9247,461 @@ mod tests {
         }
     }
 
+    /// A `Memory` store that counts the registry's store work.
+    struct CountStore {
+        inner: Arc<durable_accounts::Memory>,
+        registry_calls: std::sync::atomic::AtomicU64,
+    }
+
+    impl CountStore {
+        fn bump(&self) {
+            self.registry_calls
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+        fn calls(&self) -> u64 {
+            self.registry_calls
+                .load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl AccountStore for CountStore {
+        async fn verify_key(&self, h: &[u8; 32]) -> Result<Option<KeyGrant>, AccountError> {
+            self.inner.verify_key(h).await
+        }
+        async fn workspace_by_id(&self, id: u64) -> Result<Option<Workspace>, AccountError> {
+            self.bump();
+            self.inner.workspace_by_id(id).await
+        }
+        async fn workspace_by_public_id(
+            &self,
+            public_id: uuid::Uuid,
+        ) -> Result<Option<Workspace>, AccountError> {
+            self.inner.workspace_by_public_id(public_id).await
+        }
+        async fn create_workspace(&self, name: &str) -> Result<Workspace, AccountError> {
+            self.inner.create_workspace(name).await
+        }
+        async fn list_workspaces(
+            &self,
+            limit: u32,
+            after: Option<u64>,
+        ) -> Result<Vec<Workspace>, AccountError> {
+            self.inner.list_workspaces(limit, after).await
+        }
+        async fn create_key(
+            &self,
+            workspace: u64,
+            name: &str,
+            permission: Permission,
+            key_hash: &[u8; 32],
+            prefix: &str,
+        ) -> Result<ApiKeyInfo, AccountError> {
+            self.inner
+                .create_key(workspace, name, permission, key_hash, prefix)
+                .await
+        }
+        async fn revoke_key(
+            &self,
+            workspace: u64,
+            key_id: u64,
+        ) -> Result<Option<[u8; 32]>, AccountError> {
+            self.inner.revoke_key(workspace, key_id).await
+        }
+        async fn list_keys(&self, workspace: u64) -> Result<Vec<ApiKeyInfo>, AccountError> {
+            self.inner.list_keys(workspace).await
+        }
+        async fn list_handlers(
+            &self,
+            workspace: u64,
+        ) -> Result<Vec<HandlerRegistration>, AccountError> {
+            self.bump();
+            self.inner.list_handlers(workspace).await
+        }
+        async fn put_handler(
+            &self,
+            workspace: u64,
+            name: &str,
+            url: &str,
+        ) -> Result<(), AccountError> {
+            self.bump();
+            self.inner.put_handler(workspace, name, url).await
+        }
+        async fn delete_handler(&self, workspace: u64, name: &str) -> Result<bool, AccountError> {
+            self.bump();
+            self.inner.delete_handler(workspace, name).await
+        }
+        async fn rotate_handler_secret(
+            &self,
+            workspace: u64,
+        ) -> Result<Option<[u8; 32]>, AccountError> {
+            self.bump();
+            self.inner.rotate_handler_secret(workspace).await
+        }
+        async fn signup(
+            &self,
+            email: &str,
+            password_hash: &str,
+            token_hash: &[u8; 32],
+            token_expires_at_ms: i64,
+            verify_mail: &Mail,
+            notice_mail: &Mail,
+        ) -> Result<SignupOutcome, AccountError> {
+            self.inner
+                .signup(
+                    email,
+                    password_hash,
+                    token_hash,
+                    token_expires_at_ms,
+                    verify_mail,
+                    notice_mail,
+                )
+                .await
+        }
+        async fn account_by_email(
+            &self,
+            email: &str,
+        ) -> Result<Option<durable_accounts::Account>, AccountError> {
+            self.inner.account_by_email(email).await
+        }
+        async fn session_grant(
+            &self,
+            token_hash: &[u8; 32],
+        ) -> Result<Option<SessionGrant>, AccountError> {
+            self.inner.session_grant(token_hash).await
+        }
+        async fn create_session(
+            &self,
+            session: &durable_accounts::NewSession,
+        ) -> Result<(), AccountError> {
+            self.inner.create_session(session).await
+        }
+        async fn revoke_session(&self, token_hash: &[u8; 32]) -> Result<bool, AccountError> {
+            self.inner.revoke_session(token_hash).await
+        }
+        async fn revoke_sessions_for_account(&self, account: u64) -> Result<(), AccountError> {
+            self.inner.revoke_sessions_for_account(account).await
+        }
+        async fn member_role(
+            &self,
+            account: u64,
+            workspace: u64,
+        ) -> Result<Option<Role>, AccountError> {
+            self.inner.member_role(account, workspace).await
+        }
+        async fn outbox_mark(&self, id: u64, outcome: MailOutcome) -> Result<(), AccountError> {
+            self.inner.outbox_mark(id, outcome).await
+        }
+        async fn sessions_for_account(
+            &self,
+            account: u64,
+            limit: u32,
+        ) -> Result<Vec<durable_accounts::SessionInfo>, AccountError> {
+            self.inner.sessions_for_account(account, limit).await
+        }
+        async fn revoke_session_public(
+            &self,
+            account: u64,
+            public_id: uuid::Uuid,
+        ) -> Result<Option<[u8; 32]>, AccountError> {
+            self.inner.revoke_session_public(account, public_id).await
+        }
+        async fn revoke_sessions_except(
+            &self,
+            account: u64,
+            keep_public_id: uuid::Uuid,
+        ) -> Result<u64, AccountError> {
+            self.inner
+                .revoke_sessions_except(account, keep_public_id)
+                .await
+        }
+        async fn change_password(
+            &self,
+            account: u64,
+            new_password_hash: &str,
+        ) -> Result<(), AccountError> {
+            self.inner.change_password(account, new_password_hash).await
+        }
+        async fn touch_sessions(
+            &self,
+            touches: &[durable_accounts::SessionTouch],
+        ) -> Result<(), AccountError> {
+            self.inner.touch_sessions(touches).await
+        }
+        async fn consume_verify_token(
+            &self,
+            token_hash: &[u8; 32],
+        ) -> Result<Option<durable_accounts::Account>, AccountError> {
+            self.inner.consume_verify_token(token_hash).await
+        }
+        async fn consume_reset_token(
+            &self,
+            token_hash: &[u8; 32],
+            new_password_hash: &str,
+        ) -> Result<Option<durable_accounts::Account>, AccountError> {
+            self.inner
+                .consume_reset_token(token_hash, new_password_hash)
+                .await
+        }
+        async fn issue_reset_token(
+            &self,
+            email: &str,
+            token_hash: &[u8; 32],
+            expires_at_ms: i64,
+            reset_mail: &Mail,
+        ) -> Result<Option<u64>, AccountError> {
+            self.inner
+                .issue_reset_token(email, token_hash, expires_at_ms, reset_mail)
+                .await
+        }
+        async fn reissue_verify(
+            &self,
+            email: &str,
+            token_hash: &[u8; 32],
+            expires_at_ms: i64,
+            verify_mail: &Mail,
+        ) -> Result<Option<u64>, AccountError> {
+            self.inner
+                .reissue_verify(email, token_hash, expires_at_ms, verify_mail)
+                .await
+        }
+        async fn invite_grant(
+            &self,
+            token_hash: &[u8; 32],
+            now_ms: i64,
+        ) -> Result<Option<InviteGrant>, AccountError> {
+            self.inner.invite_grant(token_hash, now_ms).await
+        }
+        async fn enqueue_mail(&self, mail: &Mail) -> Result<Option<u64>, AccountError> {
+            self.inner.enqueue_mail(mail).await
+        }
+        async fn outbox_claim(
+            &self,
+            now_ms: i64,
+            limit: u32,
+            claim_ms: i64,
+        ) -> Result<Vec<OutboxMail>, AccountError> {
+            self.inner.outbox_claim(now_ms, limit, claim_ms).await
+        }
+        async fn outbox_sweep(&self, now_ms: i64) -> Result<u64, AccountError> {
+            self.inner.outbox_sweep(now_ms).await
+        }
+        async fn outbox_purge(&self, now_ms: i64) -> Result<u64, AccountError> {
+            self.inner.outbox_purge(now_ms).await
+        }
+    }
+
+    /// A Memory-backed harness with two tenants, A and B, each with an
+    /// admin key, behind a store that counts registry work.
+    async fn two_tenant_registry() -> (Harness, Arc<CountStore>, &'static str, &'static str) {
+        let inner = Arc::new(durable_accounts::Memory::new());
+        let key_a = "dr_3c13c13c13c13c13c13c13c13c13c13c13c13c13c13c13c1";
+        let key_b = "dr_3c23c23c23c23c23c23c23c23c23c23c23c23c23c23c23c2";
+        for (name, key) in [("ra", key_a), ("rb", key_b)] {
+            let w = inner
+                .create_workspace(name)
+                .await
+                .unwrap_or_else(|e| panic!("{e}"));
+            inner
+                .create_key(
+                    w.id,
+                    "k",
+                    Permission::Write,
+                    &sha256(key.as_bytes()),
+                    "dr_3",
+                )
+                .await
+                .unwrap_or_else(|e| panic!("{e}"));
+        }
+        let store = Arc::new(CountStore {
+            inner,
+            registry_calls: std::sync::atomic::AtomicU64::new(0),
+        });
+        let h = harness_store(true, None, Some(store.clone()));
+        (h, store, key_a, key_b)
+    }
+
+    /// Re-review S2-4: a PUT of exactly what is armed is a no-op — no
+    /// store query, no epoch bump, no file save; a changed URL is not.
+    #[tokio::test]
+    async fn a_noop_put_does_no_store_epoch_or_disk_work() {
+        let (h, store, key_a, _) = two_tenant_registry().await;
+        let put = |url: &'static str| {
+            let r = h.router.clone();
+            async move {
+                call(
+                    &r,
+                    "PUT",
+                    "/handlers/h",
+                    Some(key_a),
+                    Some(json!({ "url": url })),
+                )
+                .await
+            }
+        };
+        let (status, v) = put("http://127.0.0.1:9/a").await;
+        assert_eq!(status, StatusCode::OK, "{v}");
+        let saves = || {
+            h.app
+                .registry
+                .saves
+                .load(std::sync::atomic::Ordering::SeqCst)
+        };
+        let epoch = || {
+            h.app
+                .registry_epoch
+                .load(std::sync::atomic::Ordering::SeqCst)
+        };
+        let (calls0, epoch0, saves0) = (store.calls(), epoch(), saves());
+        assert_eq!(saves0, 1, "the first PUT saved once");
+        for _ in 0..5 {
+            let (status, v) = put("http://127.0.0.1:9/a").await;
+            // DECISIVE(registry-noop-skip)
+            assert_eq!(
+                (status, v["unchanged"].clone()),
+                (StatusCode::OK, json!(true))
+            );
+        }
+        assert_eq!(
+            (store.calls(), epoch(), saves()),
+            (calls0, epoch0, saves0),
+            "a no-op PUT did store, epoch or disk work"
+        );
+        let (status, _) = put("http://127.0.0.1:9/b").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(saves(), saves0 + 1, "a changed URL is saved");
+    }
+
+    /// Re-review S2-4: each workspace's registry mutations are rate
+    /// limited (2/s, burst 20) — past the burst a mutation is 429 with
+    /// Retry-After and no store work; another workspace is unaffected.
+    #[tokio::test]
+    async fn registry_mutations_are_rate_limited_per_workspace() {
+        let (h, store, key_a, key_b) = two_tenant_registry().await;
+        let mut refused = None;
+        for i in 0..100 {
+            let (status, v) = call(
+                &h.router,
+                "PUT",
+                &format!("/handlers/h{i}"),
+                Some(key_a),
+                Some(json!({ "url": format!("http://127.0.0.1:9/{i}") })),
+            )
+            .await;
+            if status != StatusCode::OK {
+                refused = Some((i, status, v["code"].clone()));
+                break;
+            }
+        }
+        // The exact count is the unit test's (an injected clock); here the
+        // clock is real, so tokens may refill while the burst runs.
+        // DECISIVE(registry-rate)
+        assert!(
+            matches!(&refused, Some((i, s, c))
+                if *i >= 20 && *s == StatusCode::TOO_MANY_REQUESTS
+                    && *c == json!("registry_rate_limited")),
+            "the burst is 20, then 429 registry_rate_limited: {refused:?}"
+        );
+        let calls = store.calls();
+        let (status, headers, _) = {
+            let req = Request::builder()
+                .method("DELETE")
+                .uri("/handlers/h0")
+                .header("authorization", format!("Bearer {key_a}"))
+                .body(Body::empty())
+                .unwrap_or_else(|e| panic!("{e}"));
+            let res = h
+                .router
+                .clone()
+                .oneshot(req)
+                .await
+                .unwrap_or_else(|e| panic!("{e}"));
+            (res.status(), res.headers().clone(), ())
+        };
+        assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+        assert!(headers.get(header::RETRY_AFTER).is_some(), "Retry-After");
+        assert_eq!(store.calls(), calls, "a refused mutation did store work");
+        let (status, v) = call(
+            &h.router,
+            "PUT",
+            "/handlers/x",
+            Some(key_b),
+            Some(json!({ "url": "http://127.0.0.1:9/x" })),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "another workspace is unaffected: {v}"
+        );
+    }
+
+    /// The registry limiter's arithmetic on an injected clock: a burst of
+    /// 20, then 2 per second, per workspace; idle full buckets make room
+    /// at the table's cap.
+    #[test]
+    fn the_registry_limiter_is_a_per_workspace_bucket() {
+        let r = RegistryState::default();
+        let t0 = Instant::now();
+        for i in 0..20 {
+            assert!(r.admit(7, t0).is_ok(), "burst {i}");
+        }
+        let wait = r.admit(7, t0).err().unwrap_or_default();
+        assert!(
+            wait > Duration::ZERO && wait <= Duration::from_millis(500),
+            "{wait:?}"
+        );
+        assert!(
+            r.admit(8, t0).is_ok(),
+            "another workspace has its own bucket"
+        );
+        let t1 = t0 + Duration::from_millis(500);
+        assert!(r.admit(7, t1).is_ok(), "one token per 500 ms");
+        assert!(r.admit(7, t1).is_err());
+    }
+
+    /// Re-review S2-4: the writer saves once per batch of queued writes —
+    /// 100 upserts queued before it wakes are one tmp-write and two fsyncs.
+    #[test]
+    fn the_registry_writer_saves_once_per_batch() {
+        let d = tempfile::tempdir().unwrap_or_else(|e| panic!("{e}"));
+        let path = d.path().join("handlers.json");
+        let (tx, rx) = std::sync::mpsc::sync_channel::<RegistryWrite>(512);
+        let mut acks = Vec::new();
+        for i in 0..100u64 {
+            let (ack, rx_ack) = tokio::sync::oneshot::channel();
+            tx.send(RegistryWrite::Upsert {
+                entry: RegistryEntry {
+                    ws: 1,
+                    name: format!("h{i}"),
+                    url: format!("http://example.com/{i}"),
+                    secret: None,
+                },
+                ack,
+            })
+            .unwrap_or_else(|e| panic!("{e}"));
+            acks.push(rx_ack);
+        }
+        drop(tx);
+        let saves = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        registry_writer(
+            path.clone(),
+            Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            rx,
+            Arc::clone(&saves),
+        );
+        // DECISIVE(registry-batch)
+        assert_eq!(
+            saves.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "one save per batch"
+        );
+        assert_eq!(load_registry_file(&path).map(|v| v.len()).ok(), Some(100));
+        for mut a in acks {
+            assert!(matches!(a.try_recv(), Ok(Ok(()))));
+        }
+    }
+
     /// Finding 4 (S2): the epoch bumps *before* the store write, so a
     /// pass that read the new epoch could still list the pre-commit row
     /// — its apply then re-armed a deleted handler in the engine and
@@ -7798,8 +9786,12 @@ mod tests {
             let tx = h.app.registry_tx.clone();
             let epoch = Arc::clone(&h.app.registry_epoch);
             let locks = Arc::clone(&h.app.registry_locks);
+            let view = Arc::clone(&h.app.registry);
             tokio::spawn(async move {
-                registry_sync(&dyn_store, &engine, &factory, &flags, &tx, &epoch, &locks).await
+                registry_sync(
+                    &dyn_store, &engine, &factory, &flags, &tx, &epoch, &locks, &view,
+                )
+                .await
             })
         };
         if held {
@@ -7879,10 +9871,6 @@ mod tests {
             )
             .await
             .unwrap_or_else(|e| panic!("{e}"));
-        store
-            .put_handler(ws.id, "h", "http://127.0.0.1:9/h")
-            .await
-            .unwrap_or_else(|e| panic!("{e}"));
         assert!(
             store
                 .verify_key(&sha256(key.as_bytes()))
@@ -7891,6 +9879,17 @@ mod tests {
                 .is_some(),
             "probe: the store does not see the seeded key"
         );
+        // The row is in the file (the writer skips a write that changes
+        // nothing — re-review S2-4 — so the DELETE must change it).
+        let (status, v) = call(
+            &h.router,
+            "PUT",
+            "/handlers/h",
+            Some(key),
+            Some(json!({ "url": "http://127.0.0.1:9/h" })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{v}");
         // The writer cannot persist: the file's directory refuses writes.
         let dir = h
             .app
@@ -7961,13 +9960,13 @@ mod tests {
         // The strict client — no --allow-local-handlers.
         let url = format!("http://localhost:{port}/step");
         let h = HttpHandler {
-            client: handler_client(false).unwrap_or_else(|e| panic!("{e}")),
+            client: handler_client(&ssrf::Policy::strict()).unwrap_or_else(|e| panic!("{e}")),
             policy_url: reqwest::Url::parse(&url).ok(),
             url,
             timeout: Duration::from_secs(2),
             max_output: 1024,
             secret: None,
-            allow_local: false,
+            policy: ssrf::Policy::strict(),
             pubid: pubid::PubId::ephemeral(),
         };
         let spec = StepSpec {
@@ -7990,13 +9989,13 @@ mod tests {
         // dials — the flag is what fixtures run under.
         let url = format!("http://localhost:{port}/step");
         let open = HttpHandler {
-            client: handler_client(true).unwrap_or_else(|e| panic!("{e}")),
+            client: handler_client(&ssrf::Policy::open()).unwrap_or_else(|e| panic!("{e}")),
             policy_url: reqwest::Url::parse(&url).ok(),
             url,
             timeout: Duration::from_secs(2),
             max_output: 1024,
             secret: None,
-            allow_local: true,
+            policy: ssrf::Policy::open(),
             pubid: pubid::PubId::ephemeral(),
         };
         let call = tokio::spawn(async move { open.execute(&spec, b"hi", "k").await });
@@ -8022,13 +10021,13 @@ mod tests {
         // it: strict policy, literal loopback URL.
         let url = format!("http://{addr}/step");
         let h = HttpHandler {
-            client: handler_client(false).unwrap_or_else(|e| panic!("{e}")),
+            client: handler_client(&ssrf::Policy::strict()).unwrap_or_else(|e| panic!("{e}")),
             policy_url: reqwest::Url::parse(&url).ok(),
             url,
             timeout: Duration::from_secs(2),
             max_output: 1024,
             secret: None,
-            allow_local: false,
+            policy: ssrf::Policy::strict(),
             pubid: pubid::PubId::ephemeral(),
         };
         let spec = StepSpec {
@@ -8036,6 +10035,7 @@ mod tests {
             handler: "h".into(),
         };
         let outcome = h.execute(&spec, b"hi", "k").await;
+        // DECISIVE(call-time-literal)
         assert!(
             matches!(outcome, Outcome::Failed),
             "a literal local target must fail the attempt: {outcome:?}"
@@ -8049,6 +10049,114 @@ mod tests {
             escaped.is_err(),
             "a packet reached a literal local target — the call-time check failed"
         );
+    }
+
+    /// White-hat finding A, end to end: a handler URL naming a
+    /// `--deny-cidr` address (as a literal, and as a name resolving to it)
+    /// or this host's own interface address fails its attempt and probe,
+    /// refuses at registration, and the listener there never sees a
+    /// connection. The same listener answers an open policy — the control
+    /// that makes "no connection" mean the guard, not a dead listener.
+    #[tokio::test]
+    async fn a_denied_or_own_address_gets_no_packet() {
+        use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+        let spec = StepSpec {
+            name: "s".into(),
+            handler: "h".into(),
+        };
+        let factory = |policy: &ssrf::Policy| {
+            HandlerFactory::new(
+                policy.clone(),
+                policy.clone(),
+                Duration::from_secs(2),
+                1024,
+                pubid::PubId::ephemeral(),
+            )
+            .unwrap_or_else(|e| panic!("{e}"))
+        };
+        let quiet = |l: tokio::net::TcpListener| async move {
+            tokio::time::timeout(Duration::from_millis(400), l.accept())
+                .await
+                .is_err()
+        };
+        // 1. --deny-cidr, under --allow-local-handlers: the deny still holds.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .unwrap_or_else(|e| panic!("{e}"));
+        let addr = listener.local_addr().unwrap_or_else(|e| panic!("{e}"));
+        let deny = ssrf::Policy::new(
+            true,
+            Vec::new(),
+            vec![
+                (IpAddr::V4(Ipv4Addr::LOCALHOST), 32),
+                (IpAddr::V6(Ipv6Addr::LOCALHOST), 128),
+            ],
+        );
+        let literal = format!("http://{addr}/step");
+        for url in [
+            literal.clone(),
+            format!("http://localhost:{}/step", addr.port()),
+        ] {
+            let h = factory(&deny).make(&url);
+            let outcome = h.execute(&spec, b"hi", "k").await;
+            // DECISIVE(ssrf-deny-cidr)
+            assert!(matches!(outcome, Outcome::Failed), "{url}: {outcome:?}");
+            assert!(!h.ask(None, "k").await, "{url}: the probe is refused too");
+        }
+        assert!(valid_handler_url(&literal, &deny).is_err());
+        assert!(
+            quiet(listener).await,
+            "a packet reached a --deny-cidr address"
+        );
+        // The control: the open policy reaches a listener there.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .unwrap_or_else(|e| panic!("{e}"));
+        let addr = listener.local_addr().unwrap_or_else(|e| panic!("{e}"));
+        let call = factory(&ssrf::Policy::open()).make(&format!("http://{addr}/step"));
+        let reach = tokio::spawn(async move { call.execute(&spec_of("s"), b"hi", "k").await });
+        let got = tokio::time::timeout(Duration::from_secs(5), listener.accept()).await;
+        assert!(
+            matches!(got, Ok(Ok(_))),
+            "control: the open policy must connect"
+        );
+        reach.abort();
+
+        // 2. This host's own interface address, with the shipped policy.
+        let own = ssrf::host_addresses()
+            .unwrap_or_else(|e| panic!("{e}"))
+            .into_iter()
+            .find(|ip| ip.is_ipv4() && !ip.is_loopback());
+        let Some(own) = own else {
+            eprintln!(
+                "NOTICE: no non-loopback IPv4 interface address here; the own-address \
+                 path is proved by ssrf::tests::the_hosts_own_addresses_are_refused_by_both_layers"
+            );
+            return;
+        };
+        let listener = tokio::net::TcpListener::bind((own, 0))
+            .await
+            .unwrap_or_else(|e| panic!("{e}"));
+        let addr = listener.local_addr().unwrap_or_else(|e| panic!("{e}"));
+        let shipped = ssrf::Policy::boot(false, Vec::new()).unwrap_or_else(|e| panic!("{e}"));
+        let url = format!("http://{addr}/step");
+        let h = factory(&shipped).make(&url);
+        assert!(matches!(
+            h.execute(&spec, b"hi", "k").await,
+            Outcome::Failed
+        ));
+        assert!(valid_handler_url(&url, &shipped).is_err());
+        assert!(
+            quiet(listener).await,
+            "a packet reached this host's own address {own}"
+        );
+    }
+
+    fn spec_of(name: &str) -> StepSpec {
+        StepSpec {
+            name: name.into(),
+            handler: "h".into(),
+        }
     }
 
     /// S2-5 at registration: without `--allow-local-handlers` a literal
@@ -8587,13 +10695,13 @@ mod tests {
 
     fn http_handler(url: String) -> HttpHandler {
         HttpHandler {
-            client: handler_client(true).unwrap_or_else(|e| panic!("{e}")),
+            client: handler_client(&ssrf::Policy::open()).unwrap_or_else(|e| panic!("{e}")),
             policy_url: reqwest::Url::parse(&url).ok(),
             url,
             secret: None,
             timeout: Duration::from_secs(10),
             max_output: 1024,
-            allow_local: true,
+            policy: ssrf::Policy::open(),
             pubid: pubid::PubId::ephemeral(),
         }
     }
@@ -8749,13 +10857,13 @@ mod tests {
         reg.register(
             "step",
             Arc::new(HttpHandler {
-                client: handler_client(true).unwrap_or_else(|e| panic!("{e}")),
+                client: handler_client(&ssrf::Policy::open()).unwrap_or_else(|e| panic!("{e}")),
                 policy_url: reqwest::Url::parse(&format!("http://{addr}/step")).ok(),
                 url: format!("http://{addr}/step"),
                 timeout: Duration::from_millis(300),
                 max_output: 1024,
                 secret: None,
-                allow_local: true,
+                policy: ssrf::Policy::open(),
                 pubid: pid.clone(),
             }),
         );
@@ -8978,7 +11086,13 @@ mod tests {
             .unwrap_or_else(|e| panic!("{e}"));
         let addr = listener.local_addr().unwrap_or_else(|e| panic!("{e}"));
         let (stop, stopped) = tokio::sync::oneshot::channel();
-        tokio::spawn(serve_http(listener, h.router.clone(), limits, stopped));
+        tokio::spawn(serve_http(
+            listener,
+            h.router.clone(),
+            limits,
+            Some(h.obs.clone()),
+            stopped,
+        ));
         (addr, stop, h)
     }
 
@@ -9183,6 +11297,7 @@ mod tests {
             .await
             .unwrap_or_else(|_| panic!("/health starved behind a pinned connection pool"))
             .unwrap_or_else(|e| panic!("{e}"));
+        // DECISIVE(liveness-flood)
         assert!(
             reply.starts_with(b"HTTP/1.1 200"),
             "{}",
@@ -9438,6 +11553,7 @@ mod tests {
         );
         // Past the deadline, under a still-dry pool, the dead head is
         // evicted first — long before the 60 s header timeout.
+        // DECISIVE(slot-camp)
         assert!(
             closed_within(&mut held, Duration::from_secs(4)).await,
             "a head that never arrived outlived the pressure deadline"
@@ -9530,37 +11646,67 @@ mod tests {
             pressure_head_deadline: Duration::from_secs(60),
             ..lifted_limits()
         };
-        // A dual-stack listener so both loopback families connect: each
-        // source address is its own bucket. 127/8 works on Linux; this
-        // macOS host answers for its 127.0.2.x aliases; ::1 is a fourth
-        // bucket wherever v6 loopback exists.
-        let (addr, _stop, _h) = serving_on(limits, "[::]:0").await;
-        let port = addr.port();
-        let connect_from = |src: std::net::IpAddr| async move {
-            let target = if src.is_ipv4() {
-                std::net::SocketAddr::new(std::net::Ipv4Addr::LOCALHOST.into(), port)
-            } else {
-                std::net::SocketAddr::new(std::net::Ipv6Addr::LOCALHOST.into(), port)
-            };
-            let sock = if src.is_ipv4() {
-                tokio::net::TcpSocket::new_v4().ok()?
-            } else {
-                tokio::net::TcpSocket::new_v6().ok()?
-            };
-            sock.bind(std::net::SocketAddr::new(src, 0)).ok()?;
-            sock.connect(target).await.ok()
-        };
-        let mut addrs = Vec::new();
-        for src in [
+        let (addr, _stop, _h) = serving_on(limits, "0.0.0.0:0").await;
+        // Find at least four distinct local source addresses — each is
+        // its own bucket. 127/8 works on Linux; a macOS host answers for
+        // 127.0.0.1, any lo0 aliases, and its own interface address —
+        // found by asking the kernel which source it would use for a
+        // few destinations (a UDP connect sends no packet; a VPN may own
+        // the default route, so the private ranges are asked too), never
+        // a hard-coded LAN address that changes with the network.
+        let primary = [
+            "192.0.2.1:9",
+            "192.168.0.1:9",
+            "192.168.1.1:9",
+            "10.0.0.1:9",
+            "172.16.0.1:9",
+        ]
+        .into_iter()
+        .filter_map(|dst| {
+            let u = std::net::UdpSocket::bind("0.0.0.0:0").ok()?;
+            u.connect(dst).ok()?;
+            Some(u.local_addr().ok()?.ip().to_string())
+        })
+        .collect::<Vec<_>>();
+        let mut candidates: Vec<String> = [
             "127.0.0.1",
             "127.0.0.2",
             "127.0.0.3",
             "127.0.0.4",
             "127.0.2.2",
             "127.0.2.3",
-            "::1",
-        ] {
-            if let Some(c) = connect_from(src.parse().unwrap_or_else(|_| panic!("{src}"))).await {
+        ]
+        .map(String::from)
+        .to_vec();
+        for a in primary {
+            if !candidates.contains(&a) {
+                candidates.push(a);
+            }
+        }
+        let connect_to = |src: String, dst: std::net::SocketAddr| async move {
+            let local =
+                std::net::SocketAddr::new(src.parse().unwrap_or_else(|_| panic!("{src}")), 0);
+            let sock = tokio::net::TcpSocket::new_v4().ok()?;
+            sock.bind(local).ok()?;
+            // A source the host cannot route from (a VPN tunnel's
+            // address) must not stall the search.
+            tokio::time::timeout(Duration::from_secs(1), sock.connect(dst))
+                .await
+                .ok()?
+                .ok()
+        };
+        let connect_from = |src: String| connect_to(src, addr);
+        // Probe the candidates against a throwaway listener, never the
+        // server under test: a probe conn it is still serving would hold
+        // a slot (or its address's reserve share) when the real conns
+        // arrive, and the scenario below would race it.
+        let scout = tokio::net::TcpListener::bind("0.0.0.0:0")
+            .await
+            .unwrap_or_else(|e| panic!("{e}"));
+        let scout_addr = scout.local_addr().unwrap_or_else(|e| panic!("{e}"));
+        let mut addrs = Vec::new();
+        for src in candidates {
+            if let Some(c) = connect_to(src.clone(), scout_addr).await {
                 drop(c);
                 addrs.push(src);
                 if addrs.len() == 4 {
@@ -9568,6 +11714,7 @@ mod tests {
                 }
             }
         }
+        drop(scout);
         assert!(
             addrs.len() >= 4,
             "need >= 4 distinct local source addresses, found {addrs:?}"
@@ -9606,7 +11753,8 @@ mod tests {
             tokio::time::timeout(Duration::from_secs(5), probe.read_to_end(&mut reply))
                 .await
                 .unwrap_or_else(|_| panic!("{src}: the lane conn got no answer — it was dropped"))
-                .unwrap_or_else(|e| panic!("{e}"));
+                // DECISIVE(overload-lane)
+                .unwrap_or_else(|e| panic!("{src}: the lane conn was reset, not answered: {e}"));
             let text = String::from_utf8_lossy(&reply);
             assert!(
                 text.starts_with("HTTP/1.1 503"),
@@ -11180,6 +13328,7 @@ mod tests {
         // The scoped route answers the tenant's own shape only.
         let (status, v) = call(&h.router, "GET", "/diagnostics", Some(token), None).await;
         assert_eq!(status, StatusCode::OK, "{v}");
+        // DECISIVE(diag-scope)
         assert_eq!(v["live_runs"], json!(1), "{v}");
         assert!(
             v.get("workspaces_active").is_none() && v.get("records_written").is_none(),
@@ -11618,6 +13767,7 @@ mod tests {
             None,
         )
         .await;
+        // DECISIVE(csrf)
         assert_eq!(st, StatusCode::NO_CONTENT);
         let expired = heads
             .get(header::SET_COOKIE)
@@ -11669,6 +13819,7 @@ mod tests {
             "SameSite=Lax",
             "Path=/",
         ] {
+            // DECISIVE(cookie-attrs)
             assert!(set.contains(attr), "Set-Cookie missing {attr}: {set}");
         }
         assert!(!set.contains("Domain"), "__Host- forbids Domain: {set}");
@@ -11682,6 +13833,7 @@ mod tests {
         let pubid = pubid::PubId::ephemeral();
         let key = pubid.derive_key(b"session-token-v1");
         let forged = format!("drs_{}", hex(&[0xabu8; 32]));
+        // DECISIVE(session-forge)
         assert!(
             session_token_hash(&key, &forged).is_none(),
             "a token this process never minted must fail the tag"
@@ -11735,6 +13887,7 @@ mod tests {
                 Some(json!({"email": "a@b.co", "password": "x"})),
             )
             .await;
+            // DECISIVE(csrf-open-post)
             assert_eq!(st, StatusCode::FORBIDDEN, "{bad:?}: {v}");
             assert_eq!(v["code"], "csrf_failed");
         }
@@ -11959,6 +14112,7 @@ mod tests {
         .await;
         assert_eq!(st, StatusCode::OK, "{v}");
         assert_eq!(v["verified"], true);
+        // DECISIVE(verify-sets-cookie)
         assert!(
             heads.get_all(header::SET_COOKIE).iter().next().is_none(),
             "verify must never set a cookie: {heads:?}"
@@ -11994,6 +14148,7 @@ mod tests {
         let (st, _, _) = raw(&h.router, "POST", "/auth/verify", &[], body()).await;
         assert_eq!(st, StatusCode::OK);
         let (st, _, v) = raw(&h.router, "POST", "/auth/verify", &[], body()).await;
+        // DECISIVE(token-replay)
         assert_eq!(st, StatusCode::GONE, "{v}");
         assert_eq!(v["code"], "token_gone");
         // Garbage shaped nothing like a token: same 410, no oracle.
@@ -12034,6 +14189,7 @@ mod tests {
             Some(json!({"token": reset})),
         )
         .await;
+        // DECISIVE(token-kind-confusion)
         assert_eq!(st, StatusCode::GONE, "{v}");
         // And the reset link still works for its own route.
         let (st, _, v) = raw(
@@ -12208,6 +14364,7 @@ mod tests {
         };
         let (st1, _, v1) = forgot("known@k.co").await;
         let (st2, _, v2) = forgot("nobody@nowhere.co").await;
+        // DECISIVE(enumeration)
         assert_eq!((st1, &v1), (st2, &v2), "forgot must not register");
         assert_eq!(st1, StatusCode::ACCEPTED);
         // And the outbox really did differ — a mail went only to the
@@ -12261,6 +14418,7 @@ mod tests {
             Some(b)
         };
         let (st, _, v) = raw(&r, "POST", "/auth/signup", &[], body(None)).await;
+        // DECISIVE(invite-required)
         assert_eq!(st, StatusCode::FORBIDDEN, "{v}");
         assert_eq!(v["code"], "invite_required");
         let (st, _, _) = raw(&r, "POST", "/auth/signup", &[], body(Some("drt_bogus"))).await;
@@ -12321,6 +14479,7 @@ mod tests {
             None,
         )
         .await;
+        // DECISIVE(prereg-takeover)
         assert_eq!(
             st,
             StatusCode::UNAUTHORIZED,
@@ -12354,9 +14513,22 @@ mod tests {
             let (st, _, _) = login("l@l.co", "wrong-passphrase").await;
             assert_eq!(st, StatusCode::UNAUTHORIZED, "attempt {i}");
         }
+        // The ten failures were recorded — the lockout's state, not
+        // its answer (lockout-shape's own decisive line).
+        // DECISIVE(lockout-shape)
+        assert!(
+            !h.app
+                .lockouts
+                .map
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .is_empty(),
+            "the ten failures were recorded"
+        );
         // The 11th cools off — even the right password — and the
         // Retry-After is the lockout's minutes, not the window's ~60 s.
         let (st, heads, v) = login("l@l.co", "a-long-enough-passphrase").await;
+        // DECISIVE(cooloff)
         assert_eq!(st, StatusCode::TOO_MANY_REQUESTS, "{v}");
         assert_eq!(v["code"], "rate_limited");
         let retry: u64 = heads
@@ -12480,6 +14652,7 @@ mod tests {
             "",
         ] {
             let r = store.enqueue_mail(&mail(bad)).await;
+            // DECISIVE(addr-spec-injection)
             assert!(matches!(r, Ok(None)), "{bad:?} must be refused");
         }
         assert!(store.outbox().is_empty(), "nothing enqueued");
@@ -12494,7 +14667,7 @@ mod tests {
     }
 
     /// The drain claims due rows, sends through the Mailer under the
-    /// deadline and marks `sent` — never re-claims a sent row (D-064).
+    /// deadline and marks `sent` — never re-claims a sent row (D-067).
     #[tokio::test]
     async fn s31_outbox_drain_sends() {
         let store = Arc::new(Memory::new());
@@ -12543,6 +14716,7 @@ mod tests {
         let r = router(app.clone(), None);
         signup_only(&r, "cap@c.co", "a-long-enough-passphrase").await;
         let sent = drain_outbox_once(&app).await;
+        // DECISIVE(mail-global)
         assert_eq!(sent, 0, "a zero budget sends nothing");
         let mailer = app
             .mailer
@@ -12584,6 +14758,7 @@ mod tests {
             .enqueue_mail(&mail(3))
             .await
             .unwrap_or_else(|e| panic!("{e}"));
+        // DECISIVE(mail-budget)
         assert_eq!(fourth, None, "the 4th mail inside the hour coalesces");
         assert_eq!(store.outbox().len(), 3);
     }
@@ -12778,6 +14953,7 @@ mod tests {
             None,
         )
         .await;
+        // DECISIVE(session-idor)
         assert_eq!(st, StatusCode::NOT_FOUND, "no cross-account session write");
         let (st, _, _) = raw(
             &h.router,
@@ -13003,6 +15179,7 @@ mod tests {
         );
         // Disuse past that deadline dies — inside the absolute window.
         set_now(t0 + 2 * SESSION_IDLE_MS + 1);
+        // DECISIVE(idle-timeout)
         assert_eq!(probe(&cookie).await, StatusCode::UNAUTHORIZED);
     }
 
@@ -13078,6 +15255,7 @@ mod tests {
             .and_then(|v| v.to_str().ok())
             .map(cookie_header)
             .unwrap_or_else(|| panic!("login mints a cookie: {heads:?}"));
+        // DECISIVE(session-fixation)
         assert_ne!(
             issued,
             format!("{SESSION_COOKIE}={planted}"),
@@ -13158,6 +15336,7 @@ mod tests {
             Some(json!({"token": token, "password": "another-long-passphrase"})),
         )
         .await;
+        // DECISIVE(reset-token-replay)
         assert_eq!(st, StatusCode::GONE, "{v}");
         assert_eq!(v["code"], "token_gone");
     }

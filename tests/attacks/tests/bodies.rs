@@ -25,6 +25,7 @@ async fn status_line(s: &mut TcpStream, within: Duration) -> u16 {
         let n = match timeout(left, s.read_buf(&mut buf)).await {
             Ok(Ok(n)) => n,
             Ok(Err(e)) => panic!("socket read: {e}"),
+            // DECISIVE(body-deadline)
             Err(_) => panic!("no response head within {within:?}"),
         };
         if n == 0 {
@@ -57,6 +58,7 @@ async fn an_oversized_body_is_refused_413() {
         .await
         .unwrap_or_else(|e| panic!("{e}"));
     let (status, code) = code(r).await;
+    // DECISIVE(body-limit)
     assert_eq!((status, code.as_str()), (413, "body_too_large"));
 }
 
@@ -178,6 +180,7 @@ async fn a_partial_head_is_cut() {
     let mut buf = [0u8; 64];
     let n = timeout(Duration::from_secs(10), conn.read(&mut buf))
         .await
+        // DECISIVE(head-timeout)
         .unwrap_or_else(|_| panic!("the server held a stalled head past its deadline"))
         .unwrap_or_else(|e| panic!("{e}"));
     assert_eq!(n, 0, "expected the connection closed (EOF), read {n} bytes");

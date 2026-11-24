@@ -15,7 +15,7 @@
 |---|---|
 | `durable-domain` | Pure state machine: job/step identities, transitions, invalid-state list, limits. No I/O — enforced. |
 | `durable-journal` | Framed append-only store: frame v2 = version, length, sequence, batch length, payload checksum and a header checksum per record (D-032; v1 still read); generation manifest; torn-tail detection that never cuts more than an incomplete final frame; exclusive writer lock. |
-| `durable-engine` | Execution: step claims, per-attempt deadlines, bounded retries with capped jitter, cancellation, effect reconciliation. |
+| `durable-engine` | Execution: step claims, per-attempt deadlines, bounded retries with capped jitter, cancellation, effect reconciliation. `observe`: the bounded, derived observability layer (D-058). |
 | `durable-server` | Axum API + the coordinator loop (pure reducer + fake clock, bounded channels). |
 | `durable-cli` | Submit/inspect/cancel/backup/restore from a shell. |
 | `apps/inspect` | Small SvelteKit inspection UI (read-only views of runs, steps, journal stats). |
@@ -80,6 +80,9 @@ delete every superseded `gen-*` directory (retention). Runs on `POST
 | `GET /handlers` | workspace key | that workspace's handler registry (name → url) |
 | `PUT /handlers/{name} {url}` | workspace admin key | register or update a handler, ≤256 per workspace |
 | `DELETE /handlers/{name}` | workspace admin key | remove a registration |
+| `GET /metrics?window=15m\|1h\|6h\|24h` | any key | metrics ring for the window, totals, state counts, per-handler stats (D-058); a tenant key gets its own workspace's, a workspace-0 key the global view with workspace 0's handlers (D-060) |
+| `GET /jobs/{id}/events` | any key | the caller's run's timeline: commit-order events, `complete`/`reason` (D-058); another workspace's run is 404, like `GET /jobs/{id}` (D-060) |
+| `GET /events?limit=` | any key | the caller's workspace's activity feed, newest first (1-200, default 50; D-058, D-060) |
 | `/inspector/` | static files open; the UI sends its key on every call | SvelteKit UI |
 
 The key is `DURABLE_API_KEY`; the optional `DURABLE_READ_KEY` may only read

@@ -994,44 +994,14 @@ format bump would make the service refuse to start. The rules:
   is part of it because a binary that cannot park ws ≠ 0 runs would
   execute tenant work on workspace 0's name-keyed handlers.
 
-## D-057: account records live in Neon Postgres; the journal stays sole job authority
-
-*(adopted from S2-PLAN, implemented in S2)*
-
-The account graph — workspaces (internal `u64` plus an opaque `public_id`),
-accounts, members, hashed API keys, handler registrations, signing secrets —
-lives in Neon Postgres (sqlx, `sslmode=verify-full`, a bounded pool, a
-deadline on every query). It is consulted at ingress only: dispatch reads
-the in-memory registry and the journal, so a store outage degrades sign-in
-and uncached-key submits (`503 accounts_unavailable`, fail closed) while
-accepted runs keep executing.
-
-SQLite was the honest alternative — zero dependency, no new failure mode —
-and was declined: the graph must survive a droplet loss independently of
-the journal backup so a restored journal can reattach by workspace id, and
-the family standardizes account records on Neon.
-
-Two consequences pinned by the white-hat review and now enforced:
-
-- **Bounded like everything else**: a `dr_`-format pre-check before any
-  store query, a 10k key cache that evicts denials before grants, URL caps,
-  per-workspace in-flight/live/handler quotas, a per-workspace run index,
-  and a store-enforced (not route-enforced) handler bound.
-- **Opaque ids at the boundary**: workspaces expose only `public_id`
-  (UUIDv7); run ids cross the API as a keyed 64-bit permutation
-  (`<journal>/public_id.key`), so no response reveals a sequence or
-  another tenant's volume. Neither id is a journal change.
-
-## D-058: the backup set is one agreed contract across versions
-
-*(D-057 on release/v1.0.2 — same decision, numbered for this branch's sequence)*
+## D-057: the backup set is one agreed contract across versions
 
 The S2 re-review found the branches disagreeing: v1.0.2's file list
-admitted generation paths only while this branch listed `journal.shape`
-and `public_id.key` beside them — so an S2 backup could never restore
-under v1.0.2, breaking the rollback floor for a backup taken after
-upgrade but before the first new-format commit. The agreed contract,
-decided for both branches:
+admitted generation paths only while the workspace branch listed
+`journal.shape` and `public_id.key` beside them — so an S2 backup
+could never restore under v1.0.2, breaking the rollback floor for a
+backup taken after upgrade but before the first new-format commit.
+The agreed contract, decided for both branches:
 
 - **A backup MAY list**: `gen-NNNNNN/{journal.log, snapshot.bin,
   snapshot.json}`, plus the journal-dir flats `journal.shape` and
@@ -1060,3 +1030,231 @@ decided for both branches:
   `public_id.key` lists that key, and a backup listing it is refused
   by v1.0.1's restore, which admits generation paths only — the
   rollback floor for a key-holding backup is this release.
+
+## D-058: observability is derived, in memory and bounded
+
+*(scope and per-workspace bounds amended by D-060)*
+
+Observability is derived, in memory and bounded; the journal stays the
+only authority. The server keeps a metrics ring, per-handler call stats,
+run timelines and an activity feed, fed O(1) per event from the commit
+path, the executor and journal replay. Every structure has a fixed cap. A
+restart rebuilds timelines and the activity feed from replay (journal
+records carry `at`); it does NOT rebuild metrics buckets older than the
+start (they begin at `since`). Compaction or eviction can shorten a run's
+timeline: the API says so (`complete`/`reason`), never invents.
+
+How the engine keeps that rule:
+
+- **Durable before observed.** In the running server the actor holds
+  each record's contribution until the writer reports the fsync that
+  covers it, and hands it over before it releases anything else that
+  fsync covers — so a read that waited for a record finds it, and the
+  observer never shows what a crash could take back (D-014's rule for
+  every other read). The pending queue is bounded by the outbox and the
+  writer's queue.
+- **Derived events.** `finished` (done, failed, cancelled) is emitted
+  with the record that made the run terminal. A checkpoint (or a found
+  reconcile) that moves a run onto its next step is that step's durable
+  dispatch — the engine journals no separate `StepDispatched` for it —
+  so it is shown, and counted, as a `dispatched` event at the same `at`.
+- **No payloads, no keys.** Events carry kinds and small numbers only:
+  never an input, an output or an operation key. The feed's keys are
+  read from the index when it is served, so every event costs a fixed
+  32 bytes; a run that has since left the index (expired seven days
+  after finishing) answers `key: null`.
+- **What replay can know.** The opened snapshot's `next_run` is a
+  watermark: a run below it came from the snapshot, so its history before
+  the snapshot is gone (`compacted`, with whatever came after). A run
+  accepted in the replayed log, or live, has a timeline from its
+  acceptance; one without a timeline was evicted. A live compaction drops
+  nothing from memory, so timelines stay complete until a restart.
+- **Bounds.** 360 × 10 s and 1440 × 60 s buckets; per handler the same
+  two rings (handlers are a static allowlist); 20,000 timelines, LRU on
+  the last event, each at most the first 16 and the last 80 events; a
+  1,000-event feed. Latency percentiles come from a fixed 47-bucket
+  log histogram and are the holding bucket's upper bound capped at the
+  exact maximum (over-reports by at most one bucket width).
+- **Locks.** Short `std::sync::Mutex` sections and atomics, no I/O or
+  await under a lock; a reader copies the window out and aggregates
+  outside the lock; the writer thread never touches the observer. State
+  counts are kept incrementally by the engine (O(1) for `/metrics` and
+  diagnostics alike) and recomputed after replay.
+- **Gauges** (`live_runs`, `active_runs`, `in_flight`) are sampled once a
+  second; the last sample in a bucket wins, so a bucket's gauges are its
+  value within a second of its end, `null` if it was never sampled.
+
+## D-059: account records live in Neon Postgres; the journal stays sole job authority
+
+*(adopted from S2-PLAN, where it was drafted as D-057; renumbered when S2 met
+main, whose released v1.0.2 line had already taken D-057 and D-058)*
+
+The account graph — workspaces (internal `u64` plus an opaque `public_id`),
+accounts, members, hashed API keys, handler registrations, signing secrets —
+lives in Neon Postgres (sqlx, `sslmode=verify-full`, a bounded pool, a
+deadline on every query). It is consulted at ingress only: dispatch reads
+the in-memory registry and the journal, so a store outage degrades sign-in
+and uncached-key submits (`503 accounts_unavailable`, fail closed) while
+accepted runs keep executing.
+
+SQLite was the honest alternative — zero dependency, no new failure mode —
+and was declined: the graph must survive a droplet loss independently of
+the journal backup so a restored journal can reattach by workspace id, and
+the family standardizes account records on Neon.
+
+Two consequences pinned by the white-hat review and now enforced:
+
+- **Bounded like everything else**: a `dr_`-format pre-check before any
+  store query, a 10k key cache that evicts denials before grants, URL caps,
+  per-workspace in-flight/live/handler quotas, a per-workspace run index,
+  and a store-enforced (not route-enforced) handler bound.
+- **Opaque ids at the boundary**: workspaces expose only `public_id`
+  (UUIDv7); run ids cross the API as a keyed 64-bit permutation
+  (`<journal>/public_id.key`), so no response reveals a sequence or
+  another tenant's volume. Neither id is a journal change.
+
+## D-060: observability answers the caller's workspace
+
+*(S2 meets D-058)*
+
+D-058's views were built for one tenant. Under S2 the exit gate is that
+workspace A can never see, cancel or run workspace B's work, and the
+three observability reads are reads of work: they follow the same rule
+as `GET /jobs/{id}`.
+
+- **Run-level views are always scoped.** `GET /jobs/{id}/events` decodes
+  the id like `GET /jobs/{id}` and answers 404 unless the run is the
+  caller's workspace's — the same 404 a missing run gets, for a tenant
+  key and for the workspace-0 env keys alike. `GET /events` is the
+  caller's workspace's own feed: each workspace has its own ring, so a
+  tenant's events can never appear in another's page (and the keys it
+  names are read from the index only for that workspace's runs). Both
+  carry run ids in their opaque public form, never the internal number.
+- **`/metrics` follows the key.** A tenant key, admin or read, gets its
+  workspace's counters, latency histogram, gauges (its live/active runs
+  and its calls in flight), state counts and registered handlers — never
+  another tenant's and never the totals. A workspace-0 key keeps the
+  global view: every workspace's counters, gauges, latency and state
+  counts, with workspace 0's handlers. Workspace 0 is the operator's
+  (D-059: env keys scope to it, workspace management needs it), and in
+  compat mode it is the only workspace, so compat behaves exactly as
+  D-058 shipped. Tenant handler names are not listed in the global view:
+  they are tenant data, and the global view has no per-workspace axis.
+  Submits refused before authentication (the per-address 429) count in
+  the global view only: no workspace is known yet.
+- **Bounds** (re-sized after the re-review's S2-3: 16 tenants thrashed
+  at the 17th — every lookup a miss, ~590 KB allocated and filled per
+  miss, `since` and feeds restarting continuously). The global rings and
+  the 20,000-timeline store are D-058's; workspace 0 keeps D-058's full
+  geometry. Up to 256 tenants (`MAX_TRACKED_WORKSPACES`) are tracked at
+  once, each small: one ring of 288 five-minute buckets (≈ 94 KB; its
+  `/metrics` reports `bucket_ms` 300,000), a 200-event feed (one full
+  page; D-058's 1,000-event global feed is gone), and stats for its 16
+  most recently called handlers in 24 one-hour buckets (≈ 6 KB each;
+  `resolution_ms` says so). Lookups for up to 256 rotating tenants are
+  hash hits. Past 256, eviction is scan-resistant (a tenant seen once goes
+  before one seen again, then the least recent; one-shot tenants cannot
+  flush the active ones) and an evicted entry's rings go to a pool the
+  next entry reuses, so allocations stay bounded; a call in flight holds
+  only its workspace id, never the entry. A read never creates or
+  refreshes an entry. An entry's `since` is its own creation (or the
+  observer's start, for one built by replay); an untracked workspace
+  answers `since` = the read's own time — neither leaks when another
+  tenant was evicted (re-review #6). Memory at every cap: ~110 MiB by
+  `observe::memory_bound` (timelines ~60 MiB, 256 tenant views ~48 MiB,
+  workspace 0, the pools) plus 0.41 MiB per workspace-0 handler; measured
+  RSS growth with everything filled and 10 workspace-0 handlers: 124 MiB
+  against the 114.8 MiB size bound (allocator overhead), so plan ~125 MiB.
+  Measured costs (release, development laptop at load ~14, 2026-11-24 —
+  observations, not capacity): 17 or 256 rotating tenants 154-196 ns per
+  record and ~208 ns per call with no eviction (before: 169 ns → 11.7 µs
+  per record and 471 ns → 22.4 µs per call from the 17th tenant on); 257
+  rotating (every lookup a miss) 3.0 µs per record and 3.2 µs per call
+  with allocations staying at 256 + 256; one tenant rotating 17 handlers
+  449 ns per call (before: 9.7 µs with a 432 KB allocation each).
+- **Cost.** Each committed record also takes its workspace's feed lock
+  and, live, its rings' lock; consecutive records of one workspace share
+  one table lookup; a miss past the cap is O(256) (the victim scan) plus
+  a ring reset. Per-workspace gauges are published by the actor at
+  most once a second (O(tracked workspaces)), never per iteration. The
+  engine's handler registry is now keyed workspace → name, so listing one
+  workspace's handlers for `/metrics` is O(its own registrations).
+- **Residuals, stated.** Timelines share one LRU across workspaces: a
+  tenant churning many runs can push another tenant's timelines out
+  (their views then say `evicted` — never another tenant's data, but an
+  observability-only cross-tenant effect, S3). The global view's counts
+  reveal aggregate volume to workspace-0 keys, which belong to the
+  operator.
+
+Proved by `metrics_answer_only_the_callers_workspace`,
+`run_events_answer_only_the_callers_workspace`,
+`the_feed_answers_only_the_callers_workspace` (server) and
+`a_workspace_view_holds_only_its_own_records`,
+`tracked_workspaces_are_an_lru_with_workspace_0_pinned`,
+`a_tenants_handler_stats_are_capped_lru` (observer), each scoping line
+marked `ATTACK(obs-*)` with a mutation row in `prove-attacks.sh` that
+removes it and requires its test to go red.
+
+## D-061: the host is never a handler; the proxy hop owns the client address
+
+*(two findings of an independent white-hat review of S2 + main)*
+
+**A — the host's own addresses join the SSRF deny set.** The S2-5 guard
+refused the IANA non-global blocks but not the droplet's own public
+addresses, and Linux delivers a connection to a local address over `lo`:
+a handler URL naming the droplet's public IP (or a name resolving to it)
+reached anything listening on 0.0.0.0/[::] — sshd, exporters,
+Docker-published ports, the other products on the shared droplet. Now
+one `ssrf::Policy` value is shared by registration, the call-time
+literal check and the resolver; at boot it holds every interface address
+(getifaddrs through the `if-addrs` crate: the workspace forbids `unsafe`),
+both families, and the operator's `--deny-cidr` ranges. Listing the
+interfaces fails closed: the server does not start. `--allow-local-handlers`
+still opens the local blocks and the host's addresses (fixtures dial
+127.0.0.1); `--deny-cidr` ranges are refused even then. A reserved IP is
+not on any interface, so it is listed by the operator
+(`/etc/durable/deny-cidrs`); interface addresses are read once, at boot.
+The guard decides by address; the deploy guide adds a kernel egress
+firewall for the server's user as the second layer.
+
+**B — the server trusts the loopback hop; Caddy writes the header.**
+Behind Caddy every TCP peer is 127.0.0.1, while the server believed
+`CF-Connecting-IP` only from Cloudflare's ranges — so every visitor
+shared one bucket and `--max-conns-per-addr`-style limits became global.
+The deploy wrapper now trusts 127.0.0.1/32 and ::1/128 for a loopback
+listener, and Caddy (which alone sees Cloudflare's peers) resolves the
+client from `CF-Connecting-IP` and overwrites the header with it. Not a
+server default: a loopback-trusting default would let any local client
+choose its bucket (the attack suite's spoof proof runs on loopback), and
+the trust belongs where the proxy is configured. The server also
+canonicalizes peers (`::ffff:a.b.c.d` → `a.b.c.d`), or a dual-stack
+listener would neither trust the IPv4 hop nor key IPv4 clients apart
+(all of them sharing one /64).
+
+Tracked, not built (re-review #8, #9):
+
+- **Interface addresses are read once, at boot.** An address added later
+  (a new interface, a re-attached reserved IP) is not refused until a
+  restart; list such addresses with `--deny-cidr`, or restart.
+- **Behind the proxy, single-host connection fairness does not hold.**
+  Every connection comes from Caddy on loopback, so the connection-level
+  budgets — the ready reserve, the overload lane, the per-address
+  connection cap and fair-share eviction — all key on 127.0.0.1 (the
+  trusted flag raises only the connection cap, not the ready or lane caps:
+  they are passed the same cap twice). On the droplet those budgets bound
+  the server as a whole; per-visitor fairness at the connection level is
+  Caddy's and Cloudflare's job there. Only the per-request rate limit keys
+  each visitor (by the header Caddy writes).
+- **Authenticated Origin Pulls are zone-level with our own CA** (the
+  workspace deploy rule): the global Cloudflare origin-pull CA would admit
+  any Cloudflare zone pointed at the droplet. `deploy/test-proxy-hop.sh`
+  refuses a Caddyfile trusting it; `smoke.sh` checks the installed one.
+
+Proved by `the_hosts_own_addresses_are_refused_by_both_layers`,
+`deny_cidr_ranges_are_refused_even_with_allow_local`,
+`boot_refuses_every_interface_address`, `a_denied_or_own_address_gets_no_packet`
+(a real listener sees no connection; an open-policy control does),
+`visitors_behind_the_loopback_proxy_hop_get_their_own_buckets` and
+`deploy/test-proxy-hop.sh` (with known-bad copies); `ATTACK(ssrf-own-address)`,
+`ATTACK(ssrf-deny-cidr)` and `ATTACK(peer-canonical)` have mutation rows.
+

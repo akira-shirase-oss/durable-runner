@@ -131,7 +131,9 @@ else
   # runs once compaction deleted their records, and every ws-aware writer
   # has stamped a "ws" field on every record since v1.0.1 — so a
   # sidecar-less DRIX ≥ 2 journal can never prove a pre-workspace writer
-  # made it. No sidecar and DRIX ≥ 2 refuses every non-parking binary.
+  # made it. No sidecar and DRIX ≥ 2 refuses every non-parking binary
+  # (the v1.0.2 re-review's ruling; this branch had kept an admit path
+  # that no v1.0.1 journal could ever take).
   if (( sidecar == 0 && ssnap >= 2 )); then
     sws=1
   fi

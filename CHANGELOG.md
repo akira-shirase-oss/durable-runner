@@ -144,7 +144,7 @@ contract + reference verifier ship in `docs/HANDLERS.md`.
   `<journal>/public_id.key` (mode 0600, generated on first boot);
   losing it orphans every public id — never the runs.
 - **Backups carry the journal-dir flats** (`journal.shape`,
-  `public_id.key`), checksummed and owner-only (D-058): a restore
+  `public_id.key`), checksummed and owner-only (D-057): a restore
   keeps the sidecar's forward claims and decodes every public id the
   install issued — without the key they all orphaned to 404. The file
   set is one agreed contract across versions — v1.0.2's restore
@@ -167,6 +167,37 @@ contract + reference verifier ship in `docs/HANDLERS.md`.
   and exact body to the workspace's secret — a tampered body, stale
   timestamp, wrong-secret signature or a signature already seen fails
   the handler's own check (each rejection class regression-tested).
+- **Handler calls can no longer reach this host through its own
+  address** (D-061). The SSRF guard now also refuses every address on
+  the host's interfaces — the droplet's public IPv4 and IPv6 included,
+  which Linux delivers over loopback to anything listening on all
+  addresses — at registration, at call time and inside the resolver.
+  `--deny-cidr ADDR[/PREFIX]` (repeatable; `/etc/durable/deny-cidrs` on
+  the droplet) adds ranges such as a reserved IP, refused even with
+  `--allow-local-handlers`. The server refuses to start if it cannot
+  list its interfaces. The deploy guide adds an nftables egress firewall
+  for the server's user as a second layer.
+- **Visitors behind Caddy are no longer all one rate bucket** (D-061).
+  The server sees only Caddy's loopback connections; `durable-run` now
+  trusts that hop for `CF-Connecting-IP`, and the Caddyfile overwrites
+  the header with the client Caddy resolved from Cloudflare, so the
+  per-address limits key each visitor (IPv6 by /64) and nobody can pick
+  their own bucket. A dual-stack listener's `::ffff:a.b.c.d` peers are
+  treated as the IPv4 clients they are. `smoke.sh` checks both halves.
+
+- **Handler registries can't be churned into the disk** (re-review
+  S2-4): registry changes are limited per workspace (2 per second, burst
+  20, `429 registry_rate_limited`), a `PUT` that changes nothing does no
+  store or disk work, and `handlers.json` is saved once per batch of
+  queued changes.
+- **One IPv6 /48 can't fill the rate-limit table** (re-review S2-2): the
+  /48 aggregate is judged before a /64 bucket exists, a /48 keeps at most
+  256 /64 buckets, refused requests don't keep a bucket alive, and the
+  idle scan runs at most once a second.
+- **`--allow-local-handlers` no longer reaches API-registered handlers**
+  (re-review S1-1): it opens the operator's own `--handler` flags only;
+  every tenant (and workspace 0's API) registration stays under the full
+  SSRF policy. Only a `--features lab` build can open tenant handlers.
 
 ### Load evidence
 
@@ -182,6 +213,43 @@ contract + reference verifier ship in `docs/HANDLERS.md`.
 - `ssrf.rs` overhead test: 200 real resolve+validate passes plus a
   10k-iteration `is_local` scan — the guard costs one OS lookup per new
   connection and nanoseconds per check (keep-alive calls pay nothing).
+
+### Added
+
+- **Observability reads for the dashboard** (D-058), each taking the read
+  key or the API key and answered `Cache-Control: no-store`:
+  `GET /metrics?window=15m|1h|6h|24h` (counters, sampled gauges and
+  step-latency percentiles per 10 s or 60 s bucket, window totals, state
+  counts, per-handler call stats), `GET /jobs/{id}/events` (one run's
+  timeline in commit order, with a derived `finished` event and an honest
+  `complete`/`reason` when compaction, eviction or the per-run cap
+  shortened it), and `GET /events?limit=` (the activity feed across runs,
+  newest first). Everything is derived in memory with fixed caps;
+  timelines and the feed are rebuilt from journal replay at startup,
+  metrics start empty. Nothing shown is ever a job's input, a
+  checkpoint's output, or a record whose fsync has not returned.
+- **The observability reads answer the caller's workspace** (D-060). A
+  tenant key's `/jobs/{id}/events` shows only its own runs (another
+  workspace's run is the same 404 as `GET /jobs/{id}`), its `/events` is
+  its own activity feed, and its `/metrics` carries only its own
+  counters, latencies, gauges, state counts and registered handlers. A
+  workspace-0 key (the operator's env keys) keeps the global `/metrics`,
+  with workspace 0's handlers; its event views show workspace 0's runs.
+  Run ids in both event views are the opaque public ids. Per-workspace
+  views are kept for workspace 0 and up to 256 tenants at once, each
+  small (5-minute buckets over a day, `bucket_ms` 300,000; stats for its
+  16 most recently called handlers in hour buckets, `resolution_ms`);
+  past 256 the least active go first, one-shot tenants before returning
+  ones. Memory at every cap: about 110 MiB by size (~125 MiB measured),
+  plus 0.4 MiB per workspace-0 handler.
+- `durable-cli metrics` and `durable-cli events [--run N]`.
+
+### Changed
+
+- Diagnostics' `states` counts are kept incrementally instead of by a scan
+  of every run per request (same output).
+- The activity feed keeps 200 events per workspace (one full page) instead
+  of 1,000 across runs: no page could ever read past 200.
 
 ## [1.0.2] - 2026-11-20
 

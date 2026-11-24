@@ -102,14 +102,14 @@ try {
         ([rk, ak, t]) => {
           sessionStorage.setItem('durable-read-key', rk);
           sessionStorage.setItem('durable-api-key', ak);
-          localStorage.setItem('durable-theme', t);
-          document.documentElement.dataset.theme = t;
+          localStorage.setItem('theme', t);
         },
         [READ_KEY, API_KEY, theme],
       );
       const page = await ctx.newPage();
+      // the dashboard's routes live in the hash (#/runs); an older build ignores it and shows its one page
       const base = `${API}/inspector/`;
-      await page.goto(base, { waitUntil: 'networkidle' });
+      await page.goto(`${base}#/runs`, { waitUntil: 'networkidle' });
       try { await page.waitForSelector('table tbody tr', { timeout: 10000 }); } catch {}
       const snap = async (name) => {
         const file = `${OUT}/${theme}-${width}-${name}.png`;
@@ -150,14 +150,21 @@ try {
       const views = [
         ['detail', async () => {
           await page.locator('table tbody tr td .link').first().click();
-          await page.waitForSelector('.panel', { timeout: 4000 });
+          await page.waitForSelector(BEFORE_MODE ? '.panel' : '.head-card', { timeout: 4000 });
         }],
         ['submit', async () => {
-          await page.locator('nav.tabs button', { hasText: 'submit' }).click();
+          if (BEFORE_MODE) await page.locator('nav.tabs button', { hasText: 'submit' }).click();
+          else await page.goto(`${base}#/submit`, { waitUntil: 'networkidle' });
         }],
         ['admin', async () => {
-          await page.locator('nav.tabs button', { hasText: 'admin' }).click();
-          await page.waitForSelector('.panel dl', { timeout: 4000 });
+          if (BEFORE_MODE) await page.locator('nav.tabs button', { hasText: 'admin' }).click();
+          else await page.goto(`${base}#/admin`, { waitUntil: 'networkidle' });
+          await page.waitForSelector(BEFORE_MODE ? '.panel dl' : '.tiles', { timeout: 4000 });
+        }],
+        ['overview', async () => {
+          if (BEFORE_MODE) throw new Error('no overview before the dashboard');
+          await page.goto(base, { waitUntil: 'networkidle' });
+          await page.waitForSelector('.kpis', { timeout: 4000 });
         }],
       ];
       for (const [name, go] of views) {

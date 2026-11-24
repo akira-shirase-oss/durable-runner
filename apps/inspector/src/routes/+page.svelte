@@ -1,591 +1,367 @@
 <script lang="ts">
-	import { onMount, onDestroy } from 'svelte';
-	import {
-		listRuns, inspect, spec as fetchSpec, submitJob, cancelRun,
-		diagnostics, compact, backup, health, ready,
-		loadKey, saveKey, forgetKeys,
-		type RunItem, type Spec, type Diag,
-	} from '../lib/api';
-	import { idChWidth } from '../lib/idch';
+	// Overview: the window at a glance. KPI tiles with sparklines, throughput, outcomes, step latency, retries and
+	// lost replies, runs by state now, the live activity feed and the handlers' health, all from GET /metrics and
+	// GET /events, refreshed every 5 s while visible. Against a server without those routes it says so and shows
+	// what the older API can: diagnostics and the latest runs.
+	import Icon from '../lib/Icon.svelte';
+	import ChartCard from '../lib/charts/ChartCard.svelte';
+	import TimeChart, { type ChartSeries } from '../lib/charts/TimeChart.svelte';
+	import ActivityFeed from '../lib/ui/ActivityFeed.svelte';
+	import KpiTile from '../lib/ui/KpiTile.svelte';
+	import Notice from '../lib/ui/Notice.svelte';
+	import StateBars from '../lib/ui/StateBars.svelte';
+	import LegacyOverview from '../lib/ui/LegacyOverview.svelte';
+	import { ApiError, diagnostics, events, metrics } from '../lib/api.ts';
+	import { fmtAgo, fmtApproxMs, fmtClock, fmtCompact, fmtInt, fmtMsTick, fmtPct, fmtRate } from '../lib/format.ts';
+	import { live, poll, Resource } from '../lib/live.svelte.ts';
+	import { column, overviewModel } from '../lib/overview.ts';
+	import { peak, WINDOW_LABEL, type Bin } from '../lib/series.ts';
+	import { session } from '../lib/session.svelte.ts';
 
-	type Tab = 'runs' | 'submit' | 'admin';
-	type Order = 'asc' | 'desc';
+	const metricsRes = new Resource((signal) => metrics(session.readerKey, session.window, signal));
+	poll(metricsRes, () => session.window);
+	const feedRes = new Resource((signal) => events(session.readerKey, 30, signal));
+	poll(feedRes);
+	const diagRes = new Resource((signal) =>
+		session.apiKey ? diagnostics(session.apiKey, signal) : Promise.reject(new ApiError('needs the API key', 401)),
+	);
+	poll(diagRes);
 
-	let tab = $state<Tab>('runs');
-	let theme = $state<'dark' | 'light'>('dark');
-	let readKey = $state('');
-	let apiKey = $state('');
-	let error = $state<string | null>(null);
-	let notice = $state<string | null>(null);
-	let timer: ReturnType<typeof setInterval> | null = null;
-
-	// Header status
-	let alive = $state<boolean | null>(null);
-	let readyNow = $state<{ ready: boolean; code: string | null } | null>(null);
-
-	// Runs tab: paging works in both orders; `trail` walks back toward page 1.
-	let order = $state<Order>('desc');
-	let runs = $state<RunItem[]>([]);
-	let cursor = $state<string | null>(null);
-	let trail = $state<(string | null)[]>([]);
-	let nextCursor = $state<string | null>(null);
-	// The phone layout's id column: widest id on this page, so keys stay
-	// aligned and ids never clip (capture.mjs asserts it).
-	let idCh = $derived(idChWidth(runs.map((r) => r.id)));
-	let detail = $state<RunItem | null>(null);
-	let detailSpec = $state<Spec | null>(null);
-	let detailErr = $state<string | null>(null);
-
-	// Submit tab
-	let opKey = $state('');
-	let steps = $state<{ name: string; handler: string }[]>([{ name: 'only', handler: '' }]);
-	let inputText = $state('');
-	let notBefore = $state('');
-	let lastRun = $state<string | null>(null);
-
-	// Admin tab
-	let diag = $state<Diag | null>(null);
-	let backupName = $state(`backup-${new Date().toISOString().slice(0, 10)}`);
-	let confirming = $state<null | 'compact' | 'backup'>(null);
-
-	function applyTheme(t: 'dark' | 'light') {
-		theme = t;
-		document.documentElement.dataset.theme = t;
-		try { localStorage.setItem('durable-theme', t); } catch { /* cosmetic only */ }
-	}
-
-	async function refreshStatus() {
-		try {
-			await health();
-			alive = true;
-		} catch {
-			alive = false;
-			return;
-		}
-		try {
-			readyNow = await ready();
-		} catch {
-			readyNow = null;
-		}
-	}
-
-	async function refresh() {
-		try {
-			const page = await listRuns(readKey || apiKey, order, cursor);
-			runs = page.runs;
-			nextCursor = (order === 'desc' ? page.next_before : page.next_after) ?? null;
-			error = null;
-		} catch (e) {
-			error = e instanceof Error ? e.message : String(e);
-		}
-	}
-
-	function setOrder(o: Order) {
-		order = o;
-		cursor = null;
-		trail = [];
-		refresh();
-	}
-
-	async function pageForward() {
-		if (nextCursor === null) return;
-		trail = [...trail, cursor];
-		cursor = nextCursor;
-		await refresh();
-	}
-
-	async function pageBack() {
-		if (trail.length === 0) return;
-		cursor = trail.at(-1) ?? null;
-		trail = trail.slice(0, -1);
-		await refresh();
-	}
-
-	async function openDetail(id: string) {
-		detail = null;
-		detailSpec = null;
-		detailErr = null;
-		try {
-			detail = await inspect(readKey || apiKey, id);
-		} catch (e) {
-			detailErr = e instanceof Error ? e.message : String(e);
-		}
-	}
-
-	async function revealSpec() {
-		if (!detail) return;
-		try {
-			detailSpec = (await fetchSpec(apiKey, detail.id)).spec;
-			detailErr = null;
-		} catch (e) {
-			detailErr = e instanceof Error ? e.message : String(e);
-		}
-	}
-
-	async function cancel(id: string) {
-		try {
-			await cancelRun(id, apiKey);
-			notice = `run ${id} cancelled`;
-			await refresh();
-			if (detail?.id === id) await openDetail(id);
-		} catch (e) {
-			error = e instanceof Error ? e.message : String(e);
-		}
-	}
-
-	function cancellable(state: string): boolean {
-		return !state.startsWith('done') && !state.startsWith('failed') && state !== 'cancelled';
-	}
-
-	function b64(s: string): string {
-		return btoa(unescape(encodeURIComponent(s)));
-	}
-
-	async function submit() {
-		try {
-			const body: Parameters<typeof submitJob>[1] = {
-				op_key: opKey,
-				spec: { version: 1, steps: steps.filter((s) => s.name && s.handler), input_b64: b64(inputText) },
-			};
-			if (notBefore) body.not_before = Date.parse(notBefore);
-			const r = await submitJob(apiKey, body);
-			lastRun = r.run_id;
-			notice = `run ${r.run_id} accepted under '${opKey}'`;
-			error = null;
-		} catch (e) {
-			error = e instanceof Error ? e.message : String(e);
-		}
-	}
-
-	async function refreshDiag() {
-		try {
-			diag = await diagnostics(apiKey);
-			error = null;
-		} catch (e) {
-			diag = null;
-			error = e instanceof Error ? e.message : String(e);
-		}
-	}
-
-	async function doCompact() {
-		confirming = null;
-		try {
-			const r = await compact(apiKey);
-			notice = `compacted — journal is now generation ${r.generation}`;
-			error = null;
-		} catch (e) {
-			error = e instanceof Error ? e.message : String(e);
-		}
-	}
-
-	async function doBackup() {
-		confirming = null;
-		try {
-			const r = await backup(apiKey, backupName);
-			notice = `backup '${r.backup}' written under the server's backup root`;
-			error = null;
-		} catch (e) {
-			error = e instanceof Error ? e.message : String(e);
-		}
-	}
-
-	function forget() {
-		forgetKeys();
-		readKey = '';
-		apiKey = '';
-		detail = null;
-		detailSpec = null;
-		diag = null;
-		notice = 'keys forgotten — nothing held for this tab';
-		refresh();
-	}
-
-	function keyBadge(kind: 'read' | 'api'): string {
-		const set = kind === 'read' ? readKey : apiKey;
-		return set ? 'set' : 'not set';
-	}
-
-	onMount(() => {
-		try { theme = (localStorage.getItem('durable-theme') as 'dark' | 'light') || 'dark'; } catch { /* default */ }
-		document.documentElement.dataset.theme = theme;
-		readKey = loadKey('read');
-		apiKey = loadKey('api');
-		refreshStatus();
-		refresh();
-		timer = setInterval(() => {
-			refreshStatus();
-			if (tab === 'runs') refresh();
-		}, 2000);
+	let gridWidth = $state(0);
+	const maxBins = $derived.by(() => {
+		const chart = gridWidth >= 900 ? gridWidth / 2 - 70 : gridWidth - 60;
+		return Math.max(20, Math.min(120, Math.floor(chart / 6)));
 	});
-	onDestroy(() => {
-		if (timer) clearInterval(timer);
+
+	const m = $derived(metricsRes.data);
+	const o = $derived(m ? overviewModel(m, maxBins) : null);
+	const bins = $derived(o?.bins ?? []);
+	const win = $derived(WINDOW_LABEL[session.window]);
+	const per = $derived(o ? `per ${o.binText}` : '');
+
+	const col = (k: keyof Bin) => column(bins, k);
+	// sparklines show finished bins only: the bin in progress is partial and would read as a drop
+	const spark = (k: keyof Bin) => (bins.at(-1)?.partial ? col(k).slice(0, -1) : col(k));
+
+	const throughput: ChartSeries[] = $derived([
+		{ id: 'accepted', label: 'Accepted', color: 'var(--c-chart-1)', kind: 'area', values: col('accepted') },
+		{ id: 'completed', label: 'Completed', color: 'var(--c-chart-ok)', kind: 'area', values: col('completed') },
+	]);
+	const outcomes: ChartSeries[] = $derived([
+		{ id: 'completed', label: 'Completed', color: 'var(--c-chart-ok)', kind: 'bar', values: col('completed') },
+		{ id: 'cancelled', label: 'Cancelled', color: 'var(--c-chart-neutral)', kind: 'bar', values: col('cancelled') },
+		{ id: 'failed', label: 'Failed', color: 'var(--c-chart-fail)', kind: 'bar', values: col('failed') },
+	]);
+	const latency: ChartSeries[] = $derived([
+		{ id: 'p50', label: 'p50', color: 'var(--c-chart-1)', kind: 'line', values: col('p50') },
+		{ id: 'p95', label: 'p95', color: 'var(--c-chart-2)', kind: 'line', values: col('p95') },
+	]);
+	const retries: ChartSeries[] = $derived([
+		{ id: 'failed', label: 'Failed attempts', color: 'var(--c-chart-retry)', kind: 'bar', values: col('steps_failed') },
+		{ id: 'lost', label: 'Lost replies', color: 'var(--c-chart-lost)', kind: 'bar', values: col('replies_lost') },
+	]);
+
+	function busiest(values: (number | null)[], what: string): string {
+		const p = peak(values);
+		if (!p || p.v === 0) return '';
+		return ` Busiest ${o?.binText ?? ''}: ${fmtInt(p.v)} ${what} at ${fmtClock(bins[p.i]!.t, false)}.`;
+	}
+
+	const handlers = $derived(
+		[...(m?.handlers ?? [])].sort((a, b) => b.failed / Math.max(1, b.calls) - a.failed / Math.max(1, a.calls) || b.calls - a.calls).slice(0, 8),
+	);
+	const unsupported = $derived(metricsRes.status === 'unsupported');
+	$effect(() => {
+		if (metricsRes.status === 'ok') session.metricsSupported = true;
+		else if (metricsRes.status === 'unsupported') session.metricsSupported = false;
 	});
 </script>
 
-<main>
-	<header>
-		<h1>durable</h1>
-		<span class="pill" class:ok={alive === true && readyNow?.ready} class:bad={alive === false || readyNow?.ready === false}>
-			{#if alive === null}…
-			{:else if alive === false}server unreachable
-			{:else if readyNow === null}up
-			{:else if readyNow.ready}ready
-			{:else}not ready: {readyNow.code ?? 'starting'}{/if}
-		</span>
-		<nav class="tabs">
-			<button class:active={tab === 'runs'} onclick={() => (tab = 'runs')}>runs</button>
-			<button class:active={tab === 'submit'} onclick={() => (tab = 'submit')}>submit</button>
-			<button class:active={tab === 'admin'} onclick={() => { tab = 'admin'; refreshDiag(); }}>admin</button>
-		</nav>
-		<button class="tool" title="switch theme" onclick={() => applyTheme(theme === 'dark' ? 'light' : 'dark')}>
-			{theme === 'dark' ? 'light' : 'dark'}
-		</button>
-		<button class="tool danger" onclick={forget}>Forget keys</button>
-	</header>
+<div class="page">
+	{#if session.notice}
+		<p class="banner notice"><Icon name="check" size={16} /><span class="msg">{session.notice}</span><button class="btn ghost sm act" onclick={() => (session.notice = null)}>Dismiss</button></p>
+	{/if}
+	{#if !(metricsRes.status === 'needs-key' && !m)}
+		<Notice status={metricsRes.status} error={metricsRes.error} what="Metrics" route="GET /metrics" stale={metricsRes.updatedAt} />
+	{/if}
 
-	<section class="keys">
-		<label>
-			read key <em class="badge" class:set={!!readKey}>{keyBadge('read')}</em>
-			<input type="password" autocomplete="off" placeholder="lists and run detail"
-				bind:value={readKey}
-				onchange={() => { saveKey('read', readKey); refresh(); }} />
-		</label>
-		<label>
-			API key <em class="badge" class:set={!!apiKey}>{keyBadge('api')}</em>
-			<input type="password" autocomplete="off" placeholder="submit, cancel, spec, admin"
-				bind:value={apiKey}
-				onchange={() => saveKey('api', apiKey)} />
-		</label>
-	</section>
-
-	{#if error}<p class="error">{error}</p>{/if}
-	{#if notice}<p class="notice">{notice} <button class="tool" onclick={() => (notice = null)}>dismiss</button></p>{/if}
-
-	{#if tab === 'runs'}
-		{#if !readKey && !apiKey}<p class="hint">reads need a key — enter the read key (or the API key) above</p>{/if}
-		<div class="bar">
-			<span class="hint">order</span>
-			<button class="tool" class:active={order === 'desc'} onclick={() => setOrder('desc')}>newest first</button>
-			<button class="tool" class:active={order === 'asc'} onclick={() => setOrder('asc')}>oldest first</button>
-		</div>
-		{#if runs.length === 0 && !error}
-			<p class="empty">no runs yet</p>
-		{/if}
-		{#if runs.length > 0}
-			<table class="runlist" style:--id-ch="{idCh}ch">
-				<thead><tr><th>id</th><th>key</th><th>state</th><th>steps</th><th>finished</th><th></th></tr></thead>
-				<tbody>
-					{#each runs as r (r.id)}
-						<tr class:selected={detail?.id === r.id}>
-							<td class="id"><button class="link" onclick={() => openDetail(r.id)}>{r.id}</button></td>
-							<td class="key">{r.key}</td>
-							<td class="state" data-state={r.state.split(':')[0]}>{r.state}</td>
-							<td>{r.steps}</td>
-							<td>{r.finished_at ? new Date(r.finished_at).toLocaleTimeString() : '—'}</td>
-							<td>{#if cancellable(r.state)}<button class="danger" onclick={() => cancel(r.id)}>cancel</button>{/if}</td>
-							<td class="meta">
-								{r.state} · {r.steps} {r.steps === 1 ? 'step' : 'steps'} ·
-								{r.finished_at ? new Date(r.finished_at).toLocaleTimeString() : '—'}
-							</td>
-						</tr>
-					{/each}
-				</tbody>
-			</table>
-			<nav class="pager">
-				<button class="tool" onclick={pageBack} disabled={trail.length === 0}>&larr; back</button>
-				<span class="empty">page {trail.length + 1}, {order === 'desc' ? 'newest' : 'oldest'} first</span>
-				<button class="tool" onclick={pageForward} disabled={nextCursor === null}>forward &rarr;</button>
-			</nav>
-		{/if}
-		{#if detailErr}<p class="error">{detailErr}</p>{/if}
-		{#if detail}
-			<section class="panel">
-				<h2>run {detail.id} <button class="tool" onclick={() => { detail = null; detailSpec = null; }}>close</button></h2>
-				<dl>
-					<dt>key</dt><dd class="key">{detail.key}</dd>
-					<dt>state</dt><dd class="state" data-state={detail.state.split(':')[0]}>{detail.state}</dd>
-					<dt>steps</dt><dd>{detail.steps}</dd>
-					<dt>finished</dt><dd>{detail.finished_at ? new Date(detail.finished_at).toLocaleString() : '—'}</dd>
-				</dl>
-				{#if cancellable(detail.state)}<button class="danger" onclick={() => cancel(detail!.id)}>cancel this run</button>{/if}
-				{#if !detailSpec}
-					<button class="tool" disabled={!apiKey} title={apiKey ? '' : 'the spec may carry customer input (D-051) — the API key reveals it'} onclick={revealSpec}>
-						reveal spec{apiKey ? '' : ' — needs the API key'}
-					</button>
-				{:else}
-					<dl>
-						<dt>version</dt><dd>{detailSpec.version}</dd>
-						<dt>steps</dt>
-						<dd>{#each detailSpec.steps as s}<span class="chip">{s.name} → {s.handler}</span> {/each}</dd>
-						<dt>input</dt><dd class="key">{detailSpec.input_b64 || '—'}</dd>
-					</dl>
-				{/if}
-			</section>
-		{/if}
-	{:else if tab === 'submit'}
-		{#if !apiKey}<p class="hint">submitting needs the API key — enter it above</p>{/if}
-		<form class="panel" onsubmit={(e) => { e.preventDefault(); submit(); }}>
-			<label>operation key (idempotency)
-				<input required maxlength="256" bind:value={opKey} placeholder="deploy-2026-11-18" /></label>
-			<fieldset>
-				<legend>steps</legend>
-				{#each steps as s, i}
-					<div class="step-row">
-						<input required placeholder="name" bind:value={s.name} />
-						<input required placeholder="handler" bind:value={s.handler} />
-						<button type="button" class="tool" disabled={steps.length === 1}
-							onclick={() => (steps = steps.filter((_, j) => j !== i))}>remove</button>
-					</div>
-				{/each}
-				<button type="button" class="tool" onclick={() => (steps = [...steps, { name: '', handler: '' }])}>+ step</button>
-			</fieldset>
-			<label>input (sent base64-encoded)
-				<textarea rows="3" bind:value={inputText} placeholder="job input bytes"></textarea></label>
-			<label>not before (optional)
-				<input type="datetime-local" bind:value={notBefore} /></label>
-			<div>
-				<button type="submit" disabled={!apiKey || !opKey || steps.some((s) => !s.name || !s.handler)}>submit</button>
-				{#if lastRun}<span class="notice-inline">last accepted: run {lastRun}</span>{/if}
-			</div>
-		</form>
+	{#if unsupported}
+		<LegacyOverview />
+	{:else if metricsRes.status === 'needs-key' && !m}
+		<section class="card start" aria-labelledby="start-title">
+			<span class="start-icon" aria-hidden="true"><Icon name="key" size={22} /></span>
+			<h2 id="start-title">Add a key to see the dashboard</h2>
+			<p class="hint">
+				The read key shows the overview, runs, timelines and handlers; the API key also submits, cancels and
+				administers. Both stay in this tab only.
+			</p>
+			<a class="btn brand sm" href="#/settings"><Icon name="settings" />Open Settings</a>
+		</section>
 	{:else}
-		{#if !apiKey}<p class="hint">admin operations need the API key — enter it above</p>{/if}
-		<section class="panel">
-			<h2>diagnostics <button class="tool" onclick={refreshDiag} disabled={!apiKey}>refresh</button></h2>
-			{#if diag}
-				<dl>
-					<dt>journal generation</dt><dd>{diag.generation}</dd>
-					<dt>records written</dt><dd>{diag.records_written.toLocaleString()}</dd>
-					<dt>live runs</dt><dd>{diag.live_runs.toLocaleString()}</dd>
-					<dt>active runs</dt><dd>{diag.active_runs.toLocaleString()}</dd>
-					<dt>index bytes</dt><dd>{diag.index_bytes.toLocaleString()}</dd>
-					<dt>dedup keys</dt><dd>{diag.dedup_keys.toLocaleString()}</dd>
-					<dt>disk reserve</dt><dd class={diag.space_ok ? 'state-ok' : 'state-bad'}>{diag.space_ok ? 'ok' : 'below reserve'}</dd>
-				</dl>
-				{#if Object.keys(diag.states).length}
-					<h3>states</h3>
-					<dl>{#each Object.entries(diag.states) as [s, n]}<dt>{s}</dt><dd>{n.toLocaleString()}</dd>{/each}</dl>
-				{/if}
-				{#if Object.keys(diag.errors).length}
-					<h3>errors (counted, never dropped)</h3>
-					<dl>{#each Object.entries(diag.errors) as [s, n]}<dt>{s}</dt><dd>{n.toLocaleString()}</dd>{/each}</dl>
-				{/if}
+		<dl class="kpis" aria-label="Key figures, {win}">
+			<KpiTile
+				label="Live runs"
+				value={fmtCompact(o?.liveRuns)}
+				sub={o?.liveRuns === null ? 'not sampled yet' : 'held in the index'}
+				spark={spark('live_runs')}
+				trend="Live runs over the {win}"
+			/>
+			<KpiTile
+				label="Active runs"
+				value={fmtCompact(o?.activeRuns)}
+				sub={o ? `${fmtInt(o.inFlight)} handler call${o.inFlight === 1 ? '' : 's'} in flight` : ''}
+				spark={spark('active_runs')}
+				trend="Active runs over the {win}"
+			/>
+			<KpiTile
+				label="Completed per min"
+				value={o ? fmtRate(o.completedPerMin).replace('/min', '') : '—'}
+				sub={o ? `${fmtRate(o.acceptedPerMin).replace('/min', '')} accepted per min` : ''}
+				spark={spark('completed')}
+				color="var(--c-chart-ok)"
+				trend="Runs completed {per} over the {win}"
+			/>
+			<KpiTile
+				label="Success rate"
+				value={fmtPct(o?.success)}
+				sub={m ? `${fmtInt(m.totals.failed)} failed of ${fmtInt(m.totals.completed + m.totals.failed)}` : ''}
+				spark={o ? (bins.at(-1)?.partial ? o.successSeries.slice(0, -1) : o.successSeries) : undefined}
+				color="var(--c-chart-ok)"
+				tone={o && o.success !== null && o.success < 0.95 ? 'warn' : undefined}
+				trend="Completed out of completed plus failed, {per}; cancelled runs are not counted"
+			/>
+			<KpiTile
+				label="p95 step latency"
+				value={fmtApproxMs(o?.p95)}
+				sub={o ? `p50 ${fmtApproxMs(o.p50)}` : ''}
+				spark={spark('p95')}
+				color="var(--c-chart-2)"
+				trend="Worst p95 {per} over the {win}"
+			/>
+			{#if diagRes.data}
+				<KpiTile
+					label="Disk reserve"
+					value={diagRes.data.space_ok ? 'OK' : 'Below reserve'}
+					tone={diagRes.data.space_ok ? 'ok' : 'bad'}
+					sub="journal generation {diagRes.data.generation}"
+				>
+					{#snippet icon()}<Icon name="hard-drive" size={18} />{/snippet}
+				</KpiTile>
 			{:else}
-				<p class="empty">no diagnostics yet — refresh above</p>
+				<KpiTile
+					label="Disk reserve"
+					value="—"
+					sub={diagRes.status === 'needs-key' ? 'needs the API key' : diagRes.status === 'error' ? 'diagnostics unavailable' : 'loading…'}
+					href={diagRes.status === 'needs-key' ? '#/settings' : undefined}
+				/>
 			{/if}
-		</section>
-		<section class="panel">
-			<h2>compact the journal</h2>
-			<p class="hint">expires finished runs past retention, snapshots the index, swaps the manifest — all or nothing</p>
-			{#if confirming === 'compact'}
-				<span class="confirm">run compaction now? <button class="danger" onclick={doCompact}>yes, compact</button> <button class="tool" onclick={() => (confirming = null)}>no</button></span>
+		</dl>
+
+		<div class="grid two" bind:clientWidth={gridWidth}>
+			<ChartCard id="throughput" title="Throughput" sub="Runs {per} · {win}" series={throughput} {bins} format={fmtInt}
+				extraColumns={[{ label: 'Deduplicated', values: col('deduplicated') }, { label: 'Refused', values: col('refused') }]}>
+				<TimeChart
+					{bins}
+					since={m?.since ?? null}
+					series={throughput}
+					label="Throughput: runs accepted and completed {per}"
+					summary={m ? `${fmtInt(m.totals.accepted)} runs accepted and ${fmtInt(m.totals.completed)} completed over the ${win}; ${fmtInt(m.totals.deduplicated)} submits deduplicated and ${fmtInt(m.totals.refused)} refused.${busiest(col('accepted'), 'accepted')}` : 'Loading'}
+					loading={metricsRes.loading}
+					empty="No runs accepted or completed in the {win}"
+					extra={(i) => [
+						{ label: 'deduplicated', value: fmtInt(bins[i]?.deduplicated) },
+						{ label: 'refused', value: fmtInt(bins[i]?.refused) },
+					]}
+				/>
+			</ChartCard>
+			<ChartCard id="outcomes" title="Outcomes" sub="Runs finished {per} · {win}" series={outcomes} {bins} format={fmtInt}>
+				<TimeChart
+					{bins}
+					since={m?.since ?? null}
+					series={outcomes}
+					stacked
+					label="Outcomes: runs completed, cancelled and failed {per}"
+					summary={m ? `${fmtInt(m.totals.completed)} completed, ${fmtInt(m.totals.cancelled)} cancelled and ${fmtInt(m.totals.failed)} failed over the ${win}.${busiest(col('failed'), 'failed')}` : 'Loading'}
+					loading={metricsRes.loading}
+					empty="No run finished in the {win}"
+				/>
+			</ChartCard>
+			<ChartCard id="latency" title="Step latency" sub="Dispatch to answer, worst bucket {per} · approximate" series={latency} {bins} format={fmtApproxMs}
+				extraColumns={[{ label: 'max', values: col('max') }]}>
+				<TimeChart
+					{bins}
+					since={m?.since ?? null}
+					series={latency}
+					format={fmtApproxMs}
+					tick={fmtMsTick}
+					label="Step latency: p50 and p95 {per}"
+					summary={o ? `Step latency over the ${win}: p50 ${fmtApproxMs(o.p50)}, p95 ${fmtApproxMs(o.p95)}, max ${fmtApproxMs(o.max)}. Percentiles are histogram bucket bounds, so approximate.` : 'Loading'}
+					loading={metricsRes.loading}
+					empty="No step attempts in the {win}"
+					extra={(i) => [{ label: 'max', value: fmtApproxMs(bins[i]?.max) }]}
+				/>
+			</ChartCard>
+			<ChartCard id="retries" title="Retries and lost replies" sub="Failed attempts and replies lost {per} · {win}" series={retries} {bins} format={fmtInt}
+				extraColumns={[{ label: 'Reconciled', values: col('reconciled') }, { label: 'Dispatched', values: col('dispatched') }]}>
+				<TimeChart
+					{bins}
+					since={m?.since ?? null}
+					series={retries}
+					stacked
+					label="Failed attempts and lost replies {per}"
+					summary={m ? `${fmtInt(m.totals.steps_failed)} failed attempts and ${fmtInt(m.totals.replies_lost)} lost replies over the ${win}; ${fmtInt(m.totals.reconciled)} reconcile probes answered, out of ${fmtInt(m.totals.dispatched)} attempts dispatched.` : 'Loading'}
+					loading={metricsRes.loading}
+					empty="No failed attempts or lost replies in the {win}"
+					extra={(i) => [
+						{ label: 'reconciled', value: fmtInt(bins[i]?.reconciled) },
+						{ label: 'dispatched', value: fmtInt(bins[i]?.dispatched) },
+					]}
+				/>
+			</ChartCard>
+		</div>
+
+		<div class="grid two lower">
+			<section class="card" aria-labelledby="states-title">
+				<div class="card-head">
+					<div>
+						<h2 id="states-title">Runs by state</h2>
+						<p class="sub">Now, across the whole journal</p>
+					</div>
+					<a class="btn ghost sm" href="#/runs">Runs<Icon name="arrow-right" size={14} /></a>
+				</div>
+				<div class="card-body">
+					{#if m}<StateBars states={m.states} />{:else}<p class="empty">{metricsRes.loading ? 'Loading…' : 'Unavailable'}</p>{/if}
+				</div>
+			</section>
+			<section class="card feed-card" aria-labelledby="feed-title">
+				<div class="card-head">
+					<div>
+						<h2 id="feed-title">Activity</h2>
+						<p class="sub">The latest events across runs</p>
+					</div>
+				</div>
+				<div class="card-body feed-body">
+					{#if feedRes.status === 'unsupported' || feedRes.status === 'needs-key' || (feedRes.status === 'error' && !feedRes.data)}
+						<Notice status={feedRes.status} error={feedRes.error} what="The activity feed" route="GET /events" />
+					{:else if feedRes.data}
+						<ActivityFeed events={feedRes.data.events} now={live.now} />
+					{:else}
+						<p class="empty">Loading…</p>
+					{/if}
+				</div>
+			</section>
+		</div>
+
+		<section class="card" aria-labelledby="handlers-title">
+			<div class="card-head ruled">
+				<div>
+					<h2 id="handlers-title">Handlers</h2>
+					<p class="sub">Calls over the {win}, sorted by failure rate</p>
+				</div>
+				<a class="btn ghost sm" href="#/handlers">All handlers<Icon name="arrow-right" size={14} /></a>
+			</div>
+			{#if handlers.length === 0}
+				<p class="empty">{m ? 'No handlers registered' : metricsRes.loading ? 'Loading…' : 'Unavailable'}</p>
 			{:else}
-				<button disabled={!apiKey} onclick={() => (confirming = 'compact')}>compact</button>
-			{/if}
-		</section>
-		<section class="panel">
-			<h2>back up the journal</h2>
-			<p class="hint">copies the journal into a named directory under the server's --backup-root (needs the flag set)</p>
-			<label>backup name <input maxlength="64" pattern="[A-Za-z0-9_.\-]+" bind:value={backupName} /></label>
-			{#if confirming === 'backup'}
-				<span class="confirm">write backup '{backupName}'? <button class="danger" onclick={doBackup}>yes, back up</button> <button class="tool" onclick={() => (confirming = null)}>no</button></span>
-			{:else}
-				<button disabled={!apiKey || !backupName} onclick={() => (confirming = 'backup')}>backup</button>
+				<div class="table-wrap">
+					<table class="data">
+						<thead>
+							<tr>
+								<th scope="col">Handler</th>
+								<th scope="col" class="num">Calls</th>
+								<th scope="col" class="num">Failure</th>
+								<th scope="col" class="num lost-col">Lost replies</th>
+								<th scope="col" class="num">p95 (approx.)</th>
+								<th scope="col" class="last-col">Last failure, since start</th>
+							</tr>
+						</thead>
+						<tbody>
+							{#each handlers as h (h.name)}
+								<tr>
+									<th scope="row" class="mono-cell"><a class="hlink" href="#/handlers">{h.name}</a></th>
+									<td class="num">{fmtInt(h.calls)}</td>
+									<td class="num" class:bad={h.calls > 0 && h.failed / h.calls >= 0.01}>{h.calls ? fmtPct(h.failed / h.calls) : '—'}</td>
+									<td class="num lost-col">{fmtInt(h.replies_lost)}</td>
+									<td class="num">{fmtApproxMs(h.step_ms.p95)}</td>
+									<td class="muted last-col">{h.last_failure_at ? fmtAgo(live.now - h.last_failure_at) : 'none'}</td>
+								</tr>
+							{/each}
+						</tbody>
+					</table>
+				</div>
 			{/if}
 		</section>
 	{/if}
-</main>
+</div>
 
 <style>
-	/* Semantic tokens only — a later shared skin re-themes these names. */
-	:root {
-		--bg: #0d1117;
-		--bg-raised: #161b22;
-		--fg: #c9d1d9;
-		--fg-muted: #8b949e;
-		--border: #30363d;
-		--border-soft: #21262d;
-		--accent: #79c0ff;
-		--ok: #3fb950;
-		--warn: #d29922;
-		--danger: #f85149;
-		--queued: #a371f7;
-		--chip-bg: #21262d;
+	.start {
+		display: flex;
+		flex-direction: column;
+		align-items: flex-start;
+		gap: 10px;
+		padding: 26px 26px 28px;
 	}
-	:root[data-theme='light'] {
-		--bg: #ffffff;
-		--bg-raised: #f6f8fa;
-		--fg: #1f2328;
-		--fg-muted: #59636e;
-		--border: #d1d9e0;
-		--border-soft: #e8ebee;
-		--accent: #0969da;
-		--ok: #1a7f37;
-		--warn: #9a6700;
-		--danger: #d1242f;
-		--queued: #8250df;
-		--chip-bg: #eaeef2;
+	.start h2 {
+		font-size: 19px;
 	}
-	:global(body) {
+	.start .hint {
+		max-width: 62ch;
 		margin: 0;
-		background: var(--bg);
-		color: var(--fg);
-		font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
-		font-size: 14px;
+		line-height: 1.55;
 	}
-	main {
-		max-width: 960px;
-		margin: 1.5rem auto;
-		padding: 0 1rem;
+	.start a {
+		margin-top: 6px;
+		text-decoration: none;
 	}
-	header {
-		display: flex;
-		align-items: center;
-		gap: 0.75rem;
-		border-bottom: 1px solid var(--border);
-		padding-bottom: 0.6rem;
-		flex-wrap: wrap;
+	.start-icon {
+		display: grid;
+		place-items: center;
+		width: 46px;
+		height: 46px;
+		border-radius: 14px;
+		background: var(--c-brand-tint);
+		color: var(--c-brand-deep);
 	}
-	h1 { font-size: 1.1rem; font-weight: 600; margin: 0; }
-	.pill {
-		font-size: 0.8rem;
-		border: 1px solid var(--border);
-		border-radius: 999px;
-		padding: 0.1rem 0.6rem;
-		color: var(--fg-muted);
+	.kpis {
+		display: grid;
+		grid-template-columns: repeat(6, minmax(0, 1fr));
+		gap: 20px;
+		margin: 0;
 	}
-	.pill.ok { color: var(--ok); border-color: var(--ok); }
-	.pill.bad { color: var(--danger); border-color: var(--danger); }
-	.tabs { display: flex; gap: 0.25rem; flex: 1; }
-	button {
-		background: var(--chip-bg);
-		color: var(--fg);
-		border: 1px solid var(--border);
-		border-radius: 4px;
-		padding: 0.15rem 0.6rem;
-		font: inherit;
-		cursor: pointer;
+	@media (max-width: 1320px) {
+		.kpis {
+			grid-template-columns: repeat(3, minmax(0, 1fr));
+		}
 	}
-	button:hover:not(:disabled) { border-color: var(--fg-muted); }
-	button:disabled { opacity: 0.4; cursor: default; }
-	button.active { border-color: var(--accent); color: var(--accent); }
-	button.danger { color: var(--danger); }
-	button.danger:hover:not(:disabled) { border-color: var(--danger); }
-	button.link {
-		background: none; border: none; padding: 0;
-		color: var(--accent); cursor: pointer;
+	@media (max-width: 620px) {
+		.kpis {
+			grid-template-columns: repeat(2, minmax(0, 1fr));
+		}
 	}
-	.keys {
-		display: flex;
-		gap: 1rem;
-		flex-wrap: wrap;
-		margin: 0.75rem 0;
+	.lower {
+		align-items: start;
 	}
-	.keys label {
-		display: flex;
-		gap: 0.5rem;
-		align-items: center;
-		color: var(--fg-muted);
-		flex: 1;
-		min-width: 16rem;
+	.feed-body {
+		max-height: 380px;
+		padding-top: 6px;
+		overflow-y: auto;
 	}
-	.badge {
-		font-style: normal;
-		font-size: 0.75rem;
-		color: var(--fg-muted);
-	}
-	.badge.set { color: var(--ok); }
-	input, textarea {
-		background: var(--bg-raised);
-		color: var(--fg);
-		border: 1px solid var(--border);
-		border-radius: 4px;
-		padding: 0.25rem 0.5rem;
-		font: inherit;
-		flex: 1;
-	}
-	.bar { display: flex; gap: 0.4rem; align-items: center; margin-bottom: 0.5rem; }
-	table { width: 100%; border-collapse: collapse; }
-	th, td {
-		text-align: left;
-		padding: 0.4rem 0.6rem;
-		border-bottom: 1px solid var(--border-soft);
-		white-space: nowrap;
-	}
-	th { color: var(--fg-muted); font-weight: 500; }
-	tr.selected td { background: var(--bg-raised); }
-	.key { color: var(--accent); word-break: break-all; white-space: normal; }
-	.state[data-state='done'], .state-ok { color: var(--ok); }
-	.state[data-state='failed'], .state-bad { color: var(--danger); }
-	.state[data-state='cancelled'] { color: var(--fg-muted); }
-	.state[data-state='running'], .state[data-state='reconciling'] { color: var(--warn); }
-	.state[data-state='queued'], .state[data-state='retry_waiting'] { color: var(--queued); }
-	.error { color: var(--danger); }
-	.notice { color: var(--ok); }
-	.hint, .empty { color: var(--fg-muted); }
-	.pager { display: flex; justify-content: space-between; align-items: center; margin-top: 1rem; }
-	.panel {
-		background: var(--bg-raised);
-		border: 1px solid var(--border-soft);
-		border-radius: 6px;
-		padding: 0.9rem 1rem;
-		margin-top: 1rem;
-	}
-	h2 { font-size: 1rem; font-weight: 600; margin: 0 0 0.6rem; display: flex; gap: 0.6rem; align-items: center; }
-	h3 { font-size: 0.9rem; color: var(--fg-muted); margin: 0.8rem 0 0.3rem; }
-	dl { display: grid; grid-template-columns: 11rem 1fr; gap: 0.2rem 1rem; margin: 0 0 0.6rem; }
-	dt { color: var(--fg-muted); }
-	dd { margin: 0; }
-	.chip {
-		display: inline-block;
-		background: var(--chip-bg);
-		border: 1px solid var(--border-soft);
-		border-radius: 999px;
-		padding: 0.05rem 0.55rem;
-		margin-right: 0.3rem;
-	}
-	.step-row { display: flex; gap: 0.5rem; margin-bottom: 0.4rem; }
-	fieldset { border: 1px solid var(--border-soft); border-radius: 6px; margin: 0 0 0.8rem; }
-	legend { color: var(--fg-muted); }
-	form label { display: block; margin-bottom: 0.8rem; color: var(--fg-muted); }
-	form label input, form label textarea { display: block; margin-top: 0.3rem; width: 100%; box-sizing: border-box; }
-	.confirm { display: block; margin-top: 0.5rem; color: var(--warn); }
-	.notice-inline { color: var(--ok); margin-left: 0.6rem; }
-	td.meta { display: none; }
 	@media (max-width: 600px) {
-		dl { grid-template-columns: 8rem 1fr; }
-		/* Two explicit rows: id (fixed 4ch, so keys align) + key ellipsized
-		   only when truly too long + action; then "state · N steps ·
-		   finished" under the key. Nothing escapes the viewport. */
-		.runlist thead { display: none; }
-		.runlist, .runlist tbody { display: block; }
-		.runlist tr {
-			display: grid;
-			grid-template-columns: var(--id-ch, 4ch) minmax(0, 1fr) auto;
-			column-gap: 0.7rem;
-			padding: 0.45rem 0;
-			align-items: baseline;
+		.lost-col,
+		.last-col {
+			display: none;
 		}
-		.runlist td { display: block; padding: 0.15rem 0; }
-		.runlist td:nth-child(1) { grid-area: 1 / 1; overflow: hidden; }
-		.runlist td:nth-child(2) {
-			grid-area: 1 / 2;
-			min-width: 0;
-			overflow: hidden;
-			text-overflow: ellipsis;
-			white-space: nowrap;
-			word-break: normal;
-		}
-		.runlist td:nth-child(6) { grid-area: 1 / 3; }
-		.runlist td:nth-child(3), .runlist td:nth-child(4), .runlist td:nth-child(5) { display: none; }
-		.runlist td.meta {
-			grid-area: 2 / 2;
-			display: block;
-			min-width: 0;
-			overflow: hidden;
-			text-overflow: ellipsis;
-			white-space: nowrap;
-			color: var(--fg-muted);
-		}
+	}
+	.hlink {
+		color: var(--c-ink);
+		text-decoration: none;
+	}
+	.hlink:hover {
+		text-decoration: underline;
+		text-underline-offset: 3px;
+	}
+	.card-head .btn {
+		text-decoration: none;
 	}
 </style>
