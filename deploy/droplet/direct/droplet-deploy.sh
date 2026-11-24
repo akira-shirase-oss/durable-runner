@@ -62,11 +62,13 @@ fi
 
 exec 9>"$BUILD/.lock"
 flock -w 120 9 || die "a build or deploy has held $BUILD/.lock for 2 minutes"
+# The lock is this script's alone: nothing it runs gets fd 9 (9>&- below), so no process left
+# behind can hold the next deploy off.
 
 if [[ "${1:-}" == --rollback ]]; then
   prev=$(dash_prev) now=$(dash_now)
   log "rolling back: deploy/rollback.sh (previous binary), dashboard ${now:-none} -> ${prev:-unchanged}"
-  (cd "$src" && deploy/rollback.sh) || die "deploy/rollback.sh failed (above); the dashboard was left as it was"
+  (cd "$src" && deploy/rollback.sh 9>&-) || die "deploy/rollback.sh failed (above); the dashboard was left as it was"
   switch_dash "$prev"
   echo "rolled back $(date -u +%FT%TZ) from: $(cat "$DR_OPT/deployed" 2>/dev/null || echo unknown)" >"$DR_OPT/deployed"
   log "rolled back ($((SECONDS - start)) s)"
@@ -131,7 +133,7 @@ if [[ ! -e "$DR_BIN/durable-server" ]]; then
   if systemctl is-active --quiet "$DR_UNIT"; then rm -f "$stage"; fail "$DR_UNIT is active with no binary installed: investigate"; fi
   (cd "$src" && FORMAT_GUARD_FILES_ONLY=1 deploy/format-guard.sh "$stage") || { rm -f "$stage"; fail "the format guard refused the build (above)"; }
   mv -f "$stage" "$DR_BIN/durable-server"
-  if ! systemctl start "$DR_UNIT" || ! wait_ready || ! "$src/deploy/droplet/smoke.sh" --release; then
+  if ! systemctl start "$DR_UNIT" 9>&- || ! wait_ready || ! "$src/deploy/droplet/smoke.sh" --release 9>&-; then
     # Fail closed: a first release that fails its checks doesn't serve. The binary is moved aside so
     # the next deploy is a first install again (upgrade.sh would keep it as .prev).
     systemctl stop "$DR_UNIT" || true
@@ -140,10 +142,10 @@ if [[ ! -e "$DR_BIN/durable-server" ]]; then
   fi
 else
   log "deploy/upgrade.sh (staged copy, format guard, swap, /ready, smoke; restore_prev on a failed start)"
-  if ! (cd "$src" && deploy/upgrade.sh "$incoming/durable-server"); then
+  if ! (cd "$src" && deploy/upgrade.sh "$incoming/durable-server" 9>&-); then
     if [[ "$(sha256_of "$DR_BIN/durable-server")" == "$sum_server" ]]; then
       log "the new build is in place but failed its checks: deploy/rollback.sh"
-      (cd "$src" && deploy/rollback.sh) || fail "upgrade failed its checks and deploy/rollback.sh failed too (above): journalctl -u $DR_UNIT"
+      (cd "$src" && deploy/rollback.sh 9>&-) || fail "upgrade failed its checks and deploy/rollback.sh failed too (above): journalctl -u $DR_UNIT"
       fail "${commit:0:12} failed its checks; rolled back to the previous binary and dashboard"
     fi
     fail "upgrade.sh refused or restored the previous binary (above); the previous dashboard is back"

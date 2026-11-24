@@ -5,7 +5,7 @@
 #
 # <file> holds the Neon project's owner connection string, as the dashboard gives it (pooled or
 # direct; it is made the direct host over verify-full, neon-url.sh). As that owner (Neon has no
-# superuser, AGENTS.md "Deploy readiness" 1):
+# superuser):
 #   1. CREATE DATABASE durable_runner, if it isn't there;
 #   2. CREATE ROLE durable_app LOGIN PASSWORD '<plaintext>', if it isn't there: Neon refuses a SCRAM
 #      verifier and hashes the plaintext itself (sent over verify-full). createrole_self_grant =

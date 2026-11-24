@@ -166,7 +166,7 @@ cn() { openssl s_client -connect "127.0.0.1:$port" -servername "$1" -cert "$work
   || bad "Colophon's site: $(req "$CHOST" /api)"
 code=$(curl -sS -o /dev/null -w '%{http_code}' --max-time 5 -k --connect-to "$HOST:443:127.0.0.1:$port" "https://$HOST/health" 2>/dev/null || true)
 [[ "$code" != 200 ]] && ok "no client certificate: refused (Authenticated Origin Pulls)" || bad "served without a client certificate"
-got=$(req "$HOST" /health -H 'Cf-Connecting-Ip: 203.0.113.7' -H 'CF-Connecting-IP: 6.6.6.6')
+got=$(req "$HOST" /health -H 'Cf-Connecting-Ip: 203.0.113.7' -H 'CF-Connecting-IP: 198.51.100.66')
 [[ "$got" == "dr cf=[203.0.113.7]" ]] && ok "from a trusted peer the server is told Cf-Connecting-Ip, one value" || bad "from a trusted peer the server was told '$got'"
 headers=$(req "$HOST" /health -D - -o /dev/null | tr -d '\r')
 grep -qix 'strict-transport-security: max-age=31536000' <<<"$headers" && ok "HSTS for this host only" || bad "HSTS: $(grep -i strict <<<"$headers")"
@@ -175,8 +175,8 @@ loc=$(req "$HOST" / -o /dev/null -w '%{http_code} %{redirect_url}')
 [[ "$loc" == "302 https://$HOST/inspector/" ]] && ok "/ redirects 302 to /inspector/" || bad "/ answered '$loc'"
 trusted '203.0.113.0/24'
 reload || bad "reload with other trusted ranges"
-got=$(req "$HOST" /health -H 'Cf-Connecting-Ip: 1.2.3.4')
-[[ "$got" =~ ^dr\ cf=\[[0-9a-f.:]+\]$ && "$got" != *1.2.3.4* ]] && ok "from an untrusted peer, its own address (${got#dr cf=}), not the header it sent" \
+got=$(req "$HOST" /health -H 'Cf-Connecting-Ip: 198.51.100.4')
+[[ "$got" =~ ^dr\ cf=\[[0-9a-f.:]+\]$ && "$got" != *198.51.100.4* ]] && ok "from an untrusted peer, its own address (${got#dr cf=}), not the header it sent" \
   || bad "from an untrusted peer the server was told '$got'"
 
 echo "Colophon's side: the import with no site files"

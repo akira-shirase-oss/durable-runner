@@ -71,7 +71,7 @@ origin=$(env_get DURABLE_PUBLIC_ORIGIN "$DR_ENV")
 host=$(origin_host "$origin") || die "fix DURABLE_PUBLIC_ORIGIN in $DR_ENV"
 labels=$(tr -cd . <<<"$host" | wc -c | tr -d ' ')
 if is_uint "$labels" && (( labels > 2 )); then
-  say "warning: $host is more than one level under its zone: Cloudflare's free certificate covers *.zone only (AGENTS.md rule 2)"
+  say "warning: $host is more than one level under its zone: Cloudflare's free certificate covers the apex and *.zone only"
 fi
 for f in handlers deny-cidrs; do
   if [[ ! -e "$DR_ETC/$f" ]]; then

@@ -1,7 +1,7 @@
 # Durable Runner, shared droplet (deploy/droplet)
 # durable-server as the hosted service, on the droplet it shares with Colophon. install.sh puts
 # this at /etc/systemd/system/durable-server.service; direct/droplet-deploy.sh refreshes it from
-# the release it switches to. The self-hosted unit is deploy/durable-server.service.
+# the commit it deploys. The self-hosted unit is deploy/durable-server.service.
 #
 # Secrets never sit in this file, the environment file or argv: each is a root-only file in
 # /etc/durable/credentials (put-secret.sh writes them), handed over by LoadCredential= and

@@ -30,7 +30,7 @@ CADDY_DIR=$ROOT/etc/caddy
 # The first line of every file this kit owns outside its own directories: an installer refuses
 # to overwrite a file of that name that doesn't carry it (it isn't ours).
 DR_MARK='# Durable Runner, shared droplet (deploy/droplet)'
-# The loopback ports from the band registry: the public listener Caddy proxies to, and the ops
+# Durable Runner's loopback ports on the shared host (Colophon has 58000): the public listener Caddy proxies to, and the ops
 # listener (--ops-listen) reached only through an SSH tunnel. The tests move them.
 DR_PUBLIC_PORT=${DURABLE_PUBLIC_PORT:-58300}
 DR_OPS_PORT=${DURABLE_OPS_PORT:-58301}
@@ -40,8 +40,8 @@ DR_DASHBOARD_SHIPPED=/inspector/
 die() { echo "error: $*" >&2; exit 1; }
 say() { printf '   %s\n' "$*"; }
 
-# Values from the environment or a file meet shell arithmetic only after this (AGENTS.md: a
-# subscript like x[$(cmd)] in (( )) runs cmd).
+# Values from the environment or a file meet shell arithmetic only after this (bash evaluates
+# array subscripts there: x[$(cmd)] in (( )) runs cmd).
 is_uint() { [[ "${1:-}" =~ ^[0-9]+$ ]]; }
 for _p in "$DR_PUBLIC_PORT" "$DR_OPS_PORT"; do
   if ! is_uint "$_p" || (( _p == 0 || _p > 65535 )); then die "DURABLE_PUBLIC_PORT / DURABLE_OPS_PORT: '$_p' isn't a port"; fi
@@ -172,7 +172,7 @@ port_listeners() {
 
 # port_check <port> <what>: fails closed unless nothing listens on the port, or the one listening is
 # durable-server itself (the unit's MainPID). Names the pid and command of anything else and leaves
-# it running (AGENTS.md: a port held by another process is a guard, never a target).
+# it running (a port held by another process is a guard, never a target).
 port_check() {
   local port=$1 what=$2 listeners ours pid cmd foreign=""
   listeners=$(port_listeners "$port") || die "can't tell what listens on $port ($what): neither ss nor lsof is here; refusing"
