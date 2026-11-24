@@ -52,6 +52,7 @@ async fn local_handler_urls_are_refused_at_registration() {
             .await
             .unwrap_or_else(|e| panic!("{url}: {e}"));
         let (status, code) = code(r).await;
+        // DECISIVE(ssrf-register)
         assert_eq!(
             (status, code.as_str()),
             if *want == "bad_handler_url" {
@@ -167,6 +168,7 @@ async fn a_domain_that_resolves_local_never_gets_a_packet() {
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
+    // DECISIVE(ssrf-resolve)
     assert!(
         state.starts_with("retry_waiting") || state.starts_with("failed"),
         "the refused call should park the run, got state {state:?}"
@@ -228,6 +230,7 @@ async fn the_operators_local_opt_out_never_reaches_a_tenant() {
     ] {
         for key in [tenant.clone(), OPS_KEY.to_string()] {
             let (status, code) = put(key, url.clone()).await;
+            // DECISIVE(tenant-register-policy) DECISIVE(tenant-strict-ssrf)
             assert_eq!(
                 (status, code.as_str()),
                 (422, "local_target_forbidden"),

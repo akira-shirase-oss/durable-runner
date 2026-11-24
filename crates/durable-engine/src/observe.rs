@@ -1430,6 +1430,7 @@ impl Observer {
         now: Millis,
     ) {
         let w = match handler {
+            // ATTACK(obs-call-scope)
             Some(_) => self.ws(ws, now),
             // A probe only counted in flight: never create an entry for it.
             None => match self.peek(ws) {
@@ -1721,7 +1722,6 @@ impl CallGuard {
     /// A call of workspace `ws`: `handler` is the attempt's handler name,
     /// `None` for a reconcile probe (counted in flight only).
     pub fn start(obs: &Arc<Observer>, ws: u64, handler: Option<&str>) -> Self {
-        // ATTACK(obs-call-scope)
         let w = obs.ws(ws, wall_ms());
         obs.in_flight.fetch_add(1, Ordering::Relaxed);
         w.in_flight.fetch_add(1, Ordering::Relaxed);
@@ -2497,6 +2497,7 @@ mod tests {
             let t = x.totals.counters;
             (t.accepted, t.refused, t.deduplicated)
         };
+        // DECISIVE(obs-record-scope)
         assert_eq!(c(&a), (1, 0, 1));
         assert_eq!(c(&b), (2, 1, 0));
         assert_eq!(c(&ops), (3, 2, 1));
@@ -2539,6 +2540,7 @@ mod tests {
         assert_eq!(o.workspace_stats(), (2, 1));
         let m = |ws| o.metrics(Scope::Ws(ws), Window::M15, T0 + 9, idx(), &[]);
         assert_eq!(m(0).totals.counters.accepted, 1, "pinned");
+        // DECISIVE(obs-scan-resistant)
         assert_eq!(m(1).totals.counters.accepted, 2);
         assert_eq!(m(3).totals.counters.accepted, 1);
         assert_eq!(m(3).since, T0 + 4, "a view counts from its own creation");

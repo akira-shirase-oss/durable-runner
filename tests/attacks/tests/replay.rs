@@ -19,6 +19,7 @@ async fn a_replayed_submit_returns_the_same_run() {
     // The replay: same op_key, same spec — byte-for-byte the first POST.
     let (s2, run2) = submit(&c, &s.base, OPS_KEY, "replay-me").await;
     assert_eq!(s2, 200, "the replayed submit must still be answered");
+    // DECISIVE(submit-dedup)
     assert_eq!(
         run2.as_deref(),
         Some(run1.as_str()),

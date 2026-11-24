@@ -5264,6 +5264,7 @@ mod tests {
                 v["states"]["done"].clone(),
             )
         };
+        // DECISIVE(obs-metrics-scope)
         assert_eq!(t(&a), (json!(2), json!(2), json!(2)), "A: {a}");
         assert_eq!(t(&ar), t(&a), "A's read key sees A's view, not more");
         assert_eq!(t(&b), (json!(1), json!(1), json!(1)), "B: {b}");
@@ -5276,6 +5277,7 @@ mod tests {
             ["secret", "step"],
             "the operator's: workspace 0's"
         );
+        // DECISIVE(obs-call-scope)
         assert_eq!(calls(&a, "step"), json!(2));
         assert_eq!(calls(&b, "step"), json!(1), "B's step is not A's step");
         assert_eq!(calls(&ops, "step"), json!(1), "workspace 0's step");
@@ -5314,6 +5316,7 @@ mod tests {
             (KEY, b_ids[0].clone()),
         ] {
             let (status, v) = get(key, foreign.clone()).await;
+            // DECISIVE(obs-run-scope)
             assert_eq!(
                 (status, &v),
                 (StatusCode::NOT_FOUND, &missing),
@@ -5367,6 +5370,7 @@ mod tests {
             v.sort();
             v
         };
+        // DECISIVE(obs-feed-scope)
         assert_eq!(runs(OBS_KEY_A).await, sorted(a_ids.clone()));
         assert_eq!(runs(OBS_READ_A).await, sorted(a_ids));
         assert_eq!(runs(OBS_KEY_B).await, sorted(b_ids));
@@ -5437,6 +5441,7 @@ mod tests {
         let (addr, _stop3, _h3) = serving_on(hop(&["127.0.0.1/32"]), "[::]:0").await;
         let base = format!("http://127.0.0.1:{}", addr.port());
         assert_eq!(get(base.clone(), "198.51.100.20").await, 200);
+        // DECISIVE(peer-canonical)
         assert_eq!(
             get(base.clone(), "198.51.100.21").await,
             200,
@@ -6010,6 +6015,7 @@ mod tests {
             !ids.contains(&run_a),
             "B's list must not show A's run: {ids:?}"
         );
+        // DECISIVE(list-scope)
         assert_eq!(ids.len(), 1, "B sees exactly its own run");
 
         // A sees A.
@@ -6795,6 +6801,7 @@ mod tests {
         .await
         .unwrap_or_else(|e| panic!("{e}"));
         assert_eq!(admits(&r, key, "good").await, StatusCode::OK, "control");
+        // DECISIVE(reconcile-recheck)
         assert_eq!(
             admits(&r, key, "evil").await,
             StatusCode::CONFLICT,
@@ -6824,6 +6831,7 @@ mod tests {
         )
         .await;
         assert_eq!(admits(&r, key, "good").await, StatusCode::OK, "control");
+        // DECISIVE(startup-recheck)
         assert_eq!(
             admits(&r, key, "evil").await,
             StatusCode::CONFLICT,
@@ -7232,6 +7240,7 @@ mod tests {
         assert_eq!(saves0, 1, "the first PUT saved once");
         for _ in 0..5 {
             let (status, v) = put("http://127.0.0.1:9/a").await;
+            // DECISIVE(registry-noop-skip)
             assert_eq!(
                 (status, v["unchanged"].clone()),
                 (StatusCode::OK, json!(true))
@@ -7268,6 +7277,7 @@ mod tests {
                 break;
             }
         }
+        // DECISIVE(registry-rate)
         assert_eq!(
             refused,
             Some((
@@ -7341,6 +7351,7 @@ mod tests {
             rx,
             Arc::clone(&saves),
         );
+        // DECISIVE(registry-batch)
         assert_eq!(
             saves.load(std::sync::atomic::Ordering::SeqCst),
             1,
@@ -7685,6 +7696,7 @@ mod tests {
             handler: "h".into(),
         };
         let outcome = h.execute(&spec, b"hi", "k").await;
+        // DECISIVE(call-time-literal)
         assert!(
             matches!(outcome, Outcome::Failed),
             "a literal local target must fail the attempt: {outcome:?}"
@@ -7748,6 +7760,7 @@ mod tests {
         ] {
             let h = factory(&deny).make(&url);
             let outcome = h.execute(&spec, b"hi", "k").await;
+            // DECISIVE(ssrf-deny-cidr)
             assert!(matches!(outcome, Outcome::Failed), "{url}: {outcome:?}");
             assert!(!h.ask(None, "k").await, "{url}: the probe is refused too");
         }
@@ -8945,6 +8958,7 @@ mod tests {
             .await
             .unwrap_or_else(|_| panic!("/health starved behind a pinned connection pool"))
             .unwrap_or_else(|e| panic!("{e}"));
+        // DECISIVE(liveness-flood)
         assert!(
             reply.starts_with(b"HTTP/1.1 200"),
             "{}",
@@ -9200,6 +9214,7 @@ mod tests {
         );
         // Past the deadline, under a still-dry pool, the dead head is
         // evicted first — long before the 60 s header timeout.
+        // DECISIVE(slot-camp)
         assert!(
             closed_within(&mut held, Duration::from_secs(4)).await,
             "a head that never arrived outlived the pressure deadline"
@@ -9399,7 +9414,8 @@ mod tests {
             tokio::time::timeout(Duration::from_secs(5), probe.read_to_end(&mut reply))
                 .await
                 .unwrap_or_else(|_| panic!("{src}: the lane conn got no answer — it was dropped"))
-                .unwrap_or_else(|e| panic!("{e}"));
+                // DECISIVE(overload-lane)
+                .unwrap_or_else(|e| panic!("{src}: the lane conn was reset, not answered: {e}"));
             let text = String::from_utf8_lossy(&reply);
             assert!(
                 text.starts_with("HTTP/1.1 503"),
@@ -10973,6 +10989,7 @@ mod tests {
         // The scoped route answers the tenant's own shape only.
         let (status, v) = call(&h.router, "GET", "/diagnostics", Some(token), None).await;
         assert_eq!(status, StatusCode::OK, "{v}");
+        // DECISIVE(diag-scope)
         assert_eq!(v["live_runs"], json!(1), "{v}");
         assert!(
             v.get("workspaces_active").is_none() && v.get("records_written").is_none(),

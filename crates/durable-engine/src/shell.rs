@@ -4289,6 +4289,7 @@ mod tests {
             }
             eng.cancel(run).await.unwrap_or_else(|e| panic!("{e}"));
             // The cancel's answer comes after its arm ran: no wait needed.
+            // DECISIVE(parked-untrack)
             assert_eq!(
                 eng.sched_counts().await.unwrap_or_else(|e| panic!("{e}")),
                 (0, 0, 0),
@@ -4357,6 +4358,7 @@ mod tests {
             .keys(2, vec![run])
             .await
             .unwrap_or_else(|e| panic!("{e}"));
+        // DECISIVE(keys-scope)
         assert_eq!(theirs, vec![None], "workspace 2 learned workspace 1's key");
     }
 
@@ -4604,6 +4606,7 @@ mod tests {
             run_effects(&mut core, &mut ex, effects, run, Some(permit), Some(slot));
             reconciled += 1;
         }
+        // DECISIVE(deadline-drop)
         assert_eq!(reconciled, 2, "both popped deadlines re-fired");
         for run in [a, b] {
             assert!(

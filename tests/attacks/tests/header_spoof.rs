@@ -34,6 +34,7 @@ async fn spoofed_client_header_does_not_evade_the_bucket() {
             );
         }
     }
+    // DECISIVE(cf-header)
     assert!(
         refusals >= 20,
         "rotating cf-connecting-ip evaded the bucket: only {refusals} refusals in 60 requests"

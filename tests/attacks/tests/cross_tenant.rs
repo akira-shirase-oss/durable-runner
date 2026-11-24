@@ -41,6 +41,7 @@ async fn a_second_workspace_cannot_read_anothers_run() {
         let r = req.send().await.unwrap_or_else(|e| panic!("{name}: {e}"));
         let (status, code) = code(r).await;
         // 404, never 403: a foreign id must leak nothing (S2-2).
+        // DECISIVE(tenant-scope)
         assert_eq!(
             (status, code.as_str()),
             (404, "not_found"),
@@ -106,6 +107,7 @@ async fn a_tenant_admin_cannot_reach_ops_routes() {
     ] {
         let r = req.send().await.unwrap_or_else(|e| panic!("{name}: {e}"));
         let (status, code) = code(r).await;
+        // DECISIVE(ops-scope)
         assert_eq!(
             (status, code.as_str()),
             (403, "forbidden"),
@@ -179,6 +181,7 @@ async fn a_tenant_cannot_address_its_own_run_by_its_internal_number() {
             .await
             .unwrap_or_else(|e| panic!("{e}"));
         let (status, code) = code(r).await;
+        // DECISIVE(numeric-id-ws0)
         assert_eq!(
             (status, code.as_str()),
             (404, "not_found"),

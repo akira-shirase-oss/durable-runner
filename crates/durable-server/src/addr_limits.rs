@@ -760,6 +760,7 @@ mod tests {
                 admitted += 1;
             }
         }
+        // DECISIVE(v6-agg-first)
         assert!(admitted <= 60, "the /48 aggregate held: {admitted}");
         assert!(
             lim.tracked() <= MAX_V6_PER_AGG + 2,
@@ -786,6 +787,7 @@ mod tests {
         for i in 0..(MAX_V6_PER_AGG as u32 + 500) {
             let _ = lim.check(slash64(i), t0 + Duration::from_millis(u64::from(i)));
         }
+        // DECISIVE(v6-per-agg-cap)
         assert_eq!(lim.per_agg.values().copied().max(), Some(MAX_V6_PER_AGG));
         assert!(lim.tracked() <= MAX_V6_PER_AGG + 2, "{}", lim.tracked());
     }
@@ -814,6 +816,7 @@ mod tests {
             lim.addrs.contains_key(&lim.addr_key(new)),
             "new took a slot"
         );
+        // DECISIVE(limiter-idle-clock)
         assert!(
             !lim.addrs.contains_key(&lim.addr_key(flooder)),
             "the refused flooder kept its slot by being refused"

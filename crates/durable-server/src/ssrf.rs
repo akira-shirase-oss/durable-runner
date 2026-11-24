@@ -473,6 +473,7 @@ mod tests {
             "http://[::ffff:8.8.4.4]/h", // mapped: judged by the v4 inside
             "http://134743044/h",        // 8.8.4.4 as one decimal number
         ] {
+            // DECISIVE(ssrf-own-address)
             assert_eq!(
                 check_url(&url(u), &ours),
                 Err("handler URL targets this server's own address"),
@@ -530,6 +531,7 @@ mod tests {
     #[test]
     fn an_ipv4_mapped_deny_cidr_names_its_ipv4_range() {
         let r = parse_cidr("::ffff:203.0.113.0/120").unwrap_or_else(|e| panic!("{e}"));
+        // DECISIVE(deny-cidr-mapped)
         assert_eq!(r, (IpAddr::V4(Ipv4Addr::new(203, 0, 113, 0)), 24));
         let one = parse_cidr("::ffff:198.51.100.7").unwrap_or_else(|e| panic!("{e}"));
         assert_eq!(one, (IpAddr::V4(Ipv4Addr::new(198, 51, 100, 7)), 32));
