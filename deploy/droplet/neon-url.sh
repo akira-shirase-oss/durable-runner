@@ -7,7 +7,9 @@
 # advisory lock don't survive a transaction pooler) and verify-full (require encrypts without
 # checking who answers; the account store refuses anything else for a non-loopback host).
 
-# neon_url_fix <url>: prints the fixed URL; NEON_URL_NOTES lists what changed.
+# neon_url_fix <url>: sets NEON_URL_FIXED to the fixed URL and NEON_URL_NOTES to what changed. Call
+# it directly, not in $( ): a command substitution's subshell would lose both (Colophon's copy
+# prints the URL and so loses the notes).
 neon_url_fix() {
   local url=$1
   NEON_URL_NOTES=()
@@ -28,7 +30,7 @@ neon_url_fix() {
     url="$url$([[ "$url" == *\?* ]] && echo '&' || echo '?')sslmode=verify-full"
     NEON_URL_NOTES+=("sslmode=verify-full added")
   fi
-  printf '%s' "$url"
+  NEON_URL_FIXED=$url
 }
 
 # neon_url_split <url>: sets NEON_USER NEON_PASSWORD (percent-decoded) NEON_HOST NEON_PORT

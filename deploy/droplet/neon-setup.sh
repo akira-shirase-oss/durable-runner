@@ -58,7 +58,8 @@ fi
 
 url=$(tr -d '\r\n' <"$owner_file")
 url=${url#"${url%%[![:space:]]*}"}; url=${url%"${url##*[![:space:]]}"}
-fixed=$(neon_url_fix "$url")
+neon_url_fix "$url"
+fixed=$NEON_URL_FIXED
 for note in "${NEON_URL_NOTES[@]+"${NEON_URL_NOTES[@]}"}"; do say "owner URL: $note"; done
 neon_url_split "$fixed" || die "the owner URL isn't postgres://<user>:<password>@<host>/<database>"
 owner_user=$NEON_USER owner_pass=$NEON_PASSWORD host=$NEON_HOST port=$NEON_PORT owner_db=$NEON_DB
