@@ -6180,7 +6180,6 @@ async fn put_handler(
             "handler name must be 1-128 chars with no control characters",
         ));
     }
-    // ATTACK(tenant-register-policy)
     let url = if name == BUILTIN_ECHO {
         let u = body.url.trim();
         if !u.is_empty() && u != BUILTIN_ECHO {
@@ -6192,6 +6191,7 @@ async fn put_handler(
         }
         BUILTIN_ECHO.to_string()
     } else {
+        // ATTACK(tenant-register-policy)
         valid_handler_url(body.url.trim(), &app.handler_factory.store_policy)?
     };
     registry_rate(&app, auth.ws())?;
