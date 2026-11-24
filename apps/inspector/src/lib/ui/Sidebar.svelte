@@ -37,9 +37,9 @@
 
 <aside class="side" class:open aria-label="Inspector">
 	<div class="head">
-		<a class="brand" href="#/" aria-label="Durable Runner Inspector, overview">
+		<a class="brand" href="#/">
 			<AppIcon size={30} />
-			<span class="names"><span class="name">Durable Runner</span><span class="sub">Inspector</span></span>
+			<span class="names"><span class="name">Durable Runner</span> <span class="sub">Inspector</span></span>
 		</a>
 		<button
 			class="btn ghost menu"

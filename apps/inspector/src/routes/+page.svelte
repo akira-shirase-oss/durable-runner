@@ -81,7 +81,9 @@
 	{#if session.notice}
 		<p class="banner notice"><Icon name="check" size={16} /><span class="msg">{session.notice}</span><button class="btn ghost sm act" onclick={() => (session.notice = null)}>Dismiss</button></p>
 	{/if}
-	<Notice status={metricsRes.status} error={metricsRes.error} what="Metrics" route="GET /metrics" stale={metricsRes.updatedAt} />
+	{#if !(metricsRes.status === 'needs-key' && !m)}
+		<Notice status={metricsRes.status} error={metricsRes.error} what="Metrics" route="GET /metrics" stale={metricsRes.updatedAt} />
+	{/if}
 
 	{#if unsupported}
 		<LegacyOverview />

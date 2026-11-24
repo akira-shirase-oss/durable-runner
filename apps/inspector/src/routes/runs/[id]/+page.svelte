@@ -372,6 +372,9 @@
 		color: var(--c-body);
 		font-size: 12.5px;
 	}
+	.facts dd .muted {
+		white-space: nowrap;
+	}
 	.facts dd {
 		margin: 3px 0 0;
 		font-size: 14.5px;

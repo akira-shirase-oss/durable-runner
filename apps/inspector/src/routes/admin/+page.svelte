@@ -84,7 +84,7 @@
 			<KpiTile label="Live runs" value={fmtCompact(d.live_runs)} sub="held in the index" />
 			<KpiTile label="Active runs" value={fmtCompact(d.active_runs)} sub="not yet terminal" />
 			<KpiTile label="Index" value={fmtBytes(d.index_bytes)} sub="{fmtInt(d.index_bytes)} bytes" />
-			<KpiTile label="Dedup keys" value={fmtCompact(d.dedup_keys)} sub="op keys remembered" />
+			<KpiTile label="Dedup keys" value={fmtCompact(d.dedup_keys)} sub="op keys kept" />
 			<KpiTile label="Disk reserve" value={d.space_ok ? 'OK' : 'Below reserve'} tone={d.space_ok ? 'ok' : 'bad'} sub={d.space_ok ? 'admission open' : 'new runs refused'}>
 				{#snippet icon()}<Icon name="hard-drive" size={18} />{/snippet}
 			</KpiTile>
