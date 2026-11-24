@@ -81,3 +81,21 @@ test('probeSession returns the status that decides the mode, with or without a b
 	answer(503, { error: 'down', code: 'accounts_unavailable' });
 	assert.equal((await probeSession()).code, 'accounts_unavailable');
 });
+
+test('verify POSTs the token and the sign-up password in the body, never anywhere else; a refusal is not a lost session', async () => {
+	const { verifyEmail } = await import('../src/lib/api.ts');
+	let lost = 0;
+	onSessionLost(() => lost++);
+	answer(200, { verified: true });
+	const tok = `drt_${'A'.repeat(43)}`;
+	assert.deepEqual(await verifyEmail(tok, 'correct horse battery'), { verified: true });
+	const s = seen[0]!;
+	assert.equal(s.url, '/auth/verify', 'no query string');
+	assert.equal(s.init.method, 'POST');
+	assert.deepEqual(JSON.parse(String(s.init.body)), { token: tok, password: 'correct horse battery' });
+	assert.equal(hdr(s)['authorization'], undefined);
+	assert.equal(hdr(s)['x-durable-csrf'], undefined, 'an open auth POST carries no CSRF token');
+	answer(401, { error: 'no', code: 'invalid_credentials' });
+	await verifyEmail(tok, 'wrong').catch(() => {});
+	assert.equal(lost, 0);
+});

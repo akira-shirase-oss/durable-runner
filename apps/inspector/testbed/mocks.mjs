@@ -363,10 +363,19 @@ export function saasMock({
       if (!body?.email || String(body.password ?? '').length < 12) return E(400, 'bad_input', 'password must be at least 12 characters');
       return ok({ status: 'verification_sent' }, 202);
     }
-    if (path === '/auth/verify') return body?.token === TOKEN ? ok({ verified: true }) : gone();
+    // verify takes the sign-up password with the token (pre-registration takeover fix): missing → 400, a token
+    // whose pending password does not match → 403 invalid_credentials, a dead token → 410
+    if (path === '/auth/verify') {
+      if (typeof body?.password !== 'string' || body.password === '') return E(400, 'bad_input', 'password is required');
+      if (body?.token !== TOKEN) return gone();
+      if (body.password !== PASSWORD) return E(403, 'invalid_credentials', 'token and password do not match');
+      s.signedIn = false; // every session of the account ends; no cookie is set
+      return ok({ verified: true });
+    }
+    // reset sets no cookie: the visitor signs in afresh
     if (path === '/auth/reset') {
       if (body?.token !== TOKEN) return gone();
-      s.signedIn = true;
+      s.signedIn = false;
       return ok({ reset: true });
     }
     if (path === '/auth/resend-verification' || path === '/auth/forgot') return ok({ status: 'sent' }, 202);

@@ -388,8 +388,10 @@ export async function logout(cred: SessionCred): Promise<void> {
 	await req('/auth/logout', cred, { method: 'POST' }, { quiet401: true });
 }
 
-export async function verifyEmail(token: string): Promise<{ verified: boolean }> {
-	return req('/auth/verify', OPEN, jsonInit('POST', { token }), { quiet401: true });
+/** Confirm an email: the mailed token plus the password chosen at sign-up (the server refuses a token whose
+ *  pending password does not match, so a stranger who signed up someone else's address cannot take it over). */
+export async function verifyEmail(token: string, password: string): Promise<{ verified: boolean }> {
+	return req('/auth/verify', OPEN, jsonInit('POST', { token, password }), { quiet401: true });
 }
 
 export async function resendVerification(email: string): Promise<{ status: string }> {

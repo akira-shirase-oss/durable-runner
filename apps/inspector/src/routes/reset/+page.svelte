@@ -1,7 +1,7 @@
 <script lang="ts">
 	// #/reset?token=… — choose a new password. The token stays in the fragment and is POSTed on submit with the
-	// new password. A reset signs out every session of the account; the server signs this browser in afresh unless
-	// it is signed in as somebody else, so the page checks the session afterwards instead of assuming.
+	// new password. A reset signs out every session of the account and sets no cookie, so success ends at sign-in
+	// with a note — unless this tab holds a different account's session, which the page reads rather than assumes.
 	import Icon from '../../lib/Icon.svelte';
 	import ErrorBanner from '../../lib/ui/ErrorBanner.svelte';
 	import PasswordField from '../../lib/ui/PasswordField.svelte';
@@ -29,11 +29,17 @@
 		try {
 			await resetPassword(token, password);
 			password = '';
-			done = true;
-			// the server signs this browser in afresh unless it holds another account's session: read which
+			// a reset sets no cookie and signs out every session of that account: read what is true now, assume nothing
 			await account.refresh().catch(() => {});
-			if (account.mode !== 'signed-in') account.notice = 'Password changed. Sign in with the new one.';
-			void goto('#/reset', { replace: true, shallow: true });
+			if (account.mode === 'signed-in') {
+				// this tab holds another account's session, which a reset does not touch
+				done = true;
+				void goto('#/reset', { replace: true, shallow: true });
+			} else {
+				account.notice = 'Password changed. Every session on that account was signed out: sign in with the new password.';
+				// replace: the token leaves the address bar and the history
+				void goto('#/sign-in', { replace: true });
+			}
 		} catch (err) {
 			const ae = err instanceof ApiError ? err : new ApiError(String(err), 0);
 			if (ae.status === 410 || ae.code === 'token_gone' || ae.code === 'invalid_or_expired_token') gone = true;
@@ -48,8 +54,8 @@
 	{#if done}
 		<span class="auth-icon" aria-hidden="true"><Icon name="check" size={22} /></span>
 		<h1 id="t">Password changed</h1>
-		<p class="lede" role="status">Every earlier session on that account was signed out.{account.mode === 'signed-in' ? ' This browser is signed in.' : ' Sign in with the new password.'}</p>
-		{#if account.mode === 'signed-in'}<a class="btn brand" href="#/overview">Go to the dashboard</a>{:else}<a class="btn brand" href="#/sign-in">Sign in</a>{/if}
+		<p class="lede" role="status">Every session on that account was signed out. This browser is signed in as {account.me?.email ?? 'another account'}, which the reset did not touch: sign out first to use the new password here.</p>
+		<a class="btn brand" href="#/overview">Go to the dashboard</a>
 	{:else if gone}
 		<span class="auth-icon" aria-hidden="true"><Icon name="alert" size={22} /></span>
 		<h1 id="t">This link is no longer valid</h1>

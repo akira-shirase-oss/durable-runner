@@ -129,13 +129,34 @@ const PAGES = [
     await p.fill('#email', 'new.person@example.com'); await p.fill('#password', 'a long enough passphrase'); await p.click('button[type=submit]');
     await p.waitForSelector('h1:has-text("Check your inbox")');
   } },
-  { name: 'verify-ok', hash: `#/verify?token=${T}`, mock: { signedIn: false }, wait: 'h1:has-text("Email verified")' },
-  { name: 'verify-gone', hash: `#/verify?token=${M.DEAD_TOKEN}`, mock: { signedIn: false }, wait: 'h1:has-text("no longer valid")' },
+  { name: 'verify', hash: `#/verify?token=${T}`, mock: { signedIn: false }, wait: 'h1:has-text("Confirm your email")', act: async (p, w, api) => {
+    if (api.state.calls.some((c) => c.path === '/auth/verify')) throw new Error('verify was POSTed on load');
+  } },
+  { name: 'verify-wrong', hash: `#/verify?token=${T}`, mock: { signedIn: false }, wait: '#password', act: async (p) => {
+    await p.fill('#password', 'not the sign-up password'); await p.click('button[type=submit]'); await p.waitForSelector('#password-hint.bad');
+  } },
+  { name: 'verify-ok', hash: `#/verify?token=${T}`, mock: { signedIn: false }, wait: '#password', act: async (p, w, api) => {
+    await p.fill('#password', M.PASSWORD); await p.click('button[type=submit]');
+    await p.waitForSelector('h1:has-text("Sign in")'); await p.waitForSelector('.banner.notice:has-text("Email verified")');
+    const call = api.state.calls.find((c) => c.path === '/auth/verify');
+    if (!call || call.headers['authorization']) throw new Error('verify must POST without an Authorization header');
+    const where = await p.evaluate(() => location.hash);
+    if (where.includes('token')) throw new Error(`the token stayed in the address bar: ${where}`);
+  } },
+  { name: 'verify-gone', hash: `#/verify?token=${M.DEAD_TOKEN}`, mock: { signedIn: false }, wait: '#password', act: async (p) => {
+    await p.fill('#password', M.PASSWORD); await p.click('button[type=submit]'); await p.waitForSelector('h1:has-text("no longer valid")');
+  } },
   { name: 'forgot', hash: '#/forgot', mock: { signedIn: false }, wait: '#email' },
   { name: 'forgot-sent', hash: '#/forgot', mock: { signedIn: false }, wait: '#email', act: async (p) => {
     await p.fill('#email', 'ada@example.com'); await p.click('button[type=submit]'); await p.waitForSelector('h1:has-text("Check your inbox")');
   } },
   { name: 'reset', hash: `#/reset?token=${T}`, mock: { signedIn: false }, wait: '#password' },
+  { name: 'reset-done', hash: `#/reset?token=${T}`, mock: { signedIn: false }, wait: '#password', act: async (p) => {
+    await p.fill('#password', 'a brand new passphrase'); await p.click('button[type=submit]');
+    await p.waitForSelector('h1:has-text("Sign in")'); await p.waitForSelector('.banner.notice:has-text("Password changed")');
+    const where = await p.evaluate(() => location.hash);
+    if (where !== '#/sign-in') throw new Error(`reset should end at sign-in (got ${where})`);
+  } },
   { name: 'reset-gone', hash: `#/reset?token=${M.DEAD_TOKEN}`, mock: { signedIn: false }, wait: '#password', act: async (p) => {
     await p.fill('#password', 'a brand new passphrase'); await p.click('button[type=submit]'); await p.waitForSelector('h1:has-text("no longer valid")');
   } },
@@ -206,10 +227,10 @@ try {
     let total = 0;
     let scanned = 0;
     for (const theme of ['light', 'dark']) for (const width of [1440, 390]) for (const pg of list) {
-      const { ctx, page } = await context({ theme, width, mock: pg.mock });
+      const { ctx, page, api } = await context({ theme, width, mock: pg.mock });
       await go(page, pg.hash);
       await page.waitForSelector(pg.wait, { timeout: 10_000 });
-      if (pg.act) await pg.act(page, width);
+      if (pg.act) await pg.act(page, width, api);
       await page.waitForTimeout(300);
       const r = await page.evaluate(async (src) => {
         if (!window.axe) (0, eval)(src);
@@ -233,7 +254,7 @@ try {
         try {
           await go(page, pg.hash);
           await page.waitForSelector(pg.wait, { timeout: 10_000 });
-          if (pg.act) await pg.act(page, width);
+          if (pg.act) await pg.act(page, width, api);
           await snap(page, tag, width, { full: pg.full !== false });
           await health(page, api, tag);
         } catch (e) {
