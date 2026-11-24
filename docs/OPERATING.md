@@ -121,15 +121,15 @@ target/release/durable-server \
   `GET /events`, D-058) take
   the API key or the optional read-only `DURABLE_READ_KEY` (at least 32
   characters, different from the API key; it gets `403 forbidden` on
-  every other route). Give the inspector or a dashboard the read key, not
+  every other route). Give the dashboard the read key, not
   the admin key. `--open-reads` serves reads without a key, and is
   refused at startup unless `--listen` is a loopback IP, and even then
   answers a request without a key only if its `Host` is `localhost` or a
   loopback IP (DNS rebinding, D-047): never pass it behind a reverse
   proxy, which makes loopback reachable. `/health`,
-  `/ready` and the inspector's static files are open. The CLI sends
+  `/ready` and the dashboard's static files are open. The CLI sends
   `DURABLE_API_KEY` (reads fall back to `DURABLE_READ_KEY`); the
-  inspector asks for a key and sends it on every call. The pilot
+  dashboard asks for a key and sends it on every call. The pilot
   generates a fresh random key per run and exports it.
 - **Account store (S2).** `DATABASE_URL` pointing at Postgres (Neon in
   production, `sslmode=verify-full` required there) enables the account
@@ -230,7 +230,8 @@ target/release/durable-server \
   files 0600; backups and restores too, D-038). Run the server as the
   user that owns them. A second server on the same
   directory **fails startup** — the exclusive writer lock is held.
-- The inspector is at `http://127.0.0.1:58300/inspector/` and covers
+- The dashboard is at `http://127.0.0.1:58300/app/` (the old
+  `/inspector` URLs 308 to the same tail under `/app`) and covers
   every API operation (list both orders, run detail, spec reveal,
   submit, cancel, diagnostics, compact, backup, health/ready). It
   holds the read key for reads and the API key for everything else,

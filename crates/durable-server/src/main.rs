@@ -14,7 +14,7 @@ use addr_limits::{
 use anyhow::{Context, Result};
 use axum::{
     extract::{DefaultBodyLimit, FromRequestParts, Path as AxPath, Query, State},
-    http::{header, request::Parts, StatusCode},
+    http::{header, request::Parts, StatusCode, Uri},
     response::{IntoResponse, Response},
     routing::{delete, get, post},
     Json, Router,
@@ -83,7 +83,7 @@ struct Args {
     /// Attempt timeout per step call, ms (bounded by domain limits).
     #[arg(long, default_value_t = 20_000)]
     step_timeout_ms: u64,
-    /// Static inspection UI directory, served at /inspector (optional).
+    /// Static dashboard UI directory, served at /app (optional).
     #[arg(long)]
     ui_dir: Option<PathBuf>,
     /// Directory that holds backups. `POST /admin/backup {"name": N}`
@@ -5771,7 +5771,7 @@ fn base64_decode(s: &str) -> Result<Vec<u8>, String> {
         .map_err(|_| "input_b64 must be canonical standard base64 (RFC 4648, padded)".to_string())
 }
 
-/// Every route. `/health`, `/ready` and the inspector's static files are
+/// Every route. `/health`, `/ready` and the dashboard's static files are
 /// open (they show no runs). `GET /jobs` and `GET /jobs/{id}` take
 /// `ReadAuthorized` (either key, or `--open-reads`); every mutating and
 /// admin handler takes `Authorized`, so it is unreachable without the API
@@ -5825,6 +5825,12 @@ fn router(app: App, ui_dir: Option<&Path>) -> Router {
         )
         .route("/invites/accept", post(invite_accept))
         .route("/invites/decline", post(invite_decline))
+        // The old inspector mount: every URL under it lives at the same
+        // tail under /app now — 308, query preserved. Nothing is served
+        // under /inspector itself.
+        .route("/inspector", get(inspector_redirect))
+        .route("/inspector/", get(inspector_redirect))
+        .route("/inspector/{*tail}", get(inspector_redirect))
         .route("/admin/compact", post(compact))
         .route("/admin/backup", post(backup))
         .route("/admin/diagnostics", get(diagnostics))
@@ -5861,12 +5867,12 @@ fn router(app: App, ui_dir: Option<&Path>) -> Router {
         .layer(DefaultBodyLimit::max(MAX_REQUEST_BYTES))
         .with_state(app);
     if let Some(ui) = ui_dir {
-        let csp = header::HeaderValue::from_str(&inspector_csp(ui)).unwrap_or(
+        let csp = header::HeaderValue::from_str(&ui_csp(ui)).unwrap_or(
             header::HeaderValue::from_static("default-src 'none'; frame-ancestors 'none'"),
         );
         let ui_routes = Router::new()
             .nest_service(
-                "/inspector",
+                "/app",
                 tower_http::services::ServeDir::new(ui)
                     .append_index_html_on_directories(true)
                     .not_found_service(tower_http::services::ServeFile::new(ui.join("index.html"))),
@@ -5896,10 +5902,10 @@ fn router(app: App, ui_dir: Option<&Path>) -> Router {
     router
 }
 
-/// The inspector's Content-Security-Policy: only its own files, and the
+/// The dashboard's Content-Security-Policy: only its own files, and the
 /// inline bootstrap script SvelteKit writes into `index.html` by hash (no
 /// `'unsafe-inline'` scripts), calls to this origin only, no framing.
-fn inspector_csp(ui: &Path) -> String {
+fn ui_csp(ui: &Path) -> String {
     use base64::Engine as _;
     let mut hashes = String::new();
     match std::fs::read_to_string(ui.join("index.html")) {
@@ -5919,7 +5925,7 @@ fn inspector_csp(ui: &Path) -> String {
             }
         }
         Err(e) => eprintln!(
-            "durable-server: cannot read {}/index.html ({e}); the inspector will not run",
+            "durable-server: cannot read {}/index.html ({e}); the dashboard will not run",
             ui.display()
         ),
     }
@@ -5928,6 +5934,17 @@ fn inspector_csp(ui: &Path) -> String {
          img-src 'self' data:; font-src 'self'; connect-src 'self'; base-uri 'none'; \
          form-action 'none'; frame-ancestors 'none'"
     )
+}
+
+/// `/inspector` and every tail under it answer 308 to the same tail under
+/// `/app`, query string preserved — `/inspector/x?y=1` -> `/app/x?y=1`,
+/// `/inspector` -> `/app`. Nothing else under /inspector is served.
+async fn inspector_redirect(uri: Uri) -> Response {
+    let tail = uri
+        .path_and_query()
+        .map(|pq| pq.as_str().strip_prefix("/inspector").unwrap_or(""))
+        .unwrap_or("");
+    axum::response::Redirect::permanent(&format!("/app{tail}")).into_response()
 }
 
 fn api_key_from_env() -> Result<ApiKey> {
@@ -12200,9 +12217,10 @@ mod tests {
         );
     }
 
-    /// Checklist: the inspector holds a key and renders op_keys. Its pages
-    /// are served with a CSP that allows only its own scripts (the inline
-    /// bootstrap by hash), no framing, nosniff and no referrer.
+    /// Checklist: the dashboard at /app holds a key and renders op_keys.
+    /// Its pages are served with a CSP that allows only its own scripts
+    /// (the inline bootstrap by hash), no framing, nosniff and no
+    /// referrer; /inspector now 308s to it and is never served.
     #[tokio::test]
     async fn the_inspector_is_served_with_security_headers() {
         let ui = tempfile::tempdir().unwrap_or_else(|e| panic!("{e}"));
@@ -12229,11 +12247,7 @@ mod tests {
         );
         use base64::Engine as _;
         let hash = base64::engine::general_purpose::STANDARD.encode(sha256(script.as_bytes()));
-        for uri in [
-            "/inspector/",
-            "/inspector/app.js",
-            "/inspector/runs/deep-link",
-        ] {
+        for uri in ["/app/", "/app/app.js", "/app/runs/deep-link"] {
             let res = r
                 .clone()
                 .oneshot(
@@ -12273,6 +12287,130 @@ mod tests {
                 "{uri}: scripts must not be unsafe-inline: {csp}"
             );
         }
+
+        // The CSP hashes match the inline script bytes on disk.
+        let csp_uri = r
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/app/")
+                    .body(Body::empty())
+                    .unwrap_or_else(|e| panic!("{e}")),
+            )
+            .await
+            .unwrap_or_else(|e| panic!("{e}"));
+        let csp = csp_uri
+            .headers()
+            .get(header::CONTENT_SECURITY_POLICY)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("")
+            .to_string();
+        assert!(
+            csp.contains(&format!("'sha256-{hash}'")),
+            "CSP must hash the file's inline script: {csp}"
+        );
+
+        // /inspector[/tail] 308s to /app[/tail] with the query preserved.
+        for (uri, want) in [
+            ("/inspector", "/app"),
+            ("/inspector/", "/app/"),
+            ("/inspector/x?y=1", "/app/x?y=1"),
+            (
+                "/inspector/runs/deep?key=abc&p=2",
+                "/app/runs/deep?key=abc&p=2",
+            ),
+        ] {
+            let res = r
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri(uri)
+                        .body(Body::empty())
+                        .unwrap_or_else(|e| panic!("{e}")),
+                )
+                .await
+                .unwrap_or_else(|e| panic!("{e}"));
+            assert_eq!(res.status(), StatusCode::PERMANENT_REDIRECT, "{uri}");
+            assert_eq!(
+                res.headers()
+                    .get(header::LOCATION)
+                    .and_then(|v| v.to_str().ok()),
+                Some(want),
+                "{uri}"
+            );
+        }
+
+        // A traversal tail cannot escape the ui dir.
+        for uri in [
+            "/app/../Cargo.toml",
+            "/app/%2e%2e/%2e%2e/Cargo.toml",
+            "/app/..%2f..%2fetc%2fpasswd",
+        ] {
+            let res = r
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri(uri)
+                        .body(Body::empty())
+                        .unwrap_or_else(|e| panic!("{e}")),
+                )
+                .await
+                .unwrap_or_else(|e| panic!("{e}"));
+            let body = res
+                .into_body()
+                .collect()
+                .await
+                .unwrap_or_else(|e| panic!("{e}"))
+                .to_bytes();
+            let text = String::from_utf8_lossy(&body);
+            assert!(
+                !text.contains("[package]") && !text.contains("root:"),
+                "{uri} escaped the ui dir"
+            );
+        }
+    }
+
+    /// Without `--ui-dir` there is no /app at all — 404, not an empty
+    /// mount; /inspector still redirects so old links land on an honest
+    /// 404 rather than a hang.
+    #[tokio::test]
+    async fn app_without_ui_dir_is_404() {
+        let journal = tempfile::tempdir().unwrap_or_else(|e| panic!("{e}"));
+        let engine = spawn(journal.path(), Registry::default(), ShellConfig::default())
+            .unwrap_or_else(|e| panic!("{e}"));
+        let r = router(
+            test_app(
+                engine,
+                Arc::new(Keyring::new(ApiKey::new(KEY), None, None)),
+                false,
+                None,
+                journal.path(),
+                true,
+            ),
+            None,
+        );
+        let res = r
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/app/")
+                    .body(Body::empty())
+                    .unwrap_or_else(|e| panic!("{e}")),
+            )
+            .await
+            .unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(res.status(), StatusCode::NOT_FOUND);
+        let res = r
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/inspector/x")
+                    .body(Body::empty())
+                    .unwrap_or_else(|e| panic!("{e}")),
+            )
+            .await
+            .unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(res.status(), StatusCode::PERMANENT_REDIRECT);
     }
 
     /// The per-address bounds lifted the way the load battery lifts them

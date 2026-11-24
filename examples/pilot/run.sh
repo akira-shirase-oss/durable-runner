@@ -31,7 +31,7 @@ healthy() {
   fail "server on port $1 never became healthy"
 }
 
-# The API key: every route but /health, /ready and the inspector's files
+# The API key: every route but /health, /ready and the dashboard's files
 # needs it. The server and the CLI both read DURABLE_API_KEY from the
 # environment (never from argv). A fresh random key per pilot run; in
 # production, keep it in your secret store and export it into the server's
@@ -60,7 +60,7 @@ SERVE=("$SRV" --journal "$WORK/journal" --listen "127.0.0.1:$SRV_PORT"
   --backup-root "$WORK/backups" --handler "step=http://127.0.0.1:$HND_PORT/step"
   --allow-local-handlers)
 
-step "start the pilot handler + the server (UI mounted at /inspector)"
+step "start the pilot handler + the server (UI mounted at /app)"
 python3 examples/pilot/handler.py "$HND_PORT" &
 "${SERVE[@]}" --ui-dir "$ROOT/apps/inspector/build" >"$WORK/server.log" 2>&1 &
 SRV_PID=$!
@@ -90,11 +90,11 @@ echo "inspect -> $S"
 echo "$S" | grep -q '"done"' || fail "run $ID never reached done"
 FINISHED=$(echo "$S" | grep -o '"finished_at":[0-9]*')
 
-step "list + inspector page (reads need the key)"
+step "list + dashboard page (reads need the key)"
 curl -s -H "Authorization: Bearer $DURABLE_API_KEY" "http://127.0.0.1:$SRV_PORT/jobs"; echo
 CODE=$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:$SRV_PORT/jobs")
 [ "$CODE" = 401 ] || fail "an unauthenticated read answered $CODE, not 401"
-echo "inspector -> http://127.0.0.1:$SRV_PORT/inspector/ ($(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:$SRV_PORT/inspector/"))"
+echo "dashboard -> http://127.0.0.1:$SRV_PORT/app/ ($(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:$SRV_PORT/app/"))"
 
 step "kill -9 the server mid-life, restart against the same journal"
 kill -9 "$SRV_PID"

@@ -190,7 +190,7 @@ curl -sS --max-time 5 --resolve durable.404human.dev:443:<droplet-ip> \
 
 `install.sh` copies `apps/inspector/build/` to
 `/usr/local/share/durable/inspector` and the env points `--ui-dir` at it.
-Open `https://durable.404human.dev/inspector/`, paste the read key for
+Open `https://durable.404human.dev/app/`, paste the read key for
 listing and the API key for submit/admin — both live in sessionStorage
 only, Forget keys clears them.
 
