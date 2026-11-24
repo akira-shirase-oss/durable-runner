@@ -102,6 +102,8 @@ export interface KeyRow {
 	createdAt: number | null;
 	lastUsedAt: number | null;
 	revoked: boolean;
+	/** the account public id that minted it (S3-5), when the server says */
+	createdBy: string | null;
 }
 
 export function normKey(raw: unknown): KeyRow | null {
@@ -118,6 +120,7 @@ export function normKey(raw: unknown): KeyRow | null {
 		createdAt: toMs(first(o, 'created_at_ms', 'created_at')),
 		lastUsedAt: toMs(first(o, 'last_used_at_ms', 'last_used_at')),
 		revoked: o.revoked === true || first(o, 'revoked_at_ms', 'revoked_at') !== null,
+		createdBy: str(o.created_by),
 	};
 }
 
@@ -329,6 +332,15 @@ export function normWorkflowRun(raw: unknown): WorkflowRun | null {
 	const runId = str(first(o, 'run_id', 'pubid', 'id'));
 	if (!runId) return null;
 	return { runId, submittedAt: toMs(first(o, 'submitted_at_ms', 'submitted_at')), state: str(o.state), finishedAt: toMs(first(o, 'finished_at_ms', 'finished_at')) };
+}
+
+/** The dashboard link for an invite: the server's `invite_url` may be its own API path
+ *  (`/invites/accept?token=dri_…`), which a browser cannot open, so the token is lifted out and put in the
+ *  dashboard's fragment route, where it never reaches a server log or a mail prefetcher. Unrecognised: as given. */
+export function inviteLink(inviteUrl: string, appUrl: string): string {
+	const m = /[?&#]token=([A-Za-z0-9_-]{8,256})/.exec(inviteUrl);
+	if (!m) return inviteUrl;
+	return `${appUrl}#/accept-invite?token=${m[1]}`;
 }
 
 // --- usage ----------------------------------------------------------------------------------------------------

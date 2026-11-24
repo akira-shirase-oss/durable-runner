@@ -63,3 +63,12 @@ test('hashParam reads the fragment query; tokenShapeOk checks the drt_ shape', (
 	assert.ok(!tokenShapeOk(`drt_${'A'.repeat(42)}=`));
 	assert.ok(!tokenShapeOk(null));
 });
+
+test('invite tokens: the server mints dri_ + 64 hex; the drt_ mail shape is accepted too', async () => {
+	const { inviteTokenShapeOk } = await import('../src/lib/mode.ts');
+	assert.ok(inviteTokenShapeOk(`dri_${'0f'.repeat(32)}`));
+	assert.ok(inviteTokenShapeOk(`drt_${'A'.repeat(43)}`));
+	assert.ok(!inviteTokenShapeOk(`dri_${'0F'.repeat(32)}`), 'lower-case hex only');
+	assert.ok(!inviteTokenShapeOk(`dri_${'0'.repeat(63)}`));
+	assert.ok(!inviteTokenShapeOk(null));
+});

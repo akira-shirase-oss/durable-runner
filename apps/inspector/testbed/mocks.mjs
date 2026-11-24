@@ -236,12 +236,17 @@ export const DIAG = {
 // One mock server per browser context: accounts, the session (held here — the testbed is one visitor), workspaces,
 // members, invites, keys, handlers, usage, onboarding and workflows, shaped like docs/S3-PLAN.md and, where the code
 // on devin/dr-s3 differs, like the code (DELETE /me/sessions, {current_password,new_password}, token_gone 410,
-// {"status":"sent"} on resend/forgot, flat member rows). It also checks what the dashboard sends: CSRF on every
+// {"status":"sent"} on resend/forgot; at 1f9f409: the workspace list from GET /workspaces while /auth/session
+// carries [], keys as {public_id, name, prefix, permission, revoked, last_used_at_ms, created_by} minted with
+// {name, permission}, members nested {account:{public_id,email}, role, since}, invite tokens dri_ + 64 hex with
+// an invite_url that is the API path, unknown invites 404, test calls that require input_b64). It also checks what the dashboard sends: CSRF on every
 // mutation, x-durable-workspace on flat routes only, never an Authorization header — every breach is logged in
 // `violations` so the testbed can fail on it.
 export const PASSWORD = 'correct horse battery';
 export const TOKEN = `drt_${'A'.repeat(43)}`;
 export const DEAD_TOKEN = `drt_${'B'.repeat(43)}`;
+export const INVITE_TOKEN = `dri_${'7c'.repeat(32)}`;
+export const DEAD_INVITE = `dri_${'00'.repeat(32)}`;
 export const WS_PROD = '0193a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a5b';
 export const WS_STAGE = '0193a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a5c';
 export const WF_DEMO = '0193b000-0000-7000-8000-00000000d0e0';
@@ -270,15 +275,15 @@ export function saasMock({
       workspaces === 'none'
         ? []
         : [
-            { public_id: WS_PROD, name: 'Production', role, plan: 'free' },
-            ...(workspaces === 'two' ? [{ public_id: WS_STAGE, name: 'Staging', role: 'viewer', plan: 'free' }] : []),
+            { public_id: WS_PROD, name: 'Production', role },
+            ...(workspaces === 'two' ? [{ public_id: WS_STAGE, name: 'Staging', role: 'viewer' }] : []),
           ],
     keys: fresh
       ? []
       : [
-          { public_id: 'k-0193-0001', name: 'ci-deploy', prefix: 'drk_7f3a', scope: 'write', created_at_ms: NOW - 9 * 86_400_000, last_used_at_ms: NOW - 4 * 60_000, revoked: false },
-          { public_id: 'k-0193-0002', name: 'grafana-read', prefix: 'drk_b21c', scope: 'read', created_at_ms: NOW - 3 * 86_400_000, last_used_at_ms: null, revoked: false },
-          { public_id: 'k-0193-0003', name: 'old-laptop', prefix: 'dr_91ee', scope: 'write', created_at_ms: NOW - 40 * 86_400_000, last_used_at_ms: NOW - 20 * 86_400_000, revoked: true },
+          { public_id: '0193d000-0000-7000-8000-000000000001', name: 'ci-deploy', prefix: 'drk_7f3a9c1', permission: 'write', revoked: false, last_used_at_ms: NOW - 4 * 60_000, created_by: '0193a000-0000-7000-8000-0000000000a1' },
+          { public_id: '0193d000-0000-7000-8000-000000000002', name: 'grafana-read', prefix: 'drk_b21c04e', permission: 'read', revoked: false, last_used_at_ms: null, created_by: '0193a000-0000-7000-8000-0000000000a2' },
+          { public_id: '0193d000-0000-7000-8000-000000000003', name: 'old-laptop', prefix: 'dr_91ee2d0', permission: 'write', revoked: true, last_used_at_ms: NOW - 20 * 86_400_000, created_by: null },
         ],
     handlers: fresh
       ? []
@@ -289,12 +294,13 @@ export function saasMock({
           { name: 'cdn-push', url: 'https://cdn.example.com/purge', health: null },
         ],
     members: [
-      { account_public_id: '0193a000-0000-7000-8000-0000000000a1', email: 'ada@example.com', role, since_ms: NOW - 30 * 86_400_000 },
-      { account_public_id: '0193a000-0000-7000-8000-0000000000a2', email: 'grace@example.com', role: 'admin', since_ms: NOW - 12 * 86_400_000 },
-      { account_public_id: '0193a000-0000-7000-8000-0000000000a3', email: 'linus.torvalds.very.long.address@example-company-with-a-long-domain.com', role: 'member', since_ms: NOW - 2 * 86_400_000 },
-      { account_public_id: '0193a000-0000-7000-8000-0000000000a4', email: 'margaret@example.com', role: 'viewer', since_ms: NOW - 86_400_000 },
+      { account: { public_id: '0193a000-0000-7000-8000-0000000000a1', email: 'ada@example.com' }, role, since: NOW - 30 * 86_400_000 },
+      { account: { public_id: '0193a000-0000-7000-8000-0000000000a2', email: 'grace@example.com' }, role: 'admin', since: NOW - 12 * 86_400_000 },
+      { account: { public_id: '0193a000-0000-7000-8000-0000000000a3', email: 'linus.torvalds.very.long.address@example-company-with-a-long-domain.com' }, role: 'member', since: NOW - 2 * 86_400_000 },
+      { account: { public_id: '0193a000-0000-7000-8000-0000000000a4', email: 'margaret@example.com' }, role: 'viewer', since: NOW - 86_400_000 },
     ],
-    invites: [{ public_id: 'i-0193-0001', email: 'ken@example.com', role: 'member', expires_at_ms: NOW + 13 * 86_400_000 }],
+    invites: [{ public_id: '0193e000-0000-7000-8000-000000000001', email: 'ken@example.com', role: 'member', expires_at: NOW + 13 * 86_400_000 }],
+    testCalls: 0,
     sessions: [
       { id: '0193c000-0000-7000-8000-000000000001', current: true, created_at_ms: NOW - 2 * 3_600_000, last_seen_at_ms: NOW - 5_000, user_agent: 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0 Safari/537.36', ip: '203.0.113.7' },
       { id: '0193c000-0000-7000-8000-000000000002', current: false, created_at_ms: NOW - 6 * 86_400_000, last_seen_at_ms: NOW - 86_400_000, user_agent: 'Mozilla/5.0 (iPhone; CPU iPhone OS 18_1 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.1 Mobile/15E148 Safari/604.1', ip: '198.51.100.24' },
@@ -327,7 +333,7 @@ export function saasMock({
     return {
       plan: 'free',
       limits: { jobs_per_min: 60, live_runs: 500, in_flight: 8, handlers: 16, max_input_bytes: 65536, retention_days: 7, members: 5, api_keys: 10, workflows: 20, test_calls_per_hour: 30, workspaces_per_account: 3, retained_bytes: 16_777_216 },
-      used: { jobs_this_minute: 7, live_runs: 41, in_flight: 3, handlers: s.handlers.length, api_keys: s.keys.filter((k) => !k.revoked).length, members: s.members.length + s.invites.length, workflows: s.workflows.length, test_calls_hour: 24 },
+      used: { jobs_this_minute: 7, live_runs: 41, in_flight: 3, handlers: s.handlers.length, api_keys: s.keys.filter((k) => !k.revoked).length, members: s.members.length + s.invites.length, workflows: s.workflows.length, test_calls_hour: 24 + s.testCalls },
       windows: { minute_ends_at: NOW + 38_000, hour_ends_at: NOW + 22 * 60_000 },
     };
   }
@@ -345,7 +351,8 @@ export function saasMock({
     if (path === '/auth/session') {
       if (bootStatus) return { status: bootStatus, body: bootStatus === 404 ? null : { error: 'store down', code: 'accounts_unavailable' } };
       if (!s.signedIn) return E(401, 'unauthenticated', 'no session');
-      return ok({ account: s.me, csrf: s.csrf, workspaces: s.ws });
+      // the code's bootstrap carries an empty list; GET /workspaces is where the memberships are
+      return ok({ account: s.me, csrf: s.csrf, workspaces: [] });
     }
     if (path === '/auth/login') {
       if (body?.password !== PASSWORD) return E(401, 'invalid_credentials', 'invalid credentials');
@@ -389,18 +396,20 @@ export function saasMock({
     }
     if (path === '/me/password') return body?.current_password === PASSWORD ? ok({ changed: true, csrf: s.csrf }) : E(403, 'invalid_credentials', 'current password does not match');
     if (path === '/invites/accept') {
-      if (body?.token !== TOKEN) return gone();
-      const w = { public_id: '0193a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a5d', name: 'Acme Payments', role: 'member', plan: 'free' };
+      if (!s.me.verified) return E(403, 'email_unverified', "verify the account's email first");
+      if (body?.token !== INVITE_TOKEN) return E(404, 'not_found', 'no such invite');
+      const w = { public_id: '0193a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a5d', name: 'Acme Payments', role: 'member' };
       s.ws.push(w);
       return ok({ workspace: w });
     }
-    if (path === '/invites/decline') return body?.token === TOKEN ? { status: 204, body: null } : gone();
+    if (path === '/invites/decline') return { status: 204, body: null };
+    if (path === '/workspaces' && method === 'GET') return ok({ workspaces: s.ws });
     if (path === '/workspaces' && method === 'POST') {
       if (!s.me.verified) return E(403, 'email_unverified', 'verify your email first');
       if (s.ws.length >= 3) return E(429, 'plan_limit', 'plan limit', { limit: 'workspaces_per_account', plan: 'free', used: 3, cap: 3 });
       const w = { public_id: `0193a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a6${s.ws.length}`, name: body.name, role: 'owner', plan: 'free' };
       s.ws.push(w);
-      return ok({ public_id: w.public_id, name: w.name, handler_secret: hex(64, 9) });
+      return ok({ public_id: w.public_id, name: w.name, role: 'owner', handler_secret: hex(64, 9) });
     }
 
     // --- /workspaces/{pid}/… : the workspace comes from the path
@@ -424,9 +433,12 @@ export function saasMock({
       if (rest === '/keys') {
         if (method === 'GET') return ok({ keys: s.keys });
         const f = need('admin'); if (f) return f;
+        if (!['write', 'read', 'admin'].includes(body?.permission)) return E(400, 'bad_input', `permission must be write or read, not ${JSON.stringify(body?.permission)}`);
         if (s.keys.filter((k) => !k.revoked).length >= 10) return E(429, 'plan_limit', 'plan limit', { limit: 'api_keys', plan: 'free', used: 10, cap: 10 });
-        s.keys.unshift({ public_id: `k-0193-${s.keys.length + 10}`, name: body.name, prefix: 'drk_' + hex(4, s.keys.length), scope: body.scope, created_at_ms: Date.now(), last_used_at_ms: null, revoked: false });
-        return ok({ key: 'drk_' + hex(64, 5) });
+        const secret = 'drk_' + hex(64, 5);
+        const row = { public_id: `0193d000-0000-7000-8000-0000000001${String(s.keys.length).padStart(2, '0')}`, name: body.name, prefix: secret.slice(0, 11), permission: body.permission === 'read' ? 'read' : 'write', revoked: false, last_used_at_ms: null, created_by: s.me.public_id };
+        s.keys.unshift(row);
+        return ok({ ...row, key: secret });
       }
       m = rest.match(/^\/keys\/([^/]+)(\/rotate)?$/);
       if (m) {
@@ -434,25 +446,32 @@ export function saasMock({
         const k = s.keys.find((x) => x.public_id === decodeURIComponent(m[1]));
         if (!k || k.revoked) return E(404, 'not_found', 'no such key');
         k.revoked = true;
-        if (m[2]) { s.keys.unshift({ ...k, public_id: k.public_id + 'r', prefix: 'drk_' + hex(4, 8), created_at_ms: Date.now(), last_used_at_ms: null, revoked: false }); return ok({ key: 'drk_' + hex(64, 6) }); }
+        if (m[2]) {
+          const secret = 'drk_' + hex(64, 6);
+          const row = { ...k, public_id: k.public_id.slice(0, -2) + 'f0', prefix: secret.slice(0, 11), last_used_at_ms: null, revoked: false, created_by: s.me.public_id };
+          s.keys.unshift(row);
+          return ok({ ...row, key: secret });
+        }
         return { status: 204, body: null };
       }
       if (rest === '/members' && method === 'GET') return ok({ members: s.members });
       if (rest === '/members' && method === 'POST') {
         const f = need('admin'); if (f) return f;
-        if (s.invites.some((i) => i.email === body.email)) return E(409, 'invite_pending', 'an invite is pending');
+        if (s.invites.some((i) => i.email === body.email)) return E(409, 'invite_pending', 'a live invite already covers this address');
+        if (s.members.some((x) => x.account.email === body.email)) return E(409, 'already_member', 'this account is already a member');
         if (s.members.length + s.invites.length >= 5) return E(429, 'plan_limit', 'plan limit', { limit: 'members', plan: 'free', used: 5, cap: 5 });
-        const inv = { public_id: `i-0193-${s.invites.length + 2}`, email: body.email, role: body.role, expires_at_ms: NOW + 14 * 86_400_000 };
+        const inv = { public_id: `0193e000-0000-7000-8000-0000000000${String(s.invites.length + 2).padStart(2, '0')}`, email: body.email, role: body.role, expires_at: NOW + 14 * 86_400_000 };
         s.invites.push(inv);
-        return ok({ invite: inv, invite_url: `https://durablerunnerapp.404human.dev/app#/accept-invite?token=${TOKEN}` });
+        // the code answers its own API path, not a dashboard link; the dashboard builds the link from the token
+        return ok({ invite: inv, invite_url: `/invites/accept?token=${INVITE_TOKEN}` });
       }
       m = rest.match(/^\/members\/([^/]+)$/);
       if (m) {
         const f = need('admin'); if (f) return f;
-        const mem = s.members.find((x) => x.account_public_id === decodeURIComponent(m[1]));
+        const mem = s.members.find((x) => x.account.public_id === decodeURIComponent(m[1]));
         if (!mem) return E(404, 'not_found', 'no such member');
         if (mem.role === 'owner') return E(409, 'last_owner', 'the owner cannot be removed or demoted');
-        if (method === 'PATCH') { mem.role = body.role; return ok(mem); }
+        if (method === 'PATCH') { mem.role = body.role; return ok({ account: { public_id: mem.account.public_id }, role: body.role }); }
         s.members = s.members.filter((x) => x !== mem);
         return { status: 204, body: null };
       }
@@ -521,13 +540,16 @@ export function saasMock({
         if (!write) return E(403, 'forbidden', 'your role cannot do this');
         const name = decodeURIComponent(m[1]);
         if (m[2]) {
+          if (typeof body?.input_b64 !== 'string') return E(422, 'bad_json', 'malformed JSON');
+          if (++s.testCalls > 30) return E(429, 'test_call_limited', 'test calls are bounded to 30 per workspace per hour');
           const h = s.handlers.find((x) => x.name === name);
-          if (!h) return E(404, 'not_found', 'no such handler');
+          if (!h) return E(404, 'not_found', 'no such handler in this workspace');
           if (name === 'send-receipt') return ok({ status: 'failed', http_status: 500, latency_ms: 412, reply_excerpt_b64: Buffer.from('{"error":"template receipt-v2 not found"}').toString('base64') });
           h.health = { ...(h.health ?? {}), last_test_at: Date.now(), last_test_status: 'ok', last_test_latency_ms: 84 };
           return ok({ status: 'ok', http_status: 200, latency_ms: name === 'builtin:echo' ? 1 : 84, reply_excerpt_b64: body?.input_b64 ?? '' });
         }
         if (method === 'PUT') {
+          if (name === 'builtin:echo' && body?.url && body.url !== 'builtin:echo') return E(400, 'bad_handler_url', 'builtin:echo registers with url "builtin:echo" or an empty url');
           if (String(body?.url ?? '').includes('127.0.0.1')) return E(400, 'url_refused', 'private or local targets are refused');
           const h = s.handlers.find((x) => x.name === name);
           if (h) h.url = body.url; else s.handlers.push({ name, url: body.url, health: null });

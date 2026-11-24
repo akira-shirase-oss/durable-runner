@@ -78,3 +78,8 @@ export function hashParam(hash: string, name: string): string | null {
 export function tokenShapeOk(t: string | null): t is string {
 	return t !== null && /^drt_[A-Za-z0-9_-]{43}$/.test(t);
 }
+
+/** An invite token: the server mints `dri_` + 64 hex (S3-3); the plan's `drt_` mail-token shape is accepted too. */
+export function inviteTokenShapeOk(t: string | null): t is string {
+	return t !== null && (/^dri_[0-9a-f]{64}$/.test(t) || tokenShapeOk(t));
+}

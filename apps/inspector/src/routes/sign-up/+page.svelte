@@ -7,12 +7,12 @@
 	import { goto } from '$app/navigation';
 	import { account } from '../../lib/account.svelte.ts';
 	import { ApiError, signup } from '../../lib/api.ts';
-	import { hashParam, tokenShapeOk } from '../../lib/mode.ts';
+	import { hashParam, inviteTokenShapeOk } from '../../lib/mode.ts';
 	import { emailError, passwordError, PASSWORD_MIN } from '../../lib/validate.ts';
 
 	const invite = (() => {
 		const t = hashParam(location.hash, 'invite');
-		return tokenShapeOk(t) ? t : null;
+		return inviteTokenShapeOk(t) ? t : null;
 	})();
 
 	let email = $state('');

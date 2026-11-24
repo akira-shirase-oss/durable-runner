@@ -39,7 +39,7 @@ test('session bootstrap parts', () => {
 
 test('keys: id or public_id, admin reads as write, _ms or ISO times, revoked flag or time', () => {
 	const k = normKey({ public_id: 'k1', name: 'ci', prefix: 'dr_ab12', scope: 'write', created_at_ms: 5, last_used_at: null, revoked: false });
-	assert.deepEqual(k, { id: 'k1', name: 'ci', prefix: 'dr_ab12', scope: 'write', createdAt: 5, lastUsedAt: null, revoked: false });
+	assert.deepEqual(k, { id: 'k1', name: 'ci', prefix: 'dr_ab12', scope: 'write', createdAt: 5, lastUsedAt: null, revoked: false, createdBy: null });
 	assert.equal(normKey({ id: 7, permission: 'admin' })?.scope, 'write');
 	assert.equal(normKey({ id: 7, permission: 'admin' })?.id, '7');
 	assert.equal(normKey({ id: 'k', scope: 'read', revoked_at: '2026-11-24T10:00:00Z' })?.revoked, true);
@@ -103,7 +103,7 @@ test('onboarding from the server: page order, unknown steps dropped, missing = n
 test('onboarding from facts: done only when a fact proves it', () => {
 	const none = deriveOnboarding({ keys: null, handlers: null, finishedRuns: null, testOkSeen: false });
 	assert.ok(none.every((x) => !x.done));
-	const key = { id: 'k', name: 'ci', prefix: 'dr_1', scope: 'write' as const, createdAt: 1, lastUsedAt: null, revoked: false };
+	const key = { id: 'k', name: 'ci', prefix: 'dr_1', scope: 'write' as const, createdAt: 1, lastUsedAt: null, revoked: false, createdBy: null };
 	const all = deriveOnboarding({
 		keys: [{ ...key, revoked: true }, key],
 		handlers: [{ name: 'builtin:echo', url: 'builtin:echo', source: null, health: { lastTestAt: 1, lastTestStatus: 'ok', lastTestLatencyMs: 1, p50: null, p95: null } }],
@@ -115,4 +115,17 @@ test('onboarding from facts: done only when a fact proves it', () => {
 	assert.deepEqual(revokedOnly.map((x) => x.done), [false, false, true, false]);
 	assert.equal(finishedFromStates({ done: 2, failed: 1, running: 4 }), 3);
 	assert.equal(finishedFromStates(undefined), null);
+});
+
+test('keys carry who minted them (S3-5 created_by)', () => {
+	assert.equal(normKey({ public_id: 'k', permission: 'write', created_by: 'acc-1' })?.createdBy, 'acc-1');
+	assert.equal(normKey({ public_id: 'k' })?.createdBy, null);
+});
+
+test('invite links: the token moves into the dashboard fragment; anything else stays as given', async () => {
+	const { inviteLink } = await import('../src/lib/saas.ts');
+	const tok = `dri_${'a'.repeat(64)}`;
+	assert.equal(inviteLink(`/invites/accept?token=${tok}`, 'https://run.example.com/app/'), `https://run.example.com/app/#/accept-invite?token=${tok}`);
+	assert.equal(inviteLink(`https://run.example.com/app#/accept-invite?token=${tok}`, 'https://run.example.com/app/'), `https://run.example.com/app/#/accept-invite?token=${tok}`);
+	assert.equal(inviteLink('https://elsewhere.example.com/x', 'https://run.example.com/app/'), 'https://elsewhere.example.com/x');
 });

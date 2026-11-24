@@ -426,6 +426,11 @@ export async function changePassword(cred: SessionCred, current: string, next: s
 // --- workspaces + team ---
 const ws = (pid: string, rest = '') => `/workspaces/${encodeURIComponent(pid)}${rest}`;
 
+/** Every workspace this account belongs to (`/auth/session` may carry the list too; this is the authority). */
+export async function listMyWorkspaces(cred: SessionCred, signal?: AbortSignal): Promise<unknown> {
+	return req('/workspaces', cred, { signal });
+}
+
 export async function createWorkspace(cred: SessionCred, name: string): Promise<{ public_id: string; name: string; handler_secret?: string }> {
 	return req('/workspaces', cred, jsonInit('POST', { name }));
 }
@@ -479,8 +484,9 @@ export async function listKeys(cred: SessionCred, pid: string, signal?: AbortSig
 	return req(ws(pid, '/keys'), cred, { signal });
 }
 
+/** The server's field is `permission` ("write" or "read"); the answer is the key row plus `key`, shown once. */
 export async function createKey(cred: SessionCred, pid: string, name: string, scope: 'read' | 'write'): Promise<{ key: string }> {
-	return req(ws(pid, '/keys'), cred, jsonInit('POST', { name, scope }));
+	return req(ws(pid, '/keys'), cred, jsonInit('POST', { name, permission: scope }));
 }
 
 export async function revokeKey(cred: SessionCred, pid: string, id: string): Promise<void> {
@@ -504,8 +510,9 @@ export async function deleteHandler(cred: Cred, name: string): Promise<void> {
 	await req(`/handlers/${encodeURIComponent(name)}`, cred, { method: 'DELETE' });
 }
 
+/** One test call (D-070). `input_b64` is required by the server (empty is an empty input), at most 8 KiB decoded. */
 export async function testHandler(cred: Cred, name: string, inputB64: string): Promise<unknown> {
-	return req(`/handlers/${encodeURIComponent(name)}/test`, cred, jsonInit('POST', inputB64 ? { input_b64: inputB64 } : {}));
+	return req(`/handlers/${encodeURIComponent(name)}/test`, cred, jsonInit('POST', { input_b64: inputB64 }));
 }
 
 export async function rotateHandlerSecret(cred: Cred): Promise<{ secret: string }> {

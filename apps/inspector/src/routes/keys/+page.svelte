@@ -149,7 +149,9 @@
 							</p>
 							<p class="row-meta">
 								<span class="mono">{k.prefix ? `${k.prefix}…` : '—'}</span>
-								<span title={k.createdAt ? fmtDateTime(k.createdAt, live.now) : ''}>Created {k.createdAt ? fmtAgo(live.now - k.createdAt) : '—'}</span>
+								{#if k.createdAt || k.createdBy}
+									<span title={k.createdAt ? fmtDateTime(k.createdAt, live.now) : ''}>Created{k.createdAt ? ` ${fmtAgo(live.now - k.createdAt)}` : ''}{k.createdBy ? (k.createdBy === account.me?.public_id ? ' by you' : ' by a teammate') : ''}</span>
+								{/if}
 								<span>Last used {k.lastUsedAt ? fmtAgo(live.now - k.lastUsedAt) : 'not yet'}</span>
 							</p>
 						</div>

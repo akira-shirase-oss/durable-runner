@@ -7,11 +7,11 @@
 	import { goto } from '$app/navigation';
 	import { account } from '../../lib/account.svelte.ts';
 	import { acceptInvite, ApiError, declineInvite } from '../../lib/api.ts';
-	import { hashParam, tokenShapeOk } from '../../lib/mode.ts';
+	import { hashParam, inviteTokenShapeOk } from '../../lib/mode.ts';
 	import { normWorkspace } from '../../lib/saas.ts';
 
 	const token = hashParam(location.hash, 'token');
-	const valid = tokenShapeOk(token);
+	const valid = inviteTokenShapeOk(token);
 	const here = valid ? `#/accept-invite?token=${token}` : null;
 	let busy = $state<'accept' | 'decline' | null>(null);
 	let phase = $state<'ask' | 'declined' | 'gone'>(valid ? 'ask' : 'gone');
@@ -41,7 +41,8 @@
 			}
 		} catch (e) {
 			const ae = e instanceof ApiError ? e : new ApiError(String(e), 0);
-			if (ae.status === 410 || ae.code === 'token_gone' || ae.code === 'invalid_or_expired_token') phase = 'gone';
+			// one answer for every dead invite: unknown, used, revoked, expired (410 in the plan, 404 not_found in the code)
+			if (ae.status === 410 || ae.status === 404 || ae.code === 'token_gone' || ae.code === 'invalid_or_expired_token') phase = 'gone';
 			else error = ae;
 		} finally {
 			busy = null;

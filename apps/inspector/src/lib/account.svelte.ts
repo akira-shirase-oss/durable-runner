@@ -2,7 +2,7 @@
 // the workspaces and the one this tab has selected. The selection lives in sessionStorage (D-062), so two tabs
 // can look at two workspaces; requests to /workspaces/{pid}/… carry it in the path, flat routes in
 // x-durable-workspace (http.ts). The session itself is the HttpOnly cookie: nothing here can read or keep it.
-import { ApiError, login, logout, onSessionLost, probeSession, type SessionCred } from './api.ts';
+import { ApiError, listMyWorkspaces, login, logout, onSessionLost, probeSession, type SessionCred } from './api.ts';
 import { modeFromStatus, type Mode } from './mode.ts';
 import { can, listOf, normMe, normWorkspace, type Action, type Me, type Role, type WorkspaceRef } from './saas.ts';
 
@@ -76,7 +76,7 @@ class Account {
 		try {
 			const r = await probeSession();
 			const m = modeFromStatus(r.status);
-			if (m === 'signed-in') this.#apply(r.body);
+			if (m === 'signed-in') await this.#apply(r.body);
 			else if (m === 'error') this.bootError = new ApiError(`GET /auth/session answered ${r.status}`, r.status, r.code);
 			if (m !== 'signed-in') this.#clear();
 			this.mode = m;
@@ -91,7 +91,7 @@ class Account {
 		const r = await probeSession();
 		const m = modeFromStatus(r.status);
 		if (m === 'signed-in') {
-			this.#apply(r.body);
+			await this.#apply(r.body);
 			this.mode = 'signed-in';
 		} else if (m === 'signed-out') {
 			this.#clear();
@@ -116,7 +116,7 @@ class Account {
 					this.#clear();
 					this.notice = 'Your session ended. Sign in again.';
 					this.mode = 'signed-out';
-				} else if (r.status === 200) this.#apply(r.body);
+				} else if (r.status === 200) await this.#apply(r.body);
 			} catch {
 				/* the server did not answer: the pages already show their own errors */
 			} finally {
@@ -183,11 +183,19 @@ class Account {
 		}
 	}
 
-	#apply(body: unknown) {
+	/** The session bootstrap, then the workspace list: GET /workspaces is the authority (the bootstrap's own
+	 *  `workspaces` may be empty on servers that fill it elsewhere); without that route, the bootstrap's list. */
+	async #apply(body: unknown) {
 		const b = (typeof body === 'object' && body !== null ? body : {}) as Record<string, unknown>;
 		this.me = normMe(b.account);
 		if (typeof b.csrf === 'string') this.csrf = b.csrf;
-		this.workspaces = listOf(b.workspaces, 'workspaces')
+		let raw: unknown = b.workspaces;
+		try {
+			raw = await listMyWorkspaces(this.cred);
+		} catch {
+			/* an older server, or a moment's outage: the bootstrap's list stands */
+		}
+		this.workspaces = listOf(raw, 'workspaces')
 			.map(normWorkspace)
 			.filter((w): w is WorkspaceRef => w !== null);
 		const keep = this.pid ?? loadPid();

@@ -13,7 +13,7 @@
 	import { ApiError, changeRole, inviteMember, listInvites, listMembers, removeMember, revokeInvite } from '../../lib/api.ts';
 	import { fmtAgo, fmtDateTime } from '../../lib/format.ts';
 	import { live, poll, Resource } from '../../lib/live.svelte.ts';
-	import { listOf, normInvite, normMember, ROLE_HINT, ROLE_LABEL, type InviteRow, type MemberRow, type Role } from '../../lib/saas.ts';
+	import { inviteLink, listOf, normInvite, normMember, ROLE_HINT, ROLE_LABEL, type InviteRow, type MemberRow, type Role } from '../../lib/saas.ts';
 	import { ui } from '../../lib/ui-state.svelte.ts';
 	import { emailError } from '../../lib/validate.ts';
 
@@ -63,8 +63,8 @@
 				ui.show({
 					title: `Invite sent to ${to}`,
 					label: 'Invite link',
-					value: res.invite_url,
-					note: `It is on its way by mail. You can also share this link with ${to} yourself: it works once, for 14 days, and only for an account with that address.`,
+					value: inviteLink(res.invite_url, `${location.origin}${location.pathname}`),
+					note: `Share this link with ${to}: it works once, for 14 days, and only for an account with that address. A mail goes to the address too.`,
 				});
 			} else notice = `Invite sent to ${to}.`;
 			email = '';

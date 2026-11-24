@@ -95,7 +95,12 @@
 	let testing = $state<string | null>(null);
 	let testInput = $state('{"hello": "world"}');
 	let testResult = $state<{ name: string; r: TestResult } | null>(null);
-	const testInputErr = $derived(inputToB64(testInput).error);
+	// the server bounds a test input to 8 KiB decoded
+	const testInputErr = $derived.by(() => {
+		const e = inputToB64(testInput);
+		if (e.error) return e.error;
+		return new TextEncoder().encode(testInput.trim()).length > 8 * 1024 ? 'A test input is at most 8 KiB' : null;
+	});
 	function openTest(h: HandlerRow) {
 		testing = testing === h.name ? null : h.name;
 		testResult = null;
@@ -241,7 +246,7 @@ def verified(method, path, headers, raw_body):
 					{/if}
 					{#if testing === h.name}
 						<form class="form inline-panel" onsubmit={(e) => sendTest(e, h)} novalidate>
-							<p class="field-hint">One signed call, exactly like a step's, outside any run: nothing is journaled and it is not retried. Free plan: 30 test calls an hour.</p>
+							<p class="field-hint">One signed call, exactly like a step's, outside any run: nothing is journaled and it is not retried. Up to 30 test calls an hour per workspace. The reply is shown as text, never run.</p>
 							<div class="field">
 								<label class="field-label" for="test-{h.name}">Input (JSON)</label>
 								<textarea id="test-{h.name}" class="mono" rows="3" bind:value={testInput} spellcheck="false" aria-invalid={testInputErr ? 'true' : undefined} aria-describedby={testInputErr ? `test-${h.name}-err` : undefined}></textarea>

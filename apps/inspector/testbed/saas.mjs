@@ -139,7 +139,7 @@ const PAGES = [
   { name: 'reset-gone', hash: `#/reset?token=${M.DEAD_TOKEN}`, mock: { signedIn: false }, wait: '#password', act: async (p) => {
     await p.fill('#password', 'a brand new passphrase'); await p.click('button[type=submit]'); await p.waitForSelector('h1:has-text("no longer valid")');
   } },
-  { name: 'accept-invite-signed-out', hash: `#/accept-invite?token=${T}`, mock: { signedIn: false }, wait: 'h1:has-text("invited")' },
+  { name: 'accept-invite-signed-out', hash: `#/accept-invite?token=${M.INVITE_TOKEN}`, mock: { signedIn: false }, wait: 'h1:has-text("invited")' },
   { name: 'boot-error', hash: '#/overview', mock: { bootStatus: 503 }, wait: 'h1:has-text("cannot reach")' },
   // signed in
   { name: 'first-workspace', hash: '#/overview', mock: { workspaces: 'none' }, wait: '#first-ws-title' },
@@ -178,7 +178,22 @@ const PAGES = [
   { name: 'team', hash: '#/team', mock: {}, wait: '.rows li' },
   { name: 'team-viewer', hash: '#/team', mock: { role: 'viewer', workspaces: 'one' }, wait: '.rows li' },
   { name: 'settings', hash: '#/settings', mock: {}, wait: '#sess-title' },
-  { name: 'accept-invite', hash: `#/accept-invite?token=${T}`, mock: {}, wait: 'h1:has-text("Join")' },
+  { name: 'accept-invite', hash: `#/accept-invite?token=${M.INVITE_TOKEN}`, mock: {}, wait: 'h1:has-text("Join")' },
+  { name: 'accept-invite-gone', hash: `#/accept-invite?token=${M.DEAD_INVITE}`, mock: {}, wait: 'h1:has-text("Join")', act: async (p) => {
+    await p.getByRole('button', { name: /^Accept/ }).click(); await p.waitForSelector('h1:has-text("no longer valid")');
+  } },
+  { name: 'team-limit', hash: '#/team', mock: {}, wait: '.rows li', full: false, act: async (p) => {
+    await p.fill('#inv-email', 'new.colleague@example.com'); await p.click('form button[type=submit]'); await p.waitForSelector('.banner.warn:has-text("plan_limit")');
+  } },
+  { name: 'team-invited', hash: '#/team', mock: {}, wait: '.rows li', full: false, act: async (p) => {
+    const ken = p.locator('.rows li', { hasText: 'ken@example.com' });
+    await ken.getByRole('button', { name: 'Revoke' }).click();
+    await ken.getByRole('button', { name: 'Revoke', exact: true }).click();
+    await p.waitForSelector('text=No pending invites');
+    await p.fill('#inv-email', 'new.colleague@example.com'); await p.click('form button[type=submit]'); await p.waitForSelector('dialog[open] .copy-value');
+    const v = await p.locator('dialog[open] .copy-value').textContent();
+    if (!v?.includes('/app/#/accept-invite?token=dri_')) throw new Error(`invite link is not a dashboard link: ${v}`);
+  } },
 ];
 
 const quick = FLAGS.has('--quick');
