@@ -75,6 +75,38 @@ pub struct Workspace {
     /// generated server-side and never leaves the store on reads that do
     /// not need it — callers must not log or serialize it.
     pub handler_secret: [u8; 32],
+    /// Soft delete (D-072): set, admission refuses and members stop
+    /// seeing the row; job data leaves on the journal's own schedule.
+    pub deleted_at_ms: Option<i64>,
+}
+
+/// A member row as the API shows it: the account's public handle only —
+/// sequential ids never cross the boundary.
+#[derive(Debug, Clone)]
+pub struct MemberInfo {
+    pub account_public_id: uuid::Uuid,
+    pub email: String,
+    pub role: Role,
+    pub since_ms: i64,
+}
+
+/// A live workspace invite as the API shows it.
+#[derive(Debug, Clone)]
+pub struct WorkspaceInvite {
+    pub public_id: uuid::Uuid,
+    pub email: String,
+    pub role: Role,
+    pub expires_at_ms: i64,
+}
+
+/// The outcome of a member-row mutation. `LastOwner` covers every edit
+/// to the owner row: exactly one owner exists (`members_one_owner`), it
+/// can never be demoted or removed, and ownership transfers do not exist.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MemberChange {
+    Changed,
+    NotFound,
+    LastOwner,
 }
 
 /// Public-facing description of an issued API key. The secret itself is
@@ -465,6 +497,102 @@ pub trait AccountStore: Send + Sync {
     /// plane is key-only).
     async fn member_role(&self, account: u64, workspace: u64)
         -> Result<Option<Role>, AccountError>;
+
+    // --- S3-3: the tenant control plane ------------------------------
+
+    /// `POST /workspaces`: one atomic write — the workspace row plus its
+    /// owner member row. Owner rows are minted here and only here; no
+    /// member mutation may ever create or move one (D-066).
+    async fn create_workspace_for(
+        &self,
+        account: u64,
+        name: &str,
+    ) -> Result<Workspace, AccountError>;
+
+    async fn rename_workspace(&self, id: u64, name: &str) -> Result<bool, AccountError>;
+
+    /// Soft delete (D-072): sets `deleted_at` and revokes every live
+    /// API key of the workspace in the same step — a key of a deleted
+    /// workspace is dead the moment the delete commits. Members and
+    /// invites stay on the row for the grace period; members stop
+    /// seeing it because `workspaces_for_account` filters.
+    async fn delete_workspace(&self, id: u64, now_ms: i64) -> Result<bool, AccountError>;
+
+    /// Every live workspace `account` belongs to, with their role.
+    /// Deleted workspaces never appear (members lose them from lists).
+    async fn workspaces_for_account(
+        &self,
+        account: u64,
+    ) -> Result<Vec<(Workspace, Role)>, AccountError>;
+
+    async fn list_members(&self, workspace: u64) -> Result<Vec<MemberInfo>, AccountError>;
+
+    /// Set `account`'s role in `workspace`. `Role::Owner` is refused by
+    /// the caller before this is reached; the owner row itself always
+    /// answers `LastOwner` — it is immutable for the workspace's life.
+    async fn set_member_role(
+        &self,
+        workspace: u64,
+        account: u64,
+        role: Role,
+    ) -> Result<MemberChange, AccountError>;
+
+    async fn remove_member(
+        &self,
+        workspace: u64,
+        account: u64,
+    ) -> Result<MemberChange, AccountError>;
+
+    async fn account_by_public_id(
+        &self,
+        public_id: uuid::Uuid,
+    ) -> Result<Option<Account>, AccountError>;
+
+    /// Create a live invite. `Ok(None)` is a live duplicate — a pending,
+    /// unexpired invite for the same (workspace, email) already exists
+    /// (`invites_pending` unique index; the route answers 409
+    /// `invite_pending`). `token_hash` is sha256 of the mailed token.
+    async fn create_invite(
+        &self,
+        workspace: u64,
+        email: &str,
+        role: Role,
+        invited_by: u64,
+        token_hash: &[u8; 32],
+        expires_at_ms: i64,
+    ) -> Result<Option<WorkspaceInvite>, AccountError>;
+
+    async fn list_invites(&self, workspace: u64) -> Result<Vec<WorkspaceInvite>, AccountError>;
+
+    /// Revoke a pending invite, bound to `workspace` — an invite id is
+    /// only ever addressed under its own workspace (child-idor).
+    async fn revoke_invite(
+        &self,
+        workspace: u64,
+        public_id: uuid::Uuid,
+    ) -> Result<bool, AccountError>;
+
+    /// Accept a live invite: mark it consumed and write the member row
+    /// (ON CONFLICT DO NOTHING — already a member still consumes the
+    /// invite and re-answers the grant). `Ok(None)` covers unknown,
+    /// consumed, revoked and expired tokens; the caller matched the
+    /// session's email to the invite's address before reaching here
+    /// (`403 invite_email_mismatch`) — the row is revealed only to the
+    /// address it was mailed to.
+    async fn accept_invite(
+        &self,
+        token_hash: &[u8; 32],
+        account: u64,
+        now_ms: i64,
+    ) -> Result<Option<(u64, Role)>, AccountError>;
+
+    /// Decline a live invite by token — marks it revoked. `Ok(false)`
+    /// for unknown or already-terminal tokens.
+    async fn decline_invite(
+        &self,
+        token_hash: &[u8; 32],
+        now_ms: i64,
+    ) -> Result<bool, AccountError>;
 
     // --- S3-1: email-token consume, outbox drain, invites -----------
 

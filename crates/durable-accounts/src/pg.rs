@@ -135,6 +135,9 @@ fn workspace_from(row: &sqlx::postgres::PgRow) -> Result<Workspace, AccountError
         public_id: row.try_get("public_id")?,
         name: row.try_get("name")?,
         handler_secret,
+        deleted_at_ms: row
+            .try_get::<Option<time::OffsetDateTime>, _>("deleted_at")?
+            .map(ms),
     })
 }
 
@@ -163,7 +166,7 @@ impl AccountStore for Pg {
 
     async fn workspace_by_id(&self, id: u64) -> Result<Option<Workspace>, AccountError> {
         let row = bounded(
-            sqlx::query("SELECT id, public_id, name, handler_secret FROM workspaces WHERE id = $1")
+            sqlx::query("SELECT id, public_id, name, handler_secret, deleted_at FROM workspaces WHERE id = $1")
                 .bind(to_i64(id, "workspace")?)
                 .fetch_optional(&self.pool),
         )
@@ -177,7 +180,7 @@ impl AccountStore for Pg {
     ) -> Result<Option<Workspace>, AccountError> {
         let row = bounded(
             sqlx::query(
-                "SELECT id, public_id, name, handler_secret FROM workspaces WHERE public_id = $1",
+                "SELECT id, public_id, name, handler_secret, deleted_at FROM workspaces WHERE public_id = $1",
             )
             .bind(public_id)
             .fetch_optional(&self.pool),
@@ -208,6 +211,7 @@ impl AccountStore for Pg {
             public_id,
             name: name.to_string(),
             handler_secret: secret,
+            deleted_at_ms: None,
         })
     }
 
@@ -219,7 +223,7 @@ impl AccountStore for Pg {
         let after = after.map(|a| to_i64(a, "workspace")).transpose()?;
         let rows = bounded(
             sqlx::query(
-                "SELECT id, public_id, name, handler_secret FROM workspaces \
+                "SELECT id, public_id, name, handler_secret, deleted_at FROM workspaces \
                  WHERE ($2::bigint IS NULL OR id > $2) \
                  ORDER BY id LIMIT $1",
             )
@@ -799,6 +803,374 @@ impl AccountStore for Pg {
             crate::Role::parse(&r).ok_or_else(|| AccountError::Store(format!("bad role {r:?}")))
         })
         .transpose()
+    }
+
+    async fn create_workspace_for(
+        &self,
+        account: u64,
+        name: &str,
+    ) -> Result<Workspace, AccountError> {
+        // One transaction: the workspace row and its owner member row
+        // land or neither does — an ownerless workspace cannot exist.
+        let mut tx = bounded(self.pool.begin()).await?;
+        let public_id = uuid::Uuid::now_v7();
+        let mut secret = [0u8; 32];
+        getrandom::fill(&mut secret)
+            .map_err(|e| AccountError::Store(format!("cannot draw a handler secret: {e}")))?;
+        let row = bounded(
+            sqlx::query(
+                "INSERT INTO workspaces (public_id, name, handler_secret, created_by) \
+                 VALUES ($1, $2, $3, $4) RETURNING id",
+            )
+            .bind(public_id)
+            .bind(name)
+            .bind(secret.as_slice())
+            .bind(to_i64(account, "account")?)
+            .fetch_one(&mut *tx),
+        )
+        .await?;
+        let id: i64 = row.try_get("id")?;
+        bounded(
+            sqlx::query(
+                "INSERT INTO members (workspace_id, account_id, role) VALUES ($1, $2, 'owner')",
+            )
+            .bind(id)
+            .bind(to_i64(account, "account")?)
+            .execute(&mut *tx),
+        )
+        .await?;
+        bounded(tx.commit()).await?;
+        Ok(Workspace {
+            id: to_u64(id, "workspace")?,
+            public_id,
+            name: name.to_string(),
+            handler_secret: secret,
+            deleted_at_ms: None,
+        })
+    }
+
+    async fn rename_workspace(&self, id: u64, name: &str) -> Result<bool, AccountError> {
+        let done = bounded(
+            sqlx::query("UPDATE workspaces SET name = $2 WHERE id = $1")
+                .bind(to_i64(id, "workspace")?)
+                .bind(name)
+                .execute(&self.pool),
+        )
+        .await?;
+        Ok(done.rows_affected() > 0)
+    }
+
+    async fn delete_workspace(&self, id: u64, now_ms: i64) -> Result<bool, AccountError> {
+        // One transaction (D-072): the row closes and every live key
+        // dies in the same commit — a deleted workspace's key can never
+        // outlive the delete.
+        let mut tx = bounded(self.pool.begin()).await?;
+        let done = bounded(
+            sqlx::query(
+                "UPDATE workspaces SET deleted_at = $2 WHERE id = $1 AND deleted_at IS NULL",
+            )
+            .bind(to_i64(id, "workspace")?)
+            .bind(ts(now_ms))
+            .execute(&mut *tx),
+        )
+        .await?;
+        if done.rows_affected() == 0 {
+            return Ok(false);
+        }
+        bounded(
+            sqlx::query(
+                "UPDATE api_keys SET revoked_at = $2 WHERE workspace_id = $1 AND revoked_at IS NULL",
+            )
+            .bind(to_i64(id, "workspace")?)
+            .bind(ts(now_ms))
+            .execute(&mut *tx),
+        )
+        .await?;
+        bounded(tx.commit()).await?;
+        Ok(true)
+    }
+
+    async fn workspaces_for_account(
+        &self,
+        account: u64,
+    ) -> Result<Vec<(Workspace, crate::Role)>, AccountError> {
+        let rows = bounded(
+            sqlx::query(
+                "SELECT w.id, w.public_id, w.name, w.handler_secret, w.deleted_at, m.role \
+                 FROM members m JOIN workspaces w ON w.id = m.workspace_id \
+                 WHERE m.account_id = $1 AND w.deleted_at IS NULL ORDER BY w.id",
+            )
+            .bind(to_i64(account, "account")?)
+            .fetch_all(&self.pool),
+        )
+        .await?;
+        rows.iter()
+            .map(|r| {
+                Ok((
+                    workspace_from(r)?,
+                    crate::Role::parse(r.try_get::<&str, _>("role")?)
+                        .ok_or_else(|| AccountError::Store("bad role".into()))?,
+                ))
+            })
+            .collect()
+    }
+
+    async fn list_members(&self, workspace: u64) -> Result<Vec<crate::MemberInfo>, AccountError> {
+        let rows = bounded(
+            sqlx::query(
+                "SELECT a.public_id, a.email, m.role, m.created_at \
+                 FROM members m JOIN accounts a ON a.id = m.account_id \
+                 WHERE m.workspace_id = $1 ORDER BY m.created_at",
+            )
+            .bind(to_i64(workspace, "workspace")?)
+            .fetch_all(&self.pool),
+        )
+        .await?;
+        rows.iter()
+            .map(|r| {
+                Ok(crate::MemberInfo {
+                    account_public_id: r.try_get("public_id")?,
+                    email: r.try_get("email")?,
+                    role: crate::Role::parse(r.try_get::<&str, _>("role")?)
+                        .ok_or_else(|| AccountError::Store("bad role".into()))?,
+                    since_ms: ms(r.try_get::<time::OffsetDateTime, _>("created_at")?),
+                })
+            })
+            .collect()
+    }
+
+    async fn set_member_role(
+        &self,
+        workspace: u64,
+        account: u64,
+        role: crate::Role,
+    ) -> Result<crate::MemberChange, AccountError> {
+        // The owner row is untouchable: the UPDATE excludes it, so a
+        // demote of the owner lands 0 rows and the read below tells the
+        // two NotFound/LastOwner cases apart.
+        let done = bounded(
+            sqlx::query(
+                "UPDATE members SET role = $3 \
+                 WHERE workspace_id = $1 AND account_id = $2 AND role <> 'owner'",
+            )
+            .bind(to_i64(workspace, "workspace")?)
+            .bind(to_i64(account, "account")?)
+            .bind(role.as_str())
+            .execute(&self.pool),
+        )
+        .await?;
+        if done.rows_affected() > 0 {
+            return Ok(crate::MemberChange::Changed);
+        }
+        Ok(match self.member_role(account, workspace).await? {
+            Some(crate::Role::Owner) => crate::MemberChange::LastOwner,
+            _ => crate::MemberChange::NotFound,
+        })
+    }
+
+    async fn remove_member(
+        &self,
+        workspace: u64,
+        account: u64,
+    ) -> Result<crate::MemberChange, AccountError> {
+        let done = bounded(
+            sqlx::query(
+                "DELETE FROM members \
+                 WHERE workspace_id = $1 AND account_id = $2 AND role <> 'owner'",
+            )
+            .bind(to_i64(workspace, "workspace")?)
+            .bind(to_i64(account, "account")?)
+            .execute(&self.pool),
+        )
+        .await?;
+        if done.rows_affected() > 0 {
+            return Ok(crate::MemberChange::Changed);
+        }
+        Ok(match self.member_role(account, workspace).await? {
+            Some(crate::Role::Owner) => crate::MemberChange::LastOwner,
+            _ => crate::MemberChange::NotFound,
+        })
+    }
+
+    async fn account_by_public_id(
+        &self,
+        public_id: uuid::Uuid,
+    ) -> Result<Option<Account>, AccountError> {
+        let row = bounded(
+            sqlx::query(
+                "SELECT id, public_id, email, email_verified_at, password_hash \
+                 FROM accounts WHERE public_id = $1",
+            )
+            .bind(public_id)
+            .fetch_optional(&self.pool),
+        )
+        .await?;
+        row.map(|r| {
+            Ok(Account {
+                id: to_u64(r.try_get("id")?, "account")?,
+                public_id: r.try_get("public_id")?,
+                email: r.try_get("email")?,
+                email_verified: r
+                    .try_get::<Option<time::OffsetDateTime>, _>("email_verified_at")?
+                    .is_some(),
+                password_hash: r.try_get("password_hash")?,
+            })
+        })
+        .transpose()
+    }
+
+    async fn create_invite(
+        &self,
+        workspace: u64,
+        email: &str,
+        role: crate::Role,
+        invited_by: u64,
+        token_hash: &[u8; 32],
+        expires_at_ms: i64,
+    ) -> Result<Option<crate::WorkspaceInvite>, AccountError> {
+        let public_id = uuid::Uuid::now_v7();
+        // `invites_pending` makes the live-dup refusal atomic: ON
+        // CONFLICT (workspace_id, email) WHERE pending DO NOTHING.
+        let done = bounded(
+            sqlx::query(
+                "INSERT INTO invites \
+                 (public_id, workspace_id, email, role, invited_by, token_hash, expires_at) \
+                 VALUES ($1, $2, $3, $4, $5, $6, $7) \
+                 ON CONFLICT (workspace_id, email) \
+                 WHERE accepted_at IS NULL AND revoked_at IS NULL DO NOTHING",
+            )
+            .bind(public_id)
+            .bind(to_i64(workspace, "workspace")?)
+            .bind(email)
+            .bind(role.as_str())
+            .bind(to_i64(invited_by, "account")?)
+            .bind(token_hash.as_slice())
+            .bind(ts(expires_at_ms))
+            .execute(&self.pool),
+        )
+        .await?;
+        if done.rows_affected() == 0 {
+            return Ok(None);
+        }
+        Ok(Some(crate::WorkspaceInvite {
+            public_id,
+            email: email.to_string(),
+            role,
+            expires_at_ms,
+        }))
+    }
+
+    async fn list_invites(
+        &self,
+        workspace: u64,
+    ) -> Result<Vec<crate::WorkspaceInvite>, AccountError> {
+        let rows = bounded(
+            sqlx::query(
+                "SELECT public_id, email, role, expires_at FROM invites \
+                 WHERE workspace_id = $1 AND accepted_at IS NULL AND revoked_at IS NULL \
+                 ORDER BY id",
+            )
+            .bind(to_i64(workspace, "workspace")?)
+            .fetch_all(&self.pool),
+        )
+        .await?;
+        rows.iter()
+            .map(|r| {
+                Ok(crate::WorkspaceInvite {
+                    public_id: r.try_get("public_id")?,
+                    email: r.try_get("email")?,
+                    role: crate::Role::parse(r.try_get::<&str, _>("role")?)
+                        .ok_or_else(|| AccountError::Store("bad role".into()))?,
+                    expires_at_ms: ms(r.try_get::<time::OffsetDateTime, _>("expires_at")?),
+                })
+            })
+            .collect()
+    }
+
+    async fn revoke_invite(
+        &self,
+        workspace: u64,
+        public_id: uuid::Uuid,
+    ) -> Result<bool, AccountError> {
+        let done = bounded(
+            sqlx::query(
+                "UPDATE invites SET revoked_at = now() \
+                 WHERE workspace_id = $1 AND public_id = $2 \
+                   AND accepted_at IS NULL AND revoked_at IS NULL",
+            )
+            .bind(to_i64(workspace, "workspace")?)
+            .bind(public_id)
+            .execute(&self.pool),
+        )
+        .await?;
+        Ok(done.rows_affected() > 0)
+    }
+
+    async fn accept_invite(
+        &self,
+        token_hash: &[u8; 32],
+        account: u64,
+        now_ms: i64,
+    ) -> Result<Option<(u64, crate::Role)>, AccountError> {
+        // One transaction: consume the invite and write the member row —
+        // ON CONFLICT DO NOTHING keeps an existing row's role.
+        let mut tx = bounded(self.pool.begin()).await?;
+        let row = bounded(
+            sqlx::query(
+                "UPDATE invites SET accepted_at = $3 \
+                 WHERE token_hash = $1 AND accepted_at IS NULL AND revoked_at IS NULL \
+                   AND expires_at > $3 \
+                 RETURNING workspace_id, role",
+            )
+            .bind(token_hash.as_slice())
+            .bind(ts(now_ms))
+            .execute(&mut *tx),
+        )
+        .await?;
+        if row.rows_affected() == 0 {
+            return Ok(None);
+        }
+        // Re-read the row we just consumed for its grant.
+        let grant = bounded(
+            sqlx::query("SELECT workspace_id, role FROM invites WHERE token_hash = $1")
+                .bind(token_hash.as_slice())
+                .fetch_one(&mut *tx),
+        )
+        .await?;
+        let ws: i64 = grant.try_get("workspace_id")?;
+        let role_str: &str = grant.try_get("role")?;
+        let role = crate::Role::parse(role_str)
+            .ok_or_else(|| AccountError::Store(format!("bad role {role_str:?}")))?;
+        bounded(
+            sqlx::query(
+                "INSERT INTO members (workspace_id, account_id, role) \
+                 VALUES ($1, $2, $3) ON CONFLICT (workspace_id, account_id) DO NOTHING",
+            )
+            .bind(ws)
+            .bind(to_i64(account, "account")?)
+            .bind(role_str)
+            .execute(&mut *tx),
+        )
+        .await?;
+        bounded(tx.commit()).await?;
+        Ok(Some((to_u64(ws, "workspace")?, role)))
+    }
+
+    async fn decline_invite(
+        &self,
+        token_hash: &[u8; 32],
+        _now_ms: i64,
+    ) -> Result<bool, AccountError> {
+        let done = bounded(
+            sqlx::query(
+                "UPDATE invites SET revoked_at = now() \
+                 WHERE token_hash = $1 AND accepted_at IS NULL AND revoked_at IS NULL",
+            )
+            .bind(token_hash.as_slice())
+            .execute(&self.pool),
+        )
+        .await?;
+        Ok(done.rows_affected() > 0)
     }
 
     async fn consume_verify_token(

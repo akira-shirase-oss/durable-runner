@@ -41,7 +41,7 @@ struct Inner {
     accounts: HashMap<u64, Account>,
     /// (workspace, account) -> role. ws 0 rows are never written — the
     /// ops plane is key-only.
-    members: HashMap<(u64, u64), crate::Role>,
+    members: HashMap<(u64, u64), MemberRow>,
     sessions: HashMap<u64, SessionRow>,
     email_tokens: HashMap<u64, EmailTokenRow>,
     invites: HashMap<u64, InviteRow>,
@@ -86,10 +86,19 @@ struct EmailTokenRow {
     superseded: bool,
 }
 
+struct MemberRow {
+    role: crate::Role,
+    since_ms: i64,
+}
+
 struct InviteRow {
     workspace: u64,
     email: String,
     role: crate::Role,
+    public_id: uuid::Uuid,
+    /// Audit linkage for the pg dialect — written, never read in memory.
+    #[allow(dead_code)]
+    invited_by: u64,
     token_hash: [u8; 32],
     expires_at_ms: i64,
     accepted: bool,
@@ -135,6 +144,7 @@ impl Memory {
             public_id: uuid::Uuid::nil(),
             name: "default".into(),
             handler_secret: secret,
+            deleted_at_ms: None,
         });
         self.next_workspace.store(1, Ordering::Relaxed);
     }
@@ -150,7 +160,13 @@ impl Memory {
     pub fn add_member(&self, workspace: u64, account: u64, role: crate::Role) {
         assert_ne!(workspace, 0, "ws 0 is the ops plane");
         let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-        inner.members.insert((workspace, account), role);
+        inner.members.insert(
+            (workspace, account),
+            MemberRow {
+                role,
+                since_ms: now_ms(),
+            },
+        );
     }
 
     /// Test seam: a live invite row for the `DURABLE_INVITE_ONLY` gate
@@ -172,6 +188,8 @@ impl Memory {
                 workspace,
                 email: email.to_string(),
                 role,
+                public_id: uuid::Uuid::now_v7(),
+                invited_by: 0,
                 token_hash,
                 expires_at_ms,
                 accepted: false,
@@ -265,6 +283,7 @@ impl AccountStore for Memory {
             public_id: uuid::Uuid::now_v7(),
             name: name.to_string(),
             handler_secret: Self::draw_secret()?,
+            deleted_at_ms: None,
         };
         inner.workspaces.insert(id, workspace.clone());
         Ok(workspace)
@@ -700,7 +719,269 @@ impl AccountStore for Memory {
             return Ok(None);
         }
         let inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-        Ok(inner.members.get(&(workspace, account)).copied())
+        Ok(inner.members.get(&(workspace, account)).map(|m| m.role))
+    }
+
+    async fn create_workspace_for(
+        &self,
+        account: u64,
+        name: &str,
+    ) -> Result<Workspace, AccountError> {
+        // One atomic write: the row and its owner member row land or
+        // neither does — an ownerless workspace can never exist.
+        let workspace = self.create_workspace(name).await?;
+        let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        inner.members.insert(
+            (workspace.id, account),
+            MemberRow {
+                role: crate::Role::Owner,
+                since_ms: now_ms(),
+            },
+        );
+        Ok(workspace)
+    }
+
+    async fn rename_workspace(&self, id: u64, name: &str) -> Result<bool, AccountError> {
+        self.check_up()?;
+        let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(ws) = inner.workspaces.get_mut(&id) else {
+            return Ok(false);
+        };
+        ws.name = name.to_string();
+        Ok(true)
+    }
+
+    async fn delete_workspace(&self, id: u64, now_ms: i64) -> Result<bool, AccountError> {
+        self.check_up()?;
+        let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(ws) = inner.workspaces.get_mut(&id) else {
+            return Ok(false);
+        };
+        ws.deleted_at_ms = Some(now_ms);
+        // Keys die in the same breath (D-072): the very next verify
+        // finds the row revoked — no cache may outlive the delete.
+        for row in inner.keys.values_mut() {
+            if row.workspace == id {
+                row.revoked = true;
+            }
+        }
+        Ok(true)
+    }
+
+    async fn workspaces_for_account(
+        &self,
+        account: u64,
+    ) -> Result<Vec<(Workspace, crate::Role)>, AccountError> {
+        self.check_up()?;
+        let inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        let mut out: Vec<(Workspace, crate::Role)> = inner
+            .members
+            .iter()
+            .filter(|((_, a), _)| *a == account)
+            .filter_map(|((w, _), m)| {
+                inner
+                    .workspaces
+                    .get(w)
+                    .filter(|ws| ws.deleted_at_ms.is_none())
+                    .map(|ws| (ws.clone(), m.role))
+            })
+            .collect();
+        out.sort_by_key(|(ws, _)| ws.id);
+        Ok(out)
+    }
+
+    async fn list_members(&self, workspace: u64) -> Result<Vec<crate::MemberInfo>, AccountError> {
+        self.check_up()?;
+        let inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        let mut out: Vec<crate::MemberInfo> = inner
+            .members
+            .iter()
+            .filter(|((w, _), _)| *w == workspace)
+            .filter_map(|((_, a), m)| {
+                inner.accounts.get(a).map(|acc| crate::MemberInfo {
+                    account_public_id: acc.public_id,
+                    email: acc.email.clone(),
+                    role: m.role,
+                    since_ms: m.since_ms,
+                })
+            })
+            .collect();
+        out.sort_by_key(|m| m.since_ms);
+        Ok(out)
+    }
+
+    async fn set_member_role(
+        &self,
+        workspace: u64,
+        account: u64,
+        role: crate::Role,
+    ) -> Result<crate::MemberChange, AccountError> {
+        self.check_up()?;
+        let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(m) = inner.members.get_mut(&(workspace, account)) else {
+            return Ok(crate::MemberChange::NotFound);
+        };
+        if m.role == crate::Role::Owner {
+            return Ok(crate::MemberChange::LastOwner);
+        }
+        m.role = role;
+        Ok(crate::MemberChange::Changed)
+    }
+
+    async fn remove_member(
+        &self,
+        workspace: u64,
+        account: u64,
+    ) -> Result<crate::MemberChange, AccountError> {
+        self.check_up()?;
+        let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        match inner.members.get(&(workspace, account)) {
+            None => return Ok(crate::MemberChange::NotFound),
+            Some(m) if m.role == crate::Role::Owner => return Ok(crate::MemberChange::LastOwner),
+            _ => {}
+        }
+        inner.members.remove(&(workspace, account));
+        Ok(crate::MemberChange::Changed)
+    }
+
+    async fn account_by_public_id(
+        &self,
+        public_id: uuid::Uuid,
+    ) -> Result<Option<Account>, AccountError> {
+        self.check_up()?;
+        let inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        Ok(inner
+            .accounts
+            .values()
+            .find(|a| a.public_id == public_id)
+            .cloned())
+    }
+
+    async fn create_invite(
+        &self,
+        workspace: u64,
+        email: &str,
+        role: crate::Role,
+        invited_by: u64,
+        token_hash: &[u8; 32],
+        expires_at_ms: i64,
+    ) -> Result<Option<crate::WorkspaceInvite>, AccountError> {
+        self.check_up()?;
+        let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        // `invites_pending`: one live (unaccepted, unrevoked) invite per
+        // (workspace, email) — expiry does not free the seat.
+        let dup = inner
+            .invites
+            .values()
+            .any(|i| i.workspace == workspace && i.email == email && !i.accepted && !i.revoked);
+        if dup {
+            return Ok(None);
+        }
+        let invite = crate::WorkspaceInvite {
+            public_id: uuid::Uuid::now_v7(),
+            email: email.to_string(),
+            role,
+            expires_at_ms,
+        };
+        let id = self.next_invite.fetch_add(1, Ordering::Relaxed);
+        inner.invites.insert(
+            id,
+            InviteRow {
+                workspace,
+                email: email.to_string(),
+                role,
+                public_id: invite.public_id,
+                invited_by,
+                token_hash: *token_hash,
+                expires_at_ms,
+                accepted: false,
+                revoked: false,
+            },
+        );
+        Ok(Some(invite))
+    }
+
+    async fn list_invites(
+        &self,
+        workspace: u64,
+    ) -> Result<Vec<crate::WorkspaceInvite>, AccountError> {
+        self.check_up()?;
+        let inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        Ok(inner
+            .invites
+            .values()
+            .filter(|i| i.workspace == workspace && !i.accepted && !i.revoked)
+            .map(|i| crate::WorkspaceInvite {
+                public_id: i.public_id,
+                email: i.email.clone(),
+                role: i.role,
+                expires_at_ms: i.expires_at_ms,
+            })
+            .collect())
+    }
+
+    async fn revoke_invite(
+        &self,
+        workspace: u64,
+        public_id: uuid::Uuid,
+    ) -> Result<bool, AccountError> {
+        self.check_up()?;
+        let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(row) = inner
+            .invites
+            .values_mut()
+            .find(|i| i.public_id == public_id && i.workspace == workspace && !i.accepted)
+        else {
+            return Ok(false);
+        };
+        row.revoked = true;
+        Ok(true)
+    }
+
+    async fn accept_invite(
+        &self,
+        token_hash: &[u8; 32],
+        account: u64,
+        now_ms: i64,
+    ) -> Result<Option<(u64, crate::Role)>, AccountError> {
+        self.check_up()?;
+        let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(row) = inner
+            .invites
+            .values_mut()
+            .find(|i| i.token_hash == *token_hash && !i.accepted && !i.revoked)
+        else {
+            return Ok(None);
+        };
+        if row.expires_at_ms <= now_ms {
+            return Ok(None);
+        }
+        row.accepted = true;
+        let (ws, role) = (row.workspace, row.role);
+        // ON CONFLICT DO NOTHING: an existing member row keeps its role.
+        inner.members.entry((ws, account)).or_insert(MemberRow {
+            role,
+            since_ms: now_ms,
+        });
+        Ok(Some((ws, role)))
+    }
+
+    async fn decline_invite(
+        &self,
+        token_hash: &[u8; 32],
+        _now_ms: i64,
+    ) -> Result<bool, AccountError> {
+        self.check_up()?;
+        let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(row) = inner
+            .invites
+            .values_mut()
+            .find(|i| i.token_hash == *token_hash && !i.accepted && !i.revoked)
+        else {
+            return Ok(false);
+        };
+        row.revoked = true;
+        Ok(true)
     }
 
     async fn consume_verify_token(

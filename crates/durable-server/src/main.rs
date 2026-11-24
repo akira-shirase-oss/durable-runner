@@ -9202,6 +9202,100 @@ mod tests {
         ) -> Result<Option<Role>, AccountError> {
             self.inner.member_role(account, workspace).await
         }
+        async fn create_workspace_for(
+            &self,
+            account: u64,
+            name: &str,
+        ) -> Result<Workspace, AccountError> {
+            self.inner.create_workspace_for(account, name).await
+        }
+        async fn rename_workspace(&self, id: u64, name: &str) -> Result<bool, AccountError> {
+            self.inner.rename_workspace(id, name).await
+        }
+        async fn delete_workspace(&self, id: u64, now_ms: i64) -> Result<bool, AccountError> {
+            self.inner.delete_workspace(id, now_ms).await
+        }
+        async fn workspaces_for_account(
+            &self,
+            account: u64,
+        ) -> Result<Vec<(Workspace, Role)>, AccountError> {
+            self.inner.workspaces_for_account(account).await
+        }
+        async fn list_members(
+            &self,
+            workspace: u64,
+        ) -> Result<Vec<durable_accounts::MemberInfo>, AccountError> {
+            self.inner.list_members(workspace).await
+        }
+        async fn set_member_role(
+            &self,
+            workspace: u64,
+            account: u64,
+            role: Role,
+        ) -> Result<durable_accounts::MemberChange, AccountError> {
+            self.inner.set_member_role(workspace, account, role).await
+        }
+        async fn remove_member(
+            &self,
+            workspace: u64,
+            account: u64,
+        ) -> Result<durable_accounts::MemberChange, AccountError> {
+            self.inner.remove_member(workspace, account).await
+        }
+        async fn account_by_public_id(
+            &self,
+            public_id: uuid::Uuid,
+        ) -> Result<Option<durable_accounts::Account>, AccountError> {
+            self.inner.account_by_public_id(public_id).await
+        }
+        async fn create_invite(
+            &self,
+            workspace: u64,
+            email: &str,
+            role: Role,
+            invited_by: u64,
+            token_hash: &[u8; 32],
+            expires_at_ms: i64,
+        ) -> Result<Option<durable_accounts::WorkspaceInvite>, AccountError> {
+            self.inner
+                .create_invite(
+                    workspace,
+                    email,
+                    role,
+                    invited_by,
+                    token_hash,
+                    expires_at_ms,
+                )
+                .await
+        }
+        async fn list_invites(
+            &self,
+            workspace: u64,
+        ) -> Result<Vec<durable_accounts::WorkspaceInvite>, AccountError> {
+            self.inner.list_invites(workspace).await
+        }
+        async fn revoke_invite(
+            &self,
+            workspace: u64,
+            public_id: uuid::Uuid,
+        ) -> Result<bool, AccountError> {
+            self.inner.revoke_invite(workspace, public_id).await
+        }
+        async fn accept_invite(
+            &self,
+            token_hash: &[u8; 32],
+            account: u64,
+            now_ms: i64,
+        ) -> Result<Option<(u64, Role)>, AccountError> {
+            self.inner.accept_invite(token_hash, account, now_ms).await
+        }
+        async fn decline_invite(
+            &self,
+            token_hash: &[u8; 32],
+            now_ms: i64,
+        ) -> Result<bool, AccountError> {
+            self.inner.decline_invite(token_hash, now_ms).await
+        }
         async fn outbox_mark(&self, id: u64, outcome: MailOutcome) -> Result<(), AccountError> {
             self.inner.outbox_mark(id, outcome).await
         }
@@ -9445,6 +9539,100 @@ mod tests {
             workspace: u64,
         ) -> Result<Option<Role>, AccountError> {
             self.inner.member_role(account, workspace).await
+        }
+        async fn create_workspace_for(
+            &self,
+            account: u64,
+            name: &str,
+        ) -> Result<Workspace, AccountError> {
+            self.inner.create_workspace_for(account, name).await
+        }
+        async fn rename_workspace(&self, id: u64, name: &str) -> Result<bool, AccountError> {
+            self.inner.rename_workspace(id, name).await
+        }
+        async fn delete_workspace(&self, id: u64, now_ms: i64) -> Result<bool, AccountError> {
+            self.inner.delete_workspace(id, now_ms).await
+        }
+        async fn workspaces_for_account(
+            &self,
+            account: u64,
+        ) -> Result<Vec<(Workspace, Role)>, AccountError> {
+            self.inner.workspaces_for_account(account).await
+        }
+        async fn list_members(
+            &self,
+            workspace: u64,
+        ) -> Result<Vec<durable_accounts::MemberInfo>, AccountError> {
+            self.inner.list_members(workspace).await
+        }
+        async fn set_member_role(
+            &self,
+            workspace: u64,
+            account: u64,
+            role: Role,
+        ) -> Result<durable_accounts::MemberChange, AccountError> {
+            self.inner.set_member_role(workspace, account, role).await
+        }
+        async fn remove_member(
+            &self,
+            workspace: u64,
+            account: u64,
+        ) -> Result<durable_accounts::MemberChange, AccountError> {
+            self.inner.remove_member(workspace, account).await
+        }
+        async fn account_by_public_id(
+            &self,
+            public_id: uuid::Uuid,
+        ) -> Result<Option<durable_accounts::Account>, AccountError> {
+            self.inner.account_by_public_id(public_id).await
+        }
+        async fn create_invite(
+            &self,
+            workspace: u64,
+            email: &str,
+            role: Role,
+            invited_by: u64,
+            token_hash: &[u8; 32],
+            expires_at_ms: i64,
+        ) -> Result<Option<durable_accounts::WorkspaceInvite>, AccountError> {
+            self.inner
+                .create_invite(
+                    workspace,
+                    email,
+                    role,
+                    invited_by,
+                    token_hash,
+                    expires_at_ms,
+                )
+                .await
+        }
+        async fn list_invites(
+            &self,
+            workspace: u64,
+        ) -> Result<Vec<durable_accounts::WorkspaceInvite>, AccountError> {
+            self.inner.list_invites(workspace).await
+        }
+        async fn revoke_invite(
+            &self,
+            workspace: u64,
+            public_id: uuid::Uuid,
+        ) -> Result<bool, AccountError> {
+            self.inner.revoke_invite(workspace, public_id).await
+        }
+        async fn accept_invite(
+            &self,
+            token_hash: &[u8; 32],
+            account: u64,
+            now_ms: i64,
+        ) -> Result<Option<(u64, Role)>, AccountError> {
+            self.inner.accept_invite(token_hash, account, now_ms).await
+        }
+        async fn decline_invite(
+            &self,
+            token_hash: &[u8; 32],
+            now_ms: i64,
+        ) -> Result<bool, AccountError> {
+            self.inner.decline_invite(token_hash, now_ms).await
         }
         async fn outbox_mark(&self, id: u64, outcome: MailOutcome) -> Result<(), AccountError> {
             self.inner.outbox_mark(id, outcome).await
