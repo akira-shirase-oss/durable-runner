@@ -4449,10 +4449,16 @@ async fn ws_invite_member(
             ));
         }
     }
+    // The link the app understands: a FRAGMENT route, so the token never
+    // lands in a server log or a Referer — it appears once, here and in
+    // the inviter's response, and the store keeps only its sha256.
+    let origin = app.public_origin.as_deref().unwrap_or("http://localhost");
+    let link = format!("{origin}/app#/accept-invite?token={token}");
     let (subject, body) = (
         format!("Invitation to {}", ws.name),
         format!(
-            "You were invited to {} as {}. Accept: /invites/accept with this token.",
+            "You were invited to {} as {}. Accept the invitation: {link}\n\n\
+             If you did not expect this, ignore the message — the link expires.",
             ws.name,
             role.as_str()
         ),
@@ -4475,7 +4481,7 @@ async fn ws_invite_member(
                 "role": invite.role.as_str(),
                 "expires_at": invite.expires_at_ms,
             },
-            "invite_url": format!("/invites/accept?token={token}"),
+            "invite_url": link,
         }))
         .into_response(),
     ))
@@ -19302,5 +19308,46 @@ mod tests {
         assert_eq!(st, StatusCode::OK);
         let (st, _) = call(&h.router, "POST", "/jobs", Some(READ_KEY), Some(echo("x"))).await;
         assert_eq!(st, StatusCode::FORBIDDEN);
+    }
+
+    /// The invite carries a usable app link, in the response AND the
+    /// mail: `{origin}/app#/accept-invite?token=dri_…` — a fragment, so
+    /// the token never reaches a server log.
+    #[tokio::test]
+    async fn s3d_invite_link_is_an_app_fragment() {
+        let store = Arc::new(Memory::new());
+        let h = harness_store(false, None, Some(store.clone()));
+        signup_and_verify(&h.router, &store, "o@o.co", "a-long-enough-passphrase").await;
+        let (oc, ocsrf) = login_only(&h.router, "o@o.co", "a-long-enough-passphrase").await;
+        let pid = make_ws(&h.router, &oc, "alpha").await;
+        let (st, _, v) = raw(
+            &h.router,
+            "POST",
+            &format!("/workspaces/{pid}/members"),
+            &session_headers(&oc, &ocsrf),
+            Some(json!({"email": "n@n.co", "role": "member"})),
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK, "{v}");
+        let url = v["invite_url"].as_str().unwrap_or_default().to_string();
+        assert!(
+            url.starts_with("http://localhost/app#/accept-invite?token=dri_"),
+            "invite_url: {url}"
+        );
+        // The mailed body carries the same link — the only other place
+        // the token ever appears.
+        let mail = store
+            .outbox_claim(unix_ms(), 8, 60_000)
+            .await
+            .unwrap_or_else(|e| panic!("{e}"));
+        let invite_mail = mail
+            .iter()
+            .find(|m| m.mail.kind == "workspace-invite")
+            .unwrap_or_else(|| panic!("invite mail queued"));
+        assert!(
+            invite_mail.mail.text.contains(&url),
+            "mail body lacks the app link: {}",
+            invite_mail.mail.text
+        );
     }
 }
