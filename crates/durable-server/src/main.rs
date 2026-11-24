@@ -7149,6 +7149,17 @@ fn loopback_host(parts: &Parts) -> bool {
 /// `--ops-listen` must be a loopback socket address (finding 18): the
 /// flag exists to keep env keys off the public socket, so a non-loopback
 /// value would re-publish them — refuse the boot with the reason.
+/// With an account store the deployment is the hosted one — env ops
+/// keys MUST be confined to the loopback listener (S2-5). Refuse
+/// rather than run a hosted stack with the ops surface on the public
+/// socket.
+fn check_store_ops(store: bool, ops_listen: bool) -> anyhow::Result<()> {
+    if store && !ops_listen {
+        anyhow::bail!("--ops-listen is required when an account store is configured");
+    }
+    Ok(())
+}
+
 fn check_ops_listen(ops_listen: &Option<String>) -> Result<()> {
     let Some(addr) = ops_listen else {
         return Ok(());
@@ -7248,6 +7259,7 @@ async fn main() -> Result<()> {
         // links.
         anyhow::bail!("--public-origin is required when an account store is configured");
     }
+    check_store_ops(store.is_some(), args.ops_listen.is_some())?;
     check_open_reads(&args.listen, args.open_reads)?;
     check_ops_listen(&args.ops_listen)?;
     let backup_root = args
@@ -19498,6 +19510,15 @@ mod tests {
         assert_eq!(st, StatusCode::OK, "{v}");
     }
 
+    /// S2-5: an account store without --ops-listen refuses boot.
+    #[test]
+    fn s2d_store_requires_ops_listen() {
+        assert!(check_store_ops(true, false).is_err());
+        assert!(check_store_ops(true, true).is_ok());
+        assert!(check_store_ops(false, false).is_ok());
+        assert!(check_store_ops(false, true).is_ok());
+    }
+
     /// Boot refuses a non-loopback --ops-listen and a non-address, and
     /// takes every loopback spelling.
     #[test]
@@ -19895,7 +19916,7 @@ mod tests {
         )
         .await;
         assert_eq!(st, StatusCode::OK, "{v}");
-        let (st, _, v) = raw(
+        let (_, _, v) = raw(
             &h.router,
             "GET",
             &format!("/workspaces/{pid}"),
@@ -20055,7 +20076,7 @@ mod tests {
             &h.router,
             "PUT",
             "/handlers/builtin:echo",
-            Some(&key),
+            Some(key),
             Some(json!({"url": "builtin:echo"})),
         )
         .await;
@@ -20063,13 +20084,13 @@ mod tests {
         let mut far = submit_body("far");
         far["not_before"] = json!((unix_ms() as u64) + 31 * 86_400_000);
         far["spec"]["steps"] = json!([{ "name": "a", "handler": "builtin:echo" }]);
-        let (st, v) = call(&h.router, "POST", "/jobs", Some(&key), Some(far)).await;
+        let (st, v) = call(&h.router, "POST", "/jobs", Some(key), Some(far)).await;
         assert_eq!(st, StatusCode::BAD_REQUEST, "{v}");
         assert_eq!(v["code"], "not_before_too_far");
         let mut ok = submit_body("ok");
         ok["not_before"] = json!((unix_ms() as u64) + 86_400_000);
         ok["spec"]["steps"] = json!([{ "name": "a", "handler": "builtin:echo" }]);
-        let (st, v) = call(&h.router, "POST", "/jobs", Some(&key), Some(ok)).await;
+        let (st, v) = call(&h.router, "POST", "/jobs", Some(key), Some(ok)).await;
         assert_eq!(st, StatusCode::OK, "{v}");
     }
 
