@@ -69,46 +69,14 @@ chmod +x "$fake"/*
 export PATH="$fake:$PATH"
 
 # --- a droplet as Colophon's installer leaves it -------------------------------------------
-# The root Caddyfile mirrors Colophon's deploy/droplet/Caddyfile as its install.sh renders it.
+# The root Caddyfile (testdata/colophon-root.Caddyfile) mirrors Colophon's deploy/droplet/Caddyfile
+# as its install.sh renders it.
 seed() { # <root>
   local r=$1
   if [[ -e "$r" ]]; then chmod -R u+w "$r"; rm -rf "$r"; fi
   mkdir -p "$r/etc/caddy" "$r/etc/colophon/credentials" "$r/etc/systemd/system" "$r/etc/redis" \
     "$r/etc/ssh/sshd_config.d" "$r/etc/ufw" "$r/var/lib/caddy" "$r/usr/local/bin"
-  cat >"$r/etc/caddy/Caddyfile" <<'EOF'
-# Caddy for the S0 droplet (deploy/droplet/DEPLOY.md).
-{
-	admin unix//var/lib/caddy/admin.sock|0600
-	auto_https off
-	servers {
-		import /etc/caddy/cloudflare-trusted.caddy
-		client_ip_headers Cf-Connecting-Ip
-		protocols h1 h2
-	}
-}
-
-colophonapp.404human.dev:443 {
-	tls /etc/caddy/origin.pem /etc/caddy/origin.key {
-		client_auth {
-			mode require_and_verify
-			import /etc/caddy/origin-pull-trust.caddy
-		}
-	}
-	header Strict-Transport-Security "max-age=31536000"
-	header >X-Content-Type-Options nosniff
-	redir / /studio/ 302
-	encode zstd gzip
-	reverse_proxy 127.0.0.1:58000 {
-		header_up X-Forwarded-For {client_ip}
-		flush_interval -1
-		lb_try_duration 10s
-		lb_try_interval 100ms
-		transport http {
-			keepalive 5s
-		}
-	}
-}
-EOF
+  cp "$kit/testdata/colophon-root.Caddyfile" "$r/etc/caddy/Caddyfile"
   printf 'trusted_proxies static 173.245.48.0/20 103.21.244.0/22 2400:cb00::/32\n' >"$r/etc/caddy/cloudflare-trusted.caddy"
   printf 'trust_pool file /etc/caddy/origin-pull-custom-ca.pem\n' >"$r/etc/caddy/origin-pull-trust.caddy"
   printf -- '-----BEGIN CERTIFICATE-----\ncolophon\n-----END CERTIFICATE-----\n' >"$r/etc/caddy/origin.pem"
