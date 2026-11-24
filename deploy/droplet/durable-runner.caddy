@@ -27,7 +27,7 @@ durablerunnerapp.404human.dev:443 {
 	header >X-Content-Type-Options nosniff
 	# The bare root opens the dashboard. A path matcher of "/" alone is exact; 302, so browsers
 	# don't keep it when the dashboard moves to /app/.
-	redir / /inspector/ 302
+	redir / /app/ 302
 	encode zstd gzip
 	reverse_proxy 127.0.0.1:58300 {
 		# durable-server trusts only this loopback hop for the header (deploy/durable-run.sh) and

@@ -144,8 +144,8 @@ root_after=$(cat "$A/etc/caddy/Caddyfile")
 added=$(diff <(printf '%s\n' "$seed_root") "$A/etc/caddy/Caddyfile" | grep -c '^>' || true)
 [[ "$added" -le 3 ]] && ok "the root gained $added lines (a blank, a comment, the import)" || bad "the root gained $added lines"
 [[ "$(colophon_snap "$A")" == "$seed_colophon" ]] && ok "Colophon's files are byte-identical" || bad "Colophon's files changed: $(diff <(echo "$seed_colophon") <(colophon_snap "$A") | head -5)"
-grep -qxF 'durablerunnerapp.404human.dev:443 {' "$A/etc/caddy/sites/durable-runner.caddy" && grep -qxF $'\tredir / /inspector/ 302' "$A/etc/caddy/sites/durable-runner.caddy" \
-  && ok "the site file is rendered for durablerunnerapp.404human.dev, / -> /inspector/" || bad "the site file isn't rendered as expected"
+grep -qxF 'durablerunnerapp.404human.dev:443 {' "$A/etc/caddy/sites/durable-runner.caddy" && grep -qxF $'\tredir / /app/ 302' "$A/etc/caddy/sites/durable-runner.caddy" \
+  && ok "the site file is rendered for durablerunnerapp.404human.dev, / -> /app/" || bad "the site file isn't rendered as expected"
 [[ ! -e "$A/etc/durable/trusted-proxies" ]] && ok "no trusted-proxies file (loopback hop only)" || bad "trusted-proxies was written"
 
 before=$(snap "$A"); : >"$SA/calls"
@@ -176,16 +176,16 @@ ls "$B/var/backups/durable-runner/caddy/"*/Caddyfile >/dev/null 2>&1 && ok "a ti
 
 # 3. On the set-up host A: a changed site file that fails validation, then one whose reload fails.
 echo "a refused change on a merged host"
-sed -i.bak 's#^DURABLE_DASHBOARD_PATH=.*#DURABLE_DASHBOARD_PATH=/app/#' "$A/etc/durable/durable.env"; rm -f "$A/etc/durable/durable.env.bak"
+sed -i.bak 's#^DURABLE_DASHBOARD_PATH=.*#DURABLE_DASHBOARD_PATH=/console/#' "$A/etc/durable/durable.env"; rm -f "$A/etc/durable/durable.env.bak"
 caddy_before=$(snap "$A/etc/caddy")
 run "$A" "$SA" "$kit/caddy-merge.sh" FAKE_CADDY_VALIDATE=1 >/dev/null 2>&1 && bad "a refused change was accepted" || ok "a refused change fails"
 [[ "$(snap "$A/etc/caddy")" == "$caddy_before" ]] && ok "the previous site file is back" || bad "the site file wasn't restored"
 run "$A" "$SA" "$kit/caddy-merge.sh" FAKE_RELOAD_RC=1 >/dev/null 2>&1 && bad "a failed reload was accepted" || ok "a failed reload fails"
 [[ "$(snap "$A/etc/caddy")" == "$caddy_before" ]] && ok "after a failed reload the files match the running config again" || bad "files not restored after a failed reload"
 : >"$SA/calls"
-run "$A" "$SA" "$kit/caddy-merge.sh" >/dev/null 2>&1 || bad "the /app/ merge failed"
-grep -qxF $'\tredir / /app/ 302' "$A/etc/caddy/sites/durable-runner.caddy" && [[ "$(grep -c 'reload caddy' "$SA/calls")" == 1 ]] \
-  && ok "the accepted change lands with one reload" || bad "the /app/ change didn't land once"
+run "$A" "$SA" "$kit/caddy-merge.sh" >/dev/null 2>&1 || bad "the /console/ merge failed"
+grep -qxF $'\tredir / /console/ 302' "$A/etc/caddy/sites/durable-runner.caddy" && [[ "$(grep -c 'reload caddy' "$SA/calls")" == 1 ]] \
+  && ok "the accepted change lands with one reload" || bad "the /console/ change didn't land once"
 [[ "$(grep -cxF 'import /etc/caddy/sites/*.caddy' "$A/etc/caddy/Caddyfile")" == 1 ]] && ok "still one import line" || bad "import lines multiplied"
 
 # 4. Roots the merge must not touch.
