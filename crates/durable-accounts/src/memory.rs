@@ -2,6 +2,15 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Mutex;
 
+/// Wall clock for the in-memory store — deadlines here are real, so
+/// tests drive time travel through the caller-side `now_ms` params.
+fn now_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
+}
+
 use crate::{
     Account, AccountError, AccountStore, ApiKeyInfo, HandlerRegistration, KeyGrant, Mail,
     MailOutcome, Permission, SessionGrant, SignupOutcome, Workspace,
@@ -19,6 +28,7 @@ pub struct Memory {
     next_account: AtomicU64,
     next_session: AtomicU64,
     next_token: AtomicU64,
+    next_invite: AtomicU64,
     next_outbox: AtomicU64,
     unavailable: AtomicBool,
 }
@@ -34,6 +44,7 @@ struct Inner {
     members: HashMap<(u64, u64), crate::Role>,
     sessions: HashMap<u64, SessionRow>,
     email_tokens: HashMap<u64, EmailTokenRow>,
+    invites: HashMap<u64, InviteRow>,
     outbox: HashMap<u64, OutboxRow>,
 }
 
@@ -60,15 +71,22 @@ struct EmailTokenRow {
     account: u64,
     kind: &'static str,
     hash: [u8; 32],
-    /// Mirrors the `expires_at` column; the verify/consume path reads
-    /// it when S3-1 lands token consumption.
-    #[expect(dead_code, reason = "read by the verify path in S3-1")]
     expires_at_ms: i64,
-    /// The pending password hash verify installs (review #2).
-    #[expect(dead_code, reason = "read by the verify path in S3-1")]
-    password_hash: String,
+    /// The pending password hash verify installs (review #2); reset
+    /// tokens carry none — the new hash arrives with the consume call.
+    password_hash: Option<String>,
     consumed: bool,
     superseded: bool,
+}
+
+struct InviteRow {
+    workspace: u64,
+    email: String,
+    role: crate::Role,
+    token_hash: [u8; 32],
+    expires_at_ms: i64,
+    accepted: bool,
+    revoked: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -76,6 +94,10 @@ pub struct OutboxRow {
     pub kind: &'static str,
     pub send_to: String,
     pub status: &'static str,
+    pub attempts: i64,
+    pub next_attempt_at_ms: i64,
+    pub created_at_ms: i64,
+    pub last_error: Option<String>,
     pub mail: Mail,
 }
 
@@ -122,6 +144,33 @@ impl Memory {
         assert_ne!(workspace, 0, "ws 0 is the ops plane");
         let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         inner.members.insert((workspace, account), role);
+    }
+
+    /// Test seam: a live invite row for the `DURABLE_INVITE_ONLY` gate
+    /// (S3-3 owns the real create path).
+    pub fn add_invite(
+        &self,
+        workspace: u64,
+        email: &str,
+        role: crate::Role,
+        token_hash: [u8; 32],
+        expires_at_ms: i64,
+    ) {
+        assert_ne!(workspace, 0, "ws 0 is the ops plane");
+        let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        let id = self.next_invite.fetch_add(1, Ordering::Relaxed);
+        inner.invites.insert(
+            id,
+            InviteRow {
+                workspace,
+                email: email.to_string(),
+                role,
+                token_hash,
+                expires_at_ms,
+                accepted: false,
+                revoked: false,
+            },
+        );
     }
 
     /// Test seam: the pending email-token hash of `kind` for `email` —
@@ -400,7 +449,7 @@ impl AccountStore for Memory {
                     acct.id,
                     token_hash,
                     token_expires_at_ms,
-                    password_hash,
+                    Some(password_hash.to_string()),
                     verify_mail,
                 );
                 Ok(SignupOutcome::VerifyResent { outbox })
@@ -422,7 +471,7 @@ impl AccountStore for Memory {
                     id,
                     token_hash,
                     token_expires_at_ms,
-                    password_hash,
+                    Some(password_hash.to_string()),
                     verify_mail,
                 );
                 Ok(SignupOutcome::Created { outbox })
@@ -535,6 +584,255 @@ impl AccountStore for Memory {
         Ok(inner.members.get(&(workspace, account)).copied())
     }
 
+    async fn consume_verify_token(
+        &self,
+        token_hash: &[u8; 32],
+    ) -> Result<Option<Account>, AccountError> {
+        self.check_up()?;
+        let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        let now = now_ms();
+        // One live check covers every dead state identically — unknown,
+        // consumed, superseded, expired and wrong-kind all answer None.
+        let Some(token) = inner.email_tokens.values_mut().find(|t| {
+            t.hash == *token_hash
+                    // ATTACK(token-kind-confusion)
+                    && t.kind == "verify"
+                    // ATTACK(token-replay)
+                    && !t.consumed
+                    && !t.superseded
+                    && t.expires_at_ms > now
+        }) else {
+            return Ok(None);
+        };
+        token.consumed = true;
+        let account = token.account;
+        let pending = token.password_hash.clone();
+        if let Some(acct) = inner.accounts.get_mut(&account) {
+            if let Some(phc) = pending {
+                acct.password_hash = Some(phc);
+            }
+            acct.email_verified = true;
+        }
+        // The mailbox owner's proof kills every session the account
+        // held — a pre-registration attacker's die here (review #2).
+        // ATTACK(prereg-takeover)
+        for row in inner.sessions.values_mut() {
+            if row.account == account {
+                row.revoked = true;
+            }
+        }
+        Ok(inner.accounts.get(&account).cloned())
+    }
+
+    async fn consume_reset_token(
+        &self,
+        token_hash: &[u8; 32],
+        new_password_hash: &str,
+    ) -> Result<Option<Account>, AccountError> {
+        self.check_up()?;
+        let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        let now = now_ms();
+        let Some(token) = inner.email_tokens.values_mut().find(|t| {
+            t.hash == *token_hash
+                && t.kind == "reset"
+                && !t.consumed
+                && !t.superseded
+                && t.expires_at_ms > now
+        }) else {
+            return Ok(None);
+        };
+        token.consumed = true;
+        let account = token.account;
+        if let Some(acct) = inner.accounts.get_mut(&account) {
+            acct.password_hash = Some(new_password_hash.to_string());
+            // Holding the mailed token proves mailbox ownership — the
+            // same proof standard as the verify link.
+            acct.email_verified = true;
+        }
+        // Every other pending token of the account is now dead weight:
+        // a verify token's pending hash must never overwrite the reset.
+        for row in inner.email_tokens.values_mut() {
+            if row.account == account && !row.consumed && !row.superseded {
+                row.superseded = true;
+            }
+        }
+        for row in inner.sessions.values_mut() {
+            if row.account == account {
+                row.revoked = true;
+            }
+        }
+        Ok(inner.accounts.get(&account).cloned())
+    }
+
+    async fn issue_reset_token(
+        &self,
+        email: &str,
+        token_hash: &[u8; 32],
+        expires_at_ms: i64,
+        reset_mail: &Mail,
+    ) -> Result<Option<u64>, AccountError> {
+        self.check_up()?;
+        let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(account) = inner
+            .accounts
+            .values()
+            .find(|a| a.email == email)
+            .map(|a| a.id)
+        else {
+            return Ok(None);
+        };
+        for row in inner.email_tokens.values_mut() {
+            if row.account == account && row.kind == "reset" && !row.consumed && !row.superseded {
+                row.superseded = true;
+            }
+        }
+        let token_id = self.next_token.fetch_add(1, Ordering::Relaxed);
+        inner.email_tokens.insert(
+            token_id,
+            EmailTokenRow {
+                account,
+                kind: "reset",
+                hash: *token_hash,
+                expires_at_ms,
+                password_hash: None,
+                consumed: false,
+                superseded: false,
+            },
+        );
+        Ok(Self::enqueue(&mut inner, &self.next_outbox, reset_mail))
+    }
+
+    async fn reissue_verify(
+        &self,
+        email: &str,
+        token_hash: &[u8; 32],
+        expires_at_ms: i64,
+        verify_mail: &Mail,
+    ) -> Result<Option<u64>, AccountError> {
+        self.check_up()?;
+        let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(account) = inner
+            .accounts
+            .values()
+            .find(|a| a.email == email && !a.email_verified)
+            .map(|a| (a.id, a.password_hash.clone()))
+        else {
+            return Ok(None);
+        };
+        Ok(self.issue_verify(
+            &mut inner,
+            account.0,
+            token_hash,
+            expires_at_ms,
+            account.1,
+            verify_mail,
+        ))
+    }
+
+    async fn invite_grant(
+        &self,
+        token_hash: &[u8; 32],
+        now_ms: i64,
+    ) -> Result<Option<crate::InviteGrant>, AccountError> {
+        self.check_up()?;
+        let inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        Ok(inner
+            .invites
+            .values()
+            .find(|i| {
+                i.token_hash == *token_hash && !i.accepted && !i.revoked && i.expires_at_ms > now_ms
+            })
+            .map(|i| crate::InviteGrant {
+                workspace: i.workspace,
+                email: i.email.clone(),
+                role: i.role,
+            }))
+    }
+
+    async fn enqueue_mail(&self, mail: &Mail) -> Result<Option<u64>, AccountError> {
+        self.check_up()?;
+        let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        Ok(Self::enqueue(&mut inner, &self.next_outbox, mail))
+    }
+
+    async fn outbox_claim(
+        &self,
+        now_ms: i64,
+        limit: u32,
+        claim_ms: i64,
+    ) -> Result<Vec<crate::OutboxMail>, AccountError> {
+        self.check_up()?;
+        let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        let mut due: Vec<u64> = inner
+            .outbox
+            .iter()
+            .filter(|(id, r)| {
+                let _ = id;
+                (r.status == "pending" || r.status == "sending")
+                    && r.next_attempt_at_ms <= now_ms
+                    && r.attempts < crate::mail::OUTBOX_MAX_ATTEMPTS
+            })
+            .map(|(id, _)| *id)
+            .collect();
+        due.sort_unstable();
+        due.truncate(limit as usize);
+        let mut claimed = Vec::with_capacity(due.len());
+        for id in due {
+            let row = inner.outbox.get_mut(&id).unwrap_or_else(|| panic!("row"));
+            if row.status == "sending" {
+                row.attempts += 1; // a crash-reclaimed claim counts a lost attempt
+            }
+            row.status = "sending";
+            row.next_attempt_at_ms = now_ms + claim_ms;
+            claimed.push(crate::OutboxMail {
+                id,
+                attempts: row.attempts,
+                mail: row.mail.clone(),
+            });
+        }
+        Ok(claimed)
+    }
+
+    async fn outbox_sweep(&self, now_ms: i64) -> Result<u64, AccountError> {
+        self.check_up()?;
+        let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        let mut swept = 0;
+        for row in inner.outbox.values_mut() {
+            if (row.status == "pending" || row.status == "sending")
+                && row.attempts >= crate::mail::OUTBOX_MAX_ATTEMPTS
+            {
+                row.status = "failed";
+                if row.last_error.is_none() {
+                    row.last_error = Some("attempts exhausted".into());
+                }
+                swept += 1;
+            } else if (row.status == "pending" || row.status == "sending")
+                && row.mail.expires_at_ms.is_some_and(|e| e <= now_ms)
+            {
+                row.status = "dropped";
+                row.mail.text.clear();
+                row.mail.html.clear();
+                swept += 1;
+            }
+        }
+        Ok(swept)
+    }
+
+    async fn outbox_purge(&self, now_ms: i64) -> Result<u64, AccountError> {
+        self.check_up()?;
+        let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        let before = inner.outbox.len();
+        inner.outbox.retain(|_, r| {
+            let keep_ms = if r.status == "sent" {
+                24 * 3600 * 1000
+            } else {
+                7 * 24 * 3600 * 1000
+            };
+            !matches!(r.status, "sent" | "failed" | "dropped") || r.created_at_ms + keep_ms > now_ms
+        });
+        Ok((before - inner.outbox.len()) as u64)
+    }
+
     async fn outbox_mark(&self, id: u64, outcome: MailOutcome) -> Result<(), AccountError> {
         self.check_up()?;
         let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
@@ -543,13 +841,22 @@ impl AccountStore for Memory {
         };
         match outcome {
             MailOutcome::Sent => {
-                if row.status == "pending" {
+                if row.status == "pending" || row.status == "sending" {
                     row.status = "sent";
                 }
             }
-            MailOutcome::Retry { .. } => {
-                // Memory rows never retry — the row stays pending and a
-                // test inspects it directly.
+            MailOutcome::Retry {
+                next_attempt_at_ms,
+                error,
+            } => {
+                row.status = "pending";
+                row.attempts += 1;
+                row.next_attempt_at_ms = next_attempt_at_ms;
+                row.last_error = Some(error);
+            }
+            MailOutcome::Failed { error } => {
+                row.status = "failed";
+                row.last_error = Some(error);
             }
         }
         Ok(())
@@ -558,14 +865,15 @@ impl AccountStore for Memory {
 
 impl Memory {
     /// Token + mail for the verify flow — the same unit the pg impl
-    /// runs inside its transaction.
+    /// runs inside its transaction. `pending_hash` is what a later
+    /// `consume_verify_token` installs.
     fn issue_verify(
         &self,
         inner: &mut Inner,
         account: u64,
         token_hash: &[u8; 32],
         token_expires_at_ms: i64,
-        password_hash: &str,
+        pending_hash: Option<String>,
         verify_mail: &Mail,
     ) -> Option<u64> {
         for row in inner.email_tokens.values_mut() {
@@ -581,7 +889,7 @@ impl Memory {
                 kind: "verify",
                 hash: *token_hash,
                 expires_at_ms: token_expires_at_ms,
-                password_hash: password_hash.to_string(),
+                password_hash: pending_hash,
                 consumed: false,
                 superseded: false,
             },
@@ -589,16 +897,56 @@ impl Memory {
         Self::enqueue(inner, &self.next_outbox, verify_mail)
     }
 
-    /// The per-address pending cap: at it, the mail coalesces into the
-    /// pending rows it would duplicate — `None`, and the outbox stays
-    /// bounded. The fact the mail announced has already committed.
+    /// Enqueue inside the caller's lock (the same atomicity unit the
+    /// pg impl runs inside its transaction): strict single addr-spec,
+    /// the per-(address,kind) hourly cap, and newest-replaces-pending
+    /// do the dedupe — `None` means the mail coalesced while the fact
+    /// it announced still stands.
     fn enqueue(inner: &mut Inner, next: &AtomicU64, mail: &Mail) -> Option<u64> {
-        let pending = inner
+        if mail.subject.len() > crate::mail::MAX_MAIL_SUBJECT
+            || mail.text.len() > crate::mail::MAX_MAIL_BODY
+            || mail.html.len() > crate::mail::MAX_MAIL_BODY
+        {
+            return None;
+        }
+        // ATTACK(addr-spec-injection)
+        if !crate::mail::valid_addr_spec(&mail.send_to) {
+            return None;
+        }
+        let now = now_ms();
+        // Newest replaces pending: an unclaimed row for the same
+        // (address, kind) carries a dead link — the fresh mail takes
+        // its slot (and the hourly counter keeps the window count).
+        for row in inner.outbox.values_mut() {
+            if row.status == "pending" && row.send_to == mail.send_to && row.kind == mail.kind {
+                row.mail = mail.clone();
+                row.attempts = 0;
+                row.next_attempt_at_ms = now;
+                row.last_error = None;
+                return None;
+            }
+        }
+        // The hourly cap counts rows created inside the window in ANY
+        // state — a spam loop cannot trade deletes for more sends.
+        let in_window = inner
             .outbox
             .values()
-            .filter(|r| r.status == "pending" && r.send_to == mail.send_to)
+            .filter(|r| {
+                r.send_to == mail.send_to
+                    && r.kind == mail.kind
+                    && r.created_at_ms > now - 3_600_000
+            })
             .count() as i64;
-        if pending >= crate::mail::MAX_PENDING_PER_ADDR {
+        // ATTACK(mail-budget)
+        if in_window >= crate::mail::MAX_HOURLY_PER_ADDR {
+            return None;
+        }
+        // The provider-level dedupe: one live row per idempotency key.
+        if inner
+            .outbox
+            .values()
+            .any(|r| r.mail.idempotency_key == mail.idempotency_key)
+        {
             return None;
         }
         let id = next.fetch_add(1, Ordering::Relaxed);
@@ -608,6 +956,10 @@ impl Memory {
                 kind: mail.kind,
                 send_to: mail.send_to.clone(),
                 status: "pending",
+                attempts: 0,
+                next_attempt_at_ms: now,
+                created_at_ms: now,
+                last_error: None,
                 mail: mail.clone(),
             },
         );

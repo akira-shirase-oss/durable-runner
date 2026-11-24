@@ -449,7 +449,7 @@ impl AccountStore for Pg {
                 email,
                 token_hash,
                 token_expires_at_ms,
-                password_hash,
+                Some(password_hash.to_string()),
                 verify_mail,
             )
             .await?;
@@ -496,7 +496,7 @@ impl AccountStore for Pg {
                     email,
                     token_hash,
                     token_expires_at_ms,
-                    password_hash,
+                    Some(password_hash.to_string()),
                     verify_mail,
                 )
                 .await?,
@@ -651,14 +651,376 @@ impl AccountStore for Pg {
         .transpose()
     }
 
+    async fn consume_verify_token(
+        &self,
+        token_hash: &[u8; 32],
+    ) -> Result<Option<Account>, AccountError> {
+        // One transaction (review #2): consume, install the pending
+        // hash, verify, revoke — a partial win is impossible. The
+        // single UPDATE ... WHERE live covers unknown, consumed,
+        // superseded, expired and wrong-kind identically.
+        let mut tx = bounded(self.pool.begin()).await?;
+        let row = bounded(
+            sqlx::query(
+                "UPDATE email_tokens SET consumed_at = now() \
+                 WHERE token_hash = $1 AND kind = 'verify' \
+                   AND consumed_at IS NULL AND superseded_at IS NULL \
+                   AND expires_at > now() \
+                 RETURNING account_id, password_hash",
+            )
+            .bind(token_hash.as_slice())
+            .fetch_optional(&mut *tx),
+        )
+        .await?;
+        let Some(row) = row else {
+            bounded(tx.rollback()).await?;
+            return Ok(None);
+        };
+        let account_id: i64 = row.try_get("account_id")?;
+        let pending: Option<String> = row.try_get("password_hash")?;
+        bounded(
+            sqlx::query(
+                "UPDATE accounts SET \
+                     password_hash = COALESCE($2, password_hash), \
+                     email_verified_at = COALESCE(email_verified_at, now()) \
+                 WHERE id = $1",
+            )
+            .bind(account_id)
+            .bind(pending)
+            .execute(&mut *tx),
+        )
+        .await?;
+        bounded(
+            sqlx::query(
+                "UPDATE sessions SET revoked_at = now() \
+                 WHERE account_id = $1 AND revoked_at IS NULL",
+            )
+            .bind(account_id)
+            .execute(&mut *tx),
+        )
+        .await?;
+        let account = bounded(
+            sqlx::query(
+                "SELECT id, public_id, email, email_verified_at, password_hash \
+                 FROM accounts WHERE id = $1",
+            )
+            .bind(account_id)
+            .fetch_one(&mut *tx),
+        )
+        .await
+        .and_then(|r| account_from(&r))?;
+        bounded(tx.commit()).await?;
+        Ok(Some(account))
+    }
+
+    async fn consume_reset_token(
+        &self,
+        token_hash: &[u8; 32],
+        new_password_hash: &str,
+    ) -> Result<Option<Account>, AccountError> {
+        let mut tx = bounded(self.pool.begin()).await?;
+        let row = bounded(
+            sqlx::query(
+                "UPDATE email_tokens SET consumed_at = now() \
+                 WHERE token_hash = $1 AND kind = 'reset' \
+                   AND consumed_at IS NULL AND superseded_at IS NULL \
+                   AND expires_at > now() \
+                 RETURNING account_id",
+            )
+            .bind(token_hash.as_slice())
+            .fetch_optional(&mut *tx),
+        )
+        .await?;
+        let Some(row) = row else {
+            bounded(tx.rollback()).await?;
+            return Ok(None);
+        };
+        let account_id: i64 = row.try_get("account_id")?;
+        // The reset installs the new password and proves mailbox
+        // ownership — every other pending token (a verify token's
+        // pending hash must never overwrite the reset) is dead.
+        bounded(
+            sqlx::query(
+                "UPDATE email_tokens SET superseded_at = now() \
+                 WHERE account_id = $1 AND consumed_at IS NULL AND superseded_at IS NULL",
+            )
+            .bind(account_id)
+            .execute(&mut *tx),
+        )
+        .await?;
+        bounded(
+            sqlx::query(
+                "UPDATE accounts SET \
+                     password_hash = $2, \
+                     email_verified_at = COALESCE(email_verified_at, now()) \
+                 WHERE id = $1",
+            )
+            .bind(account_id)
+            .bind(new_password_hash)
+            .execute(&mut *tx),
+        )
+        .await?;
+        bounded(
+            sqlx::query(
+                "UPDATE sessions SET revoked_at = now() \
+                 WHERE account_id = $1 AND revoked_at IS NULL",
+            )
+            .bind(account_id)
+            .execute(&mut *tx),
+        )
+        .await?;
+        let account = bounded(
+            sqlx::query(
+                "SELECT id, public_id, email, email_verified_at, password_hash \
+                 FROM accounts WHERE id = $1",
+            )
+            .bind(account_id)
+            .fetch_one(&mut *tx),
+        )
+        .await
+        .and_then(|r| account_from(&r))?;
+        bounded(tx.commit()).await?;
+        Ok(Some(account))
+    }
+
+    async fn issue_reset_token(
+        &self,
+        email: &str,
+        token_hash: &[u8; 32],
+        expires_at_ms: i64,
+        reset_mail: &Mail,
+    ) -> Result<Option<u64>, AccountError> {
+        let mut tx = bounded(self.pool.begin()).await?;
+        bounded(
+            sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
+                .bind(email)
+                .execute(&mut *tx),
+        )
+        .await?;
+        let account: Option<i64> = bounded(
+            sqlx::query_scalar("SELECT id FROM accounts WHERE email = $1")
+                .bind(email)
+                .fetch_optional(&mut *tx),
+        )
+        .await?;
+        let Some(account_id) = account else {
+            bounded(tx.rollback()).await?;
+            return Ok(None);
+        };
+        bounded(
+            sqlx::query(
+                "UPDATE email_tokens SET superseded_at = now() \
+                 WHERE account_id = $1 AND kind = 'reset' \
+                   AND consumed_at IS NULL AND superseded_at IS NULL",
+            )
+            .bind(account_id)
+            .execute(&mut *tx),
+        )
+        .await?;
+        bounded(
+            sqlx::query(
+                "INSERT INTO email_tokens \
+                 (account_id, kind, token_hash, expires_at, sent_to) \
+                 VALUES ($1, 'reset', $2, $3, $4)",
+            )
+            .bind(account_id)
+            .bind(token_hash.as_slice())
+            .bind(ts(expires_at_ms))
+            .bind(email)
+            .execute(&mut *tx),
+        )
+        .await?;
+        let outbox = Self::enqueue(&mut tx, reset_mail).await?;
+        bounded(tx.commit()).await?;
+        Ok(outbox)
+    }
+
+    async fn reissue_verify(
+        &self,
+        email: &str,
+        token_hash: &[u8; 32],
+        expires_at_ms: i64,
+        verify_mail: &Mail,
+    ) -> Result<Option<u64>, AccountError> {
+        let mut tx = bounded(self.pool.begin()).await?;
+        bounded(
+            sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
+                .bind(email)
+                .execute(&mut *tx),
+        )
+        .await?;
+        let row = bounded(
+            sqlx::query(
+                "SELECT id, password_hash FROM accounts \
+                 WHERE email = $1 AND email_verified_at IS NULL",
+            )
+            .bind(email)
+            .fetch_optional(&mut *tx),
+        )
+        .await?;
+        let Some(row) = row else {
+            bounded(tx.rollback()).await?;
+            return Ok(None);
+        };
+        let account_id: i64 = row.try_get("id")?;
+        let password_hash: Option<String> = row.try_get("password_hash")?;
+        let outbox = Self::issue_verify(
+            &mut tx,
+            account_id,
+            email,
+            token_hash,
+            expires_at_ms,
+            password_hash,
+            verify_mail,
+        )
+        .await?;
+        bounded(tx.commit()).await?;
+        Ok(outbox)
+    }
+
+    async fn invite_grant(
+        &self,
+        token_hash: &[u8; 32],
+        now_ms: i64,
+    ) -> Result<Option<crate::InviteGrant>, AccountError> {
+        let row = bounded(
+            sqlx::query(
+                "SELECT workspace_id, email, role FROM invites \
+                 WHERE token_hash = $1 AND accepted_at IS NULL \
+                   AND revoked_at IS NULL AND expires_at > $2",
+            )
+            .bind(token_hash.as_slice())
+            .bind(ts(now_ms))
+            .fetch_optional(&self.pool),
+        )
+        .await?;
+        row.map(|r| {
+            let role: String = r.try_get("role")?;
+            Ok(crate::InviteGrant {
+                workspace: to_u64(r.try_get("workspace_id")?, "workspace")?,
+                email: r.try_get("email")?,
+                role: crate::Role::parse(&role)
+                    .ok_or_else(|| AccountError::Store(format!("bad role {role:?}")))?,
+            })
+        })
+        .transpose()
+    }
+
+    async fn enqueue_mail(&self, mail: &Mail) -> Result<Option<u64>, AccountError> {
+        let mut tx = bounded(self.pool.begin()).await?;
+        let outbox = Self::enqueue(&mut tx, mail).await?;
+        bounded(tx.commit()).await?;
+        Ok(outbox)
+    }
+
+    async fn outbox_claim(
+        &self,
+        now_ms: i64,
+        limit: u32,
+        claim_ms: i64,
+    ) -> Result<Vec<crate::OutboxMail>, AccountError> {
+        // pending→sending claims due rows; a stale 'sending' row (the
+        // worker died between claim and mark) is reclaimable past its
+        // claim deadline and that reclaim counts a lost attempt.
+        let rows = bounded(
+            sqlx::query(
+                "UPDATE email_outbox SET status = 'sending', \
+                     attempts = attempts + CASE WHEN status = 'sending' THEN 1 ELSE 0 END, \
+                     next_attempt_at = $3 \
+                 WHERE id IN ( \
+                     SELECT id FROM email_outbox \
+                     WHERE next_attempt_at <= $1 \
+                       AND status IN ('pending', 'sending') \
+                       AND attempts < $4 \
+                     ORDER BY id LIMIT $2 FOR UPDATE SKIP LOCKED \
+                 ) \
+                 RETURNING id, kind, send_to, subject, text, html, \
+                           idempotency_key, expires_at, attempts",
+            )
+            .bind(ts(now_ms))
+            .bind(limit as i64)
+            .bind(ts(now_ms + claim_ms))
+            .bind(crate::mail::OUTBOX_MAX_ATTEMPTS)
+            .fetch_all(&self.pool),
+        )
+        .await?;
+        rows.iter()
+            .map(|r| {
+                let kind: String = r.try_get("kind")?;
+                let kind: &'static str = match kind.as_str() {
+                    "verify" => "verify",
+                    "reset" => "reset",
+                    "invite" => "invite",
+                    "notice" => "notice",
+                    other => return Err(AccountError::Store(format!("bad outbox kind {other:?}"))),
+                };
+                Ok(crate::OutboxMail {
+                    id: to_u64(r.try_get("id")?, "outbox")?,
+                    attempts: i64::from(r.try_get::<i32, _>("attempts")?),
+                    mail: Mail {
+                        kind,
+                        send_to: r.try_get("send_to")?,
+                        subject: r.try_get("subject")?,
+                        text: r.try_get("text")?,
+                        html: r.try_get("html")?,
+                        idempotency_key: r.try_get("idempotency_key")?,
+                        expires_at_ms: r
+                            .try_get::<Option<time::OffsetDateTime>, _>("expires_at")?
+                            .map(ms),
+                    },
+                })
+            })
+            .collect()
+    }
+
+    async fn outbox_sweep(&self, now_ms: i64) -> Result<u64, AccountError> {
+        let exhausted = bounded(
+            sqlx::query(
+                "UPDATE email_outbox SET status = 'failed', \
+                     last_error = COALESCE(last_error, 'attempts exhausted') \
+                 WHERE status IN ('pending', 'sending') AND attempts >= $2",
+            )
+            .bind(ts(now_ms))
+            .bind(crate::mail::OUTBOX_MAX_ATTEMPTS)
+            .execute(&self.pool),
+        )
+        .await?;
+        let expired = bounded(
+            sqlx::query(
+                "UPDATE email_outbox SET status = 'dropped', text = '', html = '' \
+                 WHERE status IN ('pending', 'sending') \
+                   AND expires_at IS NOT NULL AND expires_at <= $1",
+            )
+            .bind(ts(now_ms))
+            .execute(&self.pool),
+        )
+        .await?;
+        Ok(exhausted.rows_affected() + expired.rows_affected())
+    }
+
+    async fn outbox_purge(&self, now_ms: i64) -> Result<u64, AccountError> {
+        let done = bounded(
+            sqlx::query(
+                "DELETE FROM email_outbox \
+                 WHERE (status = 'sent' AND created_at < $1) \
+                    OR (status IN ('failed', 'dropped') AND created_at < $2)",
+            )
+            .bind(ts(now_ms - 24 * 3600 * 1000))
+            .bind(ts(now_ms - 7 * 24 * 3600 * 1000))
+            .execute(&self.pool),
+        )
+        .await?;
+        Ok(done.rows_affected())
+    }
+
     async fn outbox_mark(&self, id: u64, outcome: MailOutcome) -> Result<(), AccountError> {
         match outcome {
             MailOutcome::Sent => {
                 bounded(
                     sqlx::query(
                         "UPDATE email_outbox SET status = 'sent', sent_at = now(), \
-                         attempts = attempts + 1, last_error = NULL \
-                         WHERE id = $1 AND status = 'pending'",
+                         last_error = NULL \
+                         WHERE id = $1 AND status IN ('pending', 'sending')",
                     )
                     .bind(to_i64(id, "outbox")?)
                     .execute(&self.pool),
@@ -682,6 +1044,18 @@ impl AccountStore for Pg {
                 )
                 .await?;
             }
+            MailOutcome::Failed { error } => {
+                bounded(
+                    sqlx::query(
+                        "UPDATE email_outbox SET status = 'failed', last_error = $2 \
+                         WHERE id = $1 AND status IN ('pending', 'sending')",
+                    )
+                    .bind(to_i64(id, "outbox")?)
+                    .bind(error)
+                    .execute(&self.pool),
+                )
+                .await?;
+            }
         }
         Ok(())
     }
@@ -689,14 +1063,15 @@ impl AccountStore for Pg {
 
 impl Pg {
     /// Supersede pending verify tokens, insert the fresh one, enqueue
-    /// the mail — the unit `signup` runs inside its transaction.
+    /// the mail — the unit `signup`/`reissue_verify` run inside their
+    /// transactions.
     async fn issue_verify(
         tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
         account_id: i64,
         email: &str,
         token_hash: &[u8; 32],
         token_expires_at_ms: i64,
-        password_hash: &str,
+        pending_hash: Option<String>,
         verify_mail: &Mail,
     ) -> Result<Option<u64>, AccountError> {
         bounded(
@@ -719,17 +1094,20 @@ impl Pg {
             .bind(token_hash.as_slice())
             .bind(ts(token_expires_at_ms))
             .bind(email)
-            .bind(password_hash)
+            .bind(pending_hash)
             .execute(&mut **tx),
         )
         .await?;
         Self::enqueue(tx, verify_mail).await
     }
 
-    /// The per-address pending cap, inside the caller's transaction:
-    /// at the cap the mail coalesces into the pending rows it would
-    /// duplicate — `None`, and the outbox stays bounded. The advisory
-    /// lock `signup` already took on the address serializes this count.
+    /// Enqueue inside the caller's transaction — the same dedupe as
+    /// the memory impl: strict single addr-spec, newest-replaces-
+    /// pending (an unclaimed row for the pair carries a dead link),
+    /// the per-(address,kind) hourly cap counted over rows created in
+    /// the window in ANY state, and the idempotency key's UNIQUE
+    /// constraint. `None` = the mail coalesced; the fact it announced
+    /// still commits.
     async fn enqueue(
         tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
         mail: &Mail,
@@ -742,13 +1120,17 @@ impl Pg {
                 "mail exceeds the outbox size bound".to_string(),
             ));
         }
-        let row = bounded(
+        if !crate::mail::valid_addr_spec(&mail.send_to) {
+            return Ok(None);
+        }
+        let replaced = bounded(
             sqlx::query(
-                "INSERT INTO email_outbox \
-                 (kind, send_to, subject, text, html, idempotency_key) \
-                 SELECT $1, $2, $3, $4, $5, $6 \
-                 WHERE (SELECT count(*) FROM email_outbox \
-                        WHERE send_to = $2 AND status = 'pending') < $7 \
+                "UPDATE email_outbox SET subject = $3, text = $4, html = $5, \
+                     idempotency_key = $6, expires_at = $7, attempts = 0, \
+                     next_attempt_at = now(), last_error = NULL \
+                 WHERE send_to = $2 AND kind = $1 AND status = 'pending' \
+                   AND NOT EXISTS (SELECT 1 FROM email_outbox o \
+                       WHERE o.idempotency_key = $6 AND o.id <> email_outbox.id) \
                  RETURNING id",
             )
             .bind(mail.kind)
@@ -757,7 +1139,33 @@ impl Pg {
             .bind(&mail.text)
             .bind(&mail.html)
             .bind(&mail.idempotency_key)
-            .bind(crate::mail::MAX_PENDING_PER_ADDR)
+            .bind(mail.expires_at_ms.map(ts))
+            .fetch_optional(&mut **tx),
+        )
+        .await?;
+        if let Some(row) = replaced {
+            let id: i64 = row.try_get("id")?;
+            return Ok(Some(to_u64(id, "outbox")?));
+        }
+        let row = bounded(
+            sqlx::query(
+                "INSERT INTO email_outbox \
+                 (kind, send_to, subject, text, html, idempotency_key, expires_at) \
+                 SELECT $1, $2, $3, $4, $5, $6, $7 \
+                 WHERE (SELECT count(*) FROM email_outbox \
+                        WHERE send_to = $2 AND kind = $1 \
+                          AND created_at > now() - interval '1 hour') < $8 \
+                 ON CONFLICT (idempotency_key) DO NOTHING \
+                 RETURNING id",
+            )
+            .bind(mail.kind)
+            .bind(&mail.send_to)
+            .bind(&mail.subject)
+            .bind(&mail.text)
+            .bind(&mail.html)
+            .bind(&mail.idempotency_key)
+            .bind(mail.expires_at_ms.map(ts))
+            .bind(crate::mail::MAX_HOURLY_PER_ADDR)
             .fetch_optional(&mut **tx),
         )
         .await?;
@@ -991,6 +1399,7 @@ mod tests {
             text: "body".into(),
             html: "<p>body</p>".into(),
             idempotency_key: format!("{kind}:{to}"),
+            expires_at_ms: None,
         }
     }
 
@@ -1129,5 +1538,180 @@ mod tests {
             .revoke_sessions_for_account(account.id)
             .await
             .unwrap_or_else(|e| panic!("revoke all: {e}"));
+    }
+
+    /// S3-1's consume/issue/outbox surface on the real dialect: verify
+    /// consumes once and revokes sessions, a replay and a reset-kind
+    /// token both answer the one `None`, reset installs the password
+    /// and kills siblings, and the outbox claim/mark/sweep cycle
+    /// matches the Memory contract.
+    #[tokio::test]
+    async fn pg_verify_reset_outbox_round_trip() {
+        let Some(store) = store().await else { return };
+        let email = format!("pg-s31-{}@example.com", std::process::id());
+        let verify = mail("verify", &email);
+        let notice = mail("notice", &email);
+        let pending =
+            "$argon2id$v=19$m=19456,t=2,p=1$AAAAAAAAAAA$pendinghashpendinghashpendinghashpend";
+        store
+            .signup(
+                &email,
+                pending,
+                &hash(1),
+                4_000_000_000_000,
+                &verify,
+                &notice,
+            )
+            .await
+            .unwrap_or_else(|e| panic!("signup: {e}"));
+        let account = store
+            .account_by_email(&email)
+            .await
+            .unwrap_or_else(|e| panic!("email: {e}"))
+            .unwrap_or_else(|| panic!("account"));
+        store
+            .create_session(&crate::NewSession {
+                account: account.id,
+                token_hash: hash(7),
+                csrf_seed: hash(9),
+                expires_at_ms: 4_000_000_000_000,
+                idle_expires_at_ms: 4_000_000_000_000,
+                user_agent: None,
+                ip: None,
+            })
+            .await
+            .unwrap_or_else(|e| panic!("session: {e}"));
+        // A reset-kind token is not a verify token — the kind column is
+        // bound inside the consume's WHERE (token-kind-confusion).
+        store
+            .issue_reset_token(&email, &hash(50), 4_000_000_000_000, &mail("reset", &email))
+            .await
+            .unwrap_or_else(|e| panic!("reset issue: {e}"));
+        assert!(store
+            .consume_verify_token(&hash(50))
+            .await
+            .unwrap_or_else(|e| panic!("verify reset-kind: {e}"))
+            .is_none());
+        // The real verify token: consumes, installs the pending hash,
+        // verifies, revokes the session — one transaction.
+        let verified = store
+            .consume_verify_token(&hash(1))
+            .await
+            .unwrap_or_else(|e| panic!("verify: {e}"))
+            .unwrap_or_else(|| panic!("the live token must consume"));
+        assert!(verified.email_verified);
+        assert_eq!(verified.password_hash.as_deref(), Some(pending));
+        assert!(store
+            .session_grant(&hash(7))
+            .await
+            .unwrap_or_else(|e| panic!("grant: {e}"))
+            .is_none());
+        // Replay: the consumed token answers the same `None` as unknown.
+        assert!(store
+            .consume_verify_token(&hash(1))
+            .await
+            .unwrap_or_else(|e| panic!("replay: {e}"))
+            .is_none());
+        assert!(store
+            .consume_verify_token(&hash(99))
+            .await
+            .unwrap_or_else(|e| panic!("unknown: {e}"))
+            .is_none());
+        // Reset: supersedes siblings, installs the hash, verifies,
+        // revokes — then the verify-side pending row can never land.
+        let reset = store
+            .issue_reset_token(&email, &hash(60), 4_000_000_000_000, &mail("reset", &email))
+            .await
+            .unwrap_or_else(|e| panic!("reset issue 2: {e}"));
+        assert!(reset.is_some());
+        store
+            .create_session(&crate::NewSession {
+                account: account.id,
+                token_hash: hash(8),
+                csrf_seed: hash(9),
+                expires_at_ms: 4_000_000_000_000,
+                idle_expires_at_ms: 4_000_000_000_000,
+                user_agent: None,
+                ip: None,
+            })
+            .await
+            .unwrap_or_else(|e| panic!("session 2: {e}"));
+        let new_hash =
+            "$argon2id$v=19$m=19456,t=2,p=1$CCCCCCCCCCC$newpasswordhashnewpasswordhashnewpa";
+        let done = store
+            .consume_reset_token(&hash(60), new_hash)
+            .await
+            .unwrap_or_else(|e| panic!("reset consume: {e}"))
+            .unwrap_or_else(|| panic!("the live reset must consume"));
+        assert_eq!(done.password_hash.as_deref(), Some(new_hash));
+        assert!(done.email_verified, "the mailbox proof verifies");
+        assert!(store
+            .session_grant(&hash(8))
+            .await
+            .unwrap_or_else(|e| panic!("grant 2: {e}"))
+            .is_none());
+        assert!(store
+            .consume_reset_token(&hash(60), new_hash)
+            .await
+            .unwrap_or_else(|e| panic!("reset replay: {e}"))
+            .is_none());
+        // The outbox cycle: claim → send-mark → sent rows are not
+        // reclaimed; a refused mail is `failed` terminal.
+        let claimed = store
+            .outbox_claim(unix_ms(), 10, 30_000)
+            .await
+            .unwrap_or_else(|e| panic!("claim: {e}"));
+        assert!(!claimed.is_empty(), "pending mails claim");
+        for row in &claimed {
+            store
+                .outbox_mark(row.id, MailOutcome::Sent)
+                .await
+                .unwrap_or_else(|e| panic!("mark: {e}"));
+        }
+        assert_eq!(
+            store
+                .outbox_claim(unix_ms(), 10, 30_000)
+                .await
+                .unwrap_or_else(|e| panic!("reclaim: {e}"))
+                .len(),
+            0,
+            "sent rows are not reclaimed"
+        );
+        let bad = mail("notice", "bad@example.com");
+        let bad_id = store
+            .enqueue_mail(&bad)
+            .await
+            .unwrap_or_else(|e| panic!("bad enqueue: {e}"))
+            .unwrap_or_else(|| panic!("a valid addr-spec enqueues"));
+        let claimed = store
+            .outbox_claim(unix_ms(), 10, 30_000)
+            .await
+            .unwrap_or_else(|e| panic!("claim 2: {e}"));
+        assert_eq!(claimed.len(), 1);
+        store
+            .outbox_mark(
+                bad_id,
+                MailOutcome::Failed {
+                    error: "provider 4xx".into(),
+                },
+            )
+            .await
+            .unwrap_or_else(|e| panic!("fail mark: {e}"));
+        assert_eq!(
+            store
+                .outbox_claim(unix_ms(), 10, 30_000)
+                .await
+                .unwrap_or_else(|e| panic!("reclaim 2: {e}"))
+                .len(),
+            0,
+            "a failed row is terminal"
+        );
+    }
+
+    fn unix_ms() -> i64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as i64
     }
 }

@@ -3,6 +3,7 @@
 //! HTTP endpoints configured at startup; the registry is the trust edge.
 
 mod addr_limits;
+mod mailout;
 mod pubid;
 mod ssrf;
 
@@ -1281,8 +1282,13 @@ struct App {
     argon: std::sync::Arc<ArgonQueue>,
     /// Per-address limits for the open auth surface.
     auth_limits: std::sync::Arc<AuthLimits>,
+    /// Login-failure cool-offs per (email, client prefix) — in-memory,
+    /// bounded, keyed whether or not the account exists (review #13).
+    lockouts: std::sync::Arc<LoginLockouts>,
     /// Transactional mail; MemoryMailer in tests, Log/Resend at deploy.
     mailer: std::sync::Arc<dyn Mailer>,
+    /// Global outbound guard: daily budget + circuit breaker (#14).
+    mail_budget: std::sync::Arc<MailBudget>,
     /// `DURABLE_INVITE_ONLY` — env-at-boot abuse switch (ruling 9).
     invite_only: bool,
     /// `--public-origin` — the base every mailed link is built from
@@ -1330,7 +1336,9 @@ fn test_app(
         sessions: std::sync::Arc::new(SessionCache::new()),
         argon: std::sync::Arc::new(ArgonQueue::new()),
         auth_limits: std::sync::Arc::new(AuthLimits::new()),
+        lockouts: std::sync::Arc::new(LoginLockouts::new()),
         mailer: std::sync::Arc::new(durable_accounts::MemoryMailer::new()),
+        mail_budget: std::sync::Arc::new(MailBudget::new(MAIL_DAILY_BUDGET)),
         invite_only: false,
         public_origin: None,
         pubid,
@@ -1458,6 +1466,334 @@ fn session_set_cookie(token: &str) -> String {
 
 fn session_clear_cookie() -> &'static str {
     "__Host-drs=; Path=/; Secure; HttpOnly; SameSite=Lax; Max-Age=0"
+}
+
+// ---- S3-1: email tokens, known-device, lockout, outbox drain --------
+
+const EMAIL_TOKEN_PREFIX: &str = "drt_";
+const VERIFY_TOKEN_TTL_MS: i64 = 24 * 3600 * 1000;
+const RESET_TOKEN_TTL_MS: i64 = 3600 * 1000;
+const KNOWN_DEVICE_COOKIE: &str = "__Host-drd";
+const KNOWN_DEVICE_MAX_AGE_S: u64 = 400 * 24 * 3600;
+/// The login cool-off (review #13): failures per (normalized email,
+/// client /24-or-/64) — keyed whether or not the account exists, so a
+/// 429 never answers "is this address registered".
+const LOCKOUT_FAILS: u32 = 10;
+const LOCKOUT_WINDOW_MS: i64 = 10 * 60 * 1000;
+const LOCKOUT_COOLOFF_MS: i64 = 15 * 60 * 1000;
+const LOCKOUT_CAP: usize = 10_000;
+/// Outbox drain (D-064): bounded batch, per-send deadline, claim
+/// deadline that makes a worker crash reclaimable.
+const OUTBOX_BATCH: u32 = 25;
+const OUTBOX_SEND_DEADLINE: Duration = Duration::from_secs(10);
+const OUTBOX_CLAIM_MS: i64 = 30_000;
+const OUTBOX_TICK: Duration = Duration::from_secs(5);
+/// Consecutive provider failures that open the circuit breaker.
+const MAIL_BREAKER_FAILS: u32 = 8;
+const MAIL_BREAKER_MS: i64 = 5 * 60 * 1000;
+/// Default global send budget per UTC day (`DURABLE_MAIL_DAILY_BUDGET`).
+const MAIL_DAILY_BUDGET: u32 = 500;
+
+/// Mint an email token (`verify`/`reset` share the shape — the kind
+/// column is the guard against confusion, proven by its attack).
+fn mint_email_token() -> String {
+    let mut b = [0u8; 32];
+    ring::rand::SecureRandom::fill(&ring::rand::SystemRandom::new(), &mut b)
+        .unwrap_or_else(|_| panic!("rng"));
+    format!(
+        "{EMAIL_TOKEN_PREFIX}{}",
+        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(b)
+    )
+}
+
+/// Shape-check + lookup hash for a presented `drt_` value. Malformed
+/// tokens answer `None` → the route's single 410 (no dead-kind oracle).
+fn email_token_hash(token: &str) -> Option<[u8; 32]> {
+    let body = token.strip_prefix(EMAIL_TOKEN_PREFIX)?;
+    let raw = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(body)
+        .ok()?;
+    (raw.len() == 32).then(|| sha256(token.as_bytes()))
+}
+
+/// The lockout's client key: the /24 (v4) or /64 (v6) holding the
+/// socket address — a single host can't dodge its own counter.
+fn client_prefix(addr: std::net::IpAddr) -> std::net::IpAddr {
+    match addr {
+        std::net::IpAddr::V4(a) => {
+            let mut o = a.octets();
+            o[3] = 0;
+            std::net::IpAddr::V4(o.into())
+        }
+        std::net::IpAddr::V6(a) => {
+            let mut o = a.octets();
+            o[8..].fill(0);
+            std::net::IpAddr::V6(o.into())
+        }
+    }
+}
+
+/// A signed device-recognition cookie: `drd_` + hex(16 B public_id ∥
+/// 16 B tag), the tag `HMAC(session_key, "drd/" ∥ public_id) — same
+/// self-authenticating shape as the session token; a forgery dies on
+/// the tag. It only ever buys a lockout bypass — it is never an
+/// authentication factor.
+fn mint_known_device(key: &ring::hmac::Key, public_id: &uuid::Uuid) -> String {
+    let id = public_id.as_bytes();
+    let mut msg = Vec::with_capacity(4 + 16);
+    msg.extend_from_slice(b"drd/");
+    msg.extend_from_slice(id);
+    let tag = ring::hmac::sign(key, &msg);
+    let mut body = [0u8; 32];
+    body[..16].copy_from_slice(id);
+    body[16..].copy_from_slice(&tag.as_ref()[..16]);
+    format!("drd_{}", hex(&body))
+}
+
+fn known_device_ok(key: &ring::hmac::Key, parts: &Parts, public_id: &uuid::Uuid) -> bool {
+    let Some(raw) = parts
+        .headers
+        .get(header::COOKIE)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|raw| {
+            raw.split(';').find_map(|p| {
+                p.trim()
+                    .strip_prefix(KNOWN_DEVICE_COOKIE)
+                    .and_then(|v| v.strip_prefix('='))
+                    .map(|s| s.to_string())
+            })
+        })
+    else {
+        return false;
+    };
+    let Some(body) = raw.strip_prefix("drd_").and_then(unhex) else {
+        return false;
+    };
+    let (id, tag) = body.split_at(16);
+    let mut msg = Vec::with_capacity(4 + 16);
+    msg.extend_from_slice(b"drd/");
+    msg.extend_from_slice(id);
+    let computed = ring::hmac::sign(key, &msg);
+    id == public_id.as_bytes()
+        && bool::from(subtle::ConstantTimeEq::ct_eq(&computed.as_ref()[..16], tag))
+}
+
+fn known_device_set_cookie(value: &str) -> String {
+    format!(
+        "{KNOWN_DEVICE_COOKIE}={value}; Path=/; Secure; HttpOnly; SameSite=Lax; Max-Age={KNOWN_DEVICE_MAX_AGE_S}"
+    )
+}
+
+/// Bounded login-failure counters (review #13): 10 failures inside 10
+/// minutes → a 15-minute cool-off for that (email, client-prefix)
+/// pair. Counters live per normalized email whether or not an account
+/// exists — a 429 must not reveal registration.
+struct LoginLockouts {
+    map: Mutex<HashMap<(String, std::net::IpAddr), LockEntry>>,
+}
+
+struct LockEntry {
+    fails: u32,
+    window_start_ms: i64,
+    cooloff_until_ms: i64,
+}
+
+impl LoginLockouts {
+    fn new() -> Self {
+        Self {
+            map: Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// `Some(retry_after_s)` while the pair is in cool-off.
+    fn check(&self, email: &str, prefix: std::net::IpAddr, now_ms: i64) -> Option<u64> {
+        let map = self.map.lock().unwrap_or_else(|e| e.into_inner());
+        let until = map.get(&(email.to_string(), prefix))?.cooloff_until_ms;
+        (until > now_ms).then(|| ((until - now_ms) / 1000).max(1) as u64)
+    }
+
+    /// Record one failure; `true` on the trip into cool-off (the
+    /// transition — the notice mail's one-per-day edge rides it).
+    fn fail(&self, email: &str, prefix: std::net::IpAddr, now_ms: i64) -> bool {
+        let mut map = self.map.lock().unwrap_or_else(|e| e.into_inner());
+        if map.len() >= LOCKOUT_CAP {
+            map.retain(|_, e| e.cooloff_until_ms > now_ms || e.fails > 0);
+            if map.len() >= LOCKOUT_CAP {
+                if let Some(oldest) = map
+                    .iter()
+                    .min_by_key(|(_, e)| e.window_start_ms)
+                    .map(|(k, _)| k.clone())
+                {
+                    map.remove(&oldest);
+                }
+            }
+        }
+        let e = map.entry((email.to_string(), prefix)).or_insert(LockEntry {
+            fails: 0,
+            window_start_ms: now_ms,
+            cooloff_until_ms: 0,
+        });
+        if e.window_start_ms + LOCKOUT_WINDOW_MS <= now_ms {
+            e.fails = 0;
+            e.window_start_ms = now_ms;
+        }
+        if e.cooloff_until_ms > now_ms {
+            return false;
+        }
+        e.fails += 1;
+        if e.fails >= LOCKOUT_FAILS {
+            e.cooloff_until_ms = now_ms + LOCKOUT_COOLOFF_MS;
+            return true;
+        }
+        false
+    }
+
+    fn clear(&self, email: &str, prefix: std::net::IpAddr) {
+        self.map
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&(email.to_string(), prefix));
+    }
+
+    /// A successful reset clears every counter for the address — the
+    /// mailbox owner proved themselves.
+    fn clear_email(&self, email: &str) {
+        self.map
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .retain(|(e, _), _| e != email);
+    }
+}
+
+/// The global outbound guard (review #14): a per-day send budget plus
+/// a circuit breaker on consecutive provider failures. In-process —
+/// the budget is a tripwire, not an accounting record.
+struct MailBudget {
+    inner: Mutex<BudgetInner>,
+}
+
+struct BudgetInner {
+    day: i64,
+    sent: u32,
+    cap: u32,
+    fails: u32,
+    open_until_ms: i64,
+}
+
+impl MailBudget {
+    fn new(cap: u32) -> Self {
+        Self {
+            inner: Mutex::new(BudgetInner {
+                day: 0,
+                sent: 0,
+                cap,
+                fails: 0,
+                open_until_ms: 0,
+            }),
+        }
+    }
+
+    /// Sends may proceed: budget left today and the breaker is closed.
+    fn open(&self, now_ms: i64) -> bool {
+        let mut b = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        let day = now_ms / 86_400_000;
+        if b.day != day {
+            b.day = day;
+            b.sent = 0;
+        }
+        b.sent < b.cap && b.open_until_ms <= now_ms
+    }
+
+    fn sent(&self, now_ms: i64) {
+        let mut b = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        let day = now_ms / 86_400_000;
+        if b.day != day {
+            b.day = day;
+            b.sent = 0;
+        }
+        b.sent += 1;
+        b.fails = 0;
+    }
+
+    fn failed(&self, now_ms: i64) {
+        let mut b = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        b.fails += 1;
+        if b.fails >= MAIL_BREAKER_FAILS {
+            b.open_until_ms = now_ms + MAIL_BREAKER_MS;
+            b.fails = 0;
+        }
+    }
+}
+
+/// Drain one bounded batch (D-064): sweep dead rows, claim due rows,
+/// send each under its deadline, mark the outcome. `failed` and
+/// `dropped` are terminal states the sweep owns — a mail is never
+/// lost, only dead-lettered or intentionally dropped.
+async fn drain_outbox_once(app: &App) -> usize {
+    let Some(store) = app.keyring.store.clone() else {
+        return 0;
+    };
+    let now = unix_ms();
+    let _ = store.outbox_sweep(now).await;
+    let _ = store.outbox_purge(now).await;
+    let claimed = match store.outbox_claim(now, OUTBOX_BATCH, OUTBOX_CLAIM_MS).await {
+        Ok(c) => c,
+        Err(_) => return 0,
+    };
+    let mut sent = 0;
+    for row in claimed {
+        // ATTACK(mail-global)
+        if !app.mail_budget.open(unix_ms()) {
+            break; // claimed rows stay 'sending' — reclaimable later
+        }
+        let res = tokio::time::timeout(OUTBOX_SEND_DEADLINE, app.mailer.send(&row.mail)).await;
+        let outcome = match res {
+            Ok(Ok(())) => {
+                app.mail_budget.sent(unix_ms());
+                sent += 1;
+                durable_accounts::MailOutcome::Sent
+            }
+            Ok(Err(durable_accounts::MailError::Refused(e))) => {
+                app.mail_budget.failed(unix_ms());
+                durable_accounts::MailOutcome::Failed { error: e }
+            }
+            res => {
+                app.mail_budget.failed(unix_ms());
+                let error = match res {
+                    Ok(Err(durable_accounts::MailError::Send(e))) => e,
+                    Ok(Err(durable_accounts::MailError::Refused(_))) => unreachable!(),
+                    Ok(Ok(())) => unreachable!(),
+                    Err(_) => "send deadline".to_string(),
+                };
+                // Backoff: 30 s doubling to a 1 h cap, plus jitter.
+                let shift = row.attempts.clamp(0, 6) as u32;
+                let base = 30_000i64.saturating_mul(1i64 << shift).min(3_600_000);
+                let mut j = [0u8; 2];
+                ring::rand::SecureRandom::fill(&ring::rand::SystemRandom::new(), &mut j)
+                    .unwrap_or_else(|_| panic!("rng"));
+                durable_accounts::MailOutcome::Retry {
+                    error,
+                    next_attempt_at_ms: unix_ms()
+                        + base
+                        + i64::from(u16::from_be_bytes(j) % 15_000),
+                }
+            }
+        };
+        let _ = store.outbox_mark(row.id, outcome).await;
+    }
+    sent
+}
+
+/// The background drain worker — store mode only; tests drive
+/// `drain_outbox_once` directly.
+fn spawn_mail_drain(app: App) {
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(OUTBOX_TICK);
+        loop {
+            tick.tick().await;
+            drain_outbox_once(&app).await;
+        }
+    });
 }
 
 /// Generation-checked session cache (review #10): a fill that spans an
@@ -1676,6 +2012,10 @@ struct AuthLimits {
     signup_hour: Mutex<Window>,
     signup_day: Mutex<Window>,
     login: Mutex<Window>,
+    /// verify/reset redemption: 20/min per address.
+    redeem: Mutex<Window>,
+    /// forgot/resend-verification: 5/hour per address.
+    mail_req: Mutex<Window>,
 }
 
 impl AuthLimits {
@@ -1683,7 +2023,12 @@ impl AuthLimits {
         Self {
             signup_hour: Mutex::new(Window::new(5, Duration::from_secs(3600))),
             signup_day: Mutex::new(Window::new(20, Duration::from_secs(86400))),
-            login: Mutex::new(Window::new(10, Duration::from_secs(60))),
+            // Coarser than the (email, prefix) lockout so the lockout's
+            // precise 429 — not this flood bound — answers the tripped
+            // pair; this one only stops an address spraying many emails.
+            login: Mutex::new(Window::new(30, Duration::from_secs(60))),
+            redeem: Mutex::new(Window::new(20, Duration::from_secs(60))),
+            mail_req: Mutex::new(Window::new(5, Duration::from_secs(3600))),
         }
     }
 
@@ -1862,6 +2207,9 @@ impl FromRequestParts<App> for SessionWrite {
 struct SignupReq {
     email: String,
     password: String,
+    /// Required when the deployment runs invite-only (ruling 9).
+    #[serde(default)]
+    invite_token: Option<String>,
 }
 
 #[derive(serde::Deserialize)]
@@ -1870,10 +2218,34 @@ struct LoginReq {
     password: String,
 }
 
+#[derive(serde::Deserialize)]
+struct VerifyReq {
+    token: String,
+}
+
+#[derive(serde::Deserialize)]
+struct ResetReq {
+    token: String,
+    password: String,
+}
+
+#[derive(serde::Deserialize)]
+struct EmailReq {
+    email: String,
+}
+
 fn normalize_email(raw: &str) -> Option<String> {
     let email = raw.trim().to_lowercase();
     (email.len() <= 254 && email.matches('@').count() == 1 && email.len() > 3).then_some(email)
 }
+
+/// Mail hardening (review #14): subjects are fixed strings per kind —
+/// never user input; every interpolated value is HTML-escaped in the
+/// html twin; `send_to` passes the strict addr-spec check at enqueue.
+const SUBJECT_VERIFY: &str = "Verify your Durable Runner email";
+const SUBJECT_RESET: &str = "Reset your Durable Runner password";
+const SUBJECT_TAKEN: &str = "A Durable Runner sign-up used your address";
+const SUBJECT_LOCKOUT: &str = "Unusual sign-in attempts on your Durable Runner account";
 
 fn verify_mail_body(origin: &str, token: &str) -> (String, String) {
     let link = format!("{origin}/app#/verify?token={token}");
@@ -1882,10 +2254,144 @@ fn verify_mail_body(origin: &str, token: &str) -> (String, String) {
          If you did not sign up, ignore this mail."
     );
     let html = format!(
-        "<p>Verify your Durable Runner email</p><p><a href=\"{link}\">{link}</a></p>\
-         <p>If you did not sign up, ignore this mail.</p>"
+        "<p>Verify your Durable Runner email</p><p><a href=\"{0}\">{0}</a></p>\
+         <p>If you did not sign up, ignore this mail.</p>",
+        durable_accounts::mail::html_escape(&link)
     );
     (text, html)
+}
+
+fn reset_mail_body(origin: &str, token: &str) -> (String, String) {
+    let link = format!("{origin}/app#/reset?token={token}");
+    let text = format!(
+        "Reset your Durable Runner password\n\nOpen this link within 1 hour:\n{link}\n\n\
+         If you did not ask for a reset, ignore this mail — your password is unchanged."
+    );
+    let html = format!(
+        "<p>Reset your Durable Runner password</p><p><a href=\"{0}\">{0}</a></p>\
+         <p>If you did not ask for a reset, ignore this mail — your password is unchanged.</p>",
+        durable_accounts::mail::html_escape(&link)
+    );
+    (text, html)
+}
+
+fn taken_mail_body() -> (String, String) {
+    (
+        "Someone tried to sign up with this address, which already has an account.\n\
+         If it was you, sign in or reset your password; if not, ignore this mail."
+            .to_string(),
+        "<p>Someone tried to sign up with this address, which already has an account.</p>\
+         <p>If it was you, sign in or reset your password; if not, ignore this mail.</p>"
+            .to_string(),
+    )
+}
+
+fn lockout_mail_body() -> (String, String) {
+    (
+        "Several failed sign-in attempts hit your account, so new attempts are \
+         paused for a while.\nIf this was you, wait a few minutes or reset your \
+         password; if not, your address may be getting probed — nothing was \
+         signed in."
+            .to_string(),
+        "<p>Several failed sign-in attempts hit your account, so new attempts are \
+         paused for a while.</p><p>If this was you, wait a few minutes or reset \
+         your password; if not, your address may be getting probed — nothing \
+         was signed in.</p>"
+            .to_string(),
+    )
+}
+
+/// The session cookie's account — resolved only so a token redeem can
+/// tell "my session" from "someone else's". A dead or forged cookie is
+/// `None`, same as absent.
+async fn cookie_account(
+    app: &App,
+    parts: &Parts,
+    store: &std::sync::Arc<dyn AccountStore>,
+) -> Result<Option<u64>, ApiError> {
+    let Some(token) = session_cookie(parts) else {
+        return Ok(None);
+    };
+    let Some(hash) = session_token_hash(&app.session_key, &token) else {
+        return Ok(None);
+    };
+    let now = unix_ms();
+    if let Some(grant) = app.sessions.get(&hash, now) {
+        return Ok(Some(grant.account.id));
+    }
+    match store.session_grant(&hash).await {
+        Ok(Some(g)) if g.expires_at_ms > now && g.idle_expires_at_ms > now => {
+            Ok(Some(g.account.id))
+        }
+        Ok(_) => Ok(None),
+        Err(_) => Err(accounts_unavailable()),
+    }
+}
+
+/// Who gets a fresh session cookie after a token redeem (review #2,
+/// #17): verify NEVER sets one — the mailbox owner signs in fresh;
+/// reset sets one only when the requester is signed out or already
+/// signed in as that account (never signs a different browser over).
+enum TokenCookie {
+    Never,
+    UnlessForeignSession,
+}
+
+async fn finish_redeem(
+    parts: &Parts,
+    app: &App,
+    store: &std::sync::Arc<dyn AccountStore>,
+    account: &durable_accounts::Account,
+    policy: TokenCookie,
+    mut res: Response,
+) -> Result<Response, ApiError> {
+    let set_fresh = match policy {
+        TokenCookie::Never => false,
+        TokenCookie::UnlessForeignSession => match cookie_account(app, parts, store).await? {
+            None => true,
+            Some(other) => other == account.id,
+        },
+    };
+    if !set_fresh {
+        return Ok(res);
+    }
+    let addr = client(parts);
+    let token = mint_session_token(&app.session_key);
+    let hash = sha256(token.as_bytes());
+    let mut seed = [0u8; 32];
+    ring::rand::SecureRandom::fill(&ring::rand::SystemRandom::new(), &mut seed)
+        .unwrap_or_else(|_| panic!("rng"));
+    let now = unix_ms();
+    store
+        .create_session(&durable_accounts::NewSession {
+            account: account.id,
+            token_hash: hash,
+            csrf_seed: seed,
+            expires_at_ms: now + SESSION_ABS_MS,
+            idle_expires_at_ms: now + SESSION_IDLE_MS,
+            user_agent: parts
+                .headers
+                .get(header::USER_AGENT)
+                .and_then(|v| v.to_str().ok())
+                .map(|s| s[..s.len().min(256)].to_string()),
+            ip: Some(addr),
+        })
+        .await
+        .map_err(|_| accounts_unavailable())?;
+    res.headers_mut().append(
+        header::SET_COOKIE,
+        header::HeaderValue::from_str(&session_set_cookie(&token))
+            .unwrap_or_else(|_| header::HeaderValue::from_static("")),
+    );
+    res.headers_mut().append(
+        header::SET_COOKIE,
+        header::HeaderValue::from_str(&known_device_set_cookie(&mint_known_device(
+            &app.session_key,
+            &account.public_id,
+        )))
+        .unwrap_or_else(|_| header::HeaderValue::from_static("")),
+    );
+    Ok(res)
 }
 
 async fn auth_signup(
@@ -1915,13 +2421,22 @@ async fn auth_signup(
         ));
     };
     if app.invite_only {
-        // Invite tokens arrive with the invites slice; the flag is
-        // env-at-boot and refuses until then (ruling 9).
-        return Err(ApiError::new(
-            StatusCode::FORBIDDEN,
-            "invite_required",
-            "sign-up is invite-only right now",
-        ));
+        let ok = match req.invite_token.as_deref().and_then(email_token_hash) {
+            Some(hash) => store
+                .invite_grant(&hash, unix_ms())
+                .await
+                .map_err(|_| accounts_unavailable())?
+                .is_some_and(|g| g.email == email),
+            None => false,
+        };
+        // ATTACK(invite-required)
+        if !ok {
+            return Err(ApiError::new(
+                StatusCode::FORBIDDEN,
+                "invite_required",
+                "sign-up is invite-only right now",
+            ));
+        }
     }
     // The hash runs on every branch BEFORE the store call (review S3):
     // Created / VerifyResent / Taken all cost the same work.
@@ -1933,40 +2448,34 @@ async fn auth_signup(
         })
         .await?
         .map_err(|e| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "internal", e.to_string()))?;
-    let verify_token = {
-        let mut b = [0u8; 32];
-        ring::rand::SecureRandom::fill(&ring::rand::SystemRandom::new(), &mut b)
-            .unwrap_or_else(|_| panic!("rng"));
-        format!(
-            "drt_{}",
-            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(b)
-        )
-    };
+    let verify_token = mint_email_token();
     let token_hash = sha256(verify_token.as_bytes());
-    let expires = unix_ms() + 24 * 3600 * 1000;
+    let expires = unix_ms() + VERIFY_TOKEN_TTL_MS;
     let origin = app.public_origin.as_deref().unwrap_or("http://localhost");
     let (text, html) = verify_mail_body(origin, &verify_token);
     let verify_mail = Mail {
         kind: "verify",
         send_to: email.clone(),
-        subject: "Verify your Durable Runner email".to_string(),
+        subject: SUBJECT_VERIFY.to_string(),
         text,
         html,
         idempotency_key: format!("verify:{email}:{}", hex(&token_hash[..8])),
+        expires_at_ms: Some(expires),
     };
+    let (text, html) = taken_mail_body();
     let notice_mail = Mail {
         kind: "notice",
         send_to: email.clone(),
-        subject: "A Durable Runner sign-up used your address".to_string(),
-        text: "Someone tried to sign up with this address, which already has an account.\n\
-               If it was you, sign in or reset your password; if not, ignore this mail."
-            .to_string(),
-        html: "<p>Someone tried to sign up with this address, which already has an account.</p>\
-               <p>If it was you, sign in or reset your password; if not, ignore this mail.</p>"
-            .to_string(),
+        subject: SUBJECT_TAKEN.to_string(),
+        text,
+        html,
         idempotency_key: format!("notice:{email}:{}", hex(&token_hash[..8])),
+        expires_at_ms: Some(unix_ms() + 24 * 3600 * 1000),
     };
-    let outcome = store
+    // The outbox row commits inside the signup transaction; the drain
+    // worker owns delivery — a racing immediate send could double-send
+    // with a claimed row, so there is none.
+    store
         .signup(
             &email,
             &phc,
@@ -1977,28 +2486,6 @@ async fn auth_signup(
         )
         .await
         .map_err(|_| accounts_unavailable())?;
-    let (outbox, mail) = match outcome {
-        durable_accounts::SignupOutcome::Created { outbox }
-        | durable_accounts::SignupOutcome::VerifyResent { outbox } => (outbox, &verify_mail),
-        durable_accounts::SignupOutcome::Taken { outbox } => (outbox, &notice_mail),
-    };
-    if let Some(id) = outbox {
-        // Best-effort immediate send; the S3-1 drain owns retries.
-        let sent = app.mailer.send(mail).await.is_ok();
-        let _ = store
-            .outbox_mark(
-                id,
-                if sent {
-                    durable_accounts::MailOutcome::Sent
-                } else {
-                    durable_accounts::MailOutcome::Retry {
-                        error: "send failed".into(),
-                        next_attempt_at_ms: unix_ms() + 60_000,
-                    }
-                },
-            )
-            .await;
-    }
     Ok(no_store(
         (
             StatusCode::ACCEPTED,
@@ -2015,7 +2502,6 @@ async fn auth_login(
 ) -> Result<Response, ApiError> {
     check_request_origin(&parts)?;
     let addr = client(&parts);
-    AuthLimits::check(&app.auth_limits.login, addr)?;
     let Some(email) = normalize_email(&req.email) else {
         return Err(ApiError::new(
             StatusCode::BAD_REQUEST,
@@ -2034,6 +2520,28 @@ async fn auth_login(
         .account_by_email(&email)
         .await
         .map_err(|_| accounts_unavailable())?;
+    let prefix = client_prefix(addr);
+    let now = unix_ms();
+    // A recognized device skips the cool-off (review #13): the cookie
+    // is HMAC-tagged to this account's public_id, so it can't be
+    // forged or replayed for another address — and it is checked
+    // before the lockout so a cooling attacker can't keep the owner
+    // out. Unknown accounts never bypass: no cookie can match them.
+    let known_device = account
+        .as_ref()
+        .is_some_and(|a| known_device_ok(&app.session_key, &parts, &a.public_id));
+    if !known_device {
+        if let Some(retry) = app.lockouts.check(&email, prefix, now) {
+            let mut e = ApiError::new(
+                StatusCode::TOO_MANY_REQUESTS,
+                "rate_limited",
+                "too many attempts; retry shortly",
+            );
+            e.retry_after = Some(retry);
+            return Err(e);
+        }
+    }
+    AuthLimits::check(&app.auth_limits.login, addr)?;
     // Unknown address: verify the dummy PHC — identical work, no oracle.
     let phc = account
         .as_ref()
@@ -2046,13 +2554,41 @@ async fn auth_login(
             durable_accounts::password::verify_password(&phc, &password)
         })
         .await?;
-    let Some(account) = account.filter(|_| ok) else {
+    if !ok || account.is_none() {
+        if !known_device {
+            // Failures count against (email, prefix) whether or not the
+            // account exists — keying only real accounts would make
+            // 429-vs-401 a registration oracle (review #13).
+            // ATTACK(lockout-shape)
+            let tripped = app.lockouts.fail(&email, prefix, now);
+            if tripped {
+                if let Some(acct) = &account {
+                    // The owner notice rides the outbox's own dedupe:
+                    // the once-a-day idempotency key coalesces repeats.
+                    let day = now / 86_400_000;
+                    let (text, html) = lockout_mail_body();
+                    let _ = store
+                        .enqueue_mail(&Mail {
+                            kind: "notice",
+                            send_to: acct.email.clone(),
+                            subject: SUBJECT_LOCKOUT.to_string(),
+                            text,
+                            html,
+                            idempotency_key: format!("lockout:{}:{day}", acct.id),
+                            expires_at_ms: Some(now + 24 * 3600 * 1000),
+                        })
+                        .await;
+                }
+            }
+        }
         return Err(ApiError::new(
             StatusCode::UNAUTHORIZED,
             "invalid_credentials",
             "invalid credentials",
         ));
-    };
+    }
+    let account = account.unwrap_or_else(|| panic!("checked"));
+    app.lockouts.clear(&email, prefix);
     let token = mint_session_token(&app.session_key);
     let hash = sha256(token.as_bytes());
     let mut seed = [0u8; 32];
@@ -2094,6 +2630,14 @@ async fn auth_login(
         header::HeaderValue::from_str(&session_set_cookie(&token)) // ATTACK(cookie-attrs)
             .unwrap_or_else(|_| header::HeaderValue::from_static("")),
     );
+    res.headers_mut().append(
+        header::SET_COOKIE,
+        header::HeaderValue::from_str(&known_device_set_cookie(&mint_known_device(
+            &app.session_key,
+            &account.public_id,
+        )))
+        .unwrap_or_else(|_| header::HeaderValue::from_static("")),
+    );
     Ok(res)
 }
 
@@ -2115,6 +2659,207 @@ async fn auth_logout(
         header::HeaderValue::from_static(session_clear_cookie()),
     );
     Ok(res)
+}
+
+/// One 410 for every dead token state — consumed, superseded, expired,
+/// wrong kind, unknown all look identical (review: token oracle).
+fn token_gone() -> ApiError {
+    ApiError::new(
+        StatusCode::GONE,
+        "token_gone",
+        "this link is no longer valid — request a fresh one",
+    )
+}
+
+async fn auth_verify(
+    parts: Parts,
+    State(app): State<App>,
+    J(req): J<VerifyReq>,
+) -> Result<Response, ApiError> {
+    check_request_origin(&parts)?;
+    AuthLimits::check(&app.auth_limits.redeem, client(&parts))?;
+    let Some(store) = app.keyring.store.clone() else {
+        return Err(ApiError::new(
+            StatusCode::NOT_FOUND,
+            "unauthenticated",
+            "no account store is configured",
+        ));
+    };
+    let Some(hash) = email_token_hash(&req.token) else {
+        return Err(token_gone());
+    };
+    // The consume marks the token, installs the pending password hash,
+    // sets verified_at and revokes every session — atomically, in the
+    // store's single transaction (replay and takeover both die there).
+    // ATTACK(token-replay)
+    let account = store
+        .consume_verify_token(&hash)
+        .await
+        .map_err(|_| accounts_unavailable())?
+        .ok_or_else(token_gone)?;
+    Ok(no_store(
+        finish_redeem(
+            &parts,
+            &app,
+            &store,
+            &account,
+            // ATTACK(verify-sets-cookie)
+            TokenCookie::Never,
+            Json(serde_json::json!({"verified": true})).into_response(),
+        )
+        .await?,
+    ))
+}
+
+/// Always-202 envelope for the email-keyed routes: the response and its
+/// timing must not leak whether the address is registered (review #3).
+fn accepted_sent() -> Response {
+    no_store(
+        (
+            StatusCode::ACCEPTED,
+            Json(serde_json::json!({"status": "sent"})),
+        )
+            .into_response(),
+    )
+}
+
+async fn auth_resend_verification(
+    parts: Parts,
+    State(app): State<App>,
+    J(req): J<EmailReq>,
+) -> Result<Response, ApiError> {
+    check_request_origin(&parts)?;
+    AuthLimits::check(&app.auth_limits.mail_req, client(&parts))?;
+    let res = accepted_sent();
+    let (Some(store), Some(email)) = (app.keyring.store.clone(), normalize_email(&req.email))
+    else {
+        return Ok(res);
+    };
+    // The store supersedes the pending verify token, inserts the fresh
+    // one (carrying the account's current hash) and enqueues the mail
+    // in one transaction — `None` (unknown / already verified) and the
+    // 202 already chosen keep the envelope sealed.
+    let token = mint_email_token();
+    let hash = sha256(token.as_bytes());
+    let expires = unix_ms() + VERIFY_TOKEN_TTL_MS;
+    let origin = app.public_origin.as_deref().unwrap_or("http://localhost");
+    let (text, html) = verify_mail_body(origin, &token);
+    let _ = store
+        .reissue_verify(
+            &email,
+            &hash,
+            expires,
+            &Mail {
+                kind: "verify",
+                send_to: email.clone(),
+                subject: SUBJECT_VERIFY.to_string(),
+                text,
+                html,
+                idempotency_key: format!("verify:{email}:{}", hex(&hash[..8])),
+                expires_at_ms: Some(expires),
+            },
+        )
+        .await
+        .map_err(|_| accounts_unavailable())?;
+    Ok(res)
+}
+
+async fn auth_forgot(
+    parts: Parts,
+    State(app): State<App>,
+    J(req): J<EmailReq>,
+) -> Result<Response, ApiError> {
+    check_request_origin(&parts)?;
+    AuthLimits::check(&app.auth_limits.mail_req, client(&parts))?;
+    let res = accepted_sent();
+    let (Some(store), Some(email)) = (app.keyring.store.clone(), normalize_email(&req.email))
+    else {
+        return Ok(res);
+    };
+    let token = mint_email_token();
+    let hash = sha256(token.as_bytes());
+    let expires = unix_ms() + RESET_TOKEN_TTL_MS;
+    let origin = app.public_origin.as_deref().unwrap_or("http://localhost");
+    let (text, html) = reset_mail_body(origin, &token);
+    // Token + mail commit in one store transaction; `None` (unknown or
+    // unverified address) enqueues nothing — the 202 went out either
+    // way, so the envelope never registers (review #3).
+    let issued = store
+        .issue_reset_token(
+            &email,
+            &hash,
+            expires,
+            &Mail {
+                kind: "reset",
+                send_to: email.clone(),
+                subject: SUBJECT_RESET.to_string(),
+                text,
+                html,
+                idempotency_key: format!("reset:{email}:{}", hex(&hash[..8])),
+                expires_at_ms: Some(expires),
+            },
+        )
+        .await
+        .map_err(|_| accounts_unavailable())?
+        .is_some();
+    // `issued` is deliberately dropped — whether a mail was enqueued
+    // must never shape the response.
+    // ATTACK(enumeration)
+    let _ = issued;
+    Ok(res)
+}
+
+async fn auth_reset(
+    parts: Parts,
+    State(app): State<App>,
+    J(req): J<ResetReq>,
+) -> Result<Response, ApiError> {
+    check_request_origin(&parts)?;
+    let addr = client(&parts);
+    AuthLimits::check(&app.auth_limits.redeem, addr)?;
+    if let Some(why) = durable_accounts::password::policy_refusal(&req.password) {
+        return Err(ApiError::new(StatusCode::BAD_REQUEST, "bad_input", why));
+    }
+    let Some(store) = app.keyring.store.clone() else {
+        return Err(ApiError::new(
+            StatusCode::NOT_FOUND,
+            "unauthenticated",
+            "no account store is configured",
+        ));
+    };
+    let Some(hash) = email_token_hash(&req.token) else {
+        return Err(token_gone());
+    };
+    // Hash BEFORE the consume: a dead token still costs the work, and
+    // the store only sees the digest.
+    let password = req.password.clone();
+    let phc = app
+        .argon
+        .run(addr, move || {
+            durable_accounts::password::hash_password(&password)
+        })
+        .await?
+        .map_err(|e| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "internal", e.to_string()))?;
+    // One transaction: install the hash, consume the token, kill the
+    // account's other pending tokens, revoke every session.
+    // ATTACK(token-replay)
+    let account = store
+        .consume_reset_token(&hash, &phc)
+        .await
+        .map_err(|_| accounts_unavailable())?
+        .ok_or_else(token_gone)?;
+    app.lockouts.clear_email(&account.email);
+    Ok(no_store(
+        finish_redeem(
+            &parts,
+            &app,
+            &store,
+            &account,
+            TokenCookie::UnlessForeignSession,
+            Json(serde_json::json!({"reset": true})).into_response(),
+        )
+        .await?,
+    ))
 }
 
 async fn auth_session(SessionAuth(grant): SessionAuth) -> Result<Response, ApiError> {
@@ -3354,6 +4099,10 @@ fn router(app: App, ui_dir: Option<&Path>) -> Router {
         .route("/auth/login", post(auth_login))
         .route("/auth/logout", post(auth_logout))
         .route("/auth/session", get(auth_session))
+        .route("/auth/verify", post(auth_verify))
+        .route("/auth/resend-verification", post(auth_resend_verification))
+        .route("/auth/forgot", post(auth_forgot))
+        .route("/auth/reset", post(auth_reset))
         .route("/admin/compact", post(compact))
         .route("/admin/backup", post(backup))
         .route("/admin/diagnostics", get(diagnostics))
@@ -3736,6 +4485,7 @@ async fn main() -> Result<()> {
             }
         }
     }
+    let mailer = mailout::mailer_from_env()?;
     let stopped = engine.clone();
     let registry_stale = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let registry_epoch = Arc::new(std::sync::atomic::AtomicU64::new(0));
@@ -3756,13 +4506,20 @@ async fn main() -> Result<()> {
         sessions: std::sync::Arc::new(SessionCache::new()),
         argon: std::sync::Arc::new(ArgonQueue::new()),
         auth_limits: std::sync::Arc::new(AuthLimits::new()),
-        mailer: std::sync::Arc::new(durable_accounts::LogMailer),
+        lockouts: std::sync::Arc::new(LoginLockouts::new()),
+        mailer: mailer.clone(),
+        mail_budget: std::sync::Arc::new(MailBudget::new(mailout::mail_budget_from_env(
+            MAIL_DAILY_BUDGET,
+        ))),
         invite_only: std::env::var_os("DURABLE_INVITE_ONLY").is_some(),
         public_origin: args.public_origin.clone(),
         pubid,
     };
     if let Some(store) = &store {
         spawn_registry_reconcile(store.clone(), &app, registry_stale);
+        // The outbox drain owns every send — the mail row committed in
+        // the same transaction as its fact is the only truth (D-064).
+        spawn_mail_drain(app.clone());
     }
     let router = router(app.clone(), args.ui_dir.as_deref());
     let listener = tokio::net::TcpListener::bind(&args.listen)
@@ -6339,8 +7096,8 @@ mod tests {
     }
 
     use durable_accounts::{
-        ApiKeyInfo, HandlerRegistration, KeyGrant, Mail, MailOutcome, SessionGrant, SignupOutcome,
-        Workspace,
+        ApiKeyInfo, HandlerRegistration, InviteGrant, KeyGrant, Mail, MailOutcome, OutboxMail,
+        SessionGrant, SignupOutcome, Workspace,
     };
 
     #[async_trait::async_trait]
@@ -6472,6 +7229,67 @@ mod tests {
         }
         async fn outbox_mark(&self, id: u64, outcome: MailOutcome) -> Result<(), AccountError> {
             self.inner.outbox_mark(id, outcome).await
+        }
+        async fn consume_verify_token(
+            &self,
+            token_hash: &[u8; 32],
+        ) -> Result<Option<durable_accounts::Account>, AccountError> {
+            self.inner.consume_verify_token(token_hash).await
+        }
+        async fn consume_reset_token(
+            &self,
+            token_hash: &[u8; 32],
+            new_password_hash: &str,
+        ) -> Result<Option<durable_accounts::Account>, AccountError> {
+            self.inner
+                .consume_reset_token(token_hash, new_password_hash)
+                .await
+        }
+        async fn issue_reset_token(
+            &self,
+            email: &str,
+            token_hash: &[u8; 32],
+            expires_at_ms: i64,
+            reset_mail: &Mail,
+        ) -> Result<Option<u64>, AccountError> {
+            self.inner
+                .issue_reset_token(email, token_hash, expires_at_ms, reset_mail)
+                .await
+        }
+        async fn reissue_verify(
+            &self,
+            email: &str,
+            token_hash: &[u8; 32],
+            expires_at_ms: i64,
+            verify_mail: &Mail,
+        ) -> Result<Option<u64>, AccountError> {
+            self.inner
+                .reissue_verify(email, token_hash, expires_at_ms, verify_mail)
+                .await
+        }
+        async fn invite_grant(
+            &self,
+            token_hash: &[u8; 32],
+            now_ms: i64,
+        ) -> Result<Option<InviteGrant>, AccountError> {
+            self.inner.invite_grant(token_hash, now_ms).await
+        }
+        async fn enqueue_mail(&self, mail: &Mail) -> Result<Option<u64>, AccountError> {
+            self.inner.enqueue_mail(mail).await
+        }
+        async fn outbox_claim(
+            &self,
+            now_ms: i64,
+            limit: u32,
+            claim_ms: i64,
+        ) -> Result<Vec<OutboxMail>, AccountError> {
+            self.inner.outbox_claim(now_ms, limit, claim_ms).await
+        }
+        async fn outbox_sweep(&self, now_ms: i64) -> Result<u64, AccountError> {
+            self.inner.outbox_sweep(now_ms).await
+        }
+        async fn outbox_purge(&self, now_ms: i64) -> Result<u64, AccountError> {
+            self.inner.outbox_purge(now_ms).await
         }
     }
 
@@ -10645,5 +11463,743 @@ mod tests {
         .await;
         assert_eq!(st, StatusCode::SERVICE_UNAVAILABLE, "{v}");
         assert_eq!(v["code"], "accounts_unavailable");
+    }
+
+    // ---- S3-1: verify / reset / outbox drain / lockout -------------
+
+    /// The `drt_` token out of the newest pending outbox row of `kind`
+    /// for `email` — the link the mailbox owner would click.
+    fn mailed_token(store: &Memory, kind: &'static str, email: &str) -> String {
+        store
+            .outbox()
+            .into_iter()
+            .rev()
+            .find(|r| r.status == "pending" && r.kind == kind && r.send_to == email)
+            .and_then(|r| {
+                r.mail.text.split("token=").nth(1).map(|t| {
+                    t.chars()
+                        .take_while(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_')
+                        .collect()
+                })
+            })
+            .unwrap_or_else(|| panic!("no pending {kind} mail for {email}"))
+    }
+
+    async fn signup_only(router: &Router, email: &str, password: &str) {
+        let (st, _, v) = raw(
+            router,
+            "POST",
+            "/auth/signup",
+            &[],
+            Some(json!({"email": email, "password": password})),
+        )
+        .await;
+        assert_eq!(st, StatusCode::ACCEPTED, "{v}");
+    }
+
+    /// Sign up, then click the mailed verify link.
+    async fn signup_and_verify(router: &Router, store: &Memory, email: &str, password: &str) {
+        signup_only(router, email, password).await;
+        let token = mailed_token(store, "verify", email);
+        let (st, _, v) = raw(
+            router,
+            "POST",
+            "/auth/verify",
+            &[],
+            Some(json!({"token": token})),
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK, "{v}");
+    }
+
+    /// Verify: the mailed link verifies the account, answers
+    /// `{verified: true}` — and NEVER sets a session cookie: the
+    /// mailbox owner signs in fresh (review #2/#17). Proves
+    /// `verify-sets-cookie`.
+    #[tokio::test]
+    async fn s31_verify_round_trip() {
+        let store = Arc::new(Memory::new());
+        let h = harness_store(false, None, Some(store.clone()));
+        signup_only(&h.router, "v@v.co", "a-long-enough-passphrase").await;
+        // A session minted before verify dies with it (prereg proof's
+        // other half — the revoke lives in the consume).
+        let (cookie, _) = sign_in(&h.router, "v@v.co", "a-long-enough-passphrase").await;
+        let token = mailed_token(&store, "verify", "v@v.co");
+        let (st, heads, v) = raw(
+            &h.router,
+            "POST",
+            "/auth/verify",
+            &[("cookie", cookie.clone())],
+            Some(json!({"token": token})),
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK, "{v}");
+        assert_eq!(v["verified"], true);
+        assert!(
+            heads.get_all(header::SET_COOKIE).iter().next().is_none(),
+            "verify must never set a cookie: {heads:?}"
+        );
+        let acct = store
+            .account_by_email("v@v.co")
+            .await
+            .unwrap_or_else(|e| panic!("{e}"))
+            .unwrap_or_else(|| panic!("account"));
+        assert!(acct.email_verified);
+        // The pre-verify session is dead; a fresh login works.
+        let (st, _, _) = raw(
+            &h.router,
+            "GET",
+            "/auth/session",
+            &[("cookie", cookie)],
+            None,
+        )
+        .await;
+        assert_eq!(st, StatusCode::UNAUTHORIZED);
+        let (_, _) = sign_in(&h.router, "v@v.co", "a-long-enough-passphrase").await;
+    }
+
+    /// A used `drt_` token is dead — consumed, superseded, expired and
+    /// unknown all read as the one 410. Proves `token-replay`.
+    #[tokio::test]
+    async fn s31_verify_token_replay_410() {
+        let store = Arc::new(Memory::new());
+        let h = harness_store(false, None, Some(store.clone()));
+        signup_only(&h.router, "r@r.co", "a-long-enough-passphrase").await;
+        let token = mailed_token(&store, "verify", "r@r.co");
+        let body = || Some(json!({"token": token}));
+        let (st, _, _) = raw(&h.router, "POST", "/auth/verify", &[], body()).await;
+        assert_eq!(st, StatusCode::OK);
+        let (st, _, v) = raw(&h.router, "POST", "/auth/verify", &[], body()).await;
+        assert_eq!(st, StatusCode::GONE, "{v}");
+        assert_eq!(v["code"], "token_gone");
+        // Garbage shaped nothing like a token: same 410, no oracle.
+        let (st, _, _) = raw(
+            &h.router,
+            "POST",
+            "/auth/verify",
+            &[],
+            Some(json!({"token": "not-a-token"})),
+        )
+        .await;
+        assert_eq!(st, StatusCode::GONE);
+    }
+
+    /// A `reset` token presented to `/auth/verify` is a dead verify
+    /// token — the kind is bound inside the consume. Proves
+    /// `token-kind-confusion`.
+    #[tokio::test]
+    async fn s31_reset_token_cannot_verify() {
+        let store = Arc::new(Memory::new());
+        let h = harness_store(false, None, Some(store.clone()));
+        signup_and_verify(&h.router, &store, "k@k.co", "a-long-enough-passphrase").await;
+        let (st, _, _) = raw(
+            &h.router,
+            "POST",
+            "/auth/forgot",
+            &[],
+            Some(json!({"email": "k@k.co"})),
+        )
+        .await;
+        assert_eq!(st, StatusCode::ACCEPTED);
+        let reset = mailed_token(&store, "reset", "k@k.co");
+        let (st, _, v) = raw(
+            &h.router,
+            "POST",
+            "/auth/verify",
+            &[],
+            Some(json!({"token": reset})),
+        )
+        .await;
+        assert_eq!(st, StatusCode::GONE, "{v}");
+        // And the reset link still works for its own route.
+        let (st, _, v) = raw(
+            &h.router,
+            "POST",
+            "/auth/reset",
+            &[],
+            Some(json!({"token": reset, "password": "another-long-passphrase"})),
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK, "{v}");
+    }
+
+    /// Forgot → mailed reset link → reset installs the password,
+    /// revokes every session and sibling token, and mints a fresh
+    /// session only for an unaffiliated requester.
+    #[tokio::test]
+    async fn s31_forgot_reset_round_trip() {
+        let store = Arc::new(Memory::new());
+        let h = harness_store(false, None, Some(store.clone()));
+        signup_and_verify(&h.router, &store, "f@f.co", "first-long-passphrase").await;
+        let (cookie, _) = sign_in(&h.router, "f@f.co", "first-long-passphrase").await;
+        let (st, _, v) = raw(
+            &h.router,
+            "POST",
+            "/auth/forgot",
+            &[],
+            Some(json!({"email": "f@f.co"})),
+        )
+        .await;
+        assert_eq!(st, StatusCode::ACCEPTED, "{v}");
+        assert_eq!(v, json!({"status": "sent"}));
+        let token = mailed_token(&store, "reset", "f@f.co");
+        // Unaffiliated requester (no cookie) → fresh session minted.
+        let (st, heads, v) = raw(
+            &h.router,
+            "POST",
+            "/auth/reset",
+            &[],
+            Some(json!({"token": token, "password": "second-long-passphrase"})),
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK, "{v}");
+        let fresh = heads
+            .get_all(header::SET_COOKIE)
+            .iter()
+            .filter_map(|v| v.to_str().ok())
+            .find(|s| s.starts_with("__Host-drs="))
+            .map(cookie_header)
+            .unwrap_or_else(|| panic!("reset mints a session: {heads:?}"));
+        // The pre-reset session is dead; the fresh one resolves.
+        let (st, _, _) = raw(
+            &h.router,
+            "GET",
+            "/auth/session",
+            &[("cookie", cookie)],
+            None,
+        )
+        .await;
+        assert_eq!(st, StatusCode::UNAUTHORIZED);
+        let (st, _, v) = raw(
+            &h.router,
+            "GET",
+            "/auth/session",
+            &[("cookie", fresh)],
+            None,
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK, "{v}");
+        assert_eq!(v["account"]["email"], "f@f.co");
+        // Old password dead, new password live, replay dead.
+        let (st, _, _) = raw(
+            &h.router,
+            "POST",
+            "/auth/login",
+            &[],
+            Some(json!({"email": "f@f.co", "password": "first-long-passphrase"})),
+        )
+        .await;
+        assert_eq!(st, StatusCode::UNAUTHORIZED);
+        let (st, _, _) = raw(
+            &h.router,
+            "POST",
+            "/auth/login",
+            &[],
+            Some(json!({"email": "f@f.co", "password": "second-long-passphrase"})),
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK);
+        let (st, _, _) = raw(
+            &h.router,
+            "POST",
+            "/auth/reset",
+            &[],
+            Some(json!({"token": token, "password": "third-long-passphrase"})),
+        )
+        .await;
+        assert_eq!(st, StatusCode::GONE);
+    }
+
+    /// A foreign session is never signed over by someone else's reset
+    /// link (review #17): B's browser redeeming A's link keeps B's
+    /// session — no new cookie is issued.
+    #[tokio::test]
+    async fn s31_reset_keeps_foreign_session() {
+        let store = Arc::new(Memory::new());
+        let h = harness_store(false, None, Some(store.clone()));
+        signup_and_verify(&h.router, &store, "a@a.co", "a-first-passphrase").await;
+        signup_and_verify(&h.router, &store, "b@b.co", "b-first-passphrase").await;
+        let (cookie_b, _) = sign_in(&h.router, "b@b.co", "b-first-passphrase").await;
+        let (st, _, _) = raw(
+            &h.router,
+            "POST",
+            "/auth/forgot",
+            &[],
+            Some(json!({"email": "a@a.co"})),
+        )
+        .await;
+        assert_eq!(st, StatusCode::ACCEPTED);
+        let token = mailed_token(&store, "reset", "a@a.co");
+        let (st, heads, v) = raw(
+            &h.router,
+            "POST",
+            "/auth/reset",
+            &[("cookie", cookie_b.clone())],
+            Some(json!({"token": token, "password": "a-second-passphrase"})),
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK, "{v}");
+        assert!(
+            heads
+                .get_all(header::SET_COOKIE)
+                .iter()
+                .filter_map(|v| v.to_str().ok())
+                .all(|s| !s.starts_with("__Host-drs=")),
+            "a foreign session must not be signed over: {heads:?}"
+        );
+        // B's session survives and still resolves as B.
+        let (st, _, v) = raw(
+            &h.router,
+            "GET",
+            "/auth/session",
+            &[("cookie", cookie_b)],
+            None,
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK, "{v}");
+        assert_eq!(v["account"]["email"], "b@b.co");
+    }
+
+    /// forgot + resend-verification answer one envelope for known,
+    /// unverified and unknown addresses (review #3). Proves
+    /// `enumeration` — the response may not depend on `issued`.
+    #[tokio::test]
+    async fn s31_forgot_resend_envelopes_match() {
+        let store = Arc::new(Memory::new());
+        let h = harness_store(false, None, Some(store.clone()));
+        signup_and_verify(&h.router, &store, "known@k.co", "a-long-enough-passphrase").await;
+        signup_only(&h.router, "unverified@u.co", "a-long-enough-passphrase").await;
+        let forgot = |email: &'static str| {
+            let r = h.router.clone();
+            async move {
+                raw(
+                    &r,
+                    "POST",
+                    "/auth/forgot",
+                    &[],
+                    Some(json!({"email": email})),
+                )
+                .await
+            }
+        };
+        let (st1, _, v1) = forgot("known@k.co").await;
+        let (st2, _, v2) = forgot("nobody@nowhere.co").await;
+        assert_eq!((st1, &v1), (st2, &v2), "forgot must not register");
+        assert_eq!(st1, StatusCode::ACCEPTED);
+        // And the outbox really did differ — a mail went only to the
+        // known address (the envelope hid it).
+        assert!(
+            store
+                .outbox()
+                .iter()
+                .any(|r| r.kind == "reset" && r.send_to == "known@k.co"),
+            "a reset mail was enqueued for the known address"
+        );
+        let resend = |email: &'static str| {
+            let r = h.router.clone();
+            async move {
+                raw(
+                    &r,
+                    "POST",
+                    "/auth/resend-verification",
+                    &[],
+                    Some(json!({"email": email})),
+                )
+                .await
+            }
+        };
+        let (st1, _, v1) = resend("unverified@u.co").await;
+        let (st2, _, v2) = resend("ghost@nowhere.co").await;
+        assert_eq!((st1, &v1), (st2, &v2), "resend must not register");
+        let (st3, _, v3) = resend("known@k.co").await;
+        assert_eq!(
+            (st1, &v1),
+            (st3, &v3),
+            "an already-verified address reads the same"
+        );
+    }
+
+    /// `invite_only`: the gate asks the store for a live invite whose
+    /// bound email matches the sign-up's — anything less is 403
+    /// `invite_required`. Proves `invite-required`.
+    #[tokio::test]
+    async fn s31_invite_only_gate() {
+        let store = Arc::new(Memory::new());
+        let h = harness_store(false, None, Some(store.clone()));
+        let mut app = h.app.clone();
+        app.invite_only = true;
+        let r = router(app, None);
+        let body = |tok: Option<&str>| {
+            let mut b = json!({"email": "inv@i.co", "password": "a-long-enough-passphrase"});
+            if let Some(t) = tok {
+                b["invite_token"] = json!(t);
+            }
+            Some(b)
+        };
+        let (st, _, v) = raw(&r, "POST", "/auth/signup", &[], body(None)).await;
+        assert_eq!(st, StatusCode::FORBIDDEN, "{v}");
+        assert_eq!(v["code"], "invite_required");
+        let (st, _, _) = raw(&r, "POST", "/auth/signup", &[], body(Some("drt_bogus"))).await;
+        assert_eq!(st, StatusCode::FORBIDDEN);
+        // A live invite for a DIFFERENT email is not a grant for this one.
+        let ws = store
+            .create_workspace("w")
+            .await
+            .unwrap_or_else(|e| panic!("{e}"));
+        let other = mint_email_token();
+        store.add_invite(
+            ws.id,
+            "other@o.co",
+            durable_accounts::Role::Member,
+            email_token_hash(&other).unwrap_or_else(|| panic!("shape")),
+            unix_ms() + 86_400_000,
+        );
+        let (st, _, _) = raw(&r, "POST", "/auth/signup", &[], body(Some(&other))).await;
+        assert_eq!(st, StatusCode::FORBIDDEN, "the invite binds its email");
+        // A live invite for THIS email opens the gate.
+        let tok = mint_email_token();
+        store.add_invite(
+            ws.id,
+            "inv@i.co",
+            durable_accounts::Role::Member,
+            email_token_hash(&tok).unwrap_or_else(|| panic!("shape")),
+            unix_ms() + 86_400_000,
+        );
+        let (st, _, v) = raw(&r, "POST", "/auth/signup", &[], body(Some(&tok))).await;
+        assert_eq!(st, StatusCode::ACCEPTED, "{v}");
+    }
+
+    /// The mailbox owner's click kills the pre-registration attacker's
+    /// session (review #2): sign up a victim address, hold a session,
+    /// verify — the held session dies. Proves `prereg-takeover`.
+    #[tokio::test]
+    async fn s31_verify_revokes_prereg_session() {
+        let store = Arc::new(Memory::new());
+        let h = harness_store(false, None, Some(store.clone()));
+        signup_only(&h.router, "victim@x.co", "attacker-passphrase").await;
+        let (attacker, _) = sign_in(&h.router, "victim@x.co", "attacker-passphrase").await;
+        // The victim clicks the mailed link.
+        let token = mailed_token(&store, "verify", "victim@x.co");
+        let (st, _, _) = raw(
+            &h.router,
+            "POST",
+            "/auth/verify",
+            &[],
+            Some(json!({"token": token})),
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK);
+        let (st, _, _) = raw(
+            &h.router,
+            "GET",
+            "/auth/session",
+            &[("cookie", attacker)],
+            None,
+        )
+        .await;
+        assert_eq!(
+            st,
+            StatusCode::UNAUTHORIZED,
+            "the prereg session dies at verify"
+        );
+    }
+
+    /// Failures on a (normalized email, client prefix) pair cool off at
+    /// the 10th: the next attempt — right or wrong, and whether or not
+    /// the account exists — answers the same 429 + Retry-After (review
+    /// #13). Proves `lockout-shape`.
+    #[tokio::test]
+    async fn s31_lockout_cools_off() {
+        let store = Arc::new(Memory::new());
+        let h = harness_store(false, None, Some(store.clone()));
+        signup_and_verify(&h.router, &store, "l@l.co", "a-long-enough-passphrase").await;
+        let login = |email: &'static str, pw: &'static str| {
+            let r = h.router.clone();
+            async move {
+                raw(
+                    &r,
+                    "POST",
+                    "/auth/login",
+                    &[],
+                    Some(json!({"email": email, "password": pw})),
+                )
+                .await
+            }
+        };
+        for i in 0..10 {
+            let (st, _, _) = login("l@l.co", "wrong-passphrase").await;
+            assert_eq!(st, StatusCode::UNAUTHORIZED, "attempt {i}");
+        }
+        // The 11th cools off — even the right password — and the
+        // Retry-After is the lockout's minutes, not the window's ~60 s.
+        let (st, heads, v) = login("l@l.co", "a-long-enough-passphrase").await;
+        assert_eq!(st, StatusCode::TOO_MANY_REQUESTS, "{v}");
+        assert_eq!(v["code"], "rate_limited");
+        let retry: u64 = heads
+            .get(header::RETRY_AFTER)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|s| s.parse().ok())
+            .unwrap_or_default();
+        assert!(retry > 60, "the lockout's cool-off, not the addr window");
+        // An address that does not exist cools off identically — a 429
+        // cannot answer "is this email registered" (review #13).
+        for _ in 0..10 {
+            let (st, _, _) = login("ghost@nowhere.co", "wrong-passphrase").await;
+            assert_eq!(st, StatusCode::UNAUTHORIZED);
+        }
+        let (st, _, v) = login("ghost@nowhere.co", "wrong-passphrase").await;
+        assert_eq!(st, StatusCode::TOO_MANY_REQUESTS, "{v}");
+    }
+
+    /// The HMAC-tagged known-device cookie is the owner's bypass (review
+    /// #13): it skips the cool-off but never the password check — and a
+    /// cookie minted for another account skips nothing.
+    #[tokio::test]
+    async fn s31_known_device_bypasses_cooloff() {
+        let store = Arc::new(Memory::new());
+        let h = harness_store(false, None, Some(store.clone()));
+        signup_and_verify(&h.router, &store, "d@d.co", "a-long-enough-passphrase").await;
+        signup_and_verify(&h.router, &store, "e@e.co", "a-long-enough-passphrase").await;
+        // Sign in and capture the device cookie the login minted.
+        let (st, heads, _) = raw(
+            &h.router,
+            "POST",
+            "/auth/login",
+            &[],
+            Some(json!({"email": "d@d.co", "password": "a-long-enough-passphrase"})),
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK);
+        let drd = heads
+            .get_all(header::SET_COOKIE)
+            .iter()
+            .filter_map(|v| v.to_str().ok())
+            .find(|s| s.starts_with("__Host-drd="))
+            .map(cookie_header)
+            .unwrap_or_else(|| panic!("login mints __Host-drd: {heads:?}"));
+        assert!(drd.starts_with("__Host-drd=drd_"));
+        for _ in 0..10 {
+            let (st, _, _) = raw(
+                &h.router,
+                "POST",
+                "/auth/login",
+                &[],
+                Some(json!({"email": "d@d.co", "password": "wrong-passphrase"})),
+            )
+            .await;
+            assert_eq!(st, StatusCode::UNAUTHORIZED);
+        }
+        // Without the device cookie the pair is in cool-off…
+        let (st, _, _) = raw(
+            &h.router,
+            "POST",
+            "/auth/login",
+            &[],
+            Some(json!({"email": "d@d.co", "password": "a-long-enough-passphrase"})),
+        )
+        .await;
+        assert_eq!(st, StatusCode::TOO_MANY_REQUESTS);
+        // …the device cookie carries them through — but still must
+        // answer the password, it is no auth factor.
+        let (st, _, v) = raw(
+            &h.router,
+            "POST",
+            "/auth/login",
+            &[("cookie", drd.clone())],
+            Some(json!({"email": "d@d.co", "password": "wrong-passphrase"})),
+        )
+        .await;
+        assert_eq!(st, StatusCode::UNAUTHORIZED, "{v}");
+        let (st, _, v) = raw(
+            &h.router,
+            "POST",
+            "/auth/login",
+            &[("cookie", drd.clone())],
+            Some(json!({"email": "d@d.co", "password": "a-long-enough-passphrase"})),
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK, "{v}");
+        // Another account's lockout is untouched by d@d.co's cookie.
+        let (st, _, _) = raw(
+            &h.router,
+            "POST",
+            "/auth/login",
+            &[("cookie", drd)],
+            Some(json!({"email": "e@e.co", "password": "a-long-enough-passphrase"})),
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK, "e@e.co was never locked");
+    }
+
+    /// A bad addr-spec never reaches the outbox — CRLF, display names,
+    /// second `@`s are refused at enqueue (review #14). Proves
+    /// `addr-spec-injection`.
+    #[tokio::test]
+    async fn s31_addr_spec_refused() {
+        let store = Arc::new(Memory::new());
+        let mail = |to: &str| Mail {
+            kind: "notice",
+            send_to: to.to_string(),
+            subject: "s".into(),
+            text: "t".into(),
+            html: "h".into(),
+            idempotency_key: format!("k:{to}"),
+            expires_at_ms: None,
+        };
+        for bad in [
+            "a@b.co\r\nBcc: x@y.co",
+            "a@b.co\nBcc: x@y.co",
+            "Display <a@b.co>",
+            "a@b.co, x@y.co",
+            "a@@b.co",
+            "a b@c.co",
+            "",
+        ] {
+            let r = store.enqueue_mail(&mail(bad)).await;
+            assert!(matches!(r, Ok(None)), "{bad:?} must be refused");
+        }
+        assert!(store.outbox().is_empty(), "nothing enqueued");
+        assert_eq!(store.outbox().len(), 0);
+        assert!(
+            store
+                .enqueue_mail(&mail("a+b@sub.d.co"))
+                .await
+                .is_ok_and(|id| id.is_some()),
+            "a real addr-spec enqueues"
+        );
+    }
+
+    /// The drain claims due rows, sends through the Mailer under the
+    /// deadline and marks `sent` — never re-claims a sent row (D-064).
+    #[tokio::test]
+    async fn s31_outbox_drain_sends() {
+        let store = Arc::new(Memory::new());
+        let h = harness_store(false, None, Some(store.clone()));
+        signup_only(&h.router, "o@o.co", "a-long-enough-passphrase").await;
+        assert_eq!(
+            store
+                .outbox()
+                .iter()
+                .filter(|r| r.status == "pending")
+                .count(),
+            1
+        );
+        let sent = drain_outbox_once(&h.app).await;
+        assert_eq!(sent, 1);
+        let mailer = h
+            .app
+            .mailer
+            .as_any()
+            .downcast_ref::<durable_accounts::MemoryMailer>()
+            .unwrap_or_else(|| panic!("memory mailer"));
+        let captured = mailer.captured();
+        assert_eq!(captured.len(), 1);
+        assert_eq!(captured[0].kind, "verify");
+        assert_eq!(captured[0].send_to, "o@o.co");
+        assert!(
+            store.outbox().iter().all(|r| r.status == "sent"),
+            "the row closed"
+        );
+        assert_eq!(
+            drain_outbox_once(&h.app).await,
+            0,
+            "a sent row is never re-claimed"
+        );
+    }
+
+    /// The global send budget stops the drain mid-batch (review #14):
+    /// a claimed row waits for budget rather than send uncapped.
+    /// Proves `mail-global`.
+    #[tokio::test]
+    async fn s31_mail_global_budget_stops_drain() {
+        let store = Arc::new(Memory::new());
+        let h = harness_store(false, None, Some(store.clone()));
+        let mut app = h.app.clone();
+        app.mail_budget = std::sync::Arc::new(MailBudget::new(0));
+        let r = router(app.clone(), None);
+        signup_only(&r, "cap@c.co", "a-long-enough-passphrase").await;
+        let sent = drain_outbox_once(&app).await;
+        assert_eq!(sent, 0, "a zero budget sends nothing");
+        let mailer = app
+            .mailer
+            .as_any()
+            .downcast_ref::<durable_accounts::MemoryMailer>()
+            .unwrap_or_else(|| panic!("memory mailer"));
+        assert!(mailer.captured().is_empty());
+    }
+
+    /// The per-(address, kind) hourly cap coalesces a spam loop: the
+    /// 4th mail inside the hour is dropped at enqueue — newest still
+    /// replaces a pending row for free (review #14). Proves
+    /// `mail-budget`.
+    #[tokio::test]
+    async fn s31_outbox_hourly_cap() {
+        let store = Arc::new(Memory::new());
+        let mail = |n: u32| Mail {
+            kind: "notice",
+            send_to: "cap@d.co".into(),
+            subject: "s".into(),
+            text: "t".into(),
+            html: "h".into(),
+            idempotency_key: format!("n:{n}"),
+            expires_at_ms: None,
+        };
+        // Three enqueues land when each prior row is no longer pending.
+        for n in 0..3 {
+            let id = store
+                .enqueue_mail(&mail(n))
+                .await
+                .unwrap_or_else(|e| panic!("{e}"))
+                .unwrap_or_else(|| panic!("enqueue {n}"));
+            store
+                .outbox_mark(id, durable_accounts::MailOutcome::Sent)
+                .await
+                .unwrap_or_else(|e| panic!("{e}"));
+        }
+        let fourth = store
+            .enqueue_mail(&mail(3))
+            .await
+            .unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(fourth, None, "the 4th mail inside the hour coalesces");
+        assert_eq!(store.outbox().len(), 3);
+    }
+
+    /// resend-verification supersedes the pending token and mails a
+    /// fresh link — the old link 410s, the new one verifies.
+    #[tokio::test]
+    async fn s31_resend_verification_supersedes() {
+        let store = Arc::new(Memory::new());
+        let h = harness_store(false, None, Some(store.clone()));
+        signup_only(&h.router, "rs@r.co", "a-long-enough-passphrase").await;
+        let first = mailed_token(&store, "verify", "rs@r.co");
+        let (st, _, v) = raw(
+            &h.router,
+            "POST",
+            "/auth/resend-verification",
+            &[],
+            Some(json!({"email": "rs@r.co"})),
+        )
+        .await;
+        assert_eq!(st, StatusCode::ACCEPTED, "{v}");
+        let second = mailed_token(&store, "verify", "rs@r.co");
+        assert_ne!(first, second, "a fresh token was mailed");
+        let (st, _, _) = raw(
+            &h.router,
+            "POST",
+            "/auth/verify",
+            &[],
+            Some(json!({"token": first})),
+        )
+        .await;
+        assert_eq!(st, StatusCode::GONE, "the superseded link is dead");
+        let (st, _, _) = raw(
+            &h.router,
+            "POST",
+            "/auth/verify",
+            &[],
+            Some(json!({"token": second})),
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK);
     }
 }

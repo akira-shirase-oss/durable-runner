@@ -53,6 +53,16 @@ mutations=(
   "liveness-flood|crates/durable-server/src/main.rs|unit:durable-server|health_survives_a_pinned_connection_pool|ready_pool\\.max\\(1\\)~~>ready_pool.min(0)"
   "slot-camp|crates/durable-server/src/main.rs|unit:durable-server|a_fresh_head_gets_a_one_second_grace_then_dies_under_pressure|served_n == 0~~>false"
   "overload-lane|crates/durable-server/src/main.rs|unit:durable-server|the_overload_lane_answers_conns_from_four_buckets|lane_answer\([^)]*\)~~>{ let _ = (lane_guard, lane_permit); drop(stream); }"
+  "token-replay|crates/durable-accounts/src/memory.rs|unit:durable-server|s31_verify_token_replay_410|!t\.consumed~~>true"
+  "token-kind-confusion|crates/durable-accounts/src/memory.rs|unit:durable-server|s31_reset_token_cannot_verify|t\.kind == \"verify\"~~>true"
+  "prereg-takeover|crates/durable-accounts/src/memory.rs|unit:durable-server|s31_verify_revokes_prereg_session|inner\.sessions\.values_mut\(\)~~>inner.sessions.values_mut().take(0)"
+  "addr-spec-injection|crates/durable-accounts/src/memory.rs|unit:durable-server|s31_addr_spec_refused|!crate::mail::valid_addr_spec\(&mail\.send_to\)~~>false"
+  "mail-budget|crates/durable-accounts/src/memory.rs|unit:durable-server|s31_outbox_hourly_cap|in_window >= crate::mail::MAX_HOURLY_PER_ADDR~~>in_window >= i64::MAX"
+  "enumeration|crates/durable-server/src/main.rs|unit:durable-server|s31_forgot_resend_envelopes_match|let _ = issued;~~>if !issued { return Ok(no_store(StatusCode::OK.into_response())); }"
+  "invite-required|crates/durable-server/src/main.rs|unit:durable-server|s31_invite_only_gate|!ok~~>false"
+  "verify-sets-cookie|crates/durable-server/src/main.rs|unit:durable-server|s31_verify_round_trip|TokenCookie::Never~~>TokenCookie::UnlessForeignSession"
+  "lockout-shape|crates/durable-server/src/main.rs|unit:durable-server|s31_lockout_cools_off|app\.lockouts\.fail\(&email, prefix, now\)~~>false"
+  "mail-global|crates/durable-server/src/main.rs|unit:durable-server|s31_mail_global_budget_stops_drain|!app\.mail_budget\.open\(unix_ms\(\)\)~~>false"
 )
 
 # Every marker in the source has exactly one mutation, and every mutation

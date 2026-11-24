@@ -9,7 +9,7 @@
 //! caller fails closed — new submissions answer `accounts_unavailable`
 //! while already-accepted runs keep executing.
 
-mod mail;
+pub mod mail;
 mod memory;
 pub mod password;
 mod pg;
@@ -155,6 +155,26 @@ pub enum SignupOutcome {
     /// The address has a verified account: the notice mail was queued
     /// (no token — the account's sign-in state is untouched).
     Taken { outbox: Option<u64> },
+}
+
+/// A live invite row as the invite-only sign-up gate reads it
+/// (`DURABLE_INVITE_ONLY`): the token binds the address it was mailed
+/// to — the caller refuses when it doesn't match the sign-up's.
+#[derive(Debug, Clone)]
+pub struct InviteGrant {
+    pub workspace: u64,
+    pub email: String,
+    pub role: Role,
+}
+
+/// One outbox row claimed for delivery — the rendered mail plus the
+/// bookkeeping the drain needs (`id` to mark, `attempts` to back off).
+#[derive(Debug, Clone)]
+pub struct OutboxMail {
+    pub id: u64,
+    /// Send attempts recorded so far — the drain backs off on it.
+    pub attempts: i64,
+    pub mail: Mail,
 }
 
 /// Workspace membership roles — the session side of the authorization
@@ -367,9 +387,98 @@ pub trait AccountStore: Send + Sync {
     async fn member_role(&self, account: u64, workspace: u64)
         -> Result<Option<Role>, AccountError>;
 
+    // --- S3-1: email-token consume, outbox drain, invites -----------
+
+    /// Consume a live `verify` token atomically (review #2): mark it
+    /// consumed, install its pending password hash, set
+    /// `email_verified_at` and revoke every session of the account —
+    /// one transaction, so a partial win is impossible. `Ok(None)` is
+    /// the single answer for unknown, consumed, superseded and expired
+    /// alike (no dead-kind oracle).
+    async fn consume_verify_token(
+        &self,
+        token_hash: &[u8; 32],
+    ) -> Result<Option<Account>, AccountError>;
+
+    /// Consume a live `reset` token atomically: mark it consumed,
+    /// install `new_password_hash`, prove mailbox ownership (sets
+    /// `email_verified_at`), supersede the account's other pending
+    /// tokens — a stale pending hash can never overwrite the reset —
+    /// and revoke every session. One transaction; `Ok(None)` covers
+    /// every dead state identically.
+    async fn consume_reset_token(
+        &self,
+        token_hash: &[u8; 32],
+        new_password_hash: &str,
+    ) -> Result<Option<Account>, AccountError>;
+
+    /// Issue a `reset` token + reset mail for `email` in one
+    /// transaction (pending reset tokens superseded first).
+    /// `Ok(Some(id))` = mail enqueued; `Ok(None)` = address unknown or
+    /// the mail coalesced — the caller's answer is identical.
+    async fn issue_reset_token(
+        &self,
+        email: &str,
+        token_hash: &[u8; 32],
+        expires_at_ms: i64,
+        reset_mail: &Mail,
+    ) -> Result<Option<u64>, AccountError>;
+
+    /// Re-issue a `verify` token for an existing *unverified* account:
+    /// supersede the pending one, insert fresh (carrying the account's
+    /// current password hash so verifying never reverts a reset), and
+    /// enqueue the mail. `Ok(None)` = unknown or already verified —
+    /// resend-verification's envelope never reveals which.
+    async fn reissue_verify(
+        &self,
+        email: &str,
+        token_hash: &[u8; 32],
+        expires_at_ms: i64,
+        verify_mail: &Mail,
+    ) -> Result<Option<u64>, AccountError>;
+
+    /// A live invite by its token hash — the `DURABLE_INVITE_ONLY`
+    /// sign-up gate: unaccepted, unrevoked and unexpired. `None`
+    /// covers every dead state; the caller matches `email` itself.
+    async fn invite_grant(
+        &self,
+        token_hash: &[u8; 32],
+        now_ms: i64,
+    ) -> Result<Option<InviteGrant>, AccountError>;
+
+    /// Enqueue a mail outside the token flows (the lockout notice):
+    /// the strict addr-spec check, the per-(address,kind) hourly cap
+    /// and the idempotency key's uniqueness do the dedupe — `Ok(None)`
+    /// when any of them coalesced the mail.
+    async fn enqueue_mail(&self, mail: &Mail) -> Result<Option<u64>, AccountError>;
+
+    /// Claim up to `limit` due rows for sending: `pending` and due, or
+    /// `sending` past its claim deadline (a worker died between claim
+    /// and mark — that reclaim counts a lost attempt). Claims stamp
+    /// `next_attempt_at = now + claim_ms`; a row that reaches
+    /// `OUTBOX_MAX_ATTEMPTS` stops being claimed and `outbox_sweep`
+    /// dead-letters it.
+    async fn outbox_claim(
+        &self,
+        now_ms: i64,
+        limit: u32,
+        claim_ms: i64,
+    ) -> Result<Vec<OutboxMail>, AccountError>;
+
+    /// Sweep the outbox: rows that ran out of attempts become `failed`
+    /// for inspection; rows past their `expires_at` become `dropped`
+    /// with their bodies cleared — a dead token's link never lingers
+    /// in the table. Returns the number of rows swept.
+    async fn outbox_sweep(&self, now_ms: i64) -> Result<u64, AccountError>;
+
+    /// Purge terminal rows: `sent` after 24 h, `failed`/`dropped`
+    /// after 7 days — the outbox never grows without bound.
+    async fn outbox_purge(&self, now_ms: i64) -> Result<u64, AccountError>;
+
     /// Bookkeep a delivery attempt the caller just made for an outbox
-    /// row: `Sent` closes it (only from `pending`, so a double mark is
-    /// a no-op); `Retry` stamps the error and the next-attempt time.
+    /// row: `Sent` closes it (only from a live state, so a double mark
+    /// is a no-op); `Retry` stamps the error and the next-attempt time
+    /// back to `pending`; `Failed` dead-letters it.
     async fn outbox_mark(&self, id: u64, outcome: MailOutcome) -> Result<(), AccountError>;
 }
 
