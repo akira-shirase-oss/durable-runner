@@ -15,7 +15,7 @@
 		session.apiKey ? diagnostics(session.apiKey, signal) : Promise.reject(new ApiError('needs the API key', 401)),
 	);
 	poll(diag);
-	const runs = new Resource((signal) => listRuns(session.readerKey, 'desc', null, 10, signal));
+	const runs = new Resource((signal) => listRuns(session.reader, 'desc', null, 10, signal));
 	poll(runs);
 </script>
 

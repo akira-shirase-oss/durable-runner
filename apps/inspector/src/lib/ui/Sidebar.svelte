@@ -1,24 +1,38 @@
 <script lang="ts">
-	// The inspector's navigation. Wide: a left sidebar (brand, sections, then keys, docs and the theme at the
-	// bottom). Narrow (< 900 px): a top bar with the brand and a Menu button that opens the same list below it.
+	// The dashboard's navigation. Wide: a left sidebar (brand, an optional top slot — the workspace switcher when
+	// signed in —, sections, then the foot: keys, docs and the theme in compat mode; docs and the account menu
+	// signed in). Narrow (< 900 px): a top bar with the brand and a Menu button that opens the same list below it.
+	import type { Snippet } from 'svelte';
 	import AppIcon from '../AppIcon.svelte';
 	import Icon, { type IconName } from '../Icon.svelte';
 	import ThemeToggle from './ThemeToggle.svelte';
 	import { afterNavigate } from '$app/navigation';
-	import { NAV, type Section } from '../routes.ts';
+	import { NAV, type NavItem, type Section } from '../routes.ts';
 	import { session } from '../session.svelte.ts';
 
-	let { section }: { section: Section } = $props();
+	let {
+		section,
+		nav = NAV,
+		home = '#/',
+		sub = 'Inspector',
+		top,
+		foot,
+	}: { section: Section; nav?: readonly NavItem[]; home?: string; sub?: string; top?: Snippet; foot?: Snippet } = $props();
 
 	const ICONS: Record<Section, IconName> = {
 		overview: 'dashboard',
 		runs: 'list',
+		workflows: 'workflow',
 		handlers: 'webhook',
+		keys: 'key',
+		usage: 'gauge',
+		team: 'users',
 		submit: 'file-plus',
 		admin: 'wrench',
 		settings: 'settings',
 	};
 	const DOCS = 'https://docs.durable-runner.404human.dev/inspector/';
+	const docs = $derived(foot ? 'https://docs.durable-runner.404human.dev/' : DOCS);
 
 	let open = $state(false);
 	let menuButton: HTMLButtonElement | undefined = $state();
@@ -35,11 +49,11 @@
 
 <svelte:window onkeydown={onKey} />
 
-<aside class="side" class:open aria-label="Inspector">
+<aside class="side" class:open aria-label="Navigation">
 	<div class="head">
-		<a class="brand" href="#/">
+		<a class="brand" href={home}>
 			<AppIcon size={30} />
-			<span class="names"><span class="name">Durable Runner</span> <span class="sub">Inspector</span></span>
+			<span class="names"><span class="name">Durable Runner</span> <span class="sub">{sub}</span></span>
 		</a>
 		<button
 			class="btn ghost menu"
@@ -52,9 +66,10 @@
 		</button>
 	</div>
 	<div class="menu-panel" id="side-menu">
+		{#if top}<div class="top-slot">{@render top()}</div>{/if}
 		<nav aria-label="Sections">
 			<ul>
-				{#each NAV as n (n.section)}
+				{#each nav as n (n.section)}
 					<li>
 						<a href={n.href} aria-current={section === n.section ? 'page' : undefined}>
 							<Icon name={ICONS[n.section]} size={17} />{n.label}
@@ -64,6 +79,10 @@
 			</ul>
 		</nav>
 		<div class="foot">
+			{#if foot}
+				<a class="docs" href={docs} target="_blank" rel="noopener noreferrer"><Icon name="book" size={16} />Docs<Icon name="arrow-up-right" size={13} /><span class="sr">(opens in a new tab)</span></a>
+				{@render foot()}
+			{:else}
 			<div class="keys">
 				<p class="keys-title"><Icon name="key" size={14} />Keys for this tab</p>
 				<p class="key-row"><span>Read key</span><em class="badge" class:set={!!session.readKey}>{session.readKey ? 'set' : 'not set'}</em></p>
@@ -77,6 +96,7 @@
 				<a class="docs" href={DOCS} target="_blank" rel="noopener noreferrer"><Icon name="book" size={16} />Docs<Icon name="arrow-up-right" size={13} /><span class="sr">(opens in a new tab)</span></a>
 				<ThemeToggle />
 			</div>
+			{/if}
 		</div>
 	</div>
 </aside>
@@ -133,9 +153,14 @@
 		display: flex;
 		flex: 1;
 		flex-direction: column;
-		justify-content: space-between;
 		gap: 18px;
 		min-height: 0;
+	}
+	.menu-panel nav {
+		flex: 1;
+	}
+	.top-slot {
+		margin-top: -4px;
 	}
 	nav ul {
 		display: flex;
@@ -233,6 +258,7 @@
 	}
 	.docs {
 		display: inline-flex;
+		align-self: flex-start;
 		align-items: center;
 		gap: 8px;
 		height: 36px;

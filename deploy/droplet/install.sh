@@ -83,6 +83,23 @@ for f in handlers deny-cidrs; do
     say "made $DR_ETC/$f (comments only)"
   fi
 done
+# The droplet's reserved IP (DigitalOcean's floating address) isn't on any interface, so the
+# handler-call guard can't see it as our own: deny it explicitly (D-061). The metadata service
+# answers only on the droplet; anywhere else this finds nothing and changes nothing.
+meta=${DR_METADATA_URL:-http://169.254.169.254/metadata/v1}
+if active=$(curl -fsS --max-time 2 "$meta/reserved_ip/ipv4/active" 2>/dev/null) && [[ "$active" == true ]]; then
+  rip=$(curl -fsS --max-time 2 "$meta/reserved_ip/ipv4/ip_address" 2>/dev/null || true)
+  if [[ "$rip" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]; then
+    if grep -qxF -- "$rip" "$DR_ETC/deny-cidrs"; then
+      say "deny-cidrs: the reserved IP is already denied"
+    else
+      printf '%s\n' "$rip" >>"$DR_ETC/deny-cidrs"
+      say "deny-cidrs: added the droplet's reserved IP (restart durable-server to apply)"
+    fi
+  else
+    say "warning: the metadata service says a reserved IP is active but gave no IPv4 address: add it to $DR_ETC/deny-cidrs by hand"
+  fi
+fi
 if [[ -s "$DR_ETC/trusted-proxies" ]]; then
   say "warning: $DR_ETC/trusted-proxies is not empty: on this host the server trusts the loopback hop alone (Caddy); remove it"
 fi
