@@ -122,6 +122,9 @@ export const RUNS = [
   { id: 10409, key: 'ui-scheduled', state: 'queued', steps: 1, finished_at: null },
   { id: 9, key: 'ui-seed-0', state: 'done', steps: 1, finished_at: NOW - 9_000_000 },
 ];
+/** A run as the server answers it: the id is a string. */
+export const runOut = (r) => ({ ...r, id: String(r.id) });
+export const RUNS_OUT = () => RUNS.map(runOut);
 export const SPECS = {
   10418: [['fetch', 'exporter'], ['render', 'renderer'], ['publish', 'cdn-push'], ['notify', 'chat-hook']],
   10417: [['build', 'ci-runner'], ['deploy', 'deployer'], ['notify', 'chat-hook']],
@@ -200,14 +203,15 @@ export function timeline(id) {
       complete = false; reason = 'evicted'; events = [];
       break;
   }
-  return { run: id, key: run.key, state: run.state, complete, reason, events: fix(events) };
+  // run ids cross the API as strings (S2's opaque public ids); the page compares them as strings
+  return { run: String(id), key: run.key, state: run.state, complete, reason, events: fix(events) };
 }
 
 export function feed(limit) {
   const all = [];
   for (const r of RUNS) {
     const tl = timeline(r.id);
-    for (const e of tl.events) all.push({ ...e, run: r.id, key: r.key });
+    for (const e of tl.events) all.push({ ...e, run: String(r.id), key: r.key });
   }
   // background traffic from other runs in the last 10 minutes
   const rr = rng(7);
@@ -216,7 +220,7 @@ export function feed(limit) {
     const at = NOW - Math.floor(rr() * 600_000);
     const kinds = ['accepted', 'dispatched', 'checkpointed', 'checkpointed', 'finished', 'dispatched'];
     const kind = kinds[Math.floor(rr() * kinds.length)];
-    all.push({ at, run: id, key: id % 7 === 0 ? null : `orders-sync-${id}`, kind, ...(kind === 'finished' ? { outcome: 'done' } : kind === 'accepted' ? {} : { step: Math.floor(rr() * 3), ...(kind === 'dispatched' ? { attempt: 1, deadline: at + 10_000 } : {}) }) });
+    all.push({ at, run: String(id), key: id % 7 === 0 ? null : `orders-sync-${id}`, kind, ...(kind === 'finished' ? { outcome: 'done' } : kind === 'accepted' ? {} : { step: Math.floor(rr() * 3), ...(kind === 'dispatched' ? { attempt: 1, deadline: at + 10_000 } : {}) }) });
   }
   all.sort((a, b) => b.at - a.at);
   return { since: SINCE, events: all.filter((e) => e.at <= NOW).slice(0, limit) };
@@ -227,3 +231,359 @@ export const DIAG = {
   states: { cancelled: 9, done: 18234, failed: 41, queued: 3120, reconciling: 2, retry_waiting: 12, running: 28 },
   space_ok: true, errors: { no_space: 0, stale_reply: 3 },
 };
+
+// --- the signed-in API (S3), stateful ------------------------------------------------------------------------
+// One mock server per browser context: accounts, the session (held here — the testbed is one visitor), workspaces,
+// members, invites, keys, handlers, usage, onboarding and workflows, shaped like docs/S3-PLAN.md and, where the code
+// on devin/dr-s3 differs, like the code (DELETE /me/sessions, {current_password,new_password}, token_gone 410,
+// {"status":"sent"} on resend/forgot; at 1f9f409: the workspace list from GET /workspaces while /auth/session
+// carries [], keys as {public_id, name, prefix, permission, revoked, last_used_at_ms, created_by} minted with
+// {name, permission}, members nested {account:{public_id,email}, role, since}, invite tokens dri_ + 64 hex with
+// an invite_url that is the API path, unknown invites 404, test calls that require input_b64). It also checks what the dashboard sends: CSRF on every
+// mutation, x-durable-workspace on flat routes only, never an Authorization header — every breach is logged in
+// `violations` so the testbed can fail on it.
+export const PASSWORD = 'correct horse battery';
+export const TOKEN = `drt_${'A'.repeat(43)}`;
+export const DEAD_TOKEN = `drt_${'B'.repeat(43)}`;
+export const INVITE_TOKEN = `dri_${'7c'.repeat(32)}`;
+export const DEAD_INVITE = `dri_${'00'.repeat(32)}`;
+export const WS_PROD = '0193a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a5b';
+export const WS_STAGE = '0193a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a5c';
+export const WF_DEMO = '0193b000-0000-7000-8000-00000000d0e0';
+export const WF_NIGHTLY = '0193b000-0000-7000-8000-00000000d0e1';
+const FLAT = ['/jobs', '/metrics', '/events', '/handlers', '/handler-secret', '/diagnostics', '/whoami'];
+const isFlat = (p) => FLAT.some((f) => p === f || p.startsWith(`${f}/`));
+const hex = (n, seed) => Array.from({ length: n }, (_, i) => ((seed * 31 + i * 7) % 16).toString(16)).join('');
+
+export function saasMock({
+  signedIn = true,
+  verified = true,
+  workspaces = 'two',
+  role = 'owner',
+  onboardingRoute = true,
+  fresh = false,
+  bootStatus = null,
+  unsupported = [],
+} = {}) {
+  const s = {
+    signedIn,
+    csrf: 'drc_' + hex(64, 3),
+    me: { public_id: '0193a000-0000-7000-8000-0000000000a1', email: 'ada@example.com', verified },
+    violations: [],
+    calls: [],
+    ws:
+      workspaces === 'none'
+        ? []
+        : [
+            { public_id: WS_PROD, name: 'Production', role },
+            ...(workspaces === 'two' ? [{ public_id: WS_STAGE, name: 'Staging', role: 'viewer' }] : []),
+          ],
+    keys: fresh
+      ? []
+      : [
+          { public_id: '0193d000-0000-7000-8000-000000000001', name: 'ci-deploy', prefix: 'drk_7f3a9c1', permission: 'write', revoked: false, last_used_at_ms: NOW - 4 * 60_000, created_by: '0193a000-0000-7000-8000-0000000000a1' },
+          { public_id: '0193d000-0000-7000-8000-000000000002', name: 'grafana-read', prefix: 'drk_b21c04e', permission: 'read', revoked: false, last_used_at_ms: null, created_by: '0193a000-0000-7000-8000-0000000000a2' },
+          { public_id: '0193d000-0000-7000-8000-000000000003', name: 'old-laptop', prefix: 'dr_91ee2d0', permission: 'write', revoked: true, last_used_at_ms: NOW - 20 * 86_400_000, created_by: null },
+        ],
+    handlers: fresh
+      ? []
+      : [
+          { name: 'builtin:echo', url: 'builtin:echo', health: { last_test_at: NOW - 3_600_000, last_test_status: 'ok', last_test_latency_ms: 1, p50_ms: 1, p95_ms: 2 } },
+          { name: 'charge-card', url: 'https://pay.example.com/steps/charge', health: { last_test_at: NOW - 600_000, last_test_status: 'ok', last_test_latency_ms: 84, p50_ms: 92, p95_ms: 310 } },
+          { name: 'send-receipt', url: 'https://mail.example.com/hooks/durable/receipt', health: { last_test_at: NOW - 86_400_000, last_test_status: 'failed', last_test_latency_ms: 412, p50_ms: 140, p95_ms: 980 } },
+          { name: 'cdn-push', url: 'https://cdn.example.com/purge', health: null },
+        ],
+    members: [
+      { account: { public_id: '0193a000-0000-7000-8000-0000000000a1', email: 'ada@example.com' }, role, since: NOW - 30 * 86_400_000 },
+      { account: { public_id: '0193a000-0000-7000-8000-0000000000a2', email: 'grace@example.com' }, role: 'admin', since: NOW - 12 * 86_400_000 },
+      { account: { public_id: '0193a000-0000-7000-8000-0000000000a3', email: 'linus.torvalds.very.long.address@example-company-with-a-long-domain.com' }, role: 'member', since: NOW - 2 * 86_400_000 },
+      { account: { public_id: '0193a000-0000-7000-8000-0000000000a4', email: 'margaret@example.com' }, role: 'viewer', since: NOW - 86_400_000 },
+    ],
+    invites: [{ public_id: '0193e000-0000-7000-8000-000000000001', email: 'ken@example.com', role: 'member', expires_at: NOW + 13 * 86_400_000 }],
+    testCalls: 0,
+    sessions: [
+      { id: '0193c000-0000-7000-8000-000000000001', current: true, created_at_ms: NOW - 2 * 3_600_000, last_seen_at_ms: NOW - 5_000, user_agent: 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0 Safari/537.36', ip: '203.0.113.7' },
+      { id: '0193c000-0000-7000-8000-000000000002', current: false, created_at_ms: NOW - 6 * 86_400_000, last_seen_at_ms: NOW - 86_400_000, user_agent: 'Mozilla/5.0 (iPhone; CPU iPhone OS 18_1 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.1 Mobile/15E148 Safari/604.1', ip: '198.51.100.24' },
+      { id: '0193c000-0000-7000-8000-000000000003', current: false, created_at_ms: NOW - 20 * 86_400_000, last_seen_at_ms: NOW - 9 * 86_400_000, user_agent: 'curl/8.9.1', ip: '192.0.2.10' },
+    ],
+    workflows: fresh
+      ? []
+      : [
+          { public_id: WF_DEMO, name: 'demo', current_version: 1, updated_at_ms: NOW - 2 * 3_600_000, last_run: { pubid: '10416', at: NOW - 72_400, state: 'done' } },
+          { public_id: WF_NIGHTLY, name: 'nightly-export', current_version: 3, updated_at_ms: NOW - 5 * 86_400_000, last_run: { pubid: '10418', at: NOW - 95_000, state: 'running:step:2:attempt:2' } },
+        ],
+    versions: {
+      [WF_DEMO]: [{ version: 1, spec: { version: 1, steps: [{ name: 'echo', handler: 'builtin:echo' }], input_b64: 'eyJoZWxsbyI6IndvcmxkIn0=' }, created_at_ms: NOW - 2 * 3_600_000 }],
+      [WF_NIGHTLY]: [
+        { version: 3, spec: { version: 1, steps: [{ name: 'fetch', handler: 'charge-card' }, { name: 'render', handler: 'cdn-push' }, { name: 'notify', handler: 'send-receipt' }], input_b64: '' }, created_at_ms: NOW - 5 * 86_400_000 },
+        { version: 2, spec: { version: 1, steps: [{ name: 'fetch', handler: 'charge-card' }, { name: 'render', handler: 'cdn-push' }], input_b64: '' }, created_at_ms: NOW - 9 * 86_400_000 },
+        { version: 1, spec: { version: 1, steps: [{ name: 'fetch', handler: 'charge-card' }], input_b64: '' }, created_at_ms: NOW - 14 * 86_400_000 },
+      ],
+    },
+  };
+  const wsOf = (pid) => s.ws.find((w) => w.public_id === pid) ?? null;
+  const roleIn = (pid) => wsOf(pid)?.role ?? null;
+  const rank = { viewer: 0, member: 1, admin: 2, owner: 3 };
+  const atLeast = (pid, r) => rank[roleIn(pid)] >= rank[r];
+  const E = (status, code, error, extra = {}) => ({ status, body: { error, code, ...extra } });
+  const ok = (body, status = 200) => ({ status, body });
+  const gone = () => E(410, 'token_gone', 'this link is no longer valid — request a fresh one');
+
+  function usage() {
+    return {
+      plan: 'free',
+      limits: { jobs_per_min: 60, live_runs: 500, in_flight: 8, handlers: 16, max_input_bytes: 65536, retention_days: 7, members: 5, api_keys: 10, workflows: 20, test_calls_per_hour: 30, workspaces_per_account: 3, retained_bytes: 16_777_216 },
+      used: { jobs_this_minute: 7, live_runs: 41, in_flight: 3, handlers: s.handlers.length, api_keys: s.keys.filter((k) => !k.revoked).length, members: s.members.length + s.invites.length, workflows: s.workflows.length, test_calls_hour: 24 + s.testCalls },
+      windows: { minute_ends_at: NOW + 38_000, hour_ends_at: NOW + 22 * 60_000 },
+    };
+  }
+
+  function handle({ method, path, query, headers, body }) {
+    s.calls.push({ method, path, headers });
+    const mutation = method !== 'GET' && method !== 'HEAD';
+    const has = (h) => headers[h] !== undefined;
+    if (has('authorization')) s.violations.push(`${method} ${path}: sent an Authorization header in signed-in mode`);
+    const wsHeader = headers['x-durable-workspace'];
+    if (path.startsWith('/workspaces/') && wsHeader !== undefined) s.violations.push(`${method} ${path}: x-durable-workspace on a path-scoped route`);
+    if (unsupported.some((u) => path.startsWith(u))) return { status: 404, body: null };
+
+    // --- open auth routes
+    if (path === '/auth/session') {
+      if (bootStatus) return { status: bootStatus, body: bootStatus === 404 ? null : { error: 'store down', code: 'accounts_unavailable' } };
+      if (!s.signedIn) return E(401, 'unauthenticated', 'no session');
+      // the code's bootstrap carries an empty list; GET /workspaces is where the memberships are
+      return ok({ account: s.me, csrf: s.csrf, workspaces: [] });
+    }
+    if (path === '/auth/login') {
+      if (body?.password !== PASSWORD) return E(401, 'invalid_credentials', 'invalid credentials');
+      s.signedIn = true;
+      return ok({ account: s.me, csrf: s.csrf });
+    }
+    if (path === '/auth/signup') {
+      if (!body?.email || String(body.password ?? '').length < 12) return E(400, 'bad_input', 'password must be at least 12 characters');
+      return ok({ status: 'verification_sent' }, 202);
+    }
+    // verify takes the sign-up password with the token (pre-registration takeover fix): missing → 400, a token
+    // whose pending password does not match → 403 invalid_credentials, a dead token → 410
+    if (path === '/auth/verify') {
+      if (typeof body?.password !== 'string' || body.password === '') return E(400, 'bad_input', 'password is required');
+      if (body?.token !== TOKEN) return gone();
+      if (body.password !== PASSWORD) return E(403, 'invalid_credentials', 'token and password do not match');
+      s.signedIn = false; // every session of the account ends; no cookie is set
+      return ok({ verified: true });
+    }
+    // reset sets no cookie: the visitor signs in afresh
+    if (path === '/auth/reset') {
+      if (body?.token !== TOKEN) return gone();
+      s.signedIn = false;
+      return ok({ reset: true });
+    }
+    if (path === '/auth/resend-verification' || path === '/auth/forgot') return ok({ status: 'sent' }, 202);
+
+    // --- everything else needs the session
+    if (!s.signedIn) return E(401, 'unauthenticated', 'no session');
+    if (mutation && headers['x-durable-csrf'] !== s.csrf) {
+      s.violations.push(`${method} ${path}: mutation without the CSRF token`);
+      return E(403, 'csrf_failed', 'cross-site request refused');
+    }
+    if (path === '/auth/logout') {
+      s.signedIn = false;
+      return { status: 204, body: null };
+    }
+    if (path === '/me') return ok({ account: s.me });
+    if (path === '/me/sessions' && method === 'GET') return ok({ sessions: s.sessions });
+    if (path === '/me/sessions' && method === 'DELETE') {
+      const n = s.sessions.filter((x) => !x.current).length;
+      s.sessions = s.sessions.filter((x) => x.current);
+      return ok({ revoked: n });
+    }
+    let m = path.match(/^\/me\/sessions\/([^/]+)$/);
+    if (m && method === 'DELETE') {
+      const before = s.sessions.length;
+      s.sessions = s.sessions.filter((x) => x.id !== m[1] || x.current);
+      return s.sessions.length < before ? { status: 204, body: null } : E(404, 'not_found', 'no such session');
+    }
+    if (path === '/me/password') return body?.current_password === PASSWORD ? ok({ changed: true, csrf: s.csrf }) : E(403, 'invalid_credentials', 'current password does not match');
+    if (path === '/invites/accept') {
+      if (!s.me.verified) return E(403, 'email_unverified', "verify the account's email first");
+      if (body?.token !== INVITE_TOKEN) return E(404, 'not_found', 'no such invite');
+      const w = { public_id: '0193a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a5d', name: 'Acme Payments', role: 'member' };
+      s.ws.push(w);
+      return ok({ workspace: w });
+    }
+    if (path === '/invites/decline') return { status: 204, body: null };
+    if (path === '/workspaces' && method === 'GET') return ok({ workspaces: s.ws });
+    if (path === '/workspaces' && method === 'POST') {
+      if (!s.me.verified) return E(403, 'email_unverified', 'verify your email first');
+      if (s.ws.length >= 3) return E(429, 'plan_limit', 'plan limit', { limit: 'workspaces_per_account', plan: 'free', used: 3, cap: 3 });
+      const w = { public_id: `0193a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a6${s.ws.length}`, name: body.name, role: 'owner', plan: 'free' };
+      s.ws.push(w);
+      return ok({ public_id: w.public_id, name: w.name, role: 'owner', handler_secret: hex(64, 9) });
+    }
+
+    // --- /workspaces/{pid}/… : the workspace comes from the path
+    m = path.match(/^\/workspaces\/([^/]+)(\/.*)?$/);
+    if (m) {
+      const pid = decodeURIComponent(m[1]);
+      const rest = m[2] ?? '';
+      if (!wsOf(pid)) return E(404, 'not_found', 'no such workspace');
+      if (mutation && !s.me.verified) return E(403, 'email_unverified', 'verify your email first');
+      const need = (r) => (atLeast(pid, r) ? null : E(403, 'forbidden', 'your role cannot do this'));
+      if (rest === '') {
+        if (method === 'GET') return ok({ ...wsOf(pid), created_at_ms: NOW - 30 * 86_400_000 });
+        if (method === 'PATCH') { const f = need('admin'); if (f) return f; wsOf(pid).name = body.name; return ok(wsOf(pid)); }
+        if (method === 'DELETE') {
+          const f = need('owner'); if (f) return f;
+          if (body?.confirm !== `delete ${wsOf(pid).name}`) return E(400, 'bad_input', 'confirm phrase does not match');
+          s.ws = s.ws.filter((w) => w.public_id !== pid);
+          return { status: 204, body: null };
+        }
+      }
+      if (rest === '/keys') {
+        if (method === 'GET') return ok({ keys: s.keys });
+        const f = need('admin'); if (f) return f;
+        if (!['write', 'read', 'admin'].includes(body?.permission)) return E(400, 'bad_input', `permission must be write or read, not ${JSON.stringify(body?.permission)}`);
+        if (s.keys.filter((k) => !k.revoked).length >= 10) return E(429, 'plan_limit', 'plan limit', { limit: 'api_keys', plan: 'free', used: 10, cap: 10 });
+        const secret = 'drk_' + hex(64, 5);
+        const row = { public_id: `0193d000-0000-7000-8000-0000000001${String(s.keys.length).padStart(2, '0')}`, name: body.name, prefix: secret.slice(0, 11), permission: body.permission === 'read' ? 'read' : 'write', revoked: false, last_used_at_ms: null, created_by: s.me.public_id };
+        s.keys.unshift(row);
+        return ok({ ...row, key: secret });
+      }
+      m = rest.match(/^\/keys\/([^/]+)(\/rotate)?$/);
+      if (m) {
+        const f = need('admin'); if (f) return f;
+        const k = s.keys.find((x) => x.public_id === decodeURIComponent(m[1]));
+        if (!k || k.revoked) return E(404, 'not_found', 'no such key');
+        k.revoked = true;
+        if (m[2]) {
+          const secret = 'drk_' + hex(64, 6);
+          const row = { ...k, public_id: k.public_id.slice(0, -2) + 'f0', prefix: secret.slice(0, 11), last_used_at_ms: null, revoked: false, created_by: s.me.public_id };
+          s.keys.unshift(row);
+          return ok({ ...row, key: secret });
+        }
+        return { status: 204, body: null };
+      }
+      if (rest === '/members' && method === 'GET') return ok({ members: s.members });
+      if (rest === '/members' && method === 'POST') {
+        const f = need('admin'); if (f) return f;
+        if (s.invites.some((i) => i.email === body.email)) return E(409, 'invite_pending', 'a live invite already covers this address');
+        if (s.members.some((x) => x.account.email === body.email)) return E(409, 'already_member', 'this account is already a member');
+        if (s.members.length + s.invites.length >= 5) return E(429, 'plan_limit', 'plan limit', { limit: 'members', plan: 'free', used: 5, cap: 5 });
+        const inv = { public_id: `0193e000-0000-7000-8000-0000000000${String(s.invites.length + 2).padStart(2, '0')}`, email: body.email, role: body.role, expires_at: NOW + 14 * 86_400_000 };
+        s.invites.push(inv);
+        // the code answers its own API path, not a dashboard link; the dashboard builds the link from the token
+        return ok({ invite: inv, invite_url: `/invites/accept?token=${INVITE_TOKEN}` });
+      }
+      m = rest.match(/^\/members\/([^/]+)$/);
+      if (m) {
+        const f = need('admin'); if (f) return f;
+        const mem = s.members.find((x) => x.account.public_id === decodeURIComponent(m[1]));
+        if (!mem) return E(404, 'not_found', 'no such member');
+        if (mem.role === 'owner') return E(409, 'last_owner', 'the owner cannot be removed or demoted');
+        if (method === 'PATCH') { mem.role = body.role; return ok({ account: { public_id: mem.account.public_id }, role: body.role }); }
+        s.members = s.members.filter((x) => x !== mem);
+        return { status: 204, body: null };
+      }
+      if (rest === '/invites') return ok({ invites: s.invites });
+      m = rest.match(/^\/invites\/([^/]+)$/);
+      if (m) { const f = need('admin'); if (f) return f; s.invites = s.invites.filter((i) => i.public_id !== decodeURIComponent(m[1])); return { status: 204, body: null }; }
+      if (rest === '/usage') return ok(usage());
+      if (rest === '/onboarding') {
+        if (!onboardingRoute) return { status: 404, body: null };
+        return ok({ steps: [
+          { id: 'handler', done: s.handlers.length > 0, detail: s.handlers[0]?.name ?? null },
+          { id: 'test_call', done: s.handlers.some((h) => h.health?.last_test_status === 'ok'), detail: null },
+          { id: 'api_key', done: s.keys.some((k) => !k.revoked), detail: null },
+          { id: 'first_run', done: !fresh, detail: null },
+        ] });
+      }
+      if (rest === '/workflows' && method === 'GET') return ok({ workflows: s.workflows });
+      if (rest === '/workflows' && method === 'POST') {
+        const f = need('member'); if (f) return f;
+        if (s.workflows.some((w) => w.name === body.name)) return E(409, 'name_taken', 'name taken');
+        const bad = body.spec.steps.find((st) => !s.handlers.some((h) => h.name === st.handler));
+        if (bad) return E(409, 'unregistered_handler', `no handler named ${bad.handler}`);
+        const id = `0193b000-0000-7000-8000-00000000d1${String(s.workflows.length).padStart(2, '0')}`;
+        s.workflows.unshift({ public_id: id, name: body.name, current_version: 1, updated_at_ms: Date.now(), last_run: null });
+        s.versions[id] = [{ version: 1, spec: body.spec, created_at_ms: Date.now() }];
+        return ok({ public_id: id, name: body.name, current_version: 1 });
+      }
+      m = rest.match(/^\/workflows\/([^/]+)(\/run|\/runs)?$/);
+      if (m) {
+        const id = decodeURIComponent(m[1]);
+        const wf = s.workflows.find((w) => w.public_id === id);
+        if (!wf) return E(404, 'not_found', 'no such workflow');
+        if (m[2] === '/runs') return ok({ runs: [
+          { run_id: '10416', submitted_at_ms: NOW - 72_400, state: 'done', finished_at_ms: NOW - 60_000 },
+          { run_id: '10413', submitted_at_ms: NOW - 364_000, state: 'failed:step:2', finished_at_ms: NOW - 300_000 },
+          { run_id: '10412', submitted_at_ms: NOW - 912_000, state: 'cancelled', finished_at_ms: NOW - 900_000 },
+        ] });
+        if (m[2] === '/run') {
+          const f = need('member'); if (f) return f;
+          if (!headers['idempotency-key']) s.violations.push('Run now without an Idempotency-Key');
+          wf.last_run = { pubid: '10416', at: Date.now(), state: 'queued' };
+          return ok({ run_id: '10416', version: wf.current_version });
+        }
+        if (method === 'GET') return ok({ ...wf, versions: s.versions[id] ?? [] });
+        if (method === 'PATCH') {
+          const f = need('member'); if (f) return f;
+          if (body.name) wf.name = body.name;
+          if (body.spec) { wf.current_version += 1; s.versions[id].unshift({ version: wf.current_version, spec: body.spec, created_at_ms: Date.now() }); }
+          wf.updated_at_ms = Date.now();
+          return ok(wf);
+        }
+        if (method === 'DELETE') { const f = need('member'); if (f) return f; s.workflows = s.workflows.filter((w) => w !== wf); return { status: 204, body: null }; }
+      }
+      return { status: 404, body: null };
+    }
+
+    // --- flat routes: the workspace comes from x-durable-workspace
+    if (isFlat(path)) {
+      if (!wsHeader) { s.violations.push(`${method} ${path}: flat route without x-durable-workspace`); return E(400, 'workspace_required', 'pick a workspace'); }
+      if (!wsOf(wsHeader)) return E(403, 'forbidden', 'not a member');
+      if (mutation && !s.me.verified) return E(403, 'email_unverified', 'verify your email first');
+      const write = atLeast(wsHeader, 'member');
+      if (path === '/handlers' && method === 'GET') return ok({ handlers: s.handlers });
+      m = path.match(/^\/handlers\/([^/]+)(\/test)?$/);
+      if (m) {
+        if (!write) return E(403, 'forbidden', 'your role cannot do this');
+        const name = decodeURIComponent(m[1]);
+        if (m[2]) {
+          if (typeof body?.input_b64 !== 'string') return E(422, 'bad_json', 'malformed JSON');
+          if (++s.testCalls > 30) return E(429, 'test_call_limited', 'test calls are bounded to 30 per workspace per hour');
+          const h = s.handlers.find((x) => x.name === name);
+          if (!h) return E(404, 'not_found', 'no such handler in this workspace');
+          if (name === 'send-receipt') return ok({ status: 'failed', http_status: 500, latency_ms: 412, reply_excerpt_b64: Buffer.from('{"error":"template receipt-v2 not found"}').toString('base64') });
+          h.health = { ...(h.health ?? {}), last_test_at: Date.now(), last_test_status: 'ok', last_test_latency_ms: 84 };
+          return ok({ status: 'ok', http_status: 200, latency_ms: name === 'builtin:echo' ? 1 : 84, reply_excerpt_b64: body?.input_b64 ?? '' });
+        }
+        if (method === 'PUT') {
+          if (name === 'builtin:echo' && body?.url && body.url !== 'builtin:echo') return E(400, 'bad_handler_url', 'builtin:echo registers with url "builtin:echo" or an empty url');
+          if (String(body?.url ?? '').includes('127.0.0.1')) return E(400, 'url_refused', 'private or local targets are refused');
+          const h = s.handlers.find((x) => x.name === name);
+          if (h) h.url = body.url; else s.handlers.push({ name, url: body.url, health: null });
+          return ok({ name, url: body.url });
+        }
+        if (method === 'DELETE') { s.handlers = s.handlers.filter((x) => x.name !== name); return ok({ deleted: name }); }
+      }
+      if (path === '/handler-secret') return atLeast(wsHeader, 'admin') ? ok({ secret: hex(64, 11) }) : E(403, 'forbidden', 'your role cannot do this');
+      if (path === '/diagnostics') return ok({ live_runs: fresh ? 0 : 41, active_runs: fresh ? 0 : 6, states: fresh ? {} : { queued: 2, running: 3, retry_waiting: 1, done: 31, failed: 3, cancelled: 1 } });
+      if (path === '/metrics') return ok(metrics(query.get('window') ?? '1h'));
+      if (path === '/events') return ok(feed(Number(query.get('limit') ?? 50)));
+      if (path === '/jobs' && method === 'GET') return ok(fresh ? { runs: [], next_before: null } : { runs: RUNS_OUT(), next_before: query.get('order') === 'desc' ? '10408' : null, next_after: null });
+      if (path === '/jobs' && method === 'POST') return write ? ok({ run_id: '10414' }) : E(403, 'forbidden', 'your role cannot do this');
+      m = path.match(/^\/jobs\/(\d+)$/);
+      if (m) { const r = RUNS.find((x) => x.id === Number(m[1])); return r ? ok(runOut(r)) : E(404, 'not_found', 'no such run'); }
+      m = path.match(/^\/jobs\/(\d+)\/events$/);
+      if (m) { const t = timeline(Number(m[1])); return t ? ok(t) : E(404, 'not_found', 'no such run'); }
+      m = path.match(/^\/jobs\/(\d+)\/spec$/);
+      if (m) return write ? ok({ spec: spec(Number(m[1])) }) : E(403, 'forbidden', 'your role cannot do this');
+      m = path.match(/^\/jobs\/(\d+)\/cancel$/);
+      if (m) return write ? ok({ cancelled: Number(m[1]) }) : E(403, 'forbidden', 'your role cannot do this');
+    }
+    if (path === '/health') return ok({ ok: true });
+    if (path === '/ready') return ok({ ready: true, code: null });
+    return { status: 404, body: null };
+  }
+  return { state: s, handle };
+}

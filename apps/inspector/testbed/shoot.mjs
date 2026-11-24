@@ -1,4 +1,4 @@
-// The dashboard's testbed: serves apps/inspector/build at /inspector/ with the CSP durable-server computes
+// The dashboard's testbed (compat mode: GET /auth/session answers 404 here): serves apps/inspector/build at its mount with the CSP durable-server computes
 // (inspector_csp), mocks the API (GET /metrics, /events, /jobs/{id}/events and the older routes) with Playwright
 // routes, shoots every page at 1440 and 390 in light and dark, an older server (404 on the new routes) and no
 // keys, and asserts: no horizontal overflow, no CSP violations, no console errors, the font loads, focus lands on
@@ -39,12 +39,14 @@ function inspectorCsp(html) {
 }
 const INDEX = fs.readFileSync(path.join(BUILD, 'index.html'), 'utf8');
 const CSP = inspectorCsp(INDEX);
+// the build's mount (paths.base: /app by default, DURABLE_UI_BASE at build time)
+const MOUNT = INDEX.match(/assets: "([^"]*)"/)?.[1] || '/app';
 const TYPES = { '.html': 'text/html', '.js': 'text/javascript', '.css': 'text/css', '.svg': 'image/svg+xml', '.woff2': 'font/woff2', '.json': 'application/json', '.txt': 'text/plain' };
 const server = http.createServer((req, res) => {
   const url = new URL(req.url, 'http://x');
   const headers = { 'content-security-policy': CSP, 'x-content-type-options': 'nosniff', 'referrer-policy': 'no-referrer', 'x-frame-options': 'DENY' };
-  if (!url.pathname.startsWith('/inspector')) { res.writeHead(404).end(); return; }
-  let rel = decodeURIComponent(url.pathname.slice('/inspector'.length)) || '/';
+  if (!url.pathname.startsWith(MOUNT)) { res.writeHead(404).end(); return; }
+  let rel = decodeURIComponent(url.pathname.slice(MOUNT.length)) || '/';
   if (rel.endsWith('/')) rel += 'index.html';
   const file = path.join(BUILD, path.normalize(rel));
   if (file.startsWith(path.resolve(BUILD)) && fs.existsSync(file) && fs.statSync(file).isFile()) {
@@ -80,11 +82,11 @@ async function mockApi(page, { mode = 'new', keys = true, log = null, script = n
     if (p === '/events') return json(200, M.feed(Number(url.searchParams.get('limit') ?? 50)));
     if (p === '/jobs' && req.method() === 'GET') {
       const order = url.searchParams.get('order');
-      return json(200, { runs: order === 'asc' ? [...M.RUNS].reverse() : M.RUNS, next_before: order === 'desc' ? 10408 : null, next_after: order === 'asc' ? 10419 : null });
+      return json(200, { runs: order === 'asc' ? [...M.RUNS_OUT()].reverse() : M.RUNS_OUT(), next_before: order === 'desc' ? '10408' : null, next_after: order === 'asc' ? '10419' : null });
     }
-    if (p === '/jobs' && req.method() === 'POST') return isApi ? json(200, { run_id: 10419 }) : json(403, { error: 'forbidden', code: 'forbidden' });
+    if (p === '/jobs' && req.method() === 'POST') return isApi ? json(200, { run_id: '10419' }) : json(403, { error: 'forbidden', code: 'forbidden' });
     let m = p.match(/^\/jobs\/(\d+)$/);
-    if (m) { const r = M.RUNS.find((x) => x.id === Number(m[1])); return r ? json(200, r) : json(404, { error: 'no such run', code: 'not_found' }); }
+    if (m) { const r = M.RUNS.find((x) => x.id === Number(m[1])); return r ? json(200, M.runOut(r)) : json(404, { error: 'no such run', code: 'not_found' }); }
     m = p.match(/^\/jobs\/(\d+)\/events$/);
     if (m) { const t = M.timeline(Number(m[1])); return t ? json(200, t) : json(404, { error: 'no such run', code: 'not_found' }); }
     m = p.match(/^\/jobs\/(\d+)\/spec$/);
@@ -101,7 +103,7 @@ async function mockApi(page, { mode = 'new', keys = true, log = null, script = n
 const browser = await chromium.launch();
 const failures = [];
 const shots = [];
-const base = `http://127.0.0.1:${PORT}/inspector/`;
+const base = `http://127.0.0.1:${PORT}${MOUNT}/`;
 
 async function context({ theme, width, keys = true, mode = 'new', log = null, script = null }) {
   const ctx = await browser.newContext({ viewport: { width, height: 900 }, deviceScaleFactor: width === 390 ? 2 : 1, colorScheme: 'light' });

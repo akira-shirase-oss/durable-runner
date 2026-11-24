@@ -21,11 +21,11 @@
 
 	// polling stops once the run (and its timeline) are terminal: neither will change again
 	let finished = false;
-	const runRes: Resource<RunItem> = new Resource((signal) => inspect(session.readerKey, id ?? '-', signal), {
+	const runRes: Resource<RunItem> = new Resource((signal) => inspect(session.reader, id ?? '-', signal), {
 		interval: (): number => (finished ? 0 : POLL_MS),
 	});
 	poll(runRes, () => id);
-	const tlRes: Resource<RunTimeline> = new Resource((signal) => runEvents(session.readerKey, id ?? '-', signal), {
+	const tlRes: Resource<RunTimeline> = new Resource((signal) => runEvents(session.reader, id ?? '-', signal), {
 		interval: (): number => (finished && tlRes.data !== null && terminal(tlRes.data.state) ? 0 : POLL_MS),
 	});
 	poll(tlRes, () => id);
@@ -97,7 +97,7 @@
 	async function reveal() {
 		if (id === null) return;
 		try {
-			specData = (await fetchSpec(session.apiKey, id)).spec;
+			specData = (await fetchSpec(session.writer, id)).spec;
 			specFor = id;
 			specError = null;
 		} catch (e) {
@@ -108,7 +108,7 @@
 	async function cancel() {
 		if (id === null) return;
 		try {
-			await cancelRun(id, session.apiKey);
+			await cancelRun(id, session.writer);
 			notice = `Run ${id} cancelled. A step already sent to its handler cannot be undone.`;
 			actionError = null;
 			void runRes.refresh(true);
@@ -127,9 +127,9 @@
 	<a class="back" href="#/runs"><Icon name="arrow-left" size={15} />All runs</a>
 
 	{#if id === null}
-		<p class="banner error"><Icon name="alert" size={16} /><span class="msg">“{page.params.id}” is not a run id. A run id is a whole number, like 10418.</span></p>
+		<p class="banner error"><Icon name="alert" size={16} /><span class="msg">“{page.params.id}” is not a run id. A run id is the 11-character id the submit answered, like WBwXuaDUPWc.</span></p>
 	{:else if notFound}
-		<p class="banner error"><Icon name="alert" size={16} /><span class="msg">There is no run {id} on this server. Finished runs leave after their retention when the journal is compacted.</span></p>
+		<p class="banner error"><Icon name="alert" size={16} /><span class="msg">There is no run {id} {session.signedIn ? 'in this workspace' : 'on this server'}. Finished runs leave after their retention when the journal is compacted.</span></p>
 	{:else}
 		{#if notice}
 			<p class="banner notice"><Icon name="check" size={16} /><span class="msg">{notice}</span><button class="btn ghost sm act" onclick={() => (notice = null)}>Dismiss</button></p>
@@ -148,18 +148,18 @@
 				</div>
 				<div class="actions">
 					{#if run && cancellable(run.state)}
-						<button class="btn danger" disabled={!session.apiKey} title={session.apiKey ? '' : 'Cancelling needs the API key'} onclick={cancel}>
+						<button class="btn danger" disabled={!session.canWrite} title={session.canWrite ? '' : `Cancelling ${session.writeNeed}`} onclick={cancel}>
 							<Icon name="x" />Cancel run
 						</button>
 					{/if}
 					{#if !specData}
 						<button
 							class="btn"
-							disabled={!session.apiKey || !run}
-							title={session.apiKey ? 'Fetch the spec (steps and input) with the API key' : 'The spec may carry customer input (D-051): the API key reveals it'}
+							disabled={!session.canWrite || !run}
+							title={session.canWrite ? 'Fetch the spec (steps and input)' : `The spec may carry customer input (D-051): revealing it ${session.writeNeed}`}
 							onclick={reveal}
 						>
-							<Icon name="eye" />Reveal spec{session.apiKey ? '' : ': needs the API key'}
+							<Icon name="eye" />Reveal spec{session.canWrite ? '' : `: ${session.writeNeed}`}
 						</button>
 					{/if}
 				</div>
@@ -299,8 +299,8 @@
 						<p class="input-label">Input (base64)</p>
 						<p class="input mono">{specData.input_b64 || '—'}</p>
 					{:else}
-						<p class="hint reveal-hint">The input may be customer content (D-051), so the page asks for the API key instead of fetching it on open.</p>
-						<button class="btn" disabled={!session.apiKey || !run} onclick={reveal}><Icon name="eye" />Reveal spec{session.apiKey ? '' : ': needs the API key'}</button>
+						<p class="hint reveal-hint">The input may be customer content (D-051), so the page {session.signedIn ? 'fetches it only when you ask (viewers cannot)' : 'asks for the API key instead of fetching it on open'}.</p>
+						<button class="btn" disabled={!session.canWrite || !run} onclick={reveal}><Icon name="eye" />Reveal spec{session.canWrite ? '' : `: ${session.writeNeed}`}</button>
 					{/if}
 				</div>
 			</section>

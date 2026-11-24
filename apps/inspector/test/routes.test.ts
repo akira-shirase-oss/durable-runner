@@ -38,3 +38,21 @@ test('run ids: the opaque 11-character public id, or a legacy all-digit id; neve
 	assert.equal(runHref('WBwXuaDUPWc'), '#/runs/WBwXuaDUPWc');
 	assert.equal(runHref('10'), '#/runs/10');
 });
+
+test('the signed-in navigation: the S3 information architecture, in order, all hash routes', async () => {
+	const { SAAS_NAV } = await import('../src/lib/routes.ts');
+	assert.deepEqual(SAAS_NAV.map((n) => n.label), ['Overview', 'Runs', 'Workflows', 'Handlers', 'API keys', 'Usage', 'Team', 'Settings']);
+	for (const n of SAAS_NAV) assert.match(n.href, /^#\/[a-z]+$/);
+	assert.equal(sectionOf('/workflows/[id]', SAAS_NAV), 'workflows');
+	assert.equal(sectionOf('/keys', SAAS_NAV), 'keys');
+	assert.equal(sectionOf('/admin', SAAS_NAV), 'admin', 'compat sections still resolve (the shell redirects them)');
+});
+
+test('workflow ids: a UUID, lower-cased; anything else is null', async () => {
+	const { parseWorkflowId, workflowHref } = await import('../src/lib/routes.ts');
+	assert.equal(parseWorkflowId('0193B000-0000-7000-8000-00000000D0E0'), '0193b000-0000-7000-8000-00000000d0e0');
+	assert.equal(parseWorkflowId(' 0193b000-0000-7000-8000-00000000d0e0 '), '0193b000-0000-7000-8000-00000000d0e0');
+	for (const bad of ['', 'demo', '0193b000-0000-7000-8000-00000000d0e', '0193b000000070008000000000000d0e0', '../keys', undefined, null])
+		assert.equal(parseWorkflowId(bad as string | null | undefined), null, String(bad));
+	assert.equal(workflowHref('0193b000-0000-7000-8000-00000000d0e0'), '#/workflows/0193b000-0000-7000-8000-00000000d0e0');
+});
