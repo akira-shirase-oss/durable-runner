@@ -46,6 +46,31 @@ struct Inner {
     email_tokens: HashMap<u64, EmailTokenRow>,
     invites: HashMap<u64, InviteRow>,
     outbox: HashMap<u64, OutboxRow>,
+    /// plan id -> (name, limits jsonb) — `plans` (D-067). Seeded with
+    /// the 'free' row so a fresh Memory looks like a migrated database.
+    plans: HashMap<String, (String, serde_json::Value)>,
+    /// ws -> plan_id (every workspace 'free' until a row says otherwise).
+    ws_plan: HashMap<u64, String>,
+}
+
+impl Inner {
+    /// The limits a plan row carries — Free defaults when the row or
+    /// its parse is missing, so a fixture store behaves like the
+    /// migrated 'free' seed.
+    fn plan_limits(&self, plan_id: &str) -> crate::PlanLimits {
+        self.plans
+            .get(plan_id)
+            .and_then(|(_, l)| serde_json::from_value(l.clone()).ok())
+            .unwrap_or_default()
+    }
+
+    /// The limits governing `workspace` — the ws's own plan row.
+    fn ws_limits(&self, workspace: u64) -> crate::PlanLimits {
+        match self.ws_plan.get(&workspace) {
+            Some(pid) => self.plan_limits(pid),
+            None => self.plan_limits(crate::DEFAULT_PLAN),
+        }
+    }
 }
 
 struct HandlerRow {
@@ -171,6 +196,20 @@ impl Memory {
     fn seed_default(&self) {
         let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         let secret = Self::draw_secret().unwrap_or_else(|e| panic!("{e}"));
+        inner
+            .plans
+            .entry(crate::DEFAULT_PLAN.into())
+            .or_insert_with(|| {
+                (
+                    "Free".into(),
+                    serde_json::to_value(crate::PlanLimits::default())
+                        .unwrap_or_else(|e| panic!("{e}")),
+                )
+            });
+        inner
+            .ws_plan
+            .entry(0)
+            .or_insert_with(|| crate::DEFAULT_PLAN.into());
         inner.workspaces.entry(0).or_insert_with(|| Workspace {
             id: 0,
             public_id: uuid::Uuid::nil(),
@@ -318,6 +357,7 @@ impl AccountStore for Memory {
             handler_secret: Self::draw_secret()?,
             deleted_at_ms: None,
         };
+        inner.ws_plan.insert(id, crate::DEFAULT_PLAN.into());
         inner.workspaces.insert(id, workspace.clone());
         Ok(workspace)
     }
@@ -361,7 +401,7 @@ impl AccountStore for Memory {
             .values()
             .filter(|k| k.workspace == workspace && !k.revoked)
             .count() as u64;
-        if live >= crate::STOPGAP_KEYS_PER_WS {
+        if live >= inner.ws_limits(workspace).api_keys {
             return Err(AccountError::PlanLimit("api_keys"));
         }
         let id = self.next_key.fetch_add(1, Ordering::Relaxed);
@@ -887,7 +927,11 @@ impl AccountStore for Memory {
                 .iter()
                 .filter(|((_, acc), m)| *acc == account && m.role == crate::Role::Owner)
                 .count() as u64;
-            if owned >= crate::STOPGAP_WS_PER_ACCOUNT {
+            if owned
+                >= inner
+                    .plan_limits(crate::DEFAULT_PLAN)
+                    .workspaces_per_account
+            {
                 return Err(AccountError::PlanLimit("workspaces_per_account"));
             }
         }
@@ -950,6 +994,70 @@ impl AccountStore for Memory {
             .collect();
         out.sort_by_key(|(ws, _)| ws.id);
         Ok(out)
+    }
+
+    async fn count_owned_workspaces(&self, account: u64) -> Result<u64, AccountError> {
+        self.check_up()?;
+        let inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        let n = inner
+            .members
+            .iter()
+            .filter(|((_, acc), m)| *acc == account && m.role == crate::Role::Owner)
+            .count() as u64;
+        Ok(n)
+    }
+
+    async fn plan(&self, id: &str) -> Result<Option<crate::Plan>, AccountError> {
+        self.check_up()?;
+        let inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        Ok(inner.plans.get(id).map(|(name, limits)| crate::Plan {
+            id: id.to_string(),
+            name: name.clone(),
+            limits: serde_json::from_value(limits.clone()).unwrap_or_default(),
+        }))
+    }
+
+    async fn plan_for_workspace(
+        &self,
+        workspace: u64,
+    ) -> Result<Option<crate::Plan>, AccountError> {
+        self.check_up()?;
+        let (pid, (name, limits)) = {
+            let inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+            match inner
+                .ws_plan
+                .get(&workspace)
+                .and_then(|pid| inner.plans.get(pid).map(|r| (pid.clone(), r.clone())))
+            {
+                Some(t) => t,
+                None => return Ok(None),
+            }
+        };
+        Ok(Some(crate::Plan {
+            id: pid,
+            name,
+            limits: serde_json::from_value(limits).unwrap_or_default(),
+        }))
+    }
+
+    async fn put_plan(
+        &self,
+        id: &str,
+        name: &str,
+        limits: &serde_json::Value,
+    ) -> Result<crate::Plan, AccountError> {
+        self.check_up()?;
+        let parsed: crate::PlanLimits = serde_json::from_value(limits.clone())
+            .map_err(|e| AccountError::Store(format!("plan limits do not parse: {e}")))?;
+        let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        inner
+            .plans
+            .insert(id.to_string(), (name.to_string(), limits.clone()));
+        Ok(crate::Plan {
+            id: id.to_string(),
+            name: name.to_string(),
+            limits: parsed,
+        })
     }
 
     async fn list_members(&self, workspace: u64) -> Result<Vec<crate::MemberInfo>, AccountError> {
@@ -1045,7 +1153,7 @@ impl AccountStore for Memory {
             .values()
             .filter(|i| i.workspace == workspace && i.created_at_ms > day_ago)
             .count() as u64;
-        if today >= crate::STOPGAP_INVITES_PER_WS_DAY {
+        if today >= inner.ws_limits(workspace).invites_per_day {
             return Err(AccountError::PlanLimit("invites_per_day"));
         }
         let invite = crate::WorkspaceInvite {

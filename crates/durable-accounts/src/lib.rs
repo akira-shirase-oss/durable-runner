@@ -66,6 +66,74 @@ pub struct KeyGrant {
 /// A workspace row. `id` is the internal join key used in journal records
 /// and index structures; `public_id` (UUIDv7) is the only id allowed on
 /// external surfaces so sequential ids stay unguessable.
+/// A plan's parsed limits — `plans.limits` jsonb (D-067). A missing key
+/// falls back to the Free row's v1 value so a hand-edited row can never
+/// silently uncap a meter; unknown keys are ignored (forward compat —
+/// a newer build can write a key an older one still serves).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+#[serde(default)]
+pub struct PlanLimits {
+    /// Admitted submits per minute per workspace (token bucket, burst 10).
+    pub jobs_per_min: u64,
+    /// Accepted-not-finished runs held at once (index count).
+    pub live_runs: u64,
+    /// Concurrent dispatches — fairness, not admission (recorded, not
+    /// enforced by `admit`; the engine's per-ws bound stays the backstop).
+    pub in_flight: u64,
+    /// Registered handlers per workspace.
+    pub handlers: u64,
+    /// Max submit input bytes.
+    pub max_input_bytes: u64,
+    /// Terminal-run retention — informational (the engine's expiry owns it).
+    pub retention_days: u64,
+    /// Members per workspace, owner included.
+    pub members: u64,
+    /// Live API keys per workspace.
+    pub api_keys: u64,
+    /// Workflows per workspace.
+    pub workflows: u64,
+    /// Handler test calls per hour per workspace.
+    pub test_calls_per_hour: u64,
+    /// Workspaces one account may own, soft-deleted counted until purged.
+    pub workspaces_per_account: u64,
+    /// Per-workspace share of the retained index, bytes.
+    pub retained_bytes: u64,
+    /// Invites one workspace may mint per day (pending or accepted —
+    /// the day window counts the mail, not the seat).
+    pub invites_per_day: u64,
+    /// How far ahead `not_before` may park a run, days.
+    pub not_before_days: u64,
+}
+
+impl Default for PlanLimits {
+    fn default() -> Self {
+        Self {
+            jobs_per_min: 60,
+            live_runs: 500,
+            in_flight: 8,
+            handlers: 16,
+            max_input_bytes: 64 * 1024,
+            retention_days: 7,
+            members: 5,
+            api_keys: 10,
+            workflows: 20,
+            test_calls_per_hour: 30,
+            workspaces_per_account: 3,
+            retained_bytes: 16 * 1024 * 1024,
+            invites_per_day: 20,
+            not_before_days: 30,
+        }
+    }
+}
+
+/// One `plans` row, parsed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Plan {
+    pub id: String,
+    pub name: String,
+    pub limits: PlanLimits,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Workspace {
     pub id: u64,
@@ -330,12 +398,9 @@ pub enum AccountError {
     PlanLimit(&'static str),
 }
 
-/// Pre-deploy S2-2 stopgap caps — S3-4's `plans` rows replace them
-/// with plan-shaped numbers; until then these are the same edges the
-/// Free row will carry.
-pub const STOPGAP_WS_PER_ACCOUNT: u64 = 3;
-pub const STOPGAP_KEYS_PER_WS: u64 = 10;
-pub const STOPGAP_INVITES_PER_WS_DAY: u64 = 20;
+/// The plan id every new workspace lands on — the only row the launch
+/// ships; the caps read it so the numbers live in `plans`, not code.
+pub const DEFAULT_PLAN: &str = "free";
 
 impl From<sqlx::Error> for AccountError {
     fn from(err: sqlx::Error) -> Self {
@@ -609,6 +674,31 @@ pub trait AccountStore: Send + Sync {
         &self,
         account: u64,
     ) -> Result<Vec<(Workspace, Role)>, AccountError>;
+
+    /// Workspaces `account` OWNS, soft-deleted included (D-072's "counted
+    /// until purged": a delete+recreate cycle must not dodge
+    /// `workspaces_per_account`). Owner member rows only — invites and
+    /// non-owner seats never inflate the count.
+    async fn count_owned_workspaces(&self, account: u64) -> Result<u64, AccountError>;
+
+    /// One `plans` row by id — `None` when no row has that id.
+    async fn plan(&self, id: &str) -> Result<Option<Plan>, AccountError>;
+
+    /// The plan `workspace`'s row names (join on `plan_id`; every ws
+    /// carries the default 'free' since 0002). Missing plan or ws rows
+    /// answer `None`.
+    async fn plan_for_workspace(&self, workspace: u64) -> Result<Option<Plan>, AccountError>;
+
+    /// Upsert a `plans` row — a plan change is a row write, never a
+    /// deploy (D-067). `limits` is the raw jsonb; it must parse into
+    /// `PlanLimits` or the write is refused (a bad row would uncap or
+    /// cap everything wrongly).
+    async fn put_plan(
+        &self,
+        id: &str,
+        name: &str,
+        limits: &serde_json::Value,
+    ) -> Result<Plan, AccountError>;
 
     async fn list_members(&self, workspace: u64) -> Result<Vec<MemberInfo>, AccountError>;
 

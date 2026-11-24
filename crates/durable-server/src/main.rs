@@ -1826,6 +1826,8 @@ struct App {
     test_calls_ws: std::sync::Arc<Mutex<HashMap<u64, std::collections::VecDeque<Instant>>>>,
     /// `--ops-listen` is set: env-key grants hold only on that socket.
     ops_gate: bool,
+    /// Per-workspace submit buckets (D-067) — bounded, burst-10 each.
+    plan_buckets: std::sync::Arc<std::sync::Mutex<SubmitBuckets>>,
     test_calls_addr: std::sync::Arc<Mutex<SlidingWindow>>,
     /// The bounded argon2 queue (review #9).
     argon: std::sync::Arc<ArgonQueue>,
@@ -1964,6 +1966,7 @@ fn test_app(
         engine,
         keyring,
         ops_gate,
+        plan_buckets: std::sync::Arc::new(std::sync::Mutex::new(SubmitBuckets(Default::default()))),
         open_reads,
         backup_root,
         handler_factory: Arc::new(HandlerFactory {
@@ -3841,17 +3844,24 @@ async fn auth_session(
             .unwrap_or_default(),
         Err(_) => Vec::new(),
     };
-    let workspaces: Vec<serde_json::Value> = rows
-        .iter()
-        .map(|(ws, role)| {
-            serde_json::json!({
+    let mut workspaces: Vec<serde_json::Value> = Vec::with_capacity(rows.len());
+    if let Ok(store) = accounts(&app) {
+        for (ws, role) in &rows {
+            let plan = store
+                .plan_for_workspace(ws.id)
+                .await
+                .ok()
+                .flatten()
+                .map(|p| p.id)
+                .unwrap_or_else(|| durable_accounts::DEFAULT_PLAN.into());
+            workspaces.push(serde_json::json!({
                 "public_id": ws.public_id,
                 "name": ws.name,
                 "role": role.as_str(),
-                "plan": "free",
-            })
-        })
-        .collect();
+                "plan": plan,
+            }));
+        }
+    }
     Ok(no_store(
         Json(serde_json::json!({
             "account": {
@@ -4244,6 +4254,201 @@ async fn verify_key(app: &App, parts: &Parts, key: &str) -> Verified {
     }
 }
 
+// ---- D-067: plans, the submit bucket, and the one admit() -----------
+
+/// The `plan_limit` 429 envelope (D-067): `{limit, plan, used, cap}`
+/// plus Retry-After for rate kinds — the dashboard renders a plan card
+/// from this, so the fields are the contract, not decoration.
+fn plan_limit(
+    limit: &'static str,
+    plan: &durable_accounts::Plan,
+    used: u64,
+    retry: Option<Duration>,
+) -> ApiError {
+    let cap = match limit {
+        "jobs_per_min" => plan.limits.jobs_per_min,
+        "live_runs" => plan.limits.live_runs,
+        "handlers" => plan.limits.handlers,
+        "max_input_bytes" => plan.limits.max_input_bytes,
+        "members" => plan.limits.members,
+        "api_keys" => plan.limits.api_keys,
+        "workflows" => plan.limits.workflows,
+        "test_calls_per_hour" => plan.limits.test_calls_per_hour,
+        "workspaces_per_account" => plan.limits.workspaces_per_account,
+        "retained_bytes" => plan.limits.retained_bytes,
+        "invites_per_day" => plan.limits.invites_per_day,
+        _ => 0,
+    };
+    let mut e = ApiError::new(
+        StatusCode::TOO_MANY_REQUESTS,
+        "plan_limit",
+        format!("the {} plan allows {cap} {limit}", plan.name),
+    );
+    e.retry_after = retry.map(|d| d.as_secs().max(1));
+    e.extra = Some(serde_json::json!({
+        "limit": limit,
+        "plan": plan.id,
+        "used": used,
+        "cap": cap,
+    }));
+    e
+}
+
+/// One workspace's submit bucket: a token bucket refilled at
+/// `jobs_per_min`/60 per second and capped at the 10-submit burst,
+/// plus the admitted-this-minute count `/usage` reports. In memory —
+/// a burst hits the caller's own bucket, never the shared per-address
+/// limiter (D-067).
+struct SubmitBucket {
+    tokens: f64,
+    last: Instant,
+    minute_epoch: i64,
+    used_minute: u64,
+}
+
+/// The bounded table of live submit buckets. 100k workspaces fit in a
+/// few MB; past that the stalest slot goes — a rebuilt bucket is a
+/// fresh burst, never a bypass that scales.
+struct SubmitBuckets(std::collections::BTreeMap<u64, SubmitBucket>);
+
+impl SubmitBuckets {
+    const CAP: usize = 100_000;
+    /// A bucket's capacity is the plan's own rate clamped to 64 — "N
+    /// jobs per minute" honestly admits N inside the minute, and a huge
+    /// rate can't hold an unbounded burst.
+    const BURST_CAP: f64 = 64.0;
+
+    /// Consume one token at `now` at `rate`/min refill. `Ok` admits;
+    /// `Err((retry, used))` refuses — retry is the wait for the next
+    /// whole token, used the admitted count this minute.
+    fn take(&mut self, ws: u64, rate_per_min: u64, now: Instant) -> Result<(), (Duration, u64)> {
+        if self.0.len() >= Self::CAP && !self.0.contains_key(&ws) {
+            let cutoff = now - Duration::from_secs(600);
+            self.0.retain(|_, b| b.last > cutoff);
+            if self.0.len() >= Self::CAP {
+                self.0.pop_first();
+            }
+        }
+        let refill = rate_per_min.max(1) as f64 / 60.0;
+        let burst = (rate_per_min.max(1) as f64).min(Self::BURST_CAP);
+        let minute = unix_ms() / 60_000;
+        let b = self.0.entry(ws).or_insert_with(|| SubmitBucket {
+            tokens: burst,
+            last: now,
+            minute_epoch: minute,
+            used_minute: 0,
+        });
+        b.tokens = (b.tokens + now.duration_since(b.last).as_secs_f64() * refill).min(burst);
+        b.last = now;
+        if b.minute_epoch != minute {
+            b.minute_epoch = minute;
+            b.used_minute = 0;
+        }
+        if b.tokens < 1.0 {
+            let wait = Duration::from_secs_f64((1.0 - b.tokens) / refill);
+            return Err((wait, b.used_minute));
+        }
+        b.tokens -= 1.0;
+        b.used_minute += 1;
+        Ok(())
+    }
+
+    /// The admitted count this minute (the `/usage` meter).
+    fn used_minute(&self, ws: u64) -> u64 {
+        match self.0.get(&ws) {
+            Some(b) if b.minute_epoch == unix_ms() / 60_000 => b.used_minute,
+            _ => 0,
+        }
+    }
+}
+
+/// The workspace's plan row, or the Free defaults when the store has
+/// none (ws 0, a store-made fixture ws with no plan_id join).
+fn free_plan() -> durable_accounts::Plan {
+    durable_accounts::Plan {
+        id: durable_accounts::DEFAULT_PLAN.into(),
+        name: "Free".into(),
+        limits: Default::default(),
+    }
+}
+
+/// The workspace's plan row, or the Free defaults when the store has
+/// none (ws 0, a fixture ws with no plan_id join) — or cannot answer
+/// right now: an outage must not uncap, it holds the Free floor so
+/// cached-credential calls keep working (D-067 + LKG semantics).
+async fn plan_of(app: &App, ws: u64) -> Result<durable_accounts::Plan, ApiError> {
+    let store = accounts(app)?;
+    match store.plan_for_workspace(ws).await {
+        Ok(p) => Ok(p.unwrap_or_else(free_plan)),
+        Err(AccountError::Unavailable(_)) => Ok(free_plan()),
+        Err(e) => Err(store_err(e)),
+    }
+}
+
+/// The ONE admission path for a run's acceptance (review #7): `POST
+/// /jobs` and Run now both call it, so a workflow can never bypass plan
+/// limits. Order is cheap-first: the per-ws submit bucket, then the
+/// live_runs/retained_bytes index pre-checks, then the input bound and
+/// the not_before horizon. The engine's own uniform per-ws bounds stay
+/// the hard backstop under every race (two admits can still interleave
+/// a count).
+async fn admit(
+    app: &App,
+    ws: u64,
+    spec: &JobSpec,
+    not_before: Option<u64>,
+) -> Result<(), ApiError> {
+    // ws 0 is the ops plane — no plan row and possibly no account store
+    // at all; the engine's own bounds answer.
+    if ws == 0 {
+        return Ok(());
+    }
+    let plan = match accounts(app)?.plan_for_workspace(ws).await {
+        Ok(p) => p.unwrap_or_else(free_plan),
+        // Store down: hold the Free floor, never uncap, never block.
+        Err(AccountError::Unavailable(_)) => free_plan(),
+        Err(e) => return Err(store_err(e)),
+    };
+    {
+        let mut buckets = app.plan_buckets.lock().unwrap_or_else(|e| e.into_inner());
+        if let Err((retry, used)) = buckets.take(ws, plan.limits.jobs_per_min, Instant::now()) {
+            return Err(plan_limit("jobs_per_min", &plan, used, Some(retry)));
+        }
+    }
+    // A run may park at most the plan's horizon out — a far-future
+    // not_before is a stuck slot the caller cannot observe (S2-2's cap,
+    // now plan-read, D-067).
+    if let Some(nb) = not_before {
+        let horizon = unix_ms() + (plan.limits.not_before_days * 86_400_000) as i64;
+        if nb > horizon.max(0) as u64 {
+            return Err(ApiError::new(
+                StatusCode::BAD_REQUEST,
+                "not_before_too_far",
+                format!(
+                    "not_before may be at most {} days ahead",
+                    plan.limits.not_before_days
+                ),
+            ));
+        }
+    }
+    let d = app.engine.diag_ws(ws).await?;
+    if d.active_runs >= plan.limits.live_runs {
+        return Err(plan_limit("live_runs", &plan, d.active_runs, None));
+    }
+    if d.index_bytes >= plan.limits.retained_bytes {
+        return Err(plan_limit("retained_bytes", &plan, d.index_bytes, None));
+    }
+    if spec.input.len() as u64 > plan.limits.max_input_bytes {
+        return Err(plan_limit(
+            "max_input_bytes",
+            &plan,
+            spec.input.len() as u64,
+            None,
+        ));
+    }
+    Ok(())
+}
+
 /// The dual-auth resolution for flat tenant routes (D-066/D-073): a
 /// bearer takes the key path (workspace from the grant, `key_need` the
 /// permission the call requires); a session takes the member path
@@ -4448,6 +4653,28 @@ async fn ws_create(
         ));
     }
     let store = accounts(&app)?;
+    {
+        // The 'free' row's bound is the only one that can apply before
+        // the ws exists (D-067); soft-deleted rows count until the
+        // purge removes them. The store's in-transaction count stays
+        // the atomic backstop — this check carries the rich envelope.
+        let plan = store
+            .plan(durable_accounts::DEFAULT_PLAN)
+            .await
+            .map_err(store_err)?
+            .unwrap_or_else(|| durable_accounts::Plan {
+                id: durable_accounts::DEFAULT_PLAN.into(),
+                name: "Free".into(),
+                limits: Default::default(),
+            });
+        let used = store
+            .count_owned_workspaces(grant.account.id)
+            .await
+            .map_err(store_err)?;
+        if used >= plan.limits.workspaces_per_account {
+            return Err(plan_limit("workspaces_per_account", &plan, used, None));
+        }
+    }
     let ws = store
         .create_workspace_for(grant.account.id, name.trim())
         .await
@@ -4472,18 +4699,23 @@ async fn ws_list_mine(
         .workspaces_for_account(grant.account.id)
         .await
         .map_err(store_err)?;
-    let list: Vec<serde_json::Value> = rows
-        .iter()
-        .map(|(ws, role)| {
-            serde_json::json!({
-                "public_id": ws.public_id,
-                "name": ws.name,
-                "role": role.as_str(),
-                // Every ws lives on 'free' until S3-4 lands plan rows.
-                "plan": "free",
-            })
-        })
-        .collect();
+    let mut list: Vec<serde_json::Value> = Vec::with_capacity(rows.len());
+    for (ws, role) in &rows {
+        // The ws's own plan row — 'free' is the join's default, not a
+        // constant on the wire (D-067).
+        let plan = store
+            .plan_for_workspace(ws.id)
+            .await
+            .map_err(store_err)?
+            .map(|p| p.id)
+            .unwrap_or_else(|| durable_accounts::DEFAULT_PLAN.into());
+        list.push(serde_json::json!({
+            "public_id": ws.public_id,
+            "name": ws.name,
+            "role": role.as_str(),
+            "plan": plan,
+        }));
+    }
     Ok(no_store(
         Json(serde_json::json!({ "workspaces": list })).into_response(),
     ))
@@ -4615,6 +4847,17 @@ async fn ws_invite_member(
     J(req): J<serde_json::Value>,
 ) -> Result<Response, ApiError> {
     let (ws, _) = member_access(&app, &grant, pid, &parts, Role::Admin).await?;
+    {
+        let store = accounts(&app)?;
+        let plan = plan_of(&app, ws.id).await?;
+        // Seats count member rows plus pending invites — an invite
+        // burst can't stack pending seats over the cap (D-067).
+        let used = store.list_members(ws.id).await.map_err(store_err)?.len() as u64
+            + store.list_invites(ws.id).await.map_err(store_err)?.len() as u64;
+        if used >= plan.limits.members {
+            return Err(plan_limit("members", &plan, used, None));
+        }
+    }
     let email = req
         .get("email")
         .and_then(|v| v.as_str())
@@ -4937,6 +5180,14 @@ async fn ws_key_create(
     J(req): J<WsKeyReq>,
 ) -> Result<Response, ApiError> {
     let (ws, _) = member_access(&app, &grant, pid, &parts, Role::Admin).await?;
+    {
+        let store = accounts(&app)?;
+        let plan = plan_of(&app, ws.id).await?;
+        let used = store.list_keys(ws.id).await.map_err(store_err)?.len() as u64;
+        if used >= plan.limits.api_keys {
+            return Err(plan_limit("api_keys", &plan, used, None));
+        }
+    }
     let permission = key_permission(&req.permission)?;
     if req.name.trim().is_empty() || req.name.len() > 128 {
         return Err(ApiError::new(
@@ -5000,6 +5251,88 @@ async fn ws_key_delete(
     };
     app.keyring.invalidate(hash, ws.id);
     Ok(no_store(StatusCode::NO_CONTENT.into_response()))
+}
+
+/// `GET /workspaces/{pid}/usage` (D-067) — the plan row, every meter's
+/// used value against its cap, and when the minute/hour/day windows
+/// close. Member viewer+; the numbers are facts, never flags.
+async fn ws_usage(
+    SessionAuth(grant): SessionAuth,
+    State(app): State<App>,
+    axum::extract::Path(pid): axum::extract::Path<uuid::Uuid>,
+    parts: Parts,
+) -> Result<Response, ApiError> {
+    let (ws, _) = member_access(&app, &grant, pid, &parts, Role::Viewer).await?;
+    let store = accounts(&app)?;
+    let Some(plan) = store.plan_for_workspace(ws.id).await.map_err(store_err)? else {
+        return Err(ApiError::new(
+            StatusCode::NOT_FOUND,
+            "not_found",
+            "no such workspace",
+        ));
+    };
+    let d = app.engine.diag_ws(ws.id).await?;
+    let jobs_min = app
+        .plan_buckets
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .used_minute(ws.id);
+    let handlers_n = store.list_handlers(ws.id).await.map_err(store_err)?.len() as u64;
+    let keys_n = store.list_keys(ws.id).await.map_err(store_err)?.len() as u64;
+    let members_n = store.list_members(ws.id).await.map_err(store_err)?.len() as u64;
+    let invites_n = store.list_invites(ws.id).await.map_err(store_err)?.len() as u64;
+    let tests_hour = {
+        let per = app.test_calls_ws.lock().unwrap_or_else(|e| e.into_inner());
+        let now = Instant::now();
+        per.get(&ws.id)
+            .map(|q| {
+                q.iter()
+                    .filter(|t| now.duration_since(**t) <= Duration::from_secs(3600))
+                    .count() as u64
+            })
+            .unwrap_or(0)
+    };
+    let now_ms = unix_ms();
+    let limits = &plan.limits;
+    Ok(no_store(
+        Json(serde_json::json!({
+            "plan": { "id": plan.id, "name": plan.name },
+            "limits": {
+                "jobs_per_min": limits.jobs_per_min,
+                "live_runs": limits.live_runs,
+                "in_flight": limits.in_flight,
+                "handlers": limits.handlers,
+                "max_input_bytes": limits.max_input_bytes,
+                "retention_days": limits.retention_days,
+                "members": limits.members,
+                "api_keys": limits.api_keys,
+                "workflows": limits.workflows,
+                "test_calls_per_hour": limits.test_calls_per_hour,
+                "workspaces_per_account": limits.workspaces_per_account,
+                "retained_bytes": limits.retained_bytes,
+                "invites_per_day": limits.invites_per_day,
+                "not_before_days": limits.not_before_days,
+            },
+            "used": {
+                "jobs_this_minute": jobs_min,
+                "live_runs": d.active_runs,
+                "in_flight": app.engine.in_flight(ws.id),
+                "handlers": handlers_n,
+                "api_keys": keys_n,
+                "members": members_n,
+                "invites": invites_n,
+                "workflows": 0,
+                "test_calls_hour": tests_hour,
+                "retained_bytes": d.index_bytes,
+            },
+            "windows": {
+                "minute_ends_at": ((now_ms / 60_000) + 1) * 60_000,
+                "hour_ends_at": ((now_ms / 3_600_000) + 1) * 3_600_000,
+                "day_ends_at": ((now_ms / 86_400_000) + 1) * 86_400_000,
+            },
+        }))
+        .into_response(),
+    ))
 }
 
 /// `POST /workspaces/{pid}/keys/{key_pid}/rotate` — admin+; the store
@@ -5508,17 +5841,7 @@ async fn submit(
         steps: req.spec.steps,
         input,
     };
-    // A run may park at most 30 days out — a far-future not_before is a
-    // stuck slot the caller cannot observe (S2-2).
-    if let Some(nb) = req.not_before {
-        if nb > (unix_ms() + 30 * 86_400_000).max(0) as u64 {
-            return Err(ApiError::new(
-                StatusCode::BAD_REQUEST,
-                "not_before_too_far",
-                "not_before may be at most 30 days ahead",
-            ));
-        }
-    }
+    admit(&app, auth.ws(), &spec, req.not_before).await?;
     let key = OperationKey(req.op_key);
     let submitted = match app
         .engine
@@ -6471,6 +6794,13 @@ async fn put_handler(
             "the workspace's handler registry is at its bound",
         ));
     }
+    if !regs.iter().any(|r| r.name == name) {
+        let plan = plan_of(&app, auth.ws()).await?;
+        let used = regs.len() as u64;
+        if used >= plan.limits.handlers {
+            return Err(plan_limit("handlers", &plan, used, None));
+        }
+    }
     // Order is store → engine → snapshot: the store is the authority, so
     // a row it accepted is never silently dropped. If the engine call
     // fails the row stays and the next reconcile applies it; the client
@@ -6667,6 +6997,9 @@ async fn test_call_run(
             "test input exceeds 8 KiB",
         ));
     }
+    // The hourly ws budget is the plan's — read before the lock so the
+    // store call never sits inside it (D-067).
+    let calls_cap = plan_of(app, ws).await?.limits.test_calls_per_hour;
     {
         let mut per = app.test_calls_ws.lock().unwrap_or_else(|e| e.into_inner());
         let now = Instant::now();
@@ -6678,11 +7011,11 @@ async fn test_call_run(
                 q.pop_front();
             }
         }
-        if per.get(&ws).is_some_and(|q| q.len() >= 30) {
+        if per.get(&ws).is_some_and(|q| q.len() as u64 >= calls_cap) {
             return Err(ApiError::new(
                 StatusCode::TOO_MANY_REQUESTS,
                 "test_call_limited",
-                "test calls are bounded to 30 per workspace per hour",
+                "test calls are bounded per workspace per hour",
             ));
         }
         if per.len() >= 10_000 && !per.contains_key(&ws) {
@@ -6893,6 +7226,7 @@ fn router(app: App, ui_dir: Option<&Path>) -> Router {
             "/workspaces/{pid}/keys/{key_pid}/rotate",
             post(ws_key_rotate),
         )
+        .route("/workspaces/{pid}/usage", get(ws_usage))
         .route("/invites/accept", post(invite_accept))
         .route("/invites/decline", post(invite_decline))
         // The old inspector mount: every URL under it lives at the same
@@ -7347,6 +7681,7 @@ async fn main() -> Result<()> {
             std::sync::Arc::new(pubid.derive_key(b"store-key-tag-v1")),
         )),
         ops_gate: args.ops_listen.is_some(),
+        plan_buckets: std::sync::Arc::new(std::sync::Mutex::new(SubmitBuckets(Default::default()))),
         open_reads: args.open_reads,
         backup_root,
         handler_factory: factory,
@@ -11248,6 +11583,30 @@ mod tests {
         ) -> Result<Vec<(Workspace, Role)>, AccountError> {
             self.inner.workspaces_for_account(account).await
         }
+
+        async fn count_owned_workspaces(&self, account: u64) -> Result<u64, AccountError> {
+            self.inner.count_owned_workspaces(account).await
+        }
+
+        async fn plan(&self, id: &str) -> Result<Option<durable_accounts::Plan>, AccountError> {
+            self.inner.plan(id).await
+        }
+
+        async fn plan_for_workspace(
+            &self,
+            workspace: u64,
+        ) -> Result<Option<durable_accounts::Plan>, AccountError> {
+            self.inner.plan_for_workspace(workspace).await
+        }
+
+        async fn put_plan(
+            &self,
+            id: &str,
+            name: &str,
+            limits: &serde_json::Value,
+        ) -> Result<durable_accounts::Plan, AccountError> {
+            self.inner.put_plan(id, name, limits).await
+        }
         async fn list_members(
             &self,
             workspace: u64,
@@ -11629,6 +11988,30 @@ mod tests {
             account: u64,
         ) -> Result<Vec<(Workspace, Role)>, AccountError> {
             self.inner.workspaces_for_account(account).await
+        }
+
+        async fn count_owned_workspaces(&self, account: u64) -> Result<u64, AccountError> {
+            self.inner.count_owned_workspaces(account).await
+        }
+
+        async fn plan(&self, id: &str) -> Result<Option<durable_accounts::Plan>, AccountError> {
+            self.inner.plan(id).await
+        }
+
+        async fn plan_for_workspace(
+            &self,
+            workspace: u64,
+        ) -> Result<Option<durable_accounts::Plan>, AccountError> {
+            self.inner.plan_for_workspace(workspace).await
+        }
+
+        async fn put_plan(
+            &self,
+            id: &str,
+            name: &str,
+            limits: &serde_json::Value,
+        ) -> Result<durable_accounts::Plan, AccountError> {
+            self.inner.put_plan(id, name, limits).await
         }
         async fn list_members(
             &self,
@@ -12176,6 +12559,9 @@ mod tests {
     #[tokio::test]
     async fn registry_mutations_are_rate_limited_per_workspace() {
         let (h, store, key_a, key_b) = two_tenant_registry().await;
+        // The plan's handler bound (16) sits under the rate burst
+        // (20): raise it so the limiter under test is the edge.
+        set_free(&store.inner, &[("handlers", 64)]).await;
         let mut refused = None;
         for i in 0..100 {
             let (status, v) = call(
@@ -20169,7 +20555,10 @@ mod tests {
         assert_eq!(st, StatusCode::TOO_MANY_REQUESTS, "{v}");
         assert_eq!(v["limit"], "api_keys");
         // Invites: 20 in the day, the 21st refused. The pending-dup
-        // rule means 20 distinct addresses.
+        // rule means 20 distinct addresses. Seats (members + pending
+        // invites) cap at Free's 5 — raise it so the DAY window is the
+        // edge under test (S3-4: every number is the plan row's).
+        set_free(&store, &[("members", 100)]).await;
         for i in 0..19 {
             let (st, _, v) = raw(
                 &h.router,
@@ -20257,5 +20646,329 @@ mod tests {
             v["keys"][0]["created_at_ms"].as_i64().unwrap_or(0) > 0,
             "key row carries its birth stamp: {v}"
         );
+    }
+
+    // ---- S3-4: plans, the one admit(), /usage (D-067) ----------------
+
+    const FREE_LIMITS: &[(&str, u64)] = &[
+        ("jobs_per_min", 60),
+        ("live_runs", 500),
+        ("in_flight", 8),
+        ("handlers", 16),
+        ("max_input_bytes", 65536),
+        ("retention_days", 7),
+        ("members", 5),
+        ("api_keys", 10),
+        ("workflows", 20),
+        ("test_calls_per_hour", 30),
+        ("workspaces_per_account", 3),
+        ("retained_bytes", 16777216),
+        ("invites_per_day", 20),
+        ("not_before_days", 30),
+    ];
+
+    /// Rewrite the seeded 'free' row's limits — every fixture ws lands
+    /// on it, so the test drives plan edges without a plan-assignment
+    /// path.
+    async fn set_free(store: &Memory, over: &[(&str, u64)]) {
+        let mut limits = serde_json::Map::new();
+        for (k, v) in FREE_LIMITS {
+            limits.insert((*k).to_string(), json!(*v));
+        }
+        for (k, v) in over {
+            limits.insert((*k).to_string(), json!(*v));
+        }
+        store
+            .put_plan("free", "Free", &serde_json::Value::Object(limits))
+            .await
+            .unwrap_or_else(|e| panic!("put_plan: {e}"));
+    }
+
+    /// Arm `step` for `pid` through the member route — the submits
+    /// below need it armed in the ws's armed view. A dead loopback URL
+    /// is fine: only admission is asserted, never dispatch.
+    async fn arm_step(router: &Router, cookie: &str, csrf: &str, pid: &str) {
+        let (st, _, v) = raw(
+            router,
+            "PUT",
+            "/handlers/step",
+            &ws_headers(cookie, csrf, pid),
+            Some(json!({"url": "http://127.0.0.1:9/h"})),
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK, "{v}");
+    }
+
+    /// The submit bucket is per WORKSPACE — a second key can't mint a
+    /// second bucket and slip past jobs_per_min (review #7's bypass).
+    #[tokio::test]
+    async fn s34_bucket_shared_across_keys() {
+        let store = Arc::new(Memory::new());
+        let h = harness_store(false, None, Some(store.clone()));
+        set_free(&store, &[("jobs_per_min", 2)]).await;
+        signup_and_verify(&h.router, &store, "o@o.co", "a-long-enough-passphrase").await;
+        let (oc, ocsrf) = login_only(&h.router, "o@o.co", "a-long-enough-passphrase").await;
+        let pid = make_ws(&h.router, &oc, "alpha").await;
+        arm_step(&h.router, &oc, &ocsrf, &pid).await;
+        let (_, key_a) = make_key(&h.router, &oc, &ocsrf, &pid, "write").await;
+        let (_, key_b) = make_key(&h.router, &oc, &ocsrf, &pid, "write").await;
+        // The burst equals the rate (2): two admits, then the third —
+        // through a DIFFERENT key — is refused. The bucket is the
+        // workspace's, not the key's.
+        for i in 0..2 {
+            let (st, v) = call(
+                &h.router,
+                "POST",
+                "/jobs",
+                Some(&key_a),
+                Some(submit_body(&format!("a-{i}"))),
+            )
+            .await;
+            assert_eq!(st, StatusCode::OK, "{i}: {v}");
+        }
+        let (st, v) = call(
+            &h.router,
+            "POST",
+            "/jobs",
+            Some(&key_b),
+            Some(submit_body("b-0")),
+        )
+        .await;
+        assert_eq!(st, StatusCode::TOO_MANY_REQUESTS, "{v}");
+        assert_eq!(v["code"], "plan_limit");
+        assert_eq!(v["limit"], "jobs_per_min");
+        assert_eq!(v["plan"], "free");
+        assert_eq!(v["cap"], 2);
+        // And key A is refused too — same bucket.
+        let (st2, v2) = call(
+            &h.router,
+            "POST",
+            "/jobs",
+            Some(&key_a),
+            Some(submit_body("a-2")),
+        )
+        .await;
+        assert_eq!(st2, StatusCode::TOO_MANY_REQUESTS, "{v2}");
+        assert_eq!(v2["limit"], "jobs_per_min");
+    }
+
+    /// `GET /workspaces/{pid}/usage` — plan row, meters, windows; a
+    /// non-member sees the same 404 as a missing ws.
+    #[tokio::test]
+    async fn s34_usage_route() {
+        let store = Arc::new(Memory::new());
+        let h = harness_store(false, None, Some(store.clone()));
+        signup_and_verify(&h.router, &store, "o@o.co", "a-long-enough-passphrase").await;
+        let (oc, _) = login_only(&h.router, "o@o.co", "a-long-enough-passphrase").await;
+        let pid = make_ws(&h.router, &oc, "alpha").await;
+        let (st, _, v) = raw(
+            &h.router,
+            "GET",
+            &format!("/workspaces/{pid}/usage"),
+            &[("cookie", oc.clone())],
+            None,
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK, "{v}");
+        assert_eq!(v["plan"]["id"], "free");
+        assert_eq!(v["limits"]["jobs_per_min"], 60);
+        assert_eq!(v["limits"]["not_before_days"], 30);
+        assert_eq!(v["used"]["members"], 1);
+        assert!(v["windows"]["minute_ends_at"].as_u64().unwrap_or(0) > 0);
+        // A non-member gets the IDOR-blind 404.
+        signup_and_verify(&h.router, &store, "x@x.co", "a-long-enough-passphrase").await;
+        let (xc, _) = login_only(&h.router, "x@x.co", "a-long-enough-passphrase").await;
+        let (st2, _, _) = raw(
+            &h.router,
+            "GET",
+            &format!("/workspaces/{pid}/usage"),
+            &[("cookie", xc)],
+            None,
+        )
+        .await;
+        assert_eq!(st2, StatusCode::NOT_FOUND);
+    }
+
+    /// Every count limit answers at its insert point with its own
+    /// `limit` name — handlers at PUT, seats at invite, keys at mint,
+    /// workspaces at create.
+    #[tokio::test]
+    async fn s34_count_caps_at_insert_points() {
+        let store = Arc::new(Memory::new());
+        let h = harness_store(false, None, Some(store.clone()));
+        set_free(
+            &store,
+            &[
+                ("handlers", 1),
+                ("members", 2),
+                ("api_keys", 1),
+                ("workspaces_per_account", 1),
+            ],
+        )
+        .await;
+        signup_and_verify(&h.router, &store, "o@o.co", "a-long-enough-passphrase").await;
+        let (oc, ocsrf) = login_only(&h.router, "o@o.co", "a-long-enough-passphrase").await;
+        let pid = make_ws(&h.router, &oc, "alpha").await;
+        let (_, key) = make_key(&h.router, &oc, &ocsrf, &pid, "write").await;
+        // handlers: first lands, second 429s with limit=handlers.
+        let (st, v) = call(
+            &h.router,
+            "PUT",
+            "/handlers/h1",
+            Some(&key),
+            Some(json!({"url": "http://127.0.0.1:9/h"})),
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK, "{v}");
+        let (st, v) = call(
+            &h.router,
+            "PUT",
+            "/handlers/h2",
+            Some(&key),
+            Some(json!({"url": "http://127.0.0.1:9/h"})),
+        )
+        .await;
+        assert_eq!(st, StatusCode::TOO_MANY_REQUESTS, "{v}");
+        assert_eq!(v["limit"], "handlers");
+        // api_keys: cap 1 already spent on `key`; the next mint 429s.
+        let (st, _, v) = raw(
+            &h.router,
+            "POST",
+            &format!("/workspaces/{pid}/keys"),
+            &session_headers(&oc, &ocsrf),
+            Some(json!({"name": "second", "permission": "read"})),
+        )
+        .await;
+        assert_eq!(st, StatusCode::TOO_MANY_REQUESTS, "{v}");
+        assert_eq!(v["limit"], "api_keys");
+        // members: owner holds seat 1, cap 2 leaves one seat — the
+        // second invite 429s.
+        signup_and_verify(&h.router, &store, "m1@m.co", "a-long-enough-passphrase").await;
+        signup_and_verify(&h.router, &store, "m2@m.co", "a-long-enough-passphrase").await;
+        for (email, want) in [
+            ("m1@m.co", StatusCode::OK),
+            ("m2@m.co", StatusCode::TOO_MANY_REQUESTS),
+        ] {
+            let (st, _, v) = raw(
+                &h.router,
+                "POST",
+                &format!("/workspaces/{pid}/members"),
+                &session_headers(&oc, &ocsrf),
+                Some(json!({"email": email, "role": "member"})),
+            )
+            .await;
+            assert_eq!(st, want, "{email}: {v}");
+            if st == StatusCode::TOO_MANY_REQUESTS {
+                assert_eq!(v["limit"], "members");
+            }
+        }
+        // workspaces_per_account: the second create 429s.
+        let (st, _, v) = raw(
+            &h.router,
+            "POST",
+            "/workspaces",
+            &session_headers(&oc, &ocsrf),
+            Some(json!({"name": "beta"})),
+        )
+        .await;
+        assert_eq!(st, StatusCode::TOO_MANY_REQUESTS, "{v}");
+        assert_eq!(v["limit"], "workspaces_per_account");
+    }
+
+    /// live_runs, retained bytes and max_input_bytes answer at admit();
+    /// a soft-deleted workspace still owns its seat until the purge;
+    /// the not_before horizon and invites/day are plan-read.
+    #[tokio::test]
+    async fn s34_admit_and_deleted_ws_counts() {
+        let store = Arc::new(Memory::new());
+        let h = harness_store(false, None, Some(store.clone()));
+        set_free(&store, &[("live_runs", 1), ("max_input_bytes", 8)]).await;
+        signup_and_verify(&h.router, &store, "o@o.co", "a-long-enough-passphrase").await;
+        let (oc, ocsrf) = login_only(&h.router, "o@o.co", "a-long-enough-passphrase").await;
+        let pid = make_ws(&h.router, &oc, "alpha").await;
+        arm_step(&h.router, &oc, &ocsrf, &pid).await;
+        let (_, key) = make_key(&h.router, &oc, &ocsrf, &pid, "write").await;
+        // max_input_bytes: a 19-byte input refuses before live_runs.
+        let mut big = submit_body("big");
+        big["spec"]["input_b64"] = json!("AAAAAAAAAAAAAAAAAAA=");
+        let (st, v) = call(&h.router, "POST", "/jobs", Some(&key), Some(big)).await;
+        assert_eq!(st, StatusCode::TOO_MANY_REQUESTS, "{v}");
+        assert_eq!(v["limit"], "max_input_bytes");
+        // live_runs: a run parked ~29 days out fills the one slot; the
+        // next refuses.
+        let mut parked = submit_body("parked");
+        parked["not_before"] = json!((unix_ms() + 29 * 86_400_000) as u64);
+        let (st, v) = call(&h.router, "POST", "/jobs", Some(&key), Some(parked)).await;
+        assert_eq!(st, StatusCode::OK, "{v}");
+        let (st, v) = call(
+            &h.router,
+            "POST",
+            "/jobs",
+            Some(&key),
+            Some(submit_body("two")),
+        )
+        .await;
+        assert_eq!(st, StatusCode::TOO_MANY_REQUESTS, "{v}");
+        assert_eq!(v["limit"], "live_runs");
+        // The horizon is the plan's: not_before_days=1 refuses +2 days.
+        set_free(&store, &[("not_before_days", 1)]).await;
+        let mut far = submit_body("far");
+        far["not_before"] = json!((unix_ms() + 2 * 86_400_000) as u64);
+        let (st, v) = call(&h.router, "POST", "/jobs", Some(&key), Some(far)).await;
+        assert_eq!(st, StatusCode::BAD_REQUEST, "{v}");
+        assert_eq!(v["code"], "not_before_too_far");
+        // Soft-deleted workspaces still count against
+        // workspaces_per_account until the purge (D-067).
+        set_free(&store, &[("workspaces_per_account", 1)]).await;
+        let (st, _, _) = raw(
+            &h.router,
+            "DELETE",
+            &format!("/workspaces/{pid}"),
+            &session_headers(&oc, &ocsrf),
+            Some(json!({"confirm": "delete alpha"})),
+        )
+        .await;
+        assert_eq!(st, StatusCode::NO_CONTENT, "{st}");
+        let (st, _, v) = raw(
+            &h.router,
+            "POST",
+            "/workspaces",
+            &session_headers(&oc, &ocsrf),
+            Some(json!({"name": "beta"})),
+        )
+        .await;
+        assert_eq!(st, StatusCode::TOO_MANY_REQUESTS, "{v}");
+        assert_eq!(v["limit"], "workspaces_per_account");
+    }
+
+    /// invites_per_day is a store-side plan read — the second invite in
+    /// the window 429s with the limit's name.
+    #[tokio::test]
+    async fn s34_invites_per_day_is_plan_read() {
+        let store = Arc::new(Memory::new());
+        let h = harness_store(false, None, Some(store.clone()));
+        set_free(&store, &[("invites_per_day", 1), ("members", 10)]).await;
+        signup_and_verify(&h.router, &store, "o@o.co", "a-long-enough-passphrase").await;
+        let (oc, ocsrf) = login_only(&h.router, "o@o.co", "a-long-enough-passphrase").await;
+        let pid = make_ws(&h.router, &oc, "alpha").await;
+        signup_and_verify(&h.router, &store, "m1@m.co", "a-long-enough-passphrase").await;
+        signup_and_verify(&h.router, &store, "m2@m.co", "a-long-enough-passphrase").await;
+        for (email, want) in [
+            ("m1@m.co", StatusCode::OK),
+            ("m2@m.co", StatusCode::TOO_MANY_REQUESTS),
+        ] {
+            let (st, _, v) = raw(
+                &h.router,
+                "POST",
+                &format!("/workspaces/{pid}/members"),
+                &session_headers(&oc, &ocsrf),
+                Some(json!({"email": email, "role": "member"})),
+            )
+            .await;
+            assert_eq!(st, want, "{email}: {v}");
+            if st == StatusCode::TOO_MANY_REQUESTS {
+                assert_eq!(v["limit"], "invites_per_day");
+            }
+        }
     }
 }

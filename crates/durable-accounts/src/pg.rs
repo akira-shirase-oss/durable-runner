@@ -113,6 +113,45 @@ async fn bounded<T>(
     }
 }
 
+/// The limits a `plans` row carries — Free defaults when the row or
+/// its parse is missing. Called inside the caller's transaction so the
+/// cap check and the write serialize together (S3-4: plans are the
+/// single source for every limit).
+async fn plan_limits_tx(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    plan_id: &str,
+) -> Result<crate::PlanLimits, AccountError> {
+    let limits: Option<serde_json::Value> = bounded(
+        sqlx::query_scalar("SELECT limits FROM plans WHERE id = $1")
+            .bind(plan_id)
+            .fetch_optional(&mut **tx),
+    )
+    .await?;
+    Ok(limits
+        .and_then(|l| serde_json::from_value(l).ok())
+        .unwrap_or_default())
+}
+
+/// The limits governing `workspace` inside `tx` — the ws's own plan
+/// row, Free when the join finds nothing.
+async fn ws_limits_tx(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    workspace: u64,
+) -> Result<crate::PlanLimits, AccountError> {
+    let limits: Option<serde_json::Value> = bounded(
+        sqlx::query_scalar(
+            "SELECT p.limits FROM workspaces w \
+             JOIN plans p ON p.id = w.plan_id WHERE w.id = $1",
+        )
+        .bind(to_i64(workspace, "workspace")?)
+        .fetch_optional(&mut **tx),
+    )
+    .await?;
+    Ok(limits
+        .and_then(|l| serde_json::from_value(l).ok())
+        .unwrap_or_default())
+}
+
 /// Map one `api_keys` row (id, public_id, name, prefix, permission,
 /// revoked, last_used_at, created_by selected) to `ApiKeyInfo`.
 fn key_info_from(row: &sqlx::postgres::PgRow) -> Result<ApiKeyInfo, AccountError> {
@@ -285,7 +324,7 @@ impl AccountStore for Pg {
         )
         .await?
         .try_get(0)?;
-        if live as u64 >= crate::STOPGAP_KEYS_PER_WS {
+        if live as u64 >= ws_limits_tx(&mut tx, workspace).await?.api_keys {
             return Err(AccountError::PlanLimit("api_keys"));
         }
         let row = bounded(
@@ -1019,7 +1058,11 @@ impl AccountStore for Pg {
         )
         .await?
         .try_get(0)?;
-        if owned as u64 >= crate::STOPGAP_WS_PER_ACCOUNT {
+        if owned as u64
+            >= plan_limits_tx(&mut tx, crate::DEFAULT_PLAN)
+                .await?
+                .workspaces_per_account
+        {
             return Err(AccountError::PlanLimit("workspaces_per_account"));
         }
         let public_id = uuid::Uuid::now_v7();
@@ -1122,6 +1165,68 @@ impl AccountStore for Pg {
                 ))
             })
             .collect()
+    }
+
+    async fn count_owned_workspaces(&self, account: u64) -> Result<u64, AccountError> {
+        let n: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM members WHERE account_id = $1 AND role = 'owner'",
+        )
+        .bind(account as i64)
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(n as u64)
+    }
+
+    async fn plan(&self, id: &str) -> Result<Option<crate::Plan>, AccountError> {
+        let row = sqlx::query("SELECT name, limits FROM plans WHERE id = $1")
+            .bind(id)
+            .fetch_optional(&self.pool)
+            .await?;
+        Ok(row.map(|r| crate::Plan {
+            id: id.to_string(),
+            name: r.get("name"),
+            limits: serde_json::from_value(r.get("limits")).unwrap_or_default(),
+        }))
+    }
+
+    async fn plan_for_workspace(
+        &self,
+        workspace: u64,
+    ) -> Result<Option<crate::Plan>, AccountError> {
+        let row = sqlx::query(
+            "SELECT p.id, p.name, p.limits FROM workspaces w              JOIN plans p ON p.id = w.plan_id WHERE w.id = $1",
+        )
+        .bind(workspace as i64)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row.map(|r| crate::Plan {
+            id: r.get("id"),
+            name: r.get("name"),
+            limits: serde_json::from_value(r.get("limits")).unwrap_or_default(),
+        }))
+    }
+
+    async fn put_plan(
+        &self,
+        id: &str,
+        name: &str,
+        limits: &serde_json::Value,
+    ) -> Result<crate::Plan, AccountError> {
+        let parsed: crate::PlanLimits = serde_json::from_value(limits.clone())
+            .map_err(|e| AccountError::Store(format!("plan limits do not parse: {e}")))?;
+        sqlx::query(
+            "INSERT INTO plans (id, name, limits) VALUES ($1, $2, $3)              ON CONFLICT (id) DO UPDATE SET name = $2, limits = $3",
+        )
+        .bind(id)
+        .bind(name)
+        .bind(limits)
+        .execute(&self.pool)
+        .await?;
+        Ok(crate::Plan {
+            id: id.to_string(),
+            name: name.to_string(),
+            limits: parsed,
+        })
     }
 
     async fn list_members(&self, workspace: u64) -> Result<Vec<crate::MemberInfo>, AccountError> {
@@ -1257,7 +1362,7 @@ impl AccountStore for Pg {
         )
         .await?
         .try_get(0)?;
-        if today as u64 >= crate::STOPGAP_INVITES_PER_WS_DAY {
+        if today as u64 >= ws_limits_tx(&mut tx, workspace).await?.invites_per_day {
             return Err(AccountError::PlanLimit("invites_per_day"));
         }
         let public_id = uuid::Uuid::now_v7();
