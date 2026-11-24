@@ -1517,6 +1517,15 @@ impl Keyring {
             .unwrap_or_else(|e| e.into_inner())
             .remove(&bearer_hash);
     }
+
+    /// Write-through on workspace delete (D-072): every cached grant of
+    /// the workspace dies now — its keys are revoked in the same commit.
+    fn invalidate_ws(&self, ws: u64) {
+        self.cache
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .retain(|_, e| !matches!(e.outcome, Cached::Granted(p) if p.ws() == ws));
+    }
 }
 
 #[derive(Clone)]
@@ -1558,6 +1567,8 @@ struct App {
     session_key: std::sync::Arc<ring::hmac::Key>,
     /// The generation-checked session cache (review #10).
     sessions: std::sync::Arc<SessionCache>,
+    /// The generation-checked member-role cache (D-066).
+    members: std::sync::Arc<MemberCache>,
     /// The bounded argon2 queue (review #9).
     argon: std::sync::Arc<ArgonQueue>,
     /// Per-address limits for the open auth surface.
@@ -1714,6 +1725,7 @@ fn test_app(
         registry,
         session_key: std::sync::Arc::new(pubid.derive_key(b"session-token-v1")),
         sessions: std::sync::Arc::new(SessionCache::new()),
+        members: std::sync::Arc::new(MemberCache::new()),
         argon: std::sync::Arc::new(ArgonQueue::new()),
         auth_limits: std::sync::Arc::new(AuthLimits::new()),
         lockouts: std::sync::Arc::new(LoginLockouts::new()),
@@ -2382,6 +2394,88 @@ impl SessionCache {
             }
         }
         bumps.insert(account, Instant::now());
+    }
+}
+
+// ---- S3-3: the member-role cache (D-066) ----------------------------
+
+const MEMBER_GRANT_TTL: Duration = Duration::from_secs(60);
+const MEMBER_CACHE_CAP: usize = 10_000;
+
+struct MemberEntry {
+    at: Instant,
+    role: Role,
+}
+
+/// Roles resolve exactly like key grants: cached a bounded time,
+/// generation-checked across the store await, invalidated write-through.
+/// The invalidation key is the workspace — any member change in it
+/// (role set, remove, accept, workspace delete) clears every cached
+/// role in that workspace at once; membership churn is rare, the blast
+/// radius small.
+struct MemberCache {
+    grants: Mutex<HashMap<(u64, u64), MemberEntry>>,
+    ws_bumps: Mutex<HashMap<u64, Instant>>,
+}
+
+impl MemberCache {
+    fn new() -> Self {
+        Self {
+            grants: Mutex::new(HashMap::new()),
+            ws_bumps: Mutex::new(HashMap::new()),
+        }
+    }
+
+    fn get(&self, account: u64, ws: u64) -> Option<Role> {
+        let grants = self.grants.lock().unwrap_or_else(|e| e.into_inner());
+        let entry = grants.get(&(account, ws))?;
+        (entry.at.elapsed() < MEMBER_GRANT_TTL).then_some(entry.role)
+    }
+
+    /// Fill after the store await — refused if a bump landed during it
+    /// (review #10): deny rather than serve a role already changed.
+    fn put(&self, account: u64, ws: u64, role: Role, fill_start: Instant) -> bool {
+        if self
+            .ws_bumps
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&ws)
+            .is_some_and(|b| *b > fill_start)
+        {
+            return false;
+        }
+        let mut grants = self.grants.lock().unwrap_or_else(|e| e.into_inner());
+        if grants.len() >= MEMBER_CACHE_CAP {
+            grants.retain(|_, e| e.at.elapsed() < MEMBER_GRANT_TTL);
+            if grants.len() >= MEMBER_CACHE_CAP {
+                grants.clear();
+            }
+        }
+        grants.insert(
+            (account, ws),
+            MemberEntry {
+                at: Instant::now(),
+                role,
+            },
+        );
+        true
+    }
+
+    /// Write-through: every cached role in `ws` dies now, and a fill
+    /// that started before this moment dies on `put`.
+    fn bump_ws(&self, ws: u64) {
+        self.grants
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .retain(|(_, w), _| *w != ws);
+        let mut bumps = self.ws_bumps.lock().unwrap_or_else(|e| e.into_inner());
+        if bumps.len() >= BUMP_CAP {
+            bumps.retain(|_, at| at.elapsed() < BUMP_TTL);
+            if bumps.len() >= BUMP_CAP {
+                bumps.clear();
+            }
+        }
+        bumps.insert(ws, Instant::now());
     }
 }
 
@@ -3616,6 +3710,617 @@ async fn me_password(
         .unwrap_or_else(|_| header::HeaderValue::from_static("")),
     );
     Ok(res)
+}
+
+// ---- S3-3: workspaces, members, invites (D-066, D-072) --------------
+
+const INVITE_PREFIX: &str = "dri_";
+const INVITE_TTL_MS: i64 = 7 * 24 * 3600 * 1000;
+
+/// Resolve membership for a `/workspaces/{pid}/*` route (D-066): the
+/// path pid is the only authority — an `x-durable-workspace` header
+/// that names another workspace is a 400. A deleted workspace answers
+/// 410 `workspace_closed`; a non-member answers 404 (never 403 — the
+/// workspace's existence is itself member knowledge); a role below
+/// `need` answers 403.
+async fn member_access(
+    app: &App,
+    grant: &durable_accounts::SessionGrant,
+    pid: uuid::Uuid,
+    parts: &Parts,
+    need: Role,
+) -> Result<(durable_accounts::Workspace, Role), ApiError> {
+    if let Some(h) = parts
+        .headers
+        .get("x-durable-workspace")
+        .and_then(|v| v.to_str().ok())
+    {
+        if h != pid.to_string() {
+            return Err(ApiError::new(
+                StatusCode::BAD_REQUEST,
+                "workspace_mismatch",
+                "x-durable-workspace does not match the path workspace",
+            ));
+        }
+    }
+    let store = accounts(app)?;
+    let Some(ws) = store.workspace_by_public_id(pid).await.map_err(store_err)? else {
+        return Err(ApiError::new(
+            StatusCode::NOT_FOUND,
+            "not_found",
+            "no such workspace",
+        ));
+    };
+    if ws.deleted_at_ms.is_some() {
+        return Err(ApiError::new(
+            StatusCode::GONE,
+            "workspace_closed",
+            "this workspace is deleted",
+        ));
+    }
+    let account = grant.account.id;
+    let role = match app.members.get(account, ws.id) {
+        Some(role) => role,
+        None => {
+            let fill_start = Instant::now();
+            let Some(role) = store.member_role(account, ws.id).await.map_err(store_err)? else {
+                return Err(ApiError::new(
+                    StatusCode::NOT_FOUND,
+                    "not_found",
+                    "no such workspace",
+                ));
+            };
+            app.members.put(account, ws.id, role, fill_start);
+            role
+        }
+    };
+    if role < need {
+        return Err(ApiError::new(
+            StatusCode::FORBIDDEN,
+            "forbidden",
+            "this role may not do that",
+        ));
+    }
+    Ok((ws, role))
+}
+
+/// `dri_` + hex(32 B random). The store keeps sha256 only — the token
+/// crosses once, in the inviter's response.
+fn mint_invite_token() -> String {
+    let mut raw = [0u8; 32];
+    ring::rand::SecureRandom::fill(&ring::rand::SystemRandom::new(), &mut raw)
+        .unwrap_or_else(|_| panic!("rng"));
+    format!("{INVITE_PREFIX}{}", hex(&raw))
+}
+
+fn valid_ws_name(name: &str) -> bool {
+    let n = name.trim();
+    !n.is_empty() && n.len() <= 128 && n.chars().all(|c| c != '\u{0}')
+}
+
+async fn ws_create(
+    SessionAuth(grant): SessionAuth,
+    State(app): State<App>,
+    J(req): J<serde_json::Value>,
+) -> Result<Response, ApiError> {
+    if !grant.account.email_verified {
+        return Err(ApiError::new(
+            StatusCode::FORBIDDEN,
+            "email_unverified",
+            "verify the account's email first",
+        ));
+    }
+    let name = req.get("name").and_then(|v| v.as_str()).unwrap_or_default();
+    if !valid_ws_name(name) {
+        return Err(ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "bad_input",
+            "name must be 1-128 chars",
+        ));
+    }
+    let store = accounts(&app)?;
+    let ws = store
+        .create_workspace_for(grant.account.id, name.trim())
+        .await
+        .map_err(store_err)?;
+    Ok(no_store(
+        Json(serde_json::json!({
+            "public_id": ws.public_id,
+            "name": ws.name,
+            "role": "owner",
+            "handler_secret": hex(&ws.handler_secret),
+        }))
+        .into_response(),
+    ))
+}
+
+async fn ws_list_mine(
+    SessionAuth(grant): SessionAuth,
+    State(app): State<App>,
+) -> Result<Response, ApiError> {
+    let store = accounts(&app)?;
+    let rows = store
+        .workspaces_for_account(grant.account.id)
+        .await
+        .map_err(store_err)?;
+    let list: Vec<serde_json::Value> = rows
+        .iter()
+        .map(|(ws, role)| {
+            serde_json::json!({
+                "public_id": ws.public_id,
+                "name": ws.name,
+                "role": role.as_str(),
+            })
+        })
+        .collect();
+    Ok(no_store(
+        Json(serde_json::json!({ "workspaces": list })).into_response(),
+    ))
+}
+
+async fn ws_get(
+    SessionAuth(grant): SessionAuth,
+    State(app): State<App>,
+    axum::extract::Path(pid): axum::extract::Path<uuid::Uuid>,
+    parts: Parts,
+) -> Result<Response, ApiError> {
+    let (ws, role) = member_access(&app, &grant, pid, &parts, Role::Viewer).await?;
+    Ok(no_store(
+        Json(serde_json::json!({
+            "public_id": ws.public_id,
+            "name": ws.name,
+            "role": role.as_str(),
+        }))
+        .into_response(),
+    ))
+}
+
+async fn ws_patch(
+    SessionWrite(grant): SessionWrite,
+    State(app): State<App>,
+    axum::extract::Path(pid): axum::extract::Path<uuid::Uuid>,
+    parts: Parts,
+    J(req): J<serde_json::Value>,
+) -> Result<Response, ApiError> {
+    // PATCH is UPDATE-only: `{name}` and nothing else.
+    let name = req.get("name").and_then(|v| v.as_str()).unwrap_or_default();
+    if !valid_ws_name(name)
+        || req
+            .as_object()
+            .is_none_or(|o| o.keys().any(|k| k != "name"))
+    {
+        return Err(ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "bad_input",
+            "PATCH carries {name} only",
+        ));
+    }
+    let (ws, _) = member_access(&app, &grant, pid, &parts, Role::Admin).await?;
+    accounts(&app)?
+        .rename_workspace(ws.id, name.trim())
+        .await
+        .map_err(store_err)?;
+    Ok(no_store(
+        Json(serde_json::json!({ "public_id": ws.public_id, "name": name.trim() })).into_response(),
+    ))
+}
+
+async fn ws_delete(
+    SessionWrite(grant): SessionWrite,
+    State(app): State<App>,
+    axum::extract::Path(pid): axum::extract::Path<uuid::Uuid>,
+    parts: Parts,
+    J(req): J<serde_json::Value>,
+) -> Result<Response, ApiError> {
+    let (ws, _) = member_access(&app, &grant, pid, &parts, Role::Owner).await?;
+    let confirm = req
+        .get("confirm")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default();
+    if confirm != format!("delete {}", ws.name) {
+        return Err(ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "bad_input",
+            "confirm must be \"delete <name>\"",
+        ));
+    }
+    let store = accounts(&app)?;
+    store
+        .delete_workspace(ws.id, app.now_ms())
+        .await
+        .map_err(store_err)?;
+    // Keys die now, not at the cache TTL (D-072): drop every cached
+    // grant of this workspace, then every cached member role in it.
+    app.keyring.invalidate_ws(ws.id);
+    app.members.bump_ws(ws.id);
+    // Live runs are cancelled, finished history untouched (D-072).
+    if let Ok(page) = app
+        .engine
+        .list_in(ws.id, Order::Oldest { after: None }, usize::MAX)
+        .await
+    {
+        for run in page.runs {
+            if !run.state.is_terminal() {
+                let _ = app.engine.cancel(run.id).await;
+            }
+        }
+    }
+    Ok(no_store(StatusCode::NO_CONTENT.into_response()))
+}
+
+async fn ws_members(
+    SessionAuth(grant): SessionAuth,
+    State(app): State<App>,
+    axum::extract::Path(pid): axum::extract::Path<uuid::Uuid>,
+    parts: Parts,
+) -> Result<Response, ApiError> {
+    let (ws, _) = member_access(&app, &grant, pid, &parts, Role::Viewer).await?;
+    let rows = accounts(&app)?
+        .list_members(ws.id)
+        .await
+        .map_err(store_err)?;
+    let list: Vec<serde_json::Value> = rows
+        .iter()
+        .map(|m| {
+            serde_json::json!({
+                "account": { "public_id": m.account_public_id, "email": m.email },
+                "role": m.role.as_str(),
+                "since": m.since_ms,
+            })
+        })
+        .collect();
+    Ok(no_store(
+        Json(serde_json::json!({ "members": list })).into_response(),
+    ))
+}
+
+async fn ws_invite_member(
+    SessionWrite(grant): SessionWrite,
+    State(app): State<App>,
+    axum::extract::Path(pid): axum::extract::Path<uuid::Uuid>,
+    parts: Parts,
+    J(req): J<serde_json::Value>,
+) -> Result<Response, ApiError> {
+    let (ws, _) = member_access(&app, &grant, pid, &parts, Role::Admin).await?;
+    let email = req
+        .get("email")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default()
+        .to_lowercase();
+    let role = req
+        .get("role")
+        .and_then(|v| v.as_str())
+        .and_then(Role::parse);
+    // Members join only by invite, and owner rows only from POST
+    // /workspaces — `owner` is never a valid invite role.
+    let Some(role) = role.filter(|r| *r != Role::Owner) else {
+        return Err(ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "bad_input",
+            "role must be admin, member or viewer",
+        ));
+    };
+    if !durable_accounts::mail::valid_addr_spec(&email) {
+        return Err(ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "bad_input",
+            "not an email address",
+        ));
+    }
+    let store = accounts(&app)?;
+    let token = mint_invite_token();
+    let expires = app.now_ms() + INVITE_TTL_MS;
+    let Some(invite) = store
+        .create_invite(
+            ws.id,
+            &email,
+            role,
+            grant.account.id,
+            &sha256(token.as_bytes()),
+            expires,
+        )
+        .await
+        .map_err(store_err)?
+    else {
+        return Err(ApiError::new(
+            StatusCode::CONFLICT,
+            "invite_pending",
+            "a live invite already covers this address",
+        ));
+    };
+    // If the address already belongs to a member, refuse rather than
+    // mail a meaningless invite (409 already-member per review).
+    if let Some(acc) = store.account_by_email(&email).await.map_err(store_err)? {
+        if store
+            .member_role(acc.id, ws.id)
+            .await
+            .map_err(store_err)?
+            .is_some()
+        {
+            let _ = store.revoke_invite(ws.id, invite.public_id).await;
+            return Err(ApiError::new(
+                StatusCode::CONFLICT,
+                "already_member",
+                "this account is already a member",
+            ));
+        }
+    }
+    let (subject, body) = (
+        format!("Invitation to {}", ws.name),
+        format!(
+            "You were invited to {} as {}. Accept: /invites/accept with this token.",
+            ws.name,
+            role.as_str()
+        ),
+    );
+    let mail = Mail {
+        kind: "workspace-invite",
+        send_to: email.clone(),
+        subject,
+        text: body,
+        html: String::new(),
+        idempotency_key: format!("invite-{}", invite.public_id),
+        expires_at_ms: Some(expires),
+    };
+    let _ = store.enqueue_mail(&mail).await.map_err(store_err)?;
+    Ok(no_store(
+        Json(serde_json::json!({
+            "invite": {
+                "public_id": invite.public_id,
+                "email": invite.email,
+                "role": invite.role.as_str(),
+                "expires_at": invite.expires_at_ms,
+            },
+            "invite_url": format!("/invites/accept?token={token}"),
+        }))
+        .into_response(),
+    ))
+}
+
+async fn ws_member_patch(
+    SessionWrite(grant): SessionWrite,
+    State(app): State<App>,
+    axum::extract::Path((pid, account_pid)): axum::extract::Path<(uuid::Uuid, uuid::Uuid)>,
+    parts: Parts,
+    J(req): J<serde_json::Value>,
+) -> Result<Response, ApiError> {
+    let (ws, _) = member_access(&app, &grant, pid, &parts, Role::Admin).await?;
+    let role = req
+        .get("role")
+        .and_then(|v| v.as_str())
+        .and_then(Role::parse)
+        .filter(|r| *r != Role::Owner);
+    let Some(role) = role else {
+        return Err(ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "bad_input",
+            "role must be admin, member or viewer",
+        ));
+    };
+    let store = accounts(&app)?;
+    let Some(acc) = store
+        .account_by_public_id(account_pid)
+        .await
+        .map_err(store_err)?
+    else {
+        return Err(ApiError::new(
+            StatusCode::NOT_FOUND,
+            "not_found",
+            "no such member",
+        ));
+    };
+    match store
+        .set_member_role(ws.id, acc.id, role)
+        .await
+        .map_err(store_err)?
+    {
+        durable_accounts::MemberChange::Changed => {
+            app.members.bump_ws(ws.id);
+            Ok(no_store(
+                Json(serde_json::json!({ "account": { "public_id": account_pid }, "role": role.as_str() }))
+                    .into_response(),
+            ))
+        }
+        durable_accounts::MemberChange::NotFound => Err(ApiError::new(
+            StatusCode::NOT_FOUND,
+            "not_found",
+            "no such member",
+        )),
+        durable_accounts::MemberChange::LastOwner => Err(ApiError::new(
+            StatusCode::CONFLICT,
+            "last_owner",
+            "the owner row cannot be changed",
+        )),
+    }
+}
+
+async fn ws_member_remove(
+    SessionWrite(grant): SessionWrite,
+    State(app): State<App>,
+    axum::extract::Path((pid, account_pid)): axum::extract::Path<(uuid::Uuid, uuid::Uuid)>,
+    parts: Parts,
+) -> Result<Response, ApiError> {
+    let (ws, _) = member_access(&app, &grant, pid, &parts, Role::Admin).await?;
+    let store = accounts(&app)?;
+    let Some(acc) = store
+        .account_by_public_id(account_pid)
+        .await
+        .map_err(store_err)?
+    else {
+        return Err(ApiError::new(
+            StatusCode::NOT_FOUND,
+            "not_found",
+            "no such member",
+        ));
+    };
+    match store
+        .remove_member(ws.id, acc.id)
+        .await
+        .map_err(store_err)?
+    {
+        durable_accounts::MemberChange::Changed => {
+            app.members.bump_ws(ws.id);
+            Ok(no_store(StatusCode::NO_CONTENT.into_response()))
+        }
+        durable_accounts::MemberChange::NotFound => Err(ApiError::new(
+            StatusCode::NOT_FOUND,
+            "not_found",
+            "no such member",
+        )),
+        durable_accounts::MemberChange::LastOwner => Err(ApiError::new(
+            StatusCode::CONFLICT,
+            "last_owner",
+            "the owner row cannot be removed",
+        )),
+    }
+}
+
+async fn ws_invites(
+    SessionAuth(grant): SessionAuth,
+    State(app): State<App>,
+    axum::extract::Path(pid): axum::extract::Path<uuid::Uuid>,
+    parts: Parts,
+) -> Result<Response, ApiError> {
+    let (ws, _) = member_access(&app, &grant, pid, &parts, Role::Viewer).await?;
+    let rows = accounts(&app)?
+        .list_invites(ws.id)
+        .await
+        .map_err(store_err)?;
+    let list: Vec<serde_json::Value> = rows
+        .iter()
+        .map(|i| {
+            serde_json::json!({
+                "public_id": i.public_id,
+                "email": i.email,
+                "role": i.role.as_str(),
+                "expires_at": i.expires_at_ms,
+            })
+        })
+        .collect();
+    Ok(no_store(
+        Json(serde_json::json!({ "invites": list })).into_response(),
+    ))
+}
+
+async fn ws_invite_revoke(
+    SessionWrite(grant): SessionWrite,
+    State(app): State<App>,
+    axum::extract::Path((pid, iid)): axum::extract::Path<(uuid::Uuid, uuid::Uuid)>,
+    parts: Parts,
+) -> Result<Response, ApiError> {
+    let (ws, _) = member_access(&app, &grant, pid, &parts, Role::Admin).await?;
+    if !accounts(&app)?
+        .revoke_invite(ws.id, iid)
+        .await
+        .map_err(store_err)?
+    {
+        return Err(ApiError::new(
+            StatusCode::NOT_FOUND,
+            "not_found",
+            "no such invite",
+        ));
+    }
+    Ok(no_store(StatusCode::NO_CONTENT.into_response()))
+}
+
+/// `POST /invites/accept` — any verified session whose email matches
+/// the invite's bound address; a mismatch is 403 `invite_email_mismatch`
+/// before the token is consumed (the row is only revealed to the
+/// address it was mailed to).
+async fn invite_accept(
+    SessionWrite(grant): SessionWrite,
+    State(app): State<App>,
+    J(req): J<serde_json::Value>,
+) -> Result<Response, ApiError> {
+    if !grant.account.email_verified {
+        return Err(ApiError::new(
+            StatusCode::FORBIDDEN,
+            "email_unverified",
+            "verify the account's email first",
+        ));
+    }
+    let token = req
+        .get("token")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default();
+    if !token.starts_with(INVITE_PREFIX) {
+        return Err(ApiError::new(
+            StatusCode::NOT_FOUND,
+            "not_found",
+            "no such invite",
+        ));
+    }
+    let store = accounts(&app)?;
+    let hash = sha256(token.as_bytes());
+    let Some(live) = store
+        .invite_grant(&hash, app.now_ms())
+        .await
+        .map_err(store_err)?
+    else {
+        return Err(ApiError::new(
+            StatusCode::NOT_FOUND,
+            "not_found",
+            "no such invite",
+        ));
+    };
+    if !live.email.eq_ignore_ascii_case(&grant.account.email) {
+        return Err(ApiError::new(
+            StatusCode::FORBIDDEN,
+            "invite_email_mismatch",
+            "this invite was mailed to a different address",
+        ));
+    }
+    let Some((ws, role)) = store
+        .accept_invite(&hash, grant.account.id, app.now_ms())
+        .await
+        .map_err(store_err)?
+    else {
+        return Err(ApiError::new(
+            StatusCode::NOT_FOUND,
+            "not_found",
+            "no such invite",
+        ));
+    };
+    app.members.bump_ws(ws);
+    let ws = store
+        .workspace_by_id(ws)
+        .await
+        .map_err(store_err)?
+        .unwrap_or_else(|| unreachable!("an invite's workspace exists"));
+    Ok(no_store(
+        Json(serde_json::json!({
+            "workspace": {
+                "public_id": ws.public_id,
+                "name": ws.name,
+                "role": role.as_str(),
+            }
+        }))
+        .into_response(),
+    ))
+}
+
+async fn invite_decline(
+    SessionWrite(_grant): SessionWrite,
+    State(app): State<App>,
+    J(req): J<serde_json::Value>,
+) -> Result<Response, ApiError> {
+    let token = req
+        .get("token")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default();
+    if !token.starts_with(INVITE_PREFIX) {
+        return Err(ApiError::new(
+            StatusCode::NOT_FOUND,
+            "not_found",
+            "no such invite",
+        ));
+    }
+    let store = accounts(&app)?;
+    store
+        .decline_invite(&sha256(token.as_bytes()), app.now_ms())
+        .await
+        .map_err(store_err)?;
+    Ok(no_store(StatusCode::NO_CONTENT.into_response()))
 }
 
 /// `Cache-Control: no-store` + `Vary: Cookie` on every session-surface
@@ -5097,6 +5802,29 @@ fn router(app: App, ui_dir: Option<&Path>) -> Router {
         .route("/me/password", post(me_password))
         .route("/me/sessions", get(me_sessions).delete(me_revoke_all))
         .route("/me/sessions/{public_id}", delete(me_revoke_one))
+        // S3-3: the tenant control plane. Path pid is the only workspace
+        // authority on these routes; an x-durable-workspace header that
+        // disagrees is a 400 (D-066). Members join by invite only.
+        .route("/workspaces", get(ws_list_mine).post(ws_create))
+        .route(
+            "/workspaces/{pid}",
+            get(ws_get).patch(ws_patch).delete(ws_delete),
+        )
+        .route(
+            "/workspaces/{pid}/members",
+            get(ws_members).post(ws_invite_member),
+        )
+        .route(
+            "/workspaces/{pid}/members/{account_pid}",
+            axum::routing::patch(ws_member_patch).delete(ws_member_remove),
+        )
+        .route("/workspaces/{pid}/invites", get(ws_invites))
+        .route(
+            "/workspaces/{pid}/invites/{iid}",
+            axum::routing::delete(ws_invite_revoke),
+        )
+        .route("/invites/accept", post(invite_accept))
+        .route("/invites/decline", post(invite_decline))
         .route("/admin/compact", post(compact))
         .route("/admin/backup", post(backup))
         .route("/admin/diagnostics", get(diagnostics))
@@ -5485,6 +6213,7 @@ async fn main() -> Result<()> {
         registry,
         session_key: std::sync::Arc::new(pubid.derive_key(b"session-token-v1")),
         sessions: std::sync::Arc::new(SessionCache::new()),
+        members: std::sync::Arc::new(MemberCache::new()),
         argon: std::sync::Arc::new(ArgonQueue::new()),
         auth_limits: std::sync::Arc::new(AuthLimits::new()),
         lockouts: std::sync::Arc::new(LoginLockouts::new()),
@@ -15848,5 +16577,492 @@ mod tests {
         // DECISIVE(reset-token-replay)
         assert_eq!(st, StatusCode::GONE, "{v}");
         assert_eq!(v["code"], "token_gone");
+    }
+
+    // ---- S3-3: workspaces, members, roles, invites -------------------
+
+    /// Create `name` as `cookie`'s workspace; returns its public_id.
+    async fn make_ws(router: &Router, cookie: &str, name: &str) -> String {
+        let (st, _, v) = raw(
+            router,
+            "POST",
+            "/workspaces",
+            &[("cookie", cookie.to_string())],
+            Some(json!({"name": name})),
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK, "{v}");
+        assert_eq!(v["role"], "owner");
+        assert!(v["handler_secret"].as_str().is_some_and(|s| s.len() == 64));
+        v["public_id"].as_str().unwrap_or_default().to_string()
+    }
+
+    /// Invite `email` to `pid` as `role` under `cookie`/`csrf`; returns
+    /// the mailed token string from the one-time invite_url.
+    async fn make_invite(
+        router: &Router,
+        cookie: &str,
+        csrf: &str,
+        pid: &str,
+        email: &str,
+        role: &str,
+    ) -> (StatusCode, String, String) {
+        let (st, _, v) = raw(
+            router,
+            "POST",
+            &format!("/workspaces/{pid}/members"),
+            &[
+                ("cookie", cookie.to_string()),
+                ("x-durable-csrf", csrf.to_string()),
+            ],
+            Some(json!({"email": email, "role": role})),
+        )
+        .await;
+        let iid = v["invite"]["public_id"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string();
+        let url = v["invite_url"].as_str().unwrap_or_default().to_string();
+        let token = url.split("token=").nth(1).unwrap_or_default().to_string();
+        (st, iid, token)
+    }
+
+    fn session_headers(cookie: &str, csrf: &str) -> [(&'static str, String); 2] {
+        [
+            ("cookie", cookie.to_string()),
+            ("x-durable-csrf", csrf.to_string()),
+        ]
+    }
+
+    #[tokio::test]
+    async fn s33_workspace_lifecycle() {
+        let store = Arc::new(Memory::new());
+        let h = harness_store(false, None, Some(store.clone()));
+        signup_and_verify(&h.router, &store, "o@o.co", "a-long-enough-passphrase").await;
+        let (cookie, csrf) = login_only(&h.router, "o@o.co", "a-long-enough-passphrase").await;
+        let pid = make_ws(&h.router, &cookie, "alpha").await;
+        // Lists it as owner; GET shows the same role.
+        let (st, _, v) = raw(
+            &h.router,
+            "GET",
+            "/workspaces",
+            &[("cookie", cookie.clone())],
+            None,
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK);
+        assert_eq!(v["workspaces"][0]["role"], "owner");
+        let (st, _, v) = raw(
+            &h.router,
+            "GET",
+            &format!("/workspaces/{pid}"),
+            &[("cookie", cookie.clone())],
+            None,
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK, "{v}");
+        let (st, _, v) = raw(
+            &h.router,
+            "PATCH",
+            &format!("/workspaces/{pid}"),
+            &session_headers(&cookie, &csrf),
+            Some(json!({"name": "beta"})),
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK, "{v}");
+        // Unverified account cannot create.
+        signup_only(&h.router, "u@u.co", "a-long-enough-passphrase").await;
+        let (uc, _) = login_only(&h.router, "u@u.co", "a-long-enough-passphrase").await;
+        let (st, _, v) = raw(
+            &h.router,
+            "POST",
+            "/workspaces",
+            &[("cookie", uc)],
+            Some(json!({"name": "nope"})),
+        )
+        .await;
+        assert_eq!(st, StatusCode::FORBIDDEN, "{v}");
+        assert_eq!(v["code"], "email_unverified");
+    }
+
+    /// idor-workspace: a member of A on B's pid answers 404 — never a
+    /// hint the workspace exists.
+    #[tokio::test]
+    async fn s33_idor_workspace() {
+        let store = Arc::new(Memory::new());
+        let h = harness_store(false, None, Some(store.clone()));
+        signup_and_verify(&h.router, &store, "a@a.co", "a-long-enough-passphrase").await;
+        signup_and_verify(&h.router, &store, "b@b.co", "a-long-enough-passphrase").await;
+        let (ac, _) = login_only(&h.router, "a@a.co", "a-long-enough-passphrase").await;
+        let (bc, _) = login_only(&h.router, "b@b.co", "a-long-enough-passphrase").await;
+        let pid_b = make_ws(&h.router, &bc, "bspace").await;
+        let (st, _, _) = raw(
+            &h.router,
+            "GET",
+            &format!("/workspaces/{pid_b}"),
+            &[("cookie", ac.clone())],
+            None,
+        )
+        .await;
+        assert_eq!(st, StatusCode::NOT_FOUND);
+        // Same answer for a pid that does not exist at all.
+        let ghost = uuid::Uuid::now_v7();
+        let (st2, _, _) = raw(
+            &h.router,
+            "GET",
+            &format!("/workspaces/{ghost}"),
+            &[("cookie", ac)],
+            None,
+        )
+        .await;
+        assert_eq!(st, st2, "non-member and missing must be indistinguishable");
+    }
+
+    /// ws-header-path-mismatch: a header naming another workspace is a
+    /// 400; matching the path is fine.
+    #[tokio::test]
+    async fn s33_ws_header_path_mismatch() {
+        let store = Arc::new(Memory::new());
+        let h = harness_store(false, None, Some(store.clone()));
+        signup_and_verify(&h.router, &store, "o@o.co", "a-long-enough-passphrase").await;
+        let (cookie, _) = login_only(&h.router, "o@o.co", "a-long-enough-passphrase").await;
+        let pid = make_ws(&h.router, &cookie, "alpha").await;
+        let other = make_ws(&h.router, &cookie, "beta").await;
+        let (st, _, v) = raw(
+            &h.router,
+            "GET",
+            &format!("/workspaces/{pid}"),
+            &[
+                ("cookie", cookie.clone()),
+                ("x-durable-workspace", other.clone()),
+            ],
+            None,
+        )
+        .await;
+        assert_eq!(st, StatusCode::BAD_REQUEST, "{v}");
+        assert_eq!(v["code"], "workspace_mismatch");
+        let (st, _, _) = raw(
+            &h.router,
+            "GET",
+            &format!("/workspaces/{pid}"),
+            &[
+                ("cookie", cookie.clone()),
+                ("x-durable-workspace", pid.clone()),
+            ],
+            None,
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK);
+    }
+
+    /// child-id-idor, one case per child kind under the path: a foreign
+    /// invite and a foreign member addressed under one's own pid answer
+    /// 404 and leave the foreign row untouched.
+    #[tokio::test]
+    async fn s33_child_id_idor() {
+        let store = Arc::new(Memory::new());
+        let h = harness_store(false, None, Some(store.clone()));
+        signup_and_verify(&h.router, &store, "a@a.co", "a-long-enough-passphrase").await;
+        signup_and_verify(&h.router, &store, "b@b.co", "a-long-enough-passphrase").await;
+        let (ac, acsrf) = login_only(&h.router, "a@a.co", "a-long-enough-passphrase").await;
+        let (bc, bcsrf) = login_only(&h.router, "b@b.co", "a-long-enough-passphrase").await;
+        let pid_a = make_ws(&h.router, &ac, "aspace").await;
+        let pid_b = make_ws(&h.router, &bc, "bspace").await;
+        // B holds a live invite for c@c.co; A tries to revoke it under A's pid.
+        let (ist, iid_b, _) = make_invite(&h.router, &bc, &bcsrf, &pid_b, "c@c.co", "member").await;
+        assert_eq!(ist, StatusCode::OK);
+        let (st, _, _) = raw(
+            &h.router,
+            "DELETE",
+            &format!("/workspaces/{pid_a}/invites/{iid_b}"),
+            &session_headers(&ac, &acsrf),
+            None,
+        )
+        .await;
+        assert_eq!(st, StatusCode::NOT_FOUND);
+        // B's invite is untouched — still listed for B.
+        let (st, _, v) = raw(
+            &h.router,
+            "GET",
+            &format!("/workspaces/{pid_b}/invites"),
+            &[("cookie", bc.clone())],
+            None,
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK);
+        assert_eq!(v["invites"][0]["public_id"], iid_b);
+        // Same for a member row: A tries to remove B's owner under A's pid.
+        let (st, _, v) = raw(
+            &h.router,
+            "GET",
+            &format!("/workspaces/{pid_b}/members"),
+            &[("cookie", bc.clone())],
+            None,
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK);
+        let owner_pid = v["members"][0]["account"]["public_id"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string();
+        let (st, _, _) = raw(
+            &h.router,
+            "DELETE",
+            &format!("/workspaces/{pid_a}/members/{owner_pid}"),
+            &session_headers(&ac, &acsrf),
+            None,
+        )
+        .await;
+        assert_eq!(st, StatusCode::NOT_FOUND);
+        let (st, _, v) = raw(
+            &h.router,
+            "GET",
+            &format!("/workspaces/{pid_b}/members"),
+            &[("cookie", bc.clone())],
+            None,
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK);
+        assert_eq!(
+            v["members"].as_array().map(|m| m.len()),
+            Some(1),
+            "foreign member row unchanged"
+        );
+    }
+
+    /// role-escalation: a viewer cannot PATCH a member, a member cannot
+    /// DELETE the workspace, and an admin cannot demote the owner.
+    #[tokio::test]
+    async fn s33_role_escalation() {
+        let store = Arc::new(Memory::new());
+        let h = harness_store(false, None, Some(store.clone()));
+        signup_and_verify(&h.router, &store, "o@o.co", "a-long-enough-passphrase").await;
+        signup_and_verify(&h.router, &store, "v@v.co", "a-long-enough-passphrase").await;
+        signup_and_verify(&h.router, &store, "m@m.co", "a-long-enough-passphrase").await;
+        signup_and_verify(&h.router, &store, "x@x.co", "a-long-enough-passphrase").await;
+        let (oc, ocsrf) = login_only(&h.router, "o@o.co", "a-long-enough-passphrase").await;
+        let pid = make_ws(&h.router, &oc, "alpha").await;
+        // Seat them: viewer, member, admin — via real invites.
+        for (email, role) in [
+            ("v@v.co", "viewer"),
+            ("m@m.co", "member"),
+            ("x@x.co", "admin"),
+        ] {
+            let (ist, _, token) = make_invite(&h.router, &oc, &ocsrf, &pid, email, role).await;
+            assert_eq!(ist, StatusCode::OK);
+            let (c, csrf) = login_only(&h.router, email, "a-long-enough-passphrase").await;
+            let (st, _, _) = raw(
+                &h.router,
+                "POST",
+                "/invites/accept",
+                &[("cookie", c), ("x-durable-csrf", csrf)],
+                Some(json!({"token": token})),
+            )
+            .await;
+            assert_eq!(st, StatusCode::OK);
+        }
+        let (vc, vcsrf) = login_only(&h.router, "v@v.co", "a-long-enough-passphrase").await;
+        let (mc, mcsrf) = login_only(&h.router, "m@m.co", "a-long-enough-passphrase").await;
+        let (xc, xcsrf) = login_only(&h.router, "x@x.co", "a-long-enough-passphrase").await;
+        let (st, _, v) = raw(
+            &h.router,
+            "GET",
+            &format!("/workspaces/{pid}/members"),
+            &[("cookie", vc.clone())],
+            None,
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK, "{v}");
+        let owner_pid = v["members"]
+            .as_array()
+            .unwrap_or_else(|| panic!("{v}"))
+            .iter()
+            .find(|m| m["role"] == "owner")
+            .unwrap_or_else(|| panic!("{v}"))["account"]["public_id"]
+            .as_str()
+            .unwrap_or_else(|| panic!("{v}"))
+            .to_string();
+        // Viewer PATCHes a member → 403.
+        let (st, _, _) = raw(
+            &h.router,
+            "PATCH",
+            &format!("/workspaces/{pid}/members/{owner_pid}"),
+            &session_headers(&vc, &vcsrf),
+            Some(json!({"role": "viewer"})),
+        )
+        .await;
+        assert_eq!(st, StatusCode::FORBIDDEN);
+        // Member DELETEs the workspace → 403.
+        let (st, _, _) = raw(
+            &h.router,
+            "DELETE",
+            &format!("/workspaces/{pid}"),
+            &session_headers(&mc, &mcsrf),
+            Some(json!({"confirm": "delete alpha"})),
+        )
+        .await;
+        assert_eq!(st, StatusCode::FORBIDDEN);
+        // Admin demotes the owner → 409 last_owner.
+        let (st, _, v) = raw(
+            &h.router,
+            "PATCH",
+            &format!("/workspaces/{pid}/members/{owner_pid}"),
+            &session_headers(&xc, &xcsrf),
+            Some(json!({"role": "member"})),
+        )
+        .await;
+        assert_eq!(st, StatusCode::CONFLICT, "{v}");
+        assert_eq!(v["code"], "last_owner");
+    }
+
+    /// invite-hijack: a session whose email is not the invite's bound
+    /// address answers 403 invite_email_mismatch; the invite stays live.
+    #[tokio::test]
+    async fn s33_invite_hijack() {
+        let store = Arc::new(Memory::new());
+        let h = harness_store(false, None, Some(store.clone()));
+        signup_and_verify(&h.router, &store, "o@o.co", "a-long-enough-passphrase").await;
+        signup_and_verify(&h.router, &store, "n@n.co", "a-long-enough-passphrase").await;
+        signup_and_verify(&h.router, &store, "w@w.co", "a-long-enough-passphrase").await;
+        let (oc, ocsrf) = login_only(&h.router, "o@o.co", "a-long-enough-passphrase").await;
+        let pid = make_ws(&h.router, &oc, "alpha").await;
+        let (ist, _, token) = make_invite(&h.router, &oc, &ocsrf, &pid, "w@w.co", "admin").await;
+        assert_eq!(ist, StatusCode::OK);
+        // The wrong account presents the token → 403, invite unconsumed.
+        let (nc, ncsrf) = login_only(&h.router, "n@n.co", "a-long-enough-passphrase").await;
+        let (st, _, v) = raw(
+            &h.router,
+            "POST",
+            "/invites/accept",
+            &session_headers(&nc, &ncsrf),
+            Some(json!({"token": token})),
+        )
+        .await;
+        assert_eq!(st, StatusCode::FORBIDDEN, "{v}");
+        assert_eq!(v["code"], "invite_email_mismatch");
+        // The bound account accepts → member with the invited role.
+        let (wc, wcsrf) = login_only(&h.router, "w@w.co", "a-long-enough-passphrase").await;
+        let (st, _, v) = raw(
+            &h.router,
+            "POST",
+            "/invites/accept",
+            &session_headers(&wc, &wcsrf),
+            Some(json!({"token": token})),
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK, "{v}");
+        assert_eq!(v["workspace"]["role"], "admin");
+    }
+
+    /// last-owner: removing the owner answers 409 and the row stays.
+    #[tokio::test]
+    async fn s33_last_owner() {
+        let store = Arc::new(Memory::new());
+        let h = harness_store(false, None, Some(store.clone()));
+        signup_and_verify(&h.router, &store, "o@o.co", "a-long-enough-passphrase").await;
+        let (oc, ocsrf) = login_only(&h.router, "o@o.co", "a-long-enough-passphrase").await;
+        let pid = make_ws(&h.router, &oc, "alpha").await;
+        let (st, _, v) = raw(
+            &h.router,
+            "GET",
+            &format!("/workspaces/{pid}/members"),
+            &[("cookie", oc.clone())],
+            None,
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK);
+        let owner_pid = v["members"][0]["account"]["public_id"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string();
+        let (st, _, v) = raw(
+            &h.router,
+            "DELETE",
+            &format!("/workspaces/{pid}/members/{owner_pid}"),
+            &session_headers(&oc, &ocsrf),
+            None,
+        )
+        .await;
+        assert_eq!(st, StatusCode::CONFLICT, "{v}");
+        assert_eq!(v["code"], "last_owner");
+        let (st, _, v) = raw(
+            &h.router,
+            "GET",
+            &format!("/workspaces/{pid}/members"),
+            &[("cookie", oc)],
+            None,
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK);
+        assert_eq!(v["members"].as_array().map(|m| m.len()), Some(1));
+    }
+
+    /// deleted-ws-key: a key of a deleted workspace answers 401 on the
+    /// very next request, even though it was granted moments ago; the
+    /// workspace's member surface answers 410.
+    #[tokio::test]
+    async fn s33_deleted_ws_key() {
+        let store = Arc::new(Memory::new());
+        let h = harness_store(false, None, Some(store.clone()));
+        signup_and_verify(&h.router, &store, "o@o.co", "a-long-enough-passphrase").await;
+        let (oc, ocsrf) = login_only(&h.router, "o@o.co", "a-long-enough-passphrase").await;
+        let pid = make_ws(&h.router, &oc, "alpha").await;
+        // A store key for this ws, warmed into the key cache.
+        let ws = store
+            .workspace_by_public_id(uuid::Uuid::parse_str(&pid).unwrap_or_else(|e| panic!("{e}")))
+            .await
+            .unwrap_or_else(|e| panic!("{e}"))
+            .unwrap_or_else(|| panic!("ws missing"));
+        let key = format!("dr_{}", "f".repeat(48));
+        store
+            .create_key(
+                ws.id,
+                "k",
+                Permission::Write,
+                &sha256(key.as_bytes()),
+                "dr_f",
+            )
+            .await
+            .unwrap_or_else(|e| panic!("{e}"));
+        let (st, _) = call(&h.router, "GET", "/jobs", Some(&key), None).await;
+        assert_eq!(st, StatusCode::OK, "key live before delete");
+        let (st, _, _) = raw(
+            &h.router,
+            "DELETE",
+            &format!("/workspaces/{pid}"),
+            &session_headers(&oc, &ocsrf),
+            Some(json!({"confirm": "delete alpha"})),
+        )
+        .await;
+        assert_eq!(st, StatusCode::NO_CONTENT);
+        // The cached grant is gone — 401 on this same request.
+        let (st, _) = call(&h.router, "GET", "/jobs", Some(&key), None).await;
+        assert_eq!(
+            st,
+            StatusCode::UNAUTHORIZED,
+            "deleted ws's key is dead at once"
+        );
+        // Members see 410, outsiders still see nothing.
+        let (st, _, v) = raw(
+            &h.router,
+            "GET",
+            &format!("/workspaces/{pid}"),
+            &[("cookie", oc.clone())],
+            None,
+        )
+        .await;
+        assert_eq!(st, StatusCode::GONE, "{v}");
+        assert_eq!(v["code"], "workspace_closed");
+        // And it is gone from the list.
+        let (st, _, v) = raw(
+            &h.router,
+            "GET",
+            "/workspaces",
+            &[("cookie", oc.clone())],
+            None,
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK);
+        assert_eq!(v["workspaces"].as_array().map(|w| w.len()), Some(0), "{v}");
     }
 }
