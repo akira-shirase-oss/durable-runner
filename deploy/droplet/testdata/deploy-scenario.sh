@@ -90,6 +90,8 @@ esac
 p=\$DURABLE_PROC_ROOT/\$\$; mkdir -p "\$p"
 printf '%s\0' "\$0" "\$@" >"\$p/cmdline"; env -0 >"\$p/environ"; ln -sfn /usr/local/bin/durable-server "\$p/exe"
 echo "durable-server $2 starting" >&2
+# What inspector_csp would hash: the dashboard linked at this start.
+grep -o '<title>[^<]*' "\${DURABLE_UI_DIR:-/nonexistent}/index.html" 2>/dev/null | cut -c8- >"\$p/ui-at-start" || true
 [[ -n "\${DATABASE_URL:-}" && $3 != nodb ]] && echo "durable-server: account store connected, migrations applied" >&2
 exec python3 /opt/stub/serve.py
 EOF
@@ -130,6 +132,8 @@ prev() { /usr/local/bin/durable-server.prev --version 2>/dev/null | cut -d' ' -f
 dash() { grep -o '<title>[^<]*' /opt/durable/dashboard/index.html 2>/dev/null | cut -c8-; }
 ready() { [[ "$(curl -s -o /dev/null -w '%{http_code}' --max-time 2 http://127.0.0.1:58300/ready)" == 200 ]]; }
 pid() { systemctl show -p MainPID --value durable-server; }
+# csp_ok: the running server started with the dashboard that is linked now (its CSP matches).
+csp_ok() { [[ "$(cat "$DURABLE_PROC_ROOT/$(pid)/ui-at-start" 2>/dev/null)" == "$(dash)" ]]; }
 
 echo "0. a first release that crashes"
 build v0 crash
@@ -140,7 +144,7 @@ deploy v0 && bad "a crashing first release was reported live" || ok "fails"
 echo "1. the first release"
 build v1 ok
 deploy v1 && ok "succeeds" || { tail -5 /tmp/deploy-v1.out; bad "failed"; }
-[[ "$(live)" == v1 && "$(dash)" == v1 ]] && ready && ok "v1 serves its own dashboard, /ready" || bad "live $(live), dashboard $(dash)"
+[[ "$(live)" == v1 && "$(dash)" == v1 ]] && ready && csp_ok && ok "v1 serves its own dashboard (started with it linked), /ready" || bad "live $(live), dashboard $(dash)"
 [[ -x /usr/local/bin/durable-lab-guard && -x /usr/local/bin/durable-run && -x /usr/local/bin/durable-saas-run && "$(/usr/local/bin/durable-cli)" == "durable-cli v1" ]] \
   && ok "start-up scripts, lab guard and CLI in /usr/local/bin" || bad "scripts in /usr/local/bin: $(ls /usr/local/bin)"
 [[ ! -e /root/dashboard-v1.tgz && ! -e /usr/local/bin/durable-server.failed ]] && ok "the upload and the failed binary are cleaned up" || bad "leftovers"
@@ -148,12 +152,12 @@ deploy v1 && ok "succeeds" || { tail -5 /tmp/deploy-v1.out; bad "failed"; }
 echo "2. an upgrade"
 build v2 ok
 deploy v2 && ok "succeeds" || { tail -8 /tmp/deploy-v2.out; bad "failed"; }
-[[ "$(live)" == v2 && "$(prev)" == v1 && "$(dash)" == v2 ]] && ready && ok "v2 live, v1 kept as .prev, dashboard v2" || bad "live $(live) prev $(prev) dash $(dash)"
+[[ "$(live)" == v2 && "$(prev)" == v1 && "$(dash)" == v2 ]] && ready && csp_ok && ok "v2 live, v1 kept as .prev, dashboard v2" || bad "live $(live) prev $(prev) dash $(dash)"
 grep -q 'upgrade ok' /tmp/deploy-v2.out && ok "through upgrade.sh (staged copy, format guard, smoke)" || bad "upgrade.sh didn't report ok"
 
 echo "3. --rollback"
 /kit/deploy/droplet/direct/droplet-deploy.sh --rollback >/tmp/rollback.out 2>&1 && ok "succeeds" || { tail -5 /tmp/rollback.out; bad "failed"; }
-[[ "$(live)" == v1 && "$(dash)" == v1 ]] && ready && ok "v1 and its dashboard back" || bad "after --rollback: live $(live) dash $(dash)"
+[[ "$(live)" == v1 && "$(dash)" == v1 ]] && ready && csp_ok && ok "v1 and its dashboard back, the CSP matching it" || bad "after --rollback: live $(live) dash $(dash)"
 
 echo "4. another upgrade"
 build v3 ok
@@ -165,7 +169,7 @@ echo "5. a build that dies on start"
 before=$(pid)
 build v4 crash
 deploy v4 && bad "a crashing build was reported live" || ok "fails"
-[[ "$(live)" == v3 && "$(dash)" == v3 ]] && ready && ok "restore_prev put v3 back, and its dashboard" || bad "after a crash: live $(live) dash $(dash)"
+[[ "$(live)" == v3 && "$(dash)" == v3 ]] && ready && csp_ok && ok "restore_prev put v3 back, and its dashboard, the CSP matching it" || bad "after a crash: live $(live) dash $(dash)"
 [[ "$(pid)" != "$before" ]] && ok "(v3 restarted by upgrade.sh)" || bad "v3 wasn't restarted"
 [[ ! -d "$(ls -d /opt/durable/dashboards/*v4* 2>/dev/null || echo /nonexistent)" ]] && ok "the failed dashboard is gone" || bad "v4's dashboard is left"
 
@@ -173,7 +177,7 @@ echo "6. a build that is up but fails its smoke"
 build v5 nodb
 deploy v5 && bad "a build without its account store was reported live" || ok "fails"
 grep -q 'rollback.sh' /tmp/deploy-v5.out && ok "rollback.sh was run" || bad "no rollback.sh: $(tail -5 /tmp/deploy-v5.out)"
-[[ "$(live)" == v3 && "$(dash)" == v3 ]] && ready && ok "v3 back and serving" || bad "after a failed smoke: live $(live) dash $(dash)"
+[[ "$(live)" == v3 && "$(dash)" == v3 ]] && ready && csp_ok && ok "v3 back and serving, the CSP matching its dashboard" || bad "after a failed smoke: live $(live) dash $(dash)"
 
 echo "7. a lab build"
 before=$(pid); : >"$S/calls"

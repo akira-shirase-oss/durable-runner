@@ -51,6 +51,19 @@ wait_ready() {
   return 1
 }
 
+# The server hashes the dashboard's inline scripts into its CSP once, at startup (inspector_csp).
+# So the link must point at the dashboard a server will serve BEFORE that server starts, and a
+# server that (re)started while another dashboard was linked restarts once after the link moves.
+# restart_if_started_since <pid before>: that restart, when the unit's MainPID changed.
+restart_if_started_since() {
+  local now_pid
+  now_pid=$(unit_main_pid)
+  if [[ "$now_pid" != 0 && "$now_pid" != "$1" ]]; then
+    log "restarting once so the server's CSP matches the dashboard linked now"
+    if ! systemctl restart "$DR_UNIT" 9>&- || ! wait_ready; then log "warning: that restart didn't come up ready: journalctl -u $DR_UNIT"; fi
+  fi
+}
+
 if [[ "${1:-}" == --status ]]; then
   echo "binary     $(sha256_of "$DR_BIN/durable-server" 2>/dev/null || echo none)  $("$DR_BIN/durable-server" --version 2>/dev/null || true)"
   echo "previous   $(sha256_of "$DR_BIN/durable-server.prev" 2>/dev/null || echo none)"
@@ -66,10 +79,15 @@ flock -w 120 9 || die "a build or deploy has held $BUILD/.lock for 2 minutes"
 # behind can hold the next deploy off.
 
 if [[ "${1:-}" == --rollback ]]; then
-  prev=$(dash_prev) now=$(dash_now)
+  prev=$(dash_prev) now=$(dash_now) before=$(unit_main_pid)
   log "rolling back: deploy/rollback.sh (previous binary), dashboard ${now:-none} -> ${prev:-unchanged}"
-  (cd "$src" && deploy/rollback.sh 9>&-) || die "deploy/rollback.sh failed (above); the dashboard was left as it was"
+  # The previous dashboard first, so the restored server hashes the page it will serve.
   switch_dash "$prev"
+  if ! (cd "$src" && deploy/rollback.sh 9>&-); then
+    switch_dash "$now"
+    restart_if_started_since "$before"
+    die "deploy/rollback.sh failed (above); the dashboard is back to $now"
+  fi
   echo "rolled back $(date -u +%FT%TZ) from: $(cat "$DR_OPT/deployed" 2>/dev/null || echo unknown)" >"$DR_OPT/deployed"
   log "rolled back ($((SECONDS - start)) s)"
   exit 0
@@ -116,11 +134,14 @@ old_dash=$(dash_now)
 if install_scripts "$src/deploy"; then log "start-up scripts updated in $DR_BIN"; fi
 if put_file "$src/deploy/droplet/durable-server.service" "$DR_UNIT_FILE" 0644; then systemctl daemon-reload; log "unit updated"; fi
 
-fail() { # <message>: the dashboard goes back, the new one is deleted, and we stop.
+# undo_dash [<pid before>]: the previous dashboard back and the new one deleted; with a pid, a
+# server that started since then restarts once to match it.
+undo_dash() {
   if [[ -n "$old_dash" ]]; then switch_dash "$old_dash"; fi
   rm -rf "${DR_DASHES:?}/$name"
-  die "$1"
+  if [[ -n "${1:-}" ]]; then restart_if_started_since "$1"; fi
 }
+fail() { undo_dash "${2:-}"; die "$1"; } # <message> [<pid before>]
 log "switching dashboard ${old_dash:-none} -> $name"
 switch_dash "$name"
 
@@ -142,13 +163,18 @@ if [[ ! -e "$DR_BIN/durable-server" ]]; then
   fi
 else
   log "deploy/upgrade.sh (staged copy, format guard, swap, /ready, smoke; restore_prev on a failed start)"
+  before=$(unit_main_pid)
   if ! (cd "$src" && deploy/upgrade.sh "$incoming/durable-server" 9>&-); then
     if [[ "$(sha256_of "$DR_BIN/durable-server")" == "$sum_server" ]]; then
       log "the new build is in place but failed its checks: deploy/rollback.sh"
-      (cd "$src" && deploy/rollback.sh 9>&-) || fail "upgrade failed its checks and deploy/rollback.sh failed too (above): journalctl -u $DR_UNIT"
-      fail "${commit:0:12} failed its checks; rolled back to the previous binary and dashboard"
+      # The old dashboard first, so the restored server hashes the page it will serve.
+      undo_dash
+      (cd "$src" && deploy/rollback.sh 9>&-) || die "upgrade failed its checks and deploy/rollback.sh failed too (above): journalctl -u $DR_UNIT"
+      die "${commit:0:12} failed its checks; rolled back to the previous binary and dashboard"
     fi
-    fail "upgrade.sh refused or restored the previous binary (above); the previous dashboard is back"
+    # upgrade.sh refused before the swap, or restore_prev restarted the previous binary while the new
+    # dashboard was linked: back to the old one, restarting if anything started meanwhile.
+    fail "upgrade.sh refused or restored the previous binary (above); the previous dashboard is back" "$before"
   fi
 fi
 put_file "$incoming/durable-cli" "$DR_BIN/durable-cli" 0755 || true
