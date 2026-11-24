@@ -58,7 +58,9 @@
   --c-alert: #f04438;
 
   /* inspector only: the page behind the cards, row states, input edges (3:1 on a card) */
-  --c-app: #f6f7f9;
+  --c-app: #ffffff;
+  --c-side: #ffffff;
+  --c-side-edge: #ebebeb;
   --c-row-hover: #fafafb;
   --c-row-selected: #fff4ee;
   --c-input-edge: #8d9299;
@@ -136,6 +138,8 @@
     --c-state-probe-bg: #2a2244;
     --c-alert: #f97066;
     --c-app: #0d0e10;
+    --c-side: #111316;
+    --c-side-edge: #24262a;
     --c-row-hover: #1c1f23;
     --c-row-selected: #24180f;
     --c-input-edge: #666b74;
@@ -205,6 +209,8 @@
   --c-state-probe-bg: #2a2244;
   --c-alert: #f97066;
   --c-app: #0d0e10;
+  --c-side: #111316;
+  --c-side-edge: #24262a;
   --c-row-hover: #1c1f23;
   --c-row-selected: #24180f;
   --c-input-edge: #666b74;

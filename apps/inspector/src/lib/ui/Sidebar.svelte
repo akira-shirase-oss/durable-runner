@@ -90,8 +90,10 @@
 		gap: 18px;
 		height: 100vh;
 		height: 100dvh;
-		padding: 18px 14px 14px;
+		padding: 22px 16px 16px;
 		overflow-y: auto;
+		background: var(--c-side);
+		border-right: 1px solid var(--c-side-edge);
 	}
 	.head {
 		display: flex;

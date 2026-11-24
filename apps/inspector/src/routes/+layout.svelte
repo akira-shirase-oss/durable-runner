@@ -64,13 +64,13 @@
 <style>
 	.shell {
 		display: grid;
-		grid-template-columns: 244px minmax(0, 1fr);
+		grid-template-columns: 256px minmax(0, 1fr);
 		min-height: 100vh;
 		min-height: 100dvh;
 	}
 	.content {
 		min-width: 0;
-		padding: 0 28px 48px 12px;
+		padding: 0 40px 64px;
 	}
 	.skip {
 		position: fixed;
@@ -99,8 +99,7 @@
 	}
 	main {
 		min-width: 0;
-		max-width: 1360px;
-		padding-top: 4px;
+		padding-top: 8px;
 	}
 	@media (max-width: 899px) {
 		.shell {
@@ -108,7 +107,7 @@
 			grid-template-rows: auto minmax(0, 1fr);
 		}
 		.content {
-			padding: 0 16px 40px;
+			padding: 0 16px 48px;
 		}
 	}
 </style>
