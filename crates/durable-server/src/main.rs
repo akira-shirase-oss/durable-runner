@@ -4130,6 +4130,18 @@ async fn flat_access(
     Ok(ws.id)
 }
 
+/// Read-side dual auth for the run-plane routes: bearer keys take
+/// their old `ReadAuthorized` path — `--open-reads` on a loopback name
+/// included — while a session takes the member path at viewer+
+/// (x-durable-workspace required; the D-062 rules live in
+/// `flat_member`). Downstream `auth.ws()` scopes exactly as before.
+async fn tenant_read(app: &App, parts: &Parts) -> Result<u64, ApiError> {
+    if app.open_reads && loopback_host(parts) {
+        return Ok(0);
+    }
+    flat_access(app, parts, Permission::Read, Role::Viewer, false).await
+}
+
 /// Tiny shim: the flat handlers below were written against
 /// `Authorized(auth)`'s `auth.ws()` accessor — resolved now by
 /// `flat_access`/`flat_admin_access` into the same shape.
@@ -5224,10 +5236,11 @@ impl ApiError {
 }
 
 async fn submit(
-    Authorized(auth): Authorized,
+    parts: Parts,
     State(app): State<App>,
     J(req): J<SubmitReq>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
+    let auth = FlatWs(flat_access(&app, &parts, Permission::Write, Role::Member, true).await?);
     let input = base64_decode(&req.spec.input_b64)
         .map_err(|m| ApiError::new(StatusCode::BAD_REQUEST, "bad_input", m))?;
     let spec = JobSpec {
@@ -5300,12 +5313,12 @@ fn single_param<'a>(pairs: &'a [(String, String)], name: &str) -> Result<Option<
 /// env keys, the loopback `--open-reads`) sees every workspace; any other
 /// key sees its own workspace only — its counters, latencies, gauges,
 /// states and handlers, never another tenant's or the totals.
-fn metrics_scope(auth: &Auth) -> observe::Scope {
+fn metrics_scope(ws: u64) -> observe::Scope {
     // ATTACK(obs-metrics-scope)
-    if auth.ws() == 0 {
+    if ws == 0 {
         observe::Scope::All
     } else {
-        observe::Scope::Ws(auth.ws())
+        observe::Scope::Ws(ws)
     }
 }
 
@@ -5313,10 +5326,11 @@ fn metrics_scope(auth: &Auth) -> observe::Scope {
 /// window, totals, current state counts and per-handler stats — for the
 /// caller's scope ([`metrics_scope`]).
 async fn metrics(
-    ReadAuthorized(auth): ReadAuthorized,
+    parts: Parts,
     State(app): State<App>,
     Q(pairs): Q<Vec<(String, String)>>,
 ) -> Result<Json<observe::MetricsOut>, ApiError> {
+    let auth = FlatWs(tenant_read(&app, &parts).await?);
     let invalid = || {
         ApiError::new(
             StatusCode::BAD_REQUEST,
@@ -5328,7 +5342,7 @@ async fn metrics(
         None => Window::H1,
         Some(w) => Window::parse(w).ok_or_else(invalid)?,
     };
-    let scope = metrics_scope(&auth);
+    let scope = metrics_scope(auth.ws());
     let index = app.engine.metrics_index(scope).await?;
     Ok(Json(app.obs.metrics(
         scope,
@@ -5342,10 +5356,11 @@ async fn metrics(
 /// `GET /jobs/{id}/events` (D-058): the run's timeline. 404 exactly when
 /// `GET /jobs/{id}` is — another workspace's run is 404 (D-060).
 async fn run_events(
-    ReadAuthorized(auth): ReadAuthorized,
+    parts: Parts,
     State(app): State<App>,
     P(id): P<String>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
+    let auth = FlatWs(tenant_read(&app, &parts).await?);
     let id = RunId(decode_id(&app, auth.ws(), &id)?);
     let run = match app.engine.summary(id).await? {
         // ATTACK(obs-run-scope)
@@ -5379,10 +5394,11 @@ struct FeedItem<'a> {
 /// `GET /events?limit=1..200` (D-058): the caller's workspace's activity
 /// feed, newest first — only its own runs (D-060).
 async fn feed(
-    ReadAuthorized(auth): ReadAuthorized,
+    parts: Parts,
     State(app): State<App>,
     Q(pairs): Q<Vec<(String, String)>>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
+    let auth = FlatWs(tenant_read(&app, &parts).await?);
     let invalid = || {
         ApiError::new(
             StatusCode::BAD_REQUEST,
@@ -5481,20 +5497,21 @@ fn decode_id(app: &App, ws: u64, s: &str) -> Result<u64, ApiError> {
 /// The run if it exists AND belongs to the caller's workspace — a
 /// cross-workspace id is 404, never 403: a foreign run id leaks nothing
 /// (S2-2's no-oracle rule).
-async fn scoped_run(app: &App, auth: &Auth, id: u64) -> Result<durable_domain::Run, ApiError> {
+async fn scoped_run(app: &App, ws: u64, id: u64) -> Result<durable_domain::Run, ApiError> {
     match app.engine.inspect(RunId(id)).await? {
         // ATTACK(tenant-scope)
-        Some(run) if run.ws == auth.ws() => Ok(run),
+        Some(run) if run.ws == ws => Ok(run),
         _ => Err(not_found()),
     }
 }
 
 async fn inspect(
-    ReadAuthorized(auth): ReadAuthorized,
+    parts: Parts,
     State(app): State<App>,
     P(id): P<String>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let run = scoped_run(&app, &auth, decode_id(&app, auth.ws(), &id)?).await?;
+    let auth = FlatWs(tenant_read(&app, &parts).await?);
+    let run = scoped_run(&app, auth.ws(), decode_id(&app, auth.ws(), &id)?).await?;
     Ok(Json(serde_json::json!({
         "id": app.pubid.encode(run.id),
         "key": run.key.0,
@@ -5508,12 +5525,15 @@ async fn inspect(
 /// (D-051): a controller that resubmits the same work under a new op_key needs it, and
 /// the input may be customer content, so the read key does not reveal it.
 async fn spec(
-    Authorized(auth): Authorized,
+    parts: Parts,
     State(app): State<App>,
     P(id): P<String>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
+    // Bearer stays write-gated (its old `Authorized`); a session
+    // reads its workspace's spec at viewer+ like every other GET.
+    let auth = FlatWs(flat_access(&app, &parts, Permission::Write, Role::Viewer, false).await?);
     use base64::Engine as _;
-    let run = scoped_run(&app, &auth, decode_id(&app, auth.ws(), &id)?).await?;
+    let run = scoped_run(&app, auth.ws(), decode_id(&app, auth.ws(), &id)?).await?;
     Ok(Json(serde_json::json!({
         "id": app.pubid.encode(run.id),
         "key": run.key.0,
@@ -5526,14 +5546,15 @@ async fn spec(
 }
 
 async fn cancel(
-    Authorized(auth): Authorized,
+    parts: Parts,
     State(app): State<App>,
     P(id): P<String>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
+    let auth = FlatWs(flat_access(&app, &parts, Permission::Write, Role::Member, true).await?);
     // The scope check happens before the cancel: a run's workspace is
     // fixed at acceptance, so inspecting first cannot race.
     let internal = decode_id(&app, auth.ws(), &id)?;
-    scoped_run(&app, &auth, internal).await?;
+    scoped_run(&app, auth.ws(), internal).await?;
     app.engine.cancel(RunId(internal)).await?;
     Ok(Json(serde_json::json!({ "cancelled": id })))
 }
@@ -5552,10 +5573,11 @@ struct ListQuery {
 }
 
 async fn list(
-    ReadAuthorized(auth): ReadAuthorized,
+    parts: Parts,
     State(app): State<App>,
     Q(q): Q<ListQuery>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
+    let auth = FlatWs(tenant_read(&app, &parts).await?);
     let newest = match q.order.as_deref() {
         None | Some("asc") => false,
         Some("desc") => true,
@@ -5668,11 +5690,14 @@ fn ops_admin(auth: &Auth) -> Result<(), ApiError> {
 /// totals (S1 review: diagnostics leaks tenant volume across the
 /// boundary, so the global view is ops-only).
 async fn workspace_diagnostics(
-    Authorized(auth): Authorized,
+    parts: Parts,
     State(app): State<App>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
+    // Bearer stays write-gated (its old `Authorized`); a session sees
+    // only its own workspace's counts at viewer+ — never the ops view.
     // ATTACK(diag-scope)
-    let d = app.engine.diag_ws(auth.ws()).await?;
+    let ws = flat_access(&app, &parts, Permission::Write, Role::Viewer, false).await?;
+    let d = app.engine.diag_ws(ws).await?;
     Ok(Json(serde_json::to_value(d).unwrap_or_default()))
 }
 
@@ -17838,11 +17863,12 @@ mod tests {
     /// Sign up + verify + log in `email`, then seat it as an ADMIN member
     /// of `ws` — a store-level invite + accept, the D-073 way a rotate
     /// targets a store-made workspace.
-    async fn session_admin_on(
+    async fn session_role_on(
         router: &Router,
         store: &Memory,
         ws: &durable_accounts::Workspace,
         email: &str,
+        role: Role,
     ) -> (String, String, String) {
         signup_and_verify(router, store, email, "a-long-enough-passphrase").await;
         let (cookie, csrf) = login_only(router, email, "a-long-enough-passphrase").await;
@@ -17857,7 +17883,7 @@ mod tests {
             .create_invite(
                 ws.id,
                 email,
-                Role::Admin,
+                role,
                 acc.id,
                 &sha256(token.as_bytes()),
                 now + 60_000,
@@ -17869,8 +17895,17 @@ mod tests {
             .accept_invite(&sha256(token.as_bytes()), acc.id, now)
             .await
             .unwrap_or_else(|e| panic!("{e}"));
-        assert!(seated.is_some(), "the accept must seat the admin row");
+        assert!(seated.is_some(), "the accept must seat the row");
         (cookie, csrf, ws.public_id.to_string())
+    }
+
+    async fn session_admin_on(
+        router: &Router,
+        store: &Memory,
+        ws: &durable_accounts::Workspace,
+        email: &str,
+    ) -> (String, String, String) {
+        session_role_on(router, store, ws, email, Role::Admin).await
     }
 
     /// Create `name` as `cookie`'s workspace; returns its public_id.
@@ -19106,5 +19141,166 @@ mod tests {
             );
         }
         assert_eq!(invite_only_value(None).ok(), Some(false));
+    }
+
+    // ---- first-deploy blocker: sessions reach the run plane ----------
+
+    /// Every run-plane route answers a session exactly like a flat
+    /// route: x-durable-workspace names the ws, member roles decide,
+    /// foreign workspaces are 404, never data.
+    #[tokio::test]
+    async fn s3d_sessions_on_the_run_plane() {
+        let store = Arc::new(Memory::new());
+        let h = harness_store(false, None, Some(store.clone()));
+        // Owner A + workspace A; owner B + workspace B.
+        signup_and_verify(&h.router, &store, "a@a.co", "a-long-enough-passphrase").await;
+        let (ac, acsrf) = login_only(&h.router, "a@a.co", "a-long-enough-passphrase").await;
+        let pid_a = make_ws(&h.router, &ac, "alpha").await;
+        signup_and_verify(&h.router, &store, "b@b.co", "a-long-enough-passphrase").await;
+        let (bc, _) = login_only(&h.router, "b@b.co", "a-long-enough-passphrase").await;
+        let pid_b = make_ws(&h.router, &bc, "beta").await;
+        let ws_hdr = |pid: &str| ("x-durable-workspace", pid.to_string());
+        let sess = |c: &str, csrf: &str, pid: &str| {
+            vec![
+                ("cookie", c.to_string()),
+                ("x-durable-csrf", csrf.to_string()),
+                ws_hdr(pid),
+            ]
+        };
+        // Arm `builtin:echo` on ws A via the session — flat handler auth.
+        let echo = |k: &str| {
+            json!({
+                "op_key": k,
+                "spec": {
+                    "version": 1,
+                    "steps": [{ "name": "a", "handler": "builtin:echo" }],
+                    "input_b64": "aGk=",
+                },
+            })
+        };
+        let (st, _, v) = raw(
+            &h.router,
+            "PUT",
+            "/handlers/builtin:echo",
+            &sess(&ac, &acsrf, &pid_a),
+            Some(json!({"url": "builtin:echo"})),
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK, "{v}");
+        // Session member (owner) submits.
+        let (st, _, v) = raw(
+            &h.router,
+            "POST",
+            "/jobs",
+            &sess(&ac, &acsrf, &pid_a),
+            Some(echo("s-1")),
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK, "{v}");
+        let run = v["run_id"].as_str().unwrap_or_default().to_string();
+        assert!(!run.is_empty());
+        // Every read answers for the session owner.
+        for path in [
+            "/jobs".to_string(),
+            format!("/jobs/{run}"),
+            format!("/jobs/{run}/spec"),
+            format!("/jobs/{run}/events"),
+            "/metrics".to_string(),
+            "/events".to_string(),
+            "/diagnostics".to_string(),
+        ] {
+            let (st, _, v) = raw(&h.router, "GET", &path, &sess(&ac, &acsrf, &pid_a), None).await;
+            assert_eq!(st, StatusCode::OK, "{path}: {v}");
+        }
+        // No header at all -> 400 workspace_required (D-062).
+        let (st, _, v) = raw(
+            &h.router,
+            "GET",
+            "/jobs",
+            &[("cookie", ac.to_string())],
+            None,
+        )
+        .await;
+        assert_eq!(st, StatusCode::BAD_REQUEST, "{v}");
+        assert_eq!(v["code"], "workspace_required");
+        // A's session naming B's ws -> 404 on every route, never B data.
+        for (method, path) in [
+            ("GET", "/jobs".to_string()),
+            ("POST", "/jobs".to_string()),
+            ("GET", format!("/jobs/{run}")),
+            ("GET", format!("/jobs/{run}/spec")),
+            ("POST", format!("/jobs/{run}/cancel")),
+            ("GET", format!("/jobs/{run}/events")),
+            ("GET", "/metrics".to_string()),
+            ("GET", "/events".to_string()),
+            ("GET", "/diagnostics".to_string()),
+        ] {
+            let (st, _, v) = raw(
+                &h.router,
+                method,
+                &path,
+                &sess(&ac, &acsrf, &pid_b),
+                if method == "POST" {
+                    Some(echo("x"))
+                } else {
+                    None
+                },
+            )
+            .await;
+            assert_eq!(st, StatusCode::NOT_FOUND, "{method} {path}: {v}");
+        }
+        // The owner cancels a parked run; a viewer may not submit/cancel.
+        let ws_a = store
+            .workspace_by_public_id(pid_a.parse().unwrap_or_else(|_| panic!("pid")))
+            .await
+            .unwrap_or_else(|e| panic!("{e}"))
+            .unwrap_or_else(|| panic!("ws"));
+        let (vc, vcsrf, _) =
+            session_role_on(&h.router, &store, &ws_a, "v@v.co", Role::Viewer).await;
+        for (method, path) in [
+            ("POST", "/jobs".to_string()),
+            ("POST", format!("/jobs/{run}/cancel")),
+        ] {
+            let (st, _, v) = raw(
+                &h.router,
+                method,
+                &path,
+                &sess(&vc, &vcsrf, &pid_a),
+                Some(echo("x")),
+            )
+            .await;
+            assert_eq!(st, StatusCode::FORBIDDEN, "{method} {path}: {v}");
+        }
+        // A member+ session without the CSRF header -> 403 csrf_failed.
+        let (st, _, v) = raw(
+            &h.router,
+            "POST",
+            "/jobs",
+            &[
+                ("cookie", ac.to_string()),
+                ("x-durable-workspace", pid_a.clone()),
+            ],
+            Some(echo("x")),
+        )
+        .await;
+        assert_eq!(st, StatusCode::FORBIDDEN, "{v}");
+        assert_eq!(v["code"], "csrf_failed");
+        // /diagnostics for a session is the ws view — the ops global's
+        // `registry_stale` key is the tell it isn't.
+        let (st, _, v) = raw(
+            &h.router,
+            "GET",
+            "/diagnostics",
+            &sess(&ac, &acsrf, &pid_a),
+            None,
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK);
+        assert!(v.get("registry_stale").is_none(), "ops shape leaked: {v}");
+        // Bearer keys behave exactly as before.
+        let (st, _) = call(&h.router, "GET", "/jobs", Some(READ_KEY), None).await;
+        assert_eq!(st, StatusCode::OK);
+        let (st, _) = call(&h.router, "POST", "/jobs", Some(READ_KEY), Some(echo("x"))).await;
+        assert_eq!(st, StatusCode::FORBIDDEN);
     }
 }
