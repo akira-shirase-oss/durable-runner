@@ -2,7 +2,7 @@
 
 > **Status — v1.0.0.** D0–D4 complete: model, journal, execution and
 > maintenance proven (incl. a live kill-9 → restore drill). The CLI,
-> server, and an inspector at `/inspector` cover every API operation
+> server, and a dashboard at `/app` cover every API operation
 > (submit/list/cancel/detail/spec/diagnostics/compact/backup);
 > `examples/pilot/run.sh` walks the second-developer path; per-address
 > rate limits and connection caps are on; restarting with 800k queued

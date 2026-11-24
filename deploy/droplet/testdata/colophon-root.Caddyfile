@@ -1,0 +1,35 @@
+# Colophon's root /etc/caddy/Caddyfile as its install.sh renders it on the shared droplet (from
+# Colophon's deploy/droplet/Caddyfile, comments trimmed): the fixture test-droplet-install.sh and
+# test-droplet-caddy.sh merge our site into.
+# Caddy for the S0 droplet (deploy/droplet/DEPLOY.md).
+{
+	admin unix//var/lib/caddy/admin.sock|0600
+	auto_https off
+	servers {
+		import /etc/caddy/cloudflare-trusted.caddy
+		client_ip_headers Cf-Connecting-Ip
+		protocols h1 h2
+	}
+}
+
+colophonapp.404human.dev:443 {
+	tls /etc/caddy/origin.pem /etc/caddy/origin.key {
+		client_auth {
+			mode require_and_verify
+			import /etc/caddy/origin-pull-trust.caddy
+		}
+	}
+	header Strict-Transport-Security "max-age=31536000"
+	header >X-Content-Type-Options nosniff
+	redir / /studio/ 302
+	encode zstd gzip
+	reverse_proxy 127.0.0.1:58000 {
+		header_up X-Forwarded-For {client_ip}
+		flush_interval -1
+		lb_try_duration 10s
+		lb_try_interval 100ms
+		transport http {
+			keepalive 5s
+		}
+	}
+}

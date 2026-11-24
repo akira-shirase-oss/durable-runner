@@ -11,6 +11,8 @@
 //   sustained  the million-op run: fixed submit rate for a duration
 //   workspaces S2: N workspaces, own keys, split submits + isolation
 //              (needs DATABASE_URL; skips visibly without one)
+//   auth      S3-0: one signup+login, then session verify at battery
+//              rate on the cached path (memory backend by default)
 //
 // Flags: --smoke picks the small local sizes (perf/battery.sh runs these);
 // the full sizes are what .github/workflows/load.yml runs on CI. --p99=MS
@@ -504,6 +506,9 @@ async function startServer(journalDir, extra = [], listen = `127.0.0.1:${PORT}`,
     // only a LAB build allows (`cargo build --release --features lab`,
     // re-review S1-1).
     '--allow-local-handlers',
+    // Required whenever an account backend is configured (S3-0); unused
+    // under compat mode, so every scenario passes it unconditionally.
+    '--public-origin', `http://127.0.0.1:${PORT}`,
     ...(labTenants() ? ['--allow-local-tenant-handlers'] : []),
     '--rate-limit-per-addr', '100000', '--max-conns-per-addr', String(connsPerAddr), ...extra];
   const p = track(
@@ -1486,10 +1491,114 @@ async function runConnreuse() {
   return r.verdict === 'pass';
 }
 
+// S3-0: session verify at battery rate on the cached path — the route a
+// signed-in dashboard hits most. One signup + one login (argon work done
+// once, outside the measurement), then N cached `GET /auth/session` ops:
+// every one must verify the `drs_` tag and hit the generation-checked
+// session cache — the store is never in the loop. A forged token probe at
+// the end confirms the tag check still refuses under residual load.
+async function runAuth() {
+  // Same pinning as runWorkspaces: --backend=postgres + DATABASE_URL
+  // measures the real store; the default memory backend always runs.
+  const backend = args.backend ?? (process.env.DATABASE_URL ? 'postgres' : process.env.DURABLE_ACCOUNTS_BACKEND ?? 'memory');
+  const dbUrl = args.database_url ?? process.env.DATABASE_URL;
+  if (backend === 'postgres' && !dbUrl) {
+    console.error('auth --backend=postgres needs DATABASE_URL or --database_url=; skipping — this is a skip, not a pass');
+    return true;
+  }
+  delete process.env.DATABASE_URL;
+  delete process.env.DURABLE_ACCOUNTS_BACKEND;
+  if (backend === 'postgres') process.env.DATABASE_URL = dbUrl;
+  else process.env.DURABLE_ACCOUNTS_BACKEND = backend;
+  const n = Number(args.ops ?? (SMOKE ? 2_000 : 1_000_000));
+  const dir = fs.mkdtempSync(`${os.tmpdir()}/dr-load-`);
+  const s = await startServer(`${dir}/journal`);
+  const email = `load-${process.pid}@example.com`;
+  const password = 'load-password-1';
+  const sign = await req(`${API}/auth/signup`, {
+    method: 'POST', headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ email, password }),
+  });
+  await sign.arrayBuffer();
+  if (sign.status !== 200 && sign.status !== 201 && sign.status !== 202) {
+    console.error(`signup failed: ${sign.status}`);
+    s.kill(); return false;
+  }
+  const login = await req(`${API}/auth/login`, {
+    method: 'POST', headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ email, password }),
+  });
+  // node:http reports set-cookie as an ARRAY of cookie strings.
+  const setCookie = [].concat(login.headers['set-cookie'] ?? []).join('; ');
+  await login.arrayBuffer();
+  if (login.status !== 200 || !setCookie.includes('__Host-drs=')) {
+    console.error(`login failed: ${login.status} set-cookie=${setCookie}`);
+    s.kill(); return false;
+  }
+  const cookie = setCookie.split(';')[0];
+  const H = { cookie };
+  const hst = new LatHist(); const codes = {};
+  let sent = 0, ok200 = 0, badBody = 0;
+  const pending = new Set();
+  const MAX_PENDING = +(process.env.DR_LOAD_MAX_PENDING || 384);
+  const t0 = now();
+  for (let i = 0; i < n; i++) {
+    sent++;
+    const p = (async () => {
+      const a = now();
+      const r = await fetch(`${API}/auth/session`, { headers: H });
+      const ms = now() - a;
+      const body = await r.json().catch(() => null);
+      hst.add(ms);
+      codes[r.status] = (codes[r.status] ?? 0) + 1;
+      if (r.status === 200) {
+        ok200++;
+        // The grant must name the account — a cached-but-empty answer is
+        // a hit on the wrong path, not a pass.
+        if (!body?.account?.public_id) badBody++;
+      }
+    })().finally(() => { pending.delete(p); });
+    pending.add(p);
+    if (pending.size >= MAX_PENDING) await waitSettle();
+  }
+  await Promise.all(pending);
+  // A forged drs_ token dies on its tag before any store or cache work —
+  // probed last so residual load cannot hide a slow refusal path.
+  const forged = await fetch(`${API}/auth/session`, {
+    headers: { cookie: `__Host-drs=drs_${'a'.repeat(32)}.${'b'.repeat(22)}` },
+  });
+  await forged.arrayBuffer();
+  s.kill();
+  const ms = Math.round(now() - t0);
+  const p99 = hst.pct(0.99);
+  const r = writeResult('auth', {
+    params: { ops: n, backend, smoke: SMOKE },
+    sent, ok200, bad_body: badBody, ms,
+    achieved_per_s: ms > 0 ? Math.round((sent / ms) * 1000) : sent,
+    http_codes: codes,
+    forged_status: forged.status,
+    latency_ms: hst.obj(),
+    thresholds: {
+      ok200: 'every cached session verify answers 200',
+      bad_body: 'every 200 names the account',
+      forged: 'a forged drs_ token answers 401',
+      p99_ms: `<${P99_MS} per-op response`,
+    },
+    ...verdictOf([
+      ['every cached session verify answered 200', ok200 === sent],
+      ['every 200 named the account', badBody === 0],
+      ['a forged drs_ token answered 401', forged.status === 401],
+      [`p99 < ${P99_MS}ms`, p99 !== null && p99 < P99_MS],
+    ]),
+  });
+  return r.verdict === 'pass';
+}
+
 const runners = {
   submit: runSubmit, replay: runReplay, stall: runStall,
   admission: runAdmission, compact: runCompact, sustained: runSustained,
   workspaces: runWorkspaces, overload: runOverload, overloaddist: runOverloadDist, connreuse: runConnreuse,
+  auth: runAuth,
 };
 if (!runners[scenario]) {
   console.error(`unknown scenario ${scenario}; choices: ${Object.keys(runners).join(', ')}`);

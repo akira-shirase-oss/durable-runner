@@ -3,6 +3,7 @@
 //! HTTP endpoints configured at startup; the registry is the trust edge.
 
 mod addr_limits;
+mod mailout;
 mod pubid;
 mod ssrf;
 
@@ -13,21 +14,25 @@ use addr_limits::{
 use anyhow::{Context, Result};
 use axum::{
     extract::{DefaultBodyLimit, FromRequestParts, Path as AxPath, Query, State},
-    http::{header, request::Parts, StatusCode},
+    http::{header, request::Parts, StatusCode, Uri},
     response::{IntoResponse, Response},
-    routing::{get, post},
+    routing::{delete, get, post},
     Json, Router,
 };
+use base64::Engine as _;
 use clap::Parser;
-use durable_accounts::{AccountError, AccountStore, Permission, Pg};
+use durable_accounts::{
+    AccountError, AccountStore, ApiKeyInfo, Mail, Mailer, Permission, Pg, Role,
+};
 use durable_domain::{JobSpec, Millis, OperationKey, RunId, RunState, StepSpec};
 use durable_engine::observe::{self, Observer, Window};
 use durable_engine::shell::{
-    spawn, Call, Engine, Order, Outcome, Registry, ShellConfig, StepHandler, MAX_HANDLERS_PER_WS,
+    spawn, Call, Engine, Order, Outcome, Registry, ShellConfig, StepHandler, TestReply,
+    MAX_HANDLERS_PER_WS,
 };
 use durable_engine::EngineError;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -45,6 +50,15 @@ struct Args {
     /// Listen address.
     #[arg(long, default_value = "127.0.0.1:58300")]
     listen: String,
+    /// Dedicated ops listener (review finding 18): when set, the env
+    /// keys (DURABLE_API_KEY / DURABLE_READ_KEY) are accepted only on
+    /// this socket — point the platform's private network here and
+    /// publish only `--listen`. A request on `--listen` bearing an env
+    /// key answers 401 like any bad bearer. Must be a loopback address:
+    /// anything else refuses at boot. Unset (self-host): env keys work
+    /// on `--listen` as always.
+    #[arg(long)]
+    ops_listen: Option<String>,
     /// Dedicated liveness listener: /health and /ready on their own
     /// socket and backlog, so a connection flood on the main port cannot
     /// starve probes (S2 wedge: keep-alive hoarding RST'd /health at the
@@ -81,7 +95,7 @@ struct Args {
     /// Attempt timeout per step call, ms (bounded by domain limits).
     #[arg(long, default_value_t = 20_000)]
     step_timeout_ms: u64,
-    /// Static inspection UI directory, served at /inspector (optional).
+    /// Static dashboard UI directory, served at /app (optional).
     #[arg(long)]
     ui_dir: Option<PathBuf>,
     /// Directory that holds backups. `POST /admin/backup {"name": N}`
@@ -146,6 +160,12 @@ struct Args {
     /// can reach a non-loopback listener could read every op_key (D-037).
     #[arg(long)]
     open_reads: bool,
+    /// The public origin every mailed link and redirect is built from
+    /// (e.g. https://durablerunnerapp.example.com) — never the request
+    /// Host. Required at boot when an account store is configured
+    /// (review #18); absent it then, the server refuses to start.
+    #[arg(long)]
+    public_origin: Option<String>,
     /// Connections served at once; more wait in the kernel's accept queue.
     /// Keep it below the process's descriptor limit (`ulimit -n`) less 64.
     #[arg(long, default_value_t = 512)]
@@ -473,6 +493,89 @@ impl HttpHandler {
         }
     }
 
+    /// The D-070 probe: ONE call, exactly the dispatched path's request
+    /// shape — same body, same signing, same policy recheck, same
+    /// timeout, same bounded read — with no `Call` context and a reply
+    /// detail instead of an `Outcome`. Never journaled.
+    async fn probe_call_once(&self, input: &[u8], idem_key: &str) -> TestReply {
+        let start = Instant::now();
+        let refused = || TestReply {
+            status: "refused",
+            http_status: None,
+            latency_ms: 0,
+            excerpt: Vec::new(),
+        };
+        if !self.policy_ok() {
+            return refused();
+        }
+        let body = serde_json::to_vec(&serde_json::json!({
+            "input": input,
+            "idem_key": idem_key,
+        }))
+        .unwrap_or_default();
+        let digest = hex(&sha256(&body));
+        let req = self
+            .client
+            .post(&self.url)
+            .header("x-idempotency-key", idem_key)
+            .header("content-type", "application/json")
+            .body(body)
+            .timeout(self.timeout);
+        let (authority, path) = self.authority_and_path();
+        let res = with_call(
+            req,
+            None,
+            self.secret.as_deref(),
+            idem_key,
+            &digest,
+            "POST",
+            &authority,
+            &path,
+            &self.pubid,
+        )
+        .send()
+        .await;
+        let latency = start.elapsed().as_millis() as u64;
+        match res {
+            Ok(r) => {
+                let http = r.status();
+                match read_bounded(r, 1024).await {
+                    Ok(excerpt) => TestReply {
+                        status: if http.is_success() { "ok" } else { "failed" },
+                        http_status: Some(http.as_u16()),
+                        latency_ms: latency,
+                        excerpt: excerpt.unwrap_or_default(),
+                    },
+                    Err(_) => TestReply {
+                        status: "failed",
+                        http_status: Some(http.as_u16()),
+                        latency_ms: latency,
+                        excerpt: Vec::new(),
+                    },
+                }
+            }
+            Err(e) if ssrf::refused(&e) => refused(),
+            Err(e) if e.is_timeout() => TestReply {
+                status: "lost",
+                http_status: None,
+                latency_ms: latency,
+                excerpt: Vec::new(),
+            },
+            Err(e) if e.is_connect() => TestReply {
+                status: "failed",
+                http_status: None,
+                latency_ms: latency,
+                excerpt: Vec::new(),
+            },
+            Err(_) => TestReply {
+                status: "lost",
+                http_status: None,
+                latency_ms: latency,
+                excerpt: Vec::new(),
+            },
+        }
+    }
+
     /// Probe asks the handler whether the call under `idem_key` landed.
     /// `GET {url}?idem_key=…` → 200 means found; anything else is unknown
     /// → reported as not-found honestly (default trait behaviour).
@@ -552,6 +655,13 @@ impl StepHandler for HttpHandler {
 
     async fn probe_call(&self, call: Call, _step: &StepSpec, idem_key: &str) -> bool {
         self.ask(Some(call), idem_key).await
+    }
+
+    /// The D-070 probe goes through the real signed request path — a
+    /// stored-url handler is exercised exactly as a dispatch would,
+    /// minus journaling.
+    async fn test_call(&self, _step: &StepSpec, input: &[u8], idem_key: &str) -> TestReply {
+        self.probe_call_once(input, idem_key).await
     }
 }
 
@@ -635,6 +745,40 @@ impl HandlerFactory {
             policy: policy.clone(),
             pubid: self.pubid.clone(),
         })
+    }
+}
+
+/// The onboarding sample handler (ruling 5'): the reserved name
+/// `builtin:echo` registers like any handler but executes in-process —
+/// no network hop, nothing to sign, and it can never be a reflector.
+/// Its "url" is the marker string itself.
+const BUILTIN_ECHO: &str = "builtin:echo";
+
+struct BuiltinEcho;
+#[async_trait::async_trait]
+impl StepHandler for BuiltinEcho {
+    async fn execute(&self, _step: &StepSpec, input: &[u8], _idem_key: &str) -> Outcome {
+        Outcome::Checkpoint(input.to_vec())
+    }
+    /// The D-070 probe runs in-process through the same outcome mapping.
+    async fn test_call(&self, step: &StepSpec, input: &[u8], idem_key: &str) -> TestReply {
+        let start = Instant::now();
+        let outcome = self.execute(step, input, idem_key).await;
+        TestReply::from_outcome(outcome, start.elapsed().as_millis() as u64)
+    }
+}
+
+/// What one stored registration arms: `builtin:echo` is in-process,
+/// every other URL builds through the signed, SSRF-guarded path.
+fn arm_url(
+    factory: &HandlerFactory,
+    url: &str,
+    secret: Option<Arc<[u8; 32]>>,
+) -> Arc<dyn StepHandler> {
+    if url == BUILTIN_ECHO {
+        Arc::new(BuiltinEcho)
+    } else {
+        factory.make_signed(url, secret)
     }
 }
 
@@ -1132,14 +1276,15 @@ async fn registry_sync(
             // never reaches the registry (call-time policy still
             // refuses it; dropping it here refuses it *honestly*).
             // ATTACK(reconcile-recheck)
-            let ok = reqwest::Url::parse(&r.url)
-                .map(|u| ssrf::check_url(&u, &factory.store_policy).is_ok())
-                .unwrap_or(false);
+            let ok = r.url == BUILTIN_ECHO
+                || reqwest::Url::parse(&r.url)
+                    .map(|u| ssrf::check_url(&u, &factory.store_policy).is_ok())
+                    .unwrap_or(false);
             if !ok {
                 refused += 1;
                 continue;
             }
-            set.push((r.name.clone(), factory.make_signed(&r.url, secret.clone())));
+            set.push((r.name.clone(), arm_url(factory, &r.url, secret.clone())));
             accepted.push(RegistryEntry {
                 ws: ws.id,
                 name: r.name.clone(),
@@ -1297,13 +1442,47 @@ fn sha256(bytes: &[u8]) -> [u8; 32] {
     out
 }
 
-/// Who an authenticated caller is: the workspace their key belongs to and
-/// what it may do there. `ws` is internal only — it never serializes into
-/// a response (S2-2 exposes `public_id` on workspace-facing surfaces).
+/// Who an authenticated caller is (review #4 — one enum, never a
+/// collapsed boolean): the ops plane (`DURABLE_API_KEY`/`DURABLE_READ_KEY`
+/// env keys), a per-workspace store key, or a signed-in member resolving
+/// through a member row. `ws` is internal only — it never serializes
+/// into a response.
 #[derive(Clone, Copy, Debug)]
-struct Auth {
-    ws: u64,
-    permission: Permission,
+enum Principal {
+    /// `DURABLE_API_KEY` — the only principal `ops_admin` accepts.
+    OpsKey,
+    /// `DURABLE_READ_KEY`.
+    OpsRead,
+    /// A per-workspace API key verified through the store.
+    StoreKey { ws: u64, permission: Permission },
+    /// A signed-in session, resolved to a workspace through
+    /// `x-durable-workspace` + the members table.
+    #[expect(dead_code, reason = "constructed by member resolution in S3-3")]
+    Member { account: u64, ws: u64, role: Role },
+}
+
+/// Back-compat alias at the auth boundary: handlers hold a Principal.
+type Auth = Principal;
+
+impl Principal {
+    /// The workspace this principal acts on; ops keys answer ws 0.
+    fn ws(self) -> u64 {
+        match self {
+            Principal::OpsKey | Principal::OpsRead => 0,
+            Principal::StoreKey { ws, .. } | Principal::Member { ws, .. } => ws,
+        }
+    }
+
+    /// May this principal mutate? OpsKey and write-scope store keys;
+    /// members per their role (viewer is read-only).
+    fn may_write(self) -> bool {
+        match self {
+            Principal::OpsKey => true,
+            Principal::OpsRead => false,
+            Principal::StoreKey { permission, .. } => permission == Permission::Write,
+            Principal::Member { role, .. } => role.may_write(),
+        }
+    }
 }
 
 /// The outcome of checking one bearer: a verified grant, a verified
@@ -1338,14 +1517,20 @@ enum Cached {
     Denied,
 }
 
-/// The only shape a store key can have (`new_key_secret`): `dr_` plus
-/// 48 lowercase hex — 51 chars. Non-conforming bearers deny cheaply.
+/// The only shapes a store key can have (`new_key_secret`): `drk_` plus
+/// 48 lowercase hex — 52 chars (legacy `dr_` keys, 51 chars, keep
+/// verifying until their owners rotate them). Non-conforming bearers
+/// deny cheaply.
 fn store_key_shape(bearer: &str) -> bool {
-    bearer.len() == 51
-        && bearer.starts_with("dr_")
-        && bearer[3..]
-            .bytes()
-            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+    let hex = if bearer.len() == 52 && bearer.starts_with("drk_") {
+        &bearer[4..]
+    } else if bearer.len() == 51 && bearer.starts_with("dr_") {
+        &bearer[3..]
+    } else {
+        return false;
+    };
+    hex.bytes()
+        .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
 }
 
 /// Resolves bearers to `Auth`. Env keys always grant workspace 0 — the
@@ -1358,6 +1543,10 @@ struct Keyring {
     read_key: Option<ApiKey>,
     store: Option<Arc<dyn AccountStore>>,
     cache: Mutex<HashMap<[u8; 32], CacheEntry>>,
+    /// key_hash → last-seen unix ms, coalesced between flushes (D-071):
+    /// N verifies in a tick land as ONE `last_used_at` UPDATE, so the
+    /// hot verify path writes to the store zero times.
+    touches: Mutex<HashMap<[u8; 32], i64>>,
 }
 
 impl Keyring {
@@ -1371,21 +1560,34 @@ impl Keyring {
             read_key,
             store,
             cache: Mutex::new(HashMap::new()),
+            touches: Mutex::new(HashMap::new()),
         }
+    }
+
+    /// Mark a store key used — cheap, coalesced, flushed by the tick.
+    fn touch_key(&self, hash: [u8; 32]) {
+        let mut touches = self.touches.lock().unwrap_or_else(|e| e.into_inner());
+        if touches.len() >= TOUCH_CAP {
+            touches.clear();
+        }
+        touches.insert(hash, unix_ms());
+    }
+
+    /// Drain the pending key touches for the flush task.
+    fn drain_key_touches(&self) -> Vec<durable_accounts::KeyTouch> {
+        let mut touches = self.touches.lock().unwrap_or_else(|e| e.into_inner());
+        std::mem::take(&mut *touches)
+            .into_iter()
+            .map(|(key_hash, seen_ms)| durable_accounts::KeyTouch { key_hash, seen_ms })
+            .collect()
     }
 
     async fn verify(&self, bearer: &str) -> Verified {
         if self.api_key.verify(bearer) {
-            return Verified::Granted(Auth {
-                ws: 0,
-                permission: Permission::Admin,
-            });
+            return Verified::Granted(Principal::OpsKey);
         }
         if self.read_key.as_ref().is_some_and(|k| k.verify(bearer)) {
-            return Verified::Granted(Auth {
-                ws: 0,
-                permission: Permission::Read,
-            });
+            return Verified::Granted(Principal::OpsRead);
         }
         // Store keys have exactly one shape — `dr_` + 48 hex. Anything
         // else can never verify, so it is denied here without spending
@@ -1396,13 +1598,16 @@ impl Keyring {
         }
         let hash = sha256(bearer.as_bytes());
         if let Some(outcome) = self.cached(hash) {
+            if matches!(outcome, Verified::Granted(Principal::StoreKey { .. })) {
+                self.touch_key(hash);
+            }
             return outcome;
         }
         let Some(store) = &self.store else {
             return Verified::Denied;
         };
         let verified = match store.verify_key(&hash).await {
-            Ok(Some(grant)) => Verified::Granted(Auth {
+            Ok(Some(grant)) => Verified::Granted(Principal::StoreKey {
                 ws: grant.workspace,
                 permission: grant.permission,
             }),
@@ -1410,6 +1615,9 @@ impl Keyring {
             Err(_) => Verified::Unavailable,
         };
         self.remember(hash, &verified);
+        if matches!(verified, Verified::Granted(Principal::StoreKey { .. })) {
+            self.touch_key(hash);
+        }
         verified
     }
 
@@ -1481,6 +1689,15 @@ impl Keyring {
             .unwrap_or_else(|e| e.into_inner())
             .remove(&bearer_hash);
     }
+
+    /// Write-through on workspace delete (D-072): every cached grant of
+    /// the workspace dies now — its keys are revoked in the same commit.
+    fn invalidate_ws(&self, ws: u64) {
+        self.cache
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .retain(|_, e| !matches!(e.outcome, Cached::Granted(p) if p.ws() == ws));
+    }
 }
 
 #[derive(Clone)]
@@ -1518,8 +1735,55 @@ struct App {
     /// through this keyed permutation, so no response reveals the
     /// global sequence or another workspace's volume.
     pubid: pubid::PubId,
+    /// Domain-separated HMAC key for session-token tags (review #8).
+    session_key: std::sync::Arc<ring::hmac::Key>,
+    /// The generation-checked session cache (review #10).
+    sessions: std::sync::Arc<SessionCache>,
+    /// The generation-checked member-role cache (D-066).
+    members: std::sync::Arc<MemberCache>,
+    /// D-070 probe budgets: 30/hour per workspace (the Free plan's
+    /// bound; S3-4 makes it plan-read) + 10/minute per client address.
+    test_calls_ws: std::sync::Arc<Mutex<HashMap<u64, std::collections::VecDeque<Instant>>>>,
+    /// `--ops-listen` is set: env-key grants hold only on that socket.
+    ops_gate: bool,
+    test_calls_addr: std::sync::Arc<Mutex<SlidingWindow>>,
+    /// The bounded argon2 queue (review #9).
+    argon: std::sync::Arc<ArgonQueue>,
+    /// Per-address limits for the open auth surface.
+    auth_limits: std::sync::Arc<AuthLimits>,
+    /// Login-failure cool-offs per (email, client prefix) — in-memory,
+    /// bounded, keyed whether or not the account exists (review #13).
+    lockouts: std::sync::Arc<LoginLockouts>,
+    /// Transactional mail; MemoryMailer in tests, Log/Resend at deploy.
+    mailer: std::sync::Arc<dyn Mailer>,
+    /// Global outbound guard: daily budget + circuit breaker (#14).
+    mail_budget: std::sync::Arc<MailBudget>,
+    /// `DURABLE_INVITE_ONLY` — env-at-boot abuse switch (ruling 9).
+    invite_only: bool,
+    /// `--public-origin` — the base every mailed link is built from
+    /// (never the request Host). Required at boot with an account
+    /// store (review #18); a test harness may pass None.
+    public_origin: Option<String>,
+    /// Session-clock override for tests (the idle-timeout proof is
+    /// clock-injected): 0 = wall clock. Only the session-expiry and
+    /// session-mint paths consult it; lockouts keep wall time.
+    now_override_ms: std::sync::Arc<std::sync::atomic::AtomicI64>,
     /// The engine's observer (D-058, scoped per workspace by D-060).
     obs: Arc<Observer>,
+}
+
+impl App {
+    /// The session clock — the override when a test set one, else wall.
+    fn now_ms(&self) -> i64 {
+        let v = self
+            .now_override_ms
+            .load(std::sync::atomic::Ordering::Relaxed);
+        if v == 0 {
+            unix_ms()
+        } else {
+            v
+        }
+    }
 }
 
 /// Arm the last-known-good snapshot rows at startup (before the first
@@ -1559,7 +1823,7 @@ async fn arm_snapshot(
             );
             continue;
         }
-        let h = factory.make_signed(&entry.url, secret);
+        let h = arm_url(factory, &entry.url, secret);
         match engine.put_handler(entry.ws, &entry.name, h).await {
             Ok(()) => armed.push((entry.ws, entry.name, entry.url)),
             Err(e) => eprintln!(
@@ -1605,6 +1869,7 @@ fn test_app(
     backup_root: Option<Arc<Path>>,
     journal_dir: &Path,
     allow_local: bool,
+    ops_gate: bool,
 ) -> App {
     let pubid = pubid::PubId::load_or_generate(journal_dir).unwrap_or_else(|e| panic!("{e}"));
     let registry_epoch = Arc::new(std::sync::atomic::AtomicU64::new(0));
@@ -1618,6 +1883,7 @@ fn test_app(
     App {
         engine,
         keyring,
+        ops_gate,
         open_reads,
         backup_root,
         handler_factory: Arc::new(HandlerFactory {
@@ -1637,6 +1903,22 @@ fn test_app(
         registry_epoch,
         registry_locks: Arc::new(RegistryLocks::default()),
         registry,
+        session_key: std::sync::Arc::new(pubid.derive_key(b"session-token-v1")),
+        sessions: std::sync::Arc::new(SessionCache::new()),
+        members: std::sync::Arc::new(MemberCache::new()),
+        test_calls_ws: std::sync::Arc::new(Mutex::new(HashMap::new())),
+        test_calls_addr: std::sync::Arc::new(Mutex::new(SlidingWindow::new(
+            10,
+            Duration::from_secs(60),
+        ))),
+        argon: std::sync::Arc::new(ArgonQueue::new()),
+        auth_limits: std::sync::Arc::new(AuthLimits::new()),
+        lockouts: std::sync::Arc::new(LoginLockouts::new()),
+        mailer: std::sync::Arc::new(durable_accounts::MemoryMailer::new()),
+        mail_budget: std::sync::Arc::new(MailBudget::new(MAIL_DAILY_BUDGET)),
+        invite_only: false,
+        public_origin: None,
+        now_override_ms: std::sync::Arc::new(std::sync::atomic::AtomicI64::new(0)),
         pubid,
         obs,
     }
@@ -1671,11 +1953,2962 @@ fn accounts_unavailable() -> ApiError {
 }
 
 /// Proof that the request carried an admin-capable key: which workspace
-/// it belongs to travels in `auth.ws`. Every mutating and admin handler
+/// it belongs to travels in `auth.ws()`. Every mutating and admin handler
 /// takes this as its first extractor, so it runs before the body is
 /// parsed. A read-permission key is recognised and refused 403: it is
 /// valid, but not here.
 struct Authorized(Auth);
+
+// ---- S3-0: accounts, sessions, the auth surface ---------------------
+
+const SESSION_COOKIE: &str = "__Host-drs";
+const SESSION_PREFIX: &str = "drs_";
+const SESSION_IDLE_MS: i64 = 14 * 24 * 3600 * 1000;
+const SESSION_ABS_MS: i64 = 30 * 24 * 3600 * 1000;
+const SESSION_CACHE_CAP: usize = 10_000;
+const SESSION_GRANT_TTL: Duration = Duration::from_secs(60);
+const BUMP_TTL: Duration = Duration::from_secs(120);
+const BUMP_CAP: usize = 4096;
+const ARGON_PERMITS: usize = 4;
+const ARGON_WAITERS: usize = 32;
+const ARGON_WAIT: Duration = Duration::from_secs(2);
+
+fn unix_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
+}
+
+/// Mint a session token: `drs_` + hex(16 B random ∥ 16 B tag), the tag
+/// `HMAC(session_key, random)[..16]` — self-authenticating (review #8):
+/// a forged value dies on the tag before any store I/O. The store keeps
+/// sha256 of the whole string, as with API keys.
+fn mint_session_token(key: &ring::hmac::Key) -> String {
+    let mut raw = [0u8; 16];
+    ring::rand::SecureRandom::fill(&ring::rand::SystemRandom::new(), &mut raw)
+        .unwrap_or_else(|_| panic!("rng"));
+    let tag = ring::hmac::sign(key, &raw);
+    let mut full = [0u8; 32];
+    full[..16].copy_from_slice(&raw);
+    full[16..].copy_from_slice(&tag.as_ref()[..16]);
+    format!("{SESSION_PREFIX}{}", hex(&full))
+}
+
+/// Shape + tag check on a presented token; `Some(sha256)` only for a
+/// value this process could have minted — the store lookup key.
+fn session_token_hash(key: &ring::hmac::Key, token: &str) -> Option<[u8; 32]> {
+    let body = token.strip_prefix(SESSION_PREFIX)?;
+    let raw = unhex(body)?;
+    let (rand, tag) = raw.split_at(16);
+    // ring's `verify` demands the full-length tag; ours is a 16-byte
+    // truncation, so compare the computed prefix constant-time.
+    let computed = ring::hmac::sign(key, rand);
+    // ATTACK(session-forge)
+    if !bool::from(subtle::ConstantTimeEq::ct_eq(&computed.as_ref()[..16], tag)) {
+        return None;
+    }
+    Some(sha256(token.as_bytes()))
+}
+
+/// The synchroniser CSRF value: `drc_` + hex of the seed's HMAC —
+/// never stored, recomputed per request.
+fn csrf_token(seed: &[u8; 32]) -> String {
+    let key = ring::hmac::Key::new(ring::hmac::HMAC_SHA256, seed);
+    format!("drc_{}", hex(ring::hmac::sign(&key, b"csrf").as_ref()))
+}
+
+fn csrf_ok(seed: &[u8; 32], presented: &str) -> bool {
+    // ATTACK(csrf)
+    let expect = csrf_token(seed);
+    presented.len() == expect.len()
+        && bool::from(subtle::ConstantTimeEq::ct_eq(
+            presented.as_bytes(),
+            expect.as_bytes(),
+        ))
+}
+
+fn session_cookie(parts: &Parts) -> Option<String> {
+    let raw = parts.headers.get(header::COOKIE)?.to_str().ok()?;
+    for pair in raw.split(';') {
+        let pair = pair.trim();
+        if let Some(v) = pair.strip_prefix(SESSION_COOKIE) {
+            return v.strip_prefix('=').map(|t| t.to_string());
+        }
+    }
+    None
+}
+
+fn session_set_cookie(token: &str) -> String {
+    format!("{SESSION_COOKIE}={token}; Path=/; Secure; HttpOnly; SameSite=Lax")
+}
+
+fn session_clear_cookie() -> &'static str {
+    "__Host-drs=; Path=/; Secure; HttpOnly; SameSite=Lax; Max-Age=0"
+}
+
+// ---- S3-1: email tokens, known-device, lockout, outbox drain --------
+
+const EMAIL_TOKEN_PREFIX: &str = "drt_";
+const VERIFY_TOKEN_TTL_MS: i64 = 24 * 3600 * 1000;
+const RESET_TOKEN_TTL_MS: i64 = 3600 * 1000;
+const KNOWN_DEVICE_COOKIE: &str = "__Host-drd";
+const KNOWN_DEVICE_MAX_AGE_S: u64 = 400 * 24 * 3600;
+/// The login cool-off (review #13): failures per (normalized email,
+/// client /24-or-/64) — keyed whether or not the account exists, so a
+/// 429 never answers "is this address registered".
+const LOCKOUT_FAILS: u32 = 10;
+const LOCKOUT_WINDOW_MS: i64 = 10 * 60 * 1000;
+const LOCKOUT_COOLOFF_MS: i64 = 15 * 60 * 1000;
+const LOCKOUT_CAP: usize = 10_000;
+/// Outbox drain (D-068): bounded batch, per-send deadline, claim
+/// deadline that makes a worker crash reclaimable.
+const OUTBOX_BATCH: u32 = 25;
+const OUTBOX_SEND_DEADLINE: Duration = Duration::from_secs(10);
+const OUTBOX_CLAIM_MS: i64 = 30_000;
+const OUTBOX_TICK: Duration = Duration::from_secs(5);
+/// Consecutive provider failures that open the circuit breaker.
+const MAIL_BREAKER_FAILS: u32 = 8;
+const MAIL_BREAKER_MS: i64 = 5 * 60 * 1000;
+/// Default global send budget per UTC day (`DURABLE_MAIL_DAILY_BUDGET`).
+const MAIL_DAILY_BUDGET: u32 = 500;
+
+/// Mint an email token (`verify`/`reset` share the shape — the kind
+/// column is the guard against confusion, proven by its attack).
+fn mint_email_token() -> String {
+    let mut b = [0u8; 32];
+    ring::rand::SecureRandom::fill(&ring::rand::SystemRandom::new(), &mut b)
+        .unwrap_or_else(|_| panic!("rng"));
+    format!(
+        "{EMAIL_TOKEN_PREFIX}{}",
+        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(b)
+    )
+}
+
+/// Shape-check + lookup hash for a presented `drt_` value. Malformed
+/// tokens answer `None` → the route's single 410 (no dead-kind oracle).
+fn email_token_hash(token: &str) -> Option<[u8; 32]> {
+    let body = token.strip_prefix(EMAIL_TOKEN_PREFIX)?;
+    let raw = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(body)
+        .ok()?;
+    (raw.len() == 32).then(|| sha256(token.as_bytes()))
+}
+
+/// The lockout's client key: the /24 (v4) or /64 (v6) holding the
+/// socket address — a single host can't dodge its own counter.
+fn client_prefix(addr: std::net::IpAddr) -> std::net::IpAddr {
+    match addr {
+        std::net::IpAddr::V4(a) => {
+            let mut o = a.octets();
+            o[3] = 0;
+            std::net::IpAddr::V4(o.into())
+        }
+        std::net::IpAddr::V6(a) => {
+            let mut o = a.octets();
+            o[8..].fill(0);
+            std::net::IpAddr::V6(o.into())
+        }
+    }
+}
+
+/// A signed device-recognition cookie: `drd_` + hex(16 B public_id ∥
+/// 16 B tag), the tag `HMAC(session_key, "drd/" ∥ public_id) — same
+/// self-authenticating shape as the session token; a forgery dies on
+/// the tag. It only ever buys a lockout bypass — it is never an
+/// authentication factor.
+fn mint_known_device(key: &ring::hmac::Key, public_id: &uuid::Uuid) -> String {
+    let id = public_id.as_bytes();
+    let mut msg = Vec::with_capacity(4 + 16);
+    msg.extend_from_slice(b"drd/");
+    msg.extend_from_slice(id);
+    let tag = ring::hmac::sign(key, &msg);
+    let mut body = [0u8; 32];
+    body[..16].copy_from_slice(id);
+    body[16..].copy_from_slice(&tag.as_ref()[..16]);
+    format!("drd_{}", hex(&body))
+}
+
+fn known_device_ok(key: &ring::hmac::Key, parts: &Parts, public_id: &uuid::Uuid) -> bool {
+    let Some(raw) = parts
+        .headers
+        .get(header::COOKIE)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|raw| {
+            raw.split(';').find_map(|p| {
+                p.trim()
+                    .strip_prefix(KNOWN_DEVICE_COOKIE)
+                    .and_then(|v| v.strip_prefix('='))
+                    .map(|s| s.to_string())
+            })
+        })
+    else {
+        return false;
+    };
+    let Some(body) = raw.strip_prefix("drd_").and_then(unhex) else {
+        return false;
+    };
+    let (id, tag) = body.split_at(16);
+    let mut msg = Vec::with_capacity(4 + 16);
+    msg.extend_from_slice(b"drd/");
+    msg.extend_from_slice(id);
+    let computed = ring::hmac::sign(key, &msg);
+    id == public_id.as_bytes()
+        && bool::from(subtle::ConstantTimeEq::ct_eq(&computed.as_ref()[..16], tag))
+}
+
+fn known_device_set_cookie(value: &str) -> String {
+    format!(
+        "{KNOWN_DEVICE_COOKIE}={value}; Path=/; Secure; HttpOnly; SameSite=Lax; Max-Age={KNOWN_DEVICE_MAX_AGE_S}"
+    )
+}
+
+/// Bounded login-failure counters (review #13): 10 failures inside 10
+/// minutes → a 15-minute cool-off for that (email, client-prefix)
+/// pair. Counters live per normalized email whether or not an account
+/// exists — a 429 must not reveal registration.
+struct LoginLockouts {
+    map: Mutex<HashMap<(String, std::net::IpAddr), LockEntry>>,
+}
+
+struct LockEntry {
+    fails: u32,
+    window_start_ms: i64,
+    cooloff_until_ms: i64,
+}
+
+impl LoginLockouts {
+    fn new() -> Self {
+        Self {
+            map: Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// `Some(retry_after_s)` while the pair is in cool-off.
+    fn check(&self, email: &str, prefix: std::net::IpAddr, now_ms: i64) -> Option<u64> {
+        let map = self.map.lock().unwrap_or_else(|e| e.into_inner());
+        let until = map.get(&(email.to_string(), prefix))?.cooloff_until_ms;
+        (until > now_ms).then(|| ((until - now_ms) / 1000).max(1) as u64)
+    }
+
+    /// Record one failure; `true` on the trip into cool-off (the
+    /// transition — the notice mail's one-per-day edge rides it).
+    fn fail(&self, email: &str, prefix: std::net::IpAddr, now_ms: i64) -> bool {
+        let mut map = self.map.lock().unwrap_or_else(|e| e.into_inner());
+        if map.len() >= LOCKOUT_CAP {
+            map.retain(|_, e| e.cooloff_until_ms > now_ms || e.fails > 0);
+            if map.len() >= LOCKOUT_CAP {
+                if let Some(oldest) = map
+                    .iter()
+                    .min_by_key(|(_, e)| e.window_start_ms)
+                    .map(|(k, _)| k.clone())
+                {
+                    map.remove(&oldest);
+                }
+            }
+        }
+        let e = map.entry((email.to_string(), prefix)).or_insert(LockEntry {
+            fails: 0,
+            window_start_ms: now_ms,
+            cooloff_until_ms: 0,
+        });
+        if e.window_start_ms + LOCKOUT_WINDOW_MS <= now_ms {
+            e.fails = 0;
+            e.window_start_ms = now_ms;
+        }
+        if e.cooloff_until_ms > now_ms {
+            return false;
+        }
+        e.fails += 1;
+        if e.fails >= LOCKOUT_FAILS {
+            e.cooloff_until_ms = now_ms + LOCKOUT_COOLOFF_MS;
+            return true;
+        }
+        false
+    }
+
+    fn clear(&self, email: &str, prefix: std::net::IpAddr) {
+        self.map
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&(email.to_string(), prefix));
+    }
+
+    /// A successful reset clears every counter for the address — the
+    /// mailbox owner proved themselves.
+    fn clear_email(&self, email: &str) {
+        self.map
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .retain(|(e, _), _| e != email);
+    }
+}
+
+/// The global outbound guard (review #14): a per-day send budget plus
+/// a circuit breaker on consecutive provider failures. In-process —
+/// the budget is a tripwire, not an accounting record.
+struct MailBudget {
+    inner: Mutex<BudgetInner>,
+}
+
+struct BudgetInner {
+    day: i64,
+    sent: u32,
+    cap: u32,
+    fails: u32,
+    open_until_ms: i64,
+}
+
+impl MailBudget {
+    fn new(cap: u32) -> Self {
+        Self {
+            inner: Mutex::new(BudgetInner {
+                day: 0,
+                sent: 0,
+                cap,
+                fails: 0,
+                open_until_ms: 0,
+            }),
+        }
+    }
+
+    /// Sends may proceed: budget left today and the breaker is closed.
+    fn open(&self, now_ms: i64) -> bool {
+        let mut b = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        let day = now_ms / 86_400_000;
+        if b.day != day {
+            b.day = day;
+            b.sent = 0;
+        }
+        b.sent < b.cap && b.open_until_ms <= now_ms
+    }
+
+    fn sent(&self, now_ms: i64) {
+        let mut b = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        let day = now_ms / 86_400_000;
+        if b.day != day {
+            b.day = day;
+            b.sent = 0;
+        }
+        b.sent += 1;
+        b.fails = 0;
+    }
+
+    fn failed(&self, now_ms: i64) {
+        let mut b = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        b.fails += 1;
+        if b.fails >= MAIL_BREAKER_FAILS {
+            b.open_until_ms = now_ms + MAIL_BREAKER_MS;
+            b.fails = 0;
+        }
+    }
+}
+
+/// Drain one bounded batch (D-068): sweep dead rows, claim due rows,
+/// send each under its deadline, mark the outcome. `failed` and
+/// `dropped` are terminal states the sweep owns — a mail is never
+/// lost, only dead-lettered or intentionally dropped.
+async fn drain_outbox_once(app: &App) -> usize {
+    let Some(store) = app.keyring.store.clone() else {
+        return 0;
+    };
+    let now = unix_ms();
+    let _ = store.outbox_sweep(now).await;
+    let _ = store.outbox_purge(now).await;
+    let claimed = match store.outbox_claim(now, OUTBOX_BATCH, OUTBOX_CLAIM_MS).await {
+        Ok(c) => c,
+        Err(_) => return 0,
+    };
+    let mut sent = 0;
+    for row in claimed {
+        // ATTACK(mail-global)
+        if !app.mail_budget.open(unix_ms()) {
+            break; // claimed rows stay 'sending' — reclaimable later
+        }
+        let res = tokio::time::timeout(OUTBOX_SEND_DEADLINE, app.mailer.send(&row.mail)).await;
+        let outcome = match res {
+            Ok(Ok(())) => {
+                app.mail_budget.sent(unix_ms());
+                sent += 1;
+                durable_accounts::MailOutcome::Sent
+            }
+            Ok(Err(durable_accounts::MailError::Refused(e))) => {
+                app.mail_budget.failed(unix_ms());
+                durable_accounts::MailOutcome::Failed { error: e }
+            }
+            res => {
+                app.mail_budget.failed(unix_ms());
+                let error = match res {
+                    Ok(Err(durable_accounts::MailError::Send(e))) => e,
+                    Ok(Err(durable_accounts::MailError::Refused(_))) => unreachable!(),
+                    Ok(Ok(())) => unreachable!(),
+                    Err(_) => "send deadline".to_string(),
+                };
+                // Backoff: 30 s doubling to a 1 h cap, plus jitter.
+                let shift = row.attempts.clamp(0, 6) as u32;
+                let base = 30_000i64.saturating_mul(1i64 << shift).min(3_600_000);
+                let mut j = [0u8; 2];
+                ring::rand::SecureRandom::fill(&ring::rand::SystemRandom::new(), &mut j)
+                    .unwrap_or_else(|_| panic!("rng"));
+                durable_accounts::MailOutcome::Retry {
+                    error,
+                    next_attempt_at_ms: unix_ms()
+                        + base
+                        + i64::from(u16::from_be_bytes(j) % 15_000),
+                }
+            }
+        };
+        let _ = store.outbox_mark(row.id, outcome).await;
+    }
+    sent
+}
+
+/// The background drain worker — store mode only; tests drive
+/// `drain_outbox_once` directly.
+fn spawn_mail_drain(app: App) {
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(OUTBOX_TICK);
+        loop {
+            tick.tick().await;
+            drain_outbox_once(&app).await;
+        }
+    });
+}
+
+/// Idle-expiry sliding (D-071): requests record touches in memory; one
+/// batched monotonic store update per tick keeps `idle_expires_at`
+/// moving without a write per request. A missed flush only slides
+/// less — never serves a dead session.
+const SESSION_TOUCH_TICK: std::time::Duration = std::time::Duration::from_secs(30);
+
+async fn flush_session_touches(app: &App) {
+    let Some(store) = app.keyring.store.clone() else {
+        return;
+    };
+    let touches = app.sessions.drain_touches();
+    if !touches.is_empty() {
+        let _ = store.touch_sessions(&touches).await;
+    }
+    let key_touches = app.keyring.drain_key_touches();
+    if !key_touches.is_empty() {
+        let _ = store.touch_keys(&key_touches).await;
+    }
+}
+
+fn spawn_session_flush(app: App) {
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(SESSION_TOUCH_TICK);
+        loop {
+            tick.tick().await;
+            flush_session_touches(&app).await;
+        }
+    });
+}
+
+/// Generation-checked session cache (review #10): a fill that spans an
+/// invalidation is dropped; a hit older than its key's bump is a miss.
+/// Bumps come in two keys — a session's token hash (logout, revoke-one)
+/// and its account (revoke-all, verify, reset, password change) — so an
+/// account-wide revocation dies in cache too, not just in the store.
+/// The bump maps are bounded; overflow clears the grants — a safe
+/// global invalidation. `touches` is the pending idle slide (D-071).
+struct SessionCache {
+    grants: Mutex<HashMap<[u8; 32], SessionEntry>>,
+    bumps: Mutex<HashMap<[u8; 32], Instant>>,
+    account_bumps: Mutex<HashMap<u64, Instant>>,
+    /// token_hash → last-seen unix ms, flushed to the store on the
+    /// D-071 interval; bounded — overflow clears (a lost touch slides
+    /// less, never serves a dead session).
+    touches: Mutex<HashMap<[u8; 32], i64>>,
+}
+
+struct SessionEntry {
+    at: Instant,
+    grant: std::sync::Arc<durable_accounts::SessionGrant>,
+}
+
+const TOUCH_CAP: usize = 50_000;
+
+impl SessionCache {
+    fn new() -> Self {
+        Self {
+            grants: Mutex::new(HashMap::new()),
+            bumps: Mutex::new(HashMap::new()),
+            account_bumps: Mutex::new(HashMap::new()),
+            touches: Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// The slide floor a pending touch gives this token's idle
+    /// deadline — the store row lags by up to the flush interval, so
+    /// expiry checks take max(stored, pending) rather than under-live.
+    fn touch_idle(&self, hash: &[u8; 32]) -> i64 {
+        self.touches
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(hash)
+            .map(|seen| seen + SESSION_IDLE_MS)
+            .unwrap_or(0)
+    }
+
+    /// Record use of a resolved session for the next flush.
+    fn touch(&self, hash: [u8; 32], now_ms: i64) {
+        let mut touches = self.touches.lock().unwrap_or_else(|e| e.into_inner());
+        if touches.len() >= TOUCH_CAP {
+            touches.clear();
+        }
+        touches.insert(hash, now_ms);
+    }
+
+    /// Drain pending touches for the flush task.
+    fn drain_touches(&self) -> Vec<durable_accounts::SessionTouch> {
+        let mut touches = self.touches.lock().unwrap_or_else(|e| e.into_inner());
+        std::mem::take(&mut *touches)
+            .into_iter()
+            .map(|(token_hash, seen_ms)| durable_accounts::SessionTouch {
+                token_hash,
+                seen_ms,
+                idle_expires_at_ms: seen_ms + SESSION_IDLE_MS,
+            })
+            .collect()
+    }
+
+    fn account_bumped(&self, account: u64, since: Instant) -> bool {
+        self.account_bumps
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&account)
+            .is_some_and(|b| *b > since)
+    }
+
+    fn get(
+        &self,
+        hash: &[u8; 32],
+        now_ms: i64,
+    ) -> Option<std::sync::Arc<durable_accounts::SessionGrant>> {
+        let entry = {
+            let grants = self.grants.lock().unwrap_or_else(|e| e.into_inner());
+            grants.get(hash).map(|e| SessionEntry {
+                at: e.at,
+                grant: std::sync::Arc::clone(&e.grant),
+            })
+        }?;
+        if entry.at.elapsed() >= SESSION_GRANT_TTL {
+            return None;
+        }
+        if self
+            .bumps
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(hash)
+            .is_some_and(|b| *b > entry.at)
+            || self.account_bumped(entry.grant.account.id, entry.at)
+        {
+            return None;
+        }
+        let idle = entry.grant.idle_expires_at_ms.max(self.touch_idle(hash));
+        if entry.grant.expires_at_ms <= now_ms || idle <= now_ms {
+            return None;
+        }
+        Some(entry.grant)
+    }
+
+    /// `fill_start` is the instant BEFORE the store await; a bump inside
+    /// the window means the fetched grant post-dates nothing — the fill
+    /// is refused and the caller denies.
+    fn put(
+        &self,
+        hash: [u8; 32],
+        grant: std::sync::Arc<durable_accounts::SessionGrant>,
+        fill_start: Instant,
+    ) -> bool {
+        if self
+            .bumps
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&hash)
+            .is_some_and(|b| *b > fill_start)
+            || self.account_bumped(grant.account.id, fill_start)
+        {
+            return false;
+        }
+        let mut grants = self.grants.lock().unwrap_or_else(|e| e.into_inner());
+        if grants.len() >= SESSION_CACHE_CAP {
+            grants.retain(|_, e| e.at.elapsed() < SESSION_GRANT_TTL);
+            if grants.len() >= SESSION_CACHE_CAP {
+                grants.clear();
+            }
+        }
+        grants.insert(
+            hash,
+            SessionEntry {
+                at: Instant::now(),
+                grant,
+            },
+        );
+        true
+    }
+
+    /// Write-through invalidation: revoke/logout lands at once.
+    fn bump(&self, hash: [u8; 32]) {
+        let mut bumps = self.bumps.lock().unwrap_or_else(|e| e.into_inner());
+        if bumps.len() >= BUMP_CAP {
+            bumps.retain(|_, at| at.elapsed() < BUMP_TTL);
+            if bumps.len() >= BUMP_CAP {
+                self.grants
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .clear();
+                bumps.clear();
+            }
+        }
+        bumps.insert(hash, Instant::now());
+    }
+
+    /// Account-wide invalidation (review #10's account key): verify,
+    /// reset, password change, revoke-all and unverified re-sign-up all
+    /// kill sessions in the store — this makes the cache agree before
+    /// the next request rather than at TTL.
+    fn bump_account(&self, account: u64) {
+        let mut bumps = self.account_bumps.lock().unwrap_or_else(|e| e.into_inner());
+        if bumps.len() >= BUMP_CAP {
+            bumps.retain(|_, at| at.elapsed() < BUMP_TTL);
+            if bumps.len() >= BUMP_CAP {
+                self.grants
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .clear();
+                bumps.clear();
+            }
+        }
+        bumps.insert(account, Instant::now());
+    }
+}
+
+// ---- S3-3: the member-role cache (D-066) ----------------------------
+
+const MEMBER_GRANT_TTL: Duration = Duration::from_secs(60);
+const MEMBER_CACHE_CAP: usize = 10_000;
+
+struct MemberEntry {
+    at: Instant,
+    role: Role,
+}
+
+/// Roles resolve exactly like key grants: cached a bounded time,
+/// generation-checked across the store await, invalidated write-through.
+/// The invalidation key is the workspace — any member change in it
+/// (role set, remove, accept, workspace delete) clears every cached
+/// role in that workspace at once; membership churn is rare, the blast
+/// radius small.
+struct MemberCache {
+    grants: Mutex<HashMap<(u64, u64), MemberEntry>>,
+    ws_bumps: Mutex<HashMap<u64, Instant>>,
+}
+
+impl MemberCache {
+    fn new() -> Self {
+        Self {
+            grants: Mutex::new(HashMap::new()),
+            ws_bumps: Mutex::new(HashMap::new()),
+        }
+    }
+
+    fn get(&self, account: u64, ws: u64) -> Option<Role> {
+        let grants = self.grants.lock().unwrap_or_else(|e| e.into_inner());
+        let entry = grants.get(&(account, ws))?;
+        (entry.at.elapsed() < MEMBER_GRANT_TTL).then_some(entry.role)
+    }
+
+    /// Fill after the store await — refused if a bump landed during it
+    /// (review #10): deny rather than serve a role already changed.
+    fn put(&self, account: u64, ws: u64, role: Role, fill_start: Instant) -> bool {
+        if self
+            .ws_bumps
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&ws)
+            .is_some_and(|b| *b > fill_start)
+        {
+            return false;
+        }
+        let mut grants = self.grants.lock().unwrap_or_else(|e| e.into_inner());
+        if grants.len() >= MEMBER_CACHE_CAP {
+            grants.retain(|_, e| e.at.elapsed() < MEMBER_GRANT_TTL);
+            if grants.len() >= MEMBER_CACHE_CAP {
+                grants.clear();
+            }
+        }
+        grants.insert(
+            (account, ws),
+            MemberEntry {
+                at: Instant::now(),
+                role,
+            },
+        );
+        true
+    }
+
+    /// Write-through: every cached role in `ws` dies now, and a fill
+    /// that started before this moment dies on `put`.
+    fn bump_ws(&self, ws: u64) {
+        self.grants
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .retain(|(_, w), _| *w != ws);
+        let mut bumps = self.ws_bumps.lock().unwrap_or_else(|e| e.into_inner());
+        if bumps.len() >= BUMP_CAP {
+            bumps.retain(|_, at| at.elapsed() < BUMP_TTL);
+            if bumps.len() >= BUMP_CAP {
+                bumps.clear();
+            }
+        }
+        bumps.insert(ws, Instant::now());
+    }
+}
+
+/// The bounded argon2 queue (review #9): the job permit is acquired on
+/// the async side before `spawn_blocking` — blocking-pool threads never
+/// park on auth work. Waiters are bounded and timed out; one job per
+/// client address at a time.
+struct ArgonQueue {
+    /// The public pool — `ARGON_PERMITS - 1`, so one permit is always
+    /// left for the reserve (review #13/S3-2).
+    jobs: tokio::sync::Semaphore,
+    /// The single reserved permit: only requests carrying a valid
+    /// known-device cookie may take it, so a credential-stuffing flood
+    /// that saturates the public pool can never starve the owner out.
+    reserve: tokio::sync::Semaphore,
+    tickets: tokio::sync::Semaphore,
+    addrs: Mutex<HashSet<std::net::IpAddr>>,
+    /// Test-visible count of hashes run — the dummy path must cost the
+    /// same work as a real verify.
+    ran: std::sync::atomic::AtomicU64,
+}
+
+impl ArgonQueue {
+    fn new() -> Self {
+        Self {
+            jobs: tokio::sync::Semaphore::new(ARGON_PERMITS - 1),
+            reserve: tokio::sync::Semaphore::new(1),
+            tickets: tokio::sync::Semaphore::new(ARGON_WAITERS),
+            addrs: Mutex::new(HashSet::new()),
+            ran: std::sync::atomic::AtomicU64::new(0),
+        }
+    }
+
+    fn busy() -> ApiError {
+        let mut e = ApiError::new(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "busy",
+            "authentication is saturated; retry in a moment",
+        );
+        e.retry_after = Some(1);
+        e
+    }
+
+    /// `reserved_ok` marks a request the reserve may serve (a valid
+    /// known-device cookie): it competes for the public pool first and
+    /// falls back to the one reserved permit — total concurrency still
+    /// caps at `ARGON_PERMITS`.
+    async fn run<T: Send + 'static>(
+        &self,
+        addr: std::net::IpAddr,
+        reserved_ok: bool,
+        work: impl FnOnce() -> T + Send + 'static,
+    ) -> Result<T, ApiError> {
+        {
+            let mut addrs = self.addrs.lock().unwrap_or_else(|e| e.into_inner());
+            if !addrs.insert(addr) {
+                return Err(Self::busy());
+            }
+        }
+        struct AddrGuard<'a>(&'a ArgonQueue, std::net::IpAddr);
+        impl Drop for AddrGuard<'_> {
+            fn drop(&mut self) {
+                self.0
+                    .addrs
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .remove(&self.1);
+            }
+        }
+        let _addr = AddrGuard(self, addr);
+        let _ticket = self.tickets.try_acquire().map_err(|_| Self::busy())?;
+        let _permit = match tokio::time::timeout(ARGON_WAIT, self.jobs.acquire()).await {
+            Ok(Ok(permit)) => permit,
+            Ok(Err(_)) | Err(_) if !reserved_ok => return Err(Self::busy()),
+            _ => tokio::time::timeout(ARGON_WAIT, self.reserve.acquire())
+                .await
+                .map_err(|_| Self::busy())?
+                .map_err(|_| Self::busy())?,
+        };
+        self.ran.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        tokio::task::spawn_blocking(work)
+            .await
+            .map_err(|_| Self::busy())
+    }
+}
+
+/// A bounded sliding-window counter — `cap` hits per `span` per key.
+/// `RateLimit` couples burst to the per-second rate, which makes
+/// "5/hour" mean "~1 request": low-frequency auth limits want real
+/// windows instead.
+struct SlidingWindow {
+    cap: usize,
+    span: Duration,
+    hits: HashMap<std::net::IpAddr, std::collections::VecDeque<Instant>>,
+}
+
+impl SlidingWindow {
+    fn new(cap: usize, span: Duration) -> Self {
+        Self {
+            cap,
+            span,
+            hits: HashMap::new(),
+        }
+    }
+
+    /// Ok: counted. Err: refused — how long until the oldest hit ages
+    /// out of the window (a Retry-After the client can honour).
+    fn check(&mut self, addr: std::net::IpAddr, now: Instant) -> Result<(), Duration> {
+        if self.hits.len() >= 50_000 {
+            let idle = now - self.span;
+            self.hits.retain(|_, h| h.back().is_some_and(|t| *t > idle));
+            if self.hits.len() >= 50_000 {
+                return Err(Duration::from_secs(60));
+            }
+        }
+        let h = self.hits.entry(addr).or_default();
+        while h
+            .front()
+            .is_some_and(|t| now.duration_since(*t) >= self.span)
+        {
+            h.pop_front();
+        }
+        if h.len() >= self.cap {
+            return Err(self.span - now.duration_since(*h.front().unwrap_or(&now)));
+        }
+        h.push_back(now);
+        Ok(())
+    }
+}
+
+/// Per-address limits for the open auth surface (per finding-6's
+/// `client_addr` — the untrusted socket address unless a trusted proxy).
+struct AuthLimits {
+    signup_hour: Mutex<SlidingWindow>,
+    signup_day: Mutex<SlidingWindow>,
+    login: Mutex<SlidingWindow>,
+    /// verify/reset redemption: 20/min per address.
+    redeem: Mutex<SlidingWindow>,
+    /// forgot/resend-verification: 5/hour per address.
+    mail_req: Mutex<SlidingWindow>,
+}
+
+impl AuthLimits {
+    fn new() -> Self {
+        Self {
+            signup_hour: Mutex::new(SlidingWindow::new(5, Duration::from_secs(3600))),
+            signup_day: Mutex::new(SlidingWindow::new(20, Duration::from_secs(86400))),
+            // Coarser than the (email, prefix) lockout so the lockout's
+            // precise 429 — not this flood bound — answers the tripped
+            // pair; this one only stops an address spraying many emails.
+            login: Mutex::new(SlidingWindow::new(30, Duration::from_secs(60))),
+            redeem: Mutex::new(SlidingWindow::new(20, Duration::from_secs(60))),
+            mail_req: Mutex::new(SlidingWindow::new(5, Duration::from_secs(3600))),
+        }
+    }
+
+    fn check(lim: &Mutex<SlidingWindow>, addr: std::net::IpAddr) -> Result<(), ApiError> {
+        lim.lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .check(addr, Instant::now())
+            .map_err(|retry| {
+                let mut e = ApiError::new(
+                    StatusCode::TOO_MANY_REQUESTS,
+                    "rate_limited",
+                    "too many attempts; retry shortly",
+                );
+                e.retry_after = Some(retry.as_secs().max(1));
+                e
+            })
+    }
+}
+
+/// The request's client address, inserted as an extension by the
+/// service wrapper (computed once there through `client_addr`).
+#[derive(Clone, Copy)]
+struct ClientAddr(std::net::IpAddr);
+
+/// Request extension: this connection arrived on the `--ops-listen`
+/// socket — the only place env-key principals hold (finding 18).
+#[derive(Clone, Copy)]
+struct OpsListener;
+
+fn client(parts: &Parts) -> std::net::IpAddr {
+    parts
+        .extensions
+        .get::<ClientAddr>()
+        .map(|c| c.0)
+        .unwrap_or(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST))
+}
+
+/// Origin/Fetch-Site defence for requests that carry no session yet
+/// (review #17): with no synchroniser token possible, the origin check
+/// IS the CSRF layer on the open auth POSTs — plus JSON-only bodies
+/// (the `J` extractor's 415) and no CORS layer.
+fn check_request_origin(parts: &Parts) -> Result<(), ApiError> {
+    if let Some(site) = parts
+        .headers
+        .get("sec-fetch-site")
+        .and_then(|v| v.to_str().ok())
+    {
+        // ATTACK(csrf-open-post)
+        if site != "same-origin" && site != "none" {
+            return Err(csrf_failed());
+        }
+    }
+    if let Some(origin) = parts
+        .headers
+        .get(header::ORIGIN)
+        .and_then(|v| v.to_str().ok())
+    {
+        let host = parts
+            .headers
+            .get(header::HOST)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or_default();
+        let ok = url::Url::parse(origin).ok().is_some_and(|u| {
+            u.host_str()
+                .is_some_and(|h| host == h || host.starts_with(&format!("{h}:")))
+        });
+        if !ok {
+            return Err(csrf_failed());
+        }
+    }
+    Ok(())
+}
+
+fn csrf_failed() -> ApiError {
+    ApiError::new(
+        StatusCode::FORBIDDEN,
+        "csrf_failed",
+        "cross-site request refused",
+    )
+}
+
+/// Proof of a signed-in session. Resolution order (review S3): any
+/// `Authorization` header wins — bearer-only, no cookie fallback — so a
+/// `drs_` bearer and a `dr_` cookie both die 401 rather than confuse
+/// the two planes. The session surface answers 404 (not 401) when no
+/// account store is configured: the dashboard's compat key-paste mode
+/// keys off that exact status.
+struct SessionAuth(std::sync::Arc<durable_accounts::SessionGrant>);
+
+impl FromRequestParts<App> for SessionAuth {
+    type Rejection = ApiError;
+
+    async fn from_request_parts(parts: &mut Parts, app: &App) -> Result<Self, Self::Rejection> {
+        let Some(store) = app.keyring.store.clone() else {
+            return Err(ApiError::new(
+                StatusCode::NOT_FOUND,
+                "unauthenticated",
+                "no account store is configured",
+            ));
+        };
+        if parts.headers.contains_key(header::AUTHORIZATION) {
+            return Err(ApiError::new(
+                StatusCode::UNAUTHORIZED,
+                "unauthenticated",
+                "API keys cannot reach the session surface",
+            ));
+        }
+        let grant = session_grant_for(app, parts, &store).await?;
+        Ok(SessionAuth(grant))
+    }
+}
+
+/// The session-cookie → grant resolution shared by `SessionAuth` and
+/// the dual-auth flat routes (D-066): tag-checked `drs_`, cache-then-
+/// store, idle+absolute expiry with the pending-touch floor, and the
+/// mid-await bump drop — identical answers either way in.
+async fn session_grant_for(
+    app: &App,
+    parts: &Parts,
+    store: &Arc<dyn AccountStore>,
+) -> Result<std::sync::Arc<durable_accounts::SessionGrant>, ApiError> {
+    let token = session_cookie(parts)
+        .ok_or_else(|| ApiError::new(StatusCode::UNAUTHORIZED, "unauthenticated", "no session"))?;
+    let Some(hash) = session_token_hash(&app.session_key, &token) else {
+        return Err(ApiError::new(
+            StatusCode::UNAUTHORIZED,
+            "unauthenticated",
+            "no session",
+        ));
+    };
+    let now = app.now_ms();
+    if let Some(grant) = app.sessions.get(&hash, now) {
+        app.sessions.touch(hash, now);
+        return Ok(grant);
+    }
+    let fill_start = Instant::now();
+    let grant = match store.session_grant(&hash).await {
+        Ok(Some(g)) => g,
+        Ok(None) => {
+            return Err(ApiError::new(
+                StatusCode::UNAUTHORIZED,
+                "unauthenticated",
+                "no session",
+            ))
+        }
+        Err(_) => return Err(accounts_unavailable()),
+    };
+    // The idle check takes the pending-touch floor too — a slide
+    // queued but not yet flushed still counts as use (D-071).
+    let idle = grant.idle_expires_at_ms.max(app.sessions.touch_idle(&hash));
+    // ATTACK(idle-timeout)
+    if grant.expires_at_ms <= now || idle <= now {
+        return Err(ApiError::new(
+            StatusCode::UNAUTHORIZED,
+            "unauthenticated",
+            "session expired",
+        ));
+    }
+    let grant = std::sync::Arc::new(grant);
+    // A revocation that landed inside the store await drops the
+    // fill — deny rather than serve stale (review #10).
+    if !app
+        .sessions
+        .put(hash, std::sync::Arc::clone(&grant), fill_start)
+    {
+        return Err(ApiError::new(
+            StatusCode::UNAUTHORIZED,
+            "unauthenticated",
+            "no session",
+        ));
+    }
+    app.sessions.touch(hash, now);
+    Ok(grant)
+}
+
+/// A session-authed mutation: SessionAuth plus the synchroniser CSRF
+/// check (`x-durable-csrf` recomputed from the seed, constant-time).
+struct SessionWrite(std::sync::Arc<durable_accounts::SessionGrant>);
+
+impl FromRequestParts<App> for SessionWrite {
+    type Rejection = ApiError;
+
+    async fn from_request_parts(parts: &mut Parts, app: &App) -> Result<Self, Self::Rejection> {
+        let auth = SessionAuth::from_request_parts(parts, app).await?;
+        let presented = parts
+            .headers
+            .get("x-durable-csrf")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or_default();
+        if !csrf_ok(&auth.0.csrf_seed, presented) {
+            return Err(csrf_failed());
+        }
+        check_request_origin(parts)?;
+        Ok(SessionWrite(auth.0))
+    }
+}
+
+#[derive(serde::Deserialize)]
+struct SignupReq {
+    email: String,
+    password: String,
+    /// Required when the deployment runs invite-only (ruling 9).
+    #[serde(default)]
+    invite_token: Option<String>,
+}
+
+#[derive(serde::Deserialize)]
+struct LoginReq {
+    email: String,
+    password: String,
+}
+
+#[derive(serde::Deserialize)]
+struct VerifyReq {
+    token: String,
+}
+
+#[derive(serde::Deserialize)]
+struct ResetReq {
+    token: String,
+    password: String,
+}
+
+#[derive(serde::Deserialize)]
+struct EmailReq {
+    email: String,
+}
+
+fn normalize_email(raw: &str) -> Option<String> {
+    let email = raw.trim().to_lowercase();
+    (email.len() <= 254 && email.matches('@').count() == 1 && email.len() > 3).then_some(email)
+}
+
+/// Mail hardening (review #14): subjects are fixed strings per kind —
+/// never user input; every interpolated value is HTML-escaped in the
+/// html twin; `send_to` passes the strict addr-spec check at enqueue.
+const SUBJECT_VERIFY: &str = "Verify your Durable Runner email";
+const SUBJECT_RESET: &str = "Reset your Durable Runner password";
+const SUBJECT_TAKEN: &str = "A Durable Runner sign-up used your address";
+const SUBJECT_LOCKOUT: &str = "Unusual sign-in attempts on your Durable Runner account";
+
+fn verify_mail_body(origin: &str, token: &str) -> (String, String) {
+    let link = format!("{origin}/app#/verify?token={token}");
+    let text = format!(
+        "Verify your Durable Runner email\n\nOpen this link within 24 hours:\n{link}\n\n\
+         If you did not sign up, ignore this mail."
+    );
+    let html = format!(
+        "<p>Verify your Durable Runner email</p><p><a href=\"{0}\">{0}</a></p>\
+         <p>If you did not sign up, ignore this mail.</p>",
+        durable_accounts::mail::html_escape(&link)
+    );
+    (text, html)
+}
+
+fn reset_mail_body(origin: &str, token: &str) -> (String, String) {
+    let link = format!("{origin}/app#/reset?token={token}");
+    let text = format!(
+        "Reset your Durable Runner password\n\nOpen this link within 1 hour:\n{link}\n\n\
+         If you did not ask for a reset, ignore this mail — your password is unchanged."
+    );
+    let html = format!(
+        "<p>Reset your Durable Runner password</p><p><a href=\"{0}\">{0}</a></p>\
+         <p>If you did not ask for a reset, ignore this mail — your password is unchanged.</p>",
+        durable_accounts::mail::html_escape(&link)
+    );
+    (text, html)
+}
+
+fn taken_mail_body() -> (String, String) {
+    (
+        "Someone tried to sign up with this address, which already has an account.\n\
+         If it was you, sign in or reset your password; if not, ignore this mail."
+            .to_string(),
+        "<p>Someone tried to sign up with this address, which already has an account.</p>\
+         <p>If it was you, sign in or reset your password; if not, ignore this mail.</p>"
+            .to_string(),
+    )
+}
+
+fn lockout_mail_body() -> (String, String) {
+    (
+        "Several failed sign-in attempts hit your account, so new attempts are \
+         paused for a while.\nIf this was you, wait a few minutes or reset your \
+         password; if not, your address may be getting probed — nothing was \
+         signed in."
+            .to_string(),
+        "<p>Several failed sign-in attempts hit your account, so new attempts are \
+         paused for a while.</p><p>If this was you, wait a few minutes or reset \
+         your password; if not, your address may be getting probed — nothing \
+         was signed in.</p>"
+            .to_string(),
+    )
+}
+
+/// The session cookie's account — resolved only so a token redeem can
+/// tell "my session" from "someone else's". A dead or forged cookie is
+/// `None`, same as absent.
+async fn cookie_account(
+    app: &App,
+    parts: &Parts,
+    store: &std::sync::Arc<dyn AccountStore>,
+) -> Result<Option<u64>, ApiError> {
+    let Some(token) = session_cookie(parts) else {
+        return Ok(None);
+    };
+    let Some(hash) = session_token_hash(&app.session_key, &token) else {
+        return Ok(None);
+    };
+    let now = app.now_ms();
+    if let Some(grant) = app.sessions.get(&hash, now) {
+        return Ok(Some(grant.account.id));
+    }
+    match store.session_grant(&hash).await {
+        Ok(Some(g)) if g.expires_at_ms > now && g.idle_expires_at_ms > now => {
+            Ok(Some(g.account.id))
+        }
+        Ok(_) => Ok(None),
+        Err(_) => Err(accounts_unavailable()),
+    }
+}
+
+/// Who gets a fresh session cookie after a token redeem (review #2,
+/// #17): verify NEVER sets one — the mailbox owner signs in fresh;
+/// reset sets one only when the requester is signed out or already
+/// signed in as that account (never signs a different browser over).
+enum TokenCookie {
+    Never,
+    UnlessForeignSession,
+}
+
+async fn finish_redeem(
+    parts: &Parts,
+    app: &App,
+    store: &std::sync::Arc<dyn AccountStore>,
+    account: &durable_accounts::Account,
+    policy: TokenCookie,
+    mut res: Response,
+) -> Result<Response, ApiError> {
+    let set_fresh = match policy {
+        TokenCookie::Never => false,
+        TokenCookie::UnlessForeignSession => match cookie_account(app, parts, store).await? {
+            None => true,
+            Some(other) => other == account.id,
+        },
+    };
+    if !set_fresh {
+        return Ok(res);
+    }
+    let addr = client(parts);
+    let token = mint_session_token(&app.session_key);
+    let hash = sha256(token.as_bytes());
+    let mut seed = [0u8; 32];
+    ring::rand::SecureRandom::fill(&ring::rand::SystemRandom::new(), &mut seed)
+        .unwrap_or_else(|_| panic!("rng"));
+    let now = app.now_ms();
+    store
+        .create_session(&durable_accounts::NewSession {
+            account: account.id,
+            token_hash: hash,
+            csrf_seed: seed,
+            expires_at_ms: now + SESSION_ABS_MS,
+            idle_expires_at_ms: now + SESSION_IDLE_MS,
+            replaces: None,
+            user_agent: parts
+                .headers
+                .get(header::USER_AGENT)
+                .and_then(|v| v.to_str().ok())
+                .map(|s| s[..s.len().min(256)].to_string()),
+            ip: Some(addr),
+        })
+        .await
+        .map_err(|_| accounts_unavailable())?;
+    res.headers_mut().append(
+        header::SET_COOKIE,
+        header::HeaderValue::from_str(&session_set_cookie(&token))
+            .unwrap_or_else(|_| header::HeaderValue::from_static("")),
+    );
+    res.headers_mut().append(
+        header::SET_COOKIE,
+        header::HeaderValue::from_str(&known_device_set_cookie(&mint_known_device(
+            &app.session_key,
+            &account.public_id,
+        )))
+        .unwrap_or_else(|_| header::HeaderValue::from_static("")),
+    );
+    Ok(res)
+}
+
+async fn auth_signup(
+    parts: Parts,
+    State(app): State<App>,
+    J(req): J<SignupReq>,
+) -> Result<Response, ApiError> {
+    check_request_origin(&parts)?;
+    let addr = client(&parts);
+    AuthLimits::check(&app.auth_limits.signup_hour, addr)?;
+    AuthLimits::check(&app.auth_limits.signup_day, addr)?;
+    let Some(email) = normalize_email(&req.email) else {
+        return Err(ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "bad_input",
+            "invalid email",
+        ));
+    };
+    if let Some(why) = durable_accounts::password::policy_refusal(&req.password) {
+        return Err(ApiError::new(StatusCode::BAD_REQUEST, "bad_input", why));
+    }
+    let Some(store) = app.keyring.store.clone() else {
+        return Err(ApiError::new(
+            StatusCode::NOT_FOUND,
+            "unauthenticated",
+            "no account store is configured",
+        ));
+    };
+    if app.invite_only {
+        let ok = match req.invite_token.as_deref().and_then(email_token_hash) {
+            Some(hash) => store
+                .invite_grant(&hash, unix_ms())
+                .await
+                .map_err(|_| accounts_unavailable())?
+                .is_some_and(|g| g.email == email),
+            None => false,
+        };
+        // ATTACK(invite-required)
+        if !ok {
+            return Err(ApiError::new(
+                StatusCode::FORBIDDEN,
+                "invite_required",
+                "sign-up is invite-only right now",
+            ));
+        }
+    }
+    // The hash runs on every branch BEFORE the store call (review S3):
+    // Created / VerifyResent / Taken all cost the same work.
+    let password = req.password.clone();
+    let phc = app
+        .argon
+        .run(addr, false, move || {
+            durable_accounts::password::hash_password(&password)
+        })
+        .await?
+        .map_err(|e| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "internal", e.to_string()))?;
+    let verify_token = mint_email_token();
+    let token_hash = sha256(verify_token.as_bytes());
+    let expires = unix_ms() + VERIFY_TOKEN_TTL_MS;
+    let origin = app.public_origin.as_deref().unwrap_or("http://localhost");
+    let (text, html) = verify_mail_body(origin, &verify_token);
+    let verify_mail = Mail {
+        kind: "verify",
+        send_to: email.clone(),
+        subject: SUBJECT_VERIFY.to_string(),
+        text,
+        html,
+        idempotency_key: format!("verify:{email}:{}", hex(&token_hash[..8])),
+        expires_at_ms: Some(expires),
+    };
+    let (text, html) = taken_mail_body();
+    let notice_mail = Mail {
+        kind: "notice",
+        send_to: email.clone(),
+        subject: SUBJECT_TAKEN.to_string(),
+        text,
+        html,
+        idempotency_key: format!("notice:{email}:{}", hex(&token_hash[..8])),
+        expires_at_ms: Some(unix_ms() + 24 * 3600 * 1000),
+    };
+    // The outbox row commits inside the signup transaction; the drain
+    // worker owns delivery — a racing immediate send could double-send
+    // with a claimed row, so there is none.
+    let outcome = store
+        .signup(
+            &email,
+            &phc,
+            &token_hash,
+            expires,
+            &verify_mail,
+            &notice_mail,
+        )
+        .await
+        .map_err(|_| accounts_unavailable())?;
+    // An unverified re-sign-up revoked that account's sessions inside
+    // the transaction — the cache agrees before the next request.
+    if let durable_accounts::SignupOutcome::VerifyResent { account, .. } = outcome {
+        app.sessions.bump_account(account);
+    }
+    Ok(no_store(
+        (
+            StatusCode::ACCEPTED,
+            Json(serde_json::json!({"status": "verification_sent"})),
+        )
+            .into_response(),
+    ))
+}
+
+async fn auth_login(
+    parts: Parts,
+    State(app): State<App>,
+    J(req): J<LoginReq>,
+) -> Result<Response, ApiError> {
+    check_request_origin(&parts)?;
+    let addr = client(&parts);
+    let Some(email) = normalize_email(&req.email) else {
+        return Err(ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "bad_input",
+            "invalid email",
+        ));
+    };
+    let Some(store) = app.keyring.store.clone() else {
+        return Err(ApiError::new(
+            StatusCode::NOT_FOUND,
+            "unauthenticated",
+            "no account store is configured",
+        ));
+    };
+    let account = store
+        .account_by_email(&email)
+        .await
+        .map_err(|_| accounts_unavailable())?;
+    let prefix = client_prefix(addr);
+    let now = unix_ms();
+    // A recognized device skips the cool-off (review #13): the cookie
+    // is HMAC-tagged to this account's public_id, so it can't be
+    // forged or replayed for another address — and it is checked
+    // before the lockout so a cooling attacker can't keep the owner
+    // out. Unknown accounts never bypass: no cookie can match them.
+    let known_device = account
+        .as_ref()
+        .is_some_and(|a| known_device_ok(&app.session_key, &parts, &a.public_id));
+    if !known_device {
+        // ATTACK(cooloff)
+        if let Some(retry) = app.lockouts.check(&email, prefix, now) {
+            let mut e = ApiError::new(
+                StatusCode::TOO_MANY_REQUESTS,
+                "rate_limited",
+                "too many attempts; retry shortly",
+            );
+            e.retry_after = Some(retry);
+            return Err(e);
+        }
+    }
+    AuthLimits::check(&app.auth_limits.login, addr)?;
+    // Unknown address: verify the dummy PHC — identical work, no oracle.
+    let phc = account
+        .as_ref()
+        .and_then(|a| a.password_hash.clone())
+        .unwrap_or_else(|| durable_accounts::password::DUMMY_PHC.to_string());
+    let password = req.password.clone();
+    let ok = app
+        .argon
+        .run(addr, known_device, move || {
+            durable_accounts::password::verify_password(&phc, &password)
+        })
+        .await?;
+    if !ok || account.is_none() {
+        if !known_device {
+            // Failures count against (email, prefix) whether or not the
+            // account exists — keying only real accounts would make
+            // 429-vs-401 a registration oracle (review #13).
+            // ATTACK(lockout-shape)
+            let tripped = app.lockouts.fail(&email, prefix, now);
+            if tripped {
+                if let Some(acct) = &account {
+                    // The owner notice rides the outbox's own dedupe:
+                    // the once-a-day idempotency key coalesces repeats.
+                    let day = now / 86_400_000;
+                    let (text, html) = lockout_mail_body();
+                    let _ = store
+                        .enqueue_mail(&Mail {
+                            kind: "notice",
+                            send_to: acct.email.clone(),
+                            subject: SUBJECT_LOCKOUT.to_string(),
+                            text,
+                            html,
+                            idempotency_key: format!("lockout:{}:{day}", acct.id),
+                            expires_at_ms: Some(now + 24 * 3600 * 1000),
+                        })
+                        .await;
+                }
+            }
+        }
+        return Err(ApiError::new(
+            StatusCode::UNAUTHORIZED,
+            "invalid_credentials",
+            "invalid credentials",
+        ));
+    }
+    let account = account.unwrap_or_else(|| panic!("checked"));
+    app.lockouts.clear(&email, prefix);
+    // Sign-in always mints a fresh token — a cookie value the client
+    // arrived with can never become the session (no fixation).
+    // ATTACK(session-fixation)
+    let token = mint_session_token(&app.session_key);
+    let hash = sha256(token.as_bytes());
+    let mut seed = [0u8; 32];
+    ring::rand::SecureRandom::fill(&ring::rand::SystemRandom::new(), &mut seed)
+        .unwrap_or_else(|_| panic!("rng"));
+    let now = app.now_ms();
+    store
+        .create_session(&durable_accounts::NewSession {
+            account: account.id,
+            token_hash: hash,
+            csrf_seed: seed,
+            expires_at_ms: now + SESSION_ABS_MS,
+            idle_expires_at_ms: now + SESSION_IDLE_MS,
+            replaces: None,
+            user_agent: parts
+                .headers
+                .get(header::USER_AGENT)
+                .and_then(|v| v.to_str().ok())
+                .map(|s| s[..s.len().min(256)].to_string()),
+            ip: Some(addr),
+        })
+        .await
+        .map_err(|_| accounts_unavailable())?;
+    let mut res = no_store(
+        (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "account": {
+                    "public_id": account.public_id,
+                    "email": account.email,
+                    "verified": account.email_verified,
+                },
+                "csrf": csrf_token(&seed),
+            })),
+        )
+            .into_response(),
+    );
+    res.headers_mut().insert(
+        header::SET_COOKIE,
+        header::HeaderValue::from_str(&session_set_cookie(&token)) // ATTACK(cookie-attrs)
+            .unwrap_or_else(|_| header::HeaderValue::from_static("")),
+    );
+    res.headers_mut().append(
+        header::SET_COOKIE,
+        header::HeaderValue::from_str(&known_device_set_cookie(&mint_known_device(
+            &app.session_key,
+            &account.public_id,
+        )))
+        .unwrap_or_else(|_| header::HeaderValue::from_static("")),
+    );
+    Ok(res)
+}
+
+async fn auth_logout(
+    SessionWrite(_grant): SessionWrite,
+    State(app): State<App>,
+    parts: Parts,
+) -> Result<Response, ApiError> {
+    let Some(store) = app.keyring.store.clone() else {
+        return Err(accounts_unavailable());
+    };
+    let token = session_cookie(&parts).unwrap_or_default();
+    let hash = sha256(token.as_bytes());
+    let _ = store.revoke_session(&hash).await;
+    app.sessions.bump(hash);
+    let mut res = no_store(StatusCode::NO_CONTENT.into_response());
+    res.headers_mut().insert(
+        header::SET_COOKIE,
+        header::HeaderValue::from_static(session_clear_cookie()),
+    );
+    Ok(res)
+}
+
+/// One 410 for every dead token state — consumed, superseded, expired,
+/// wrong kind, unknown all look identical (review: token oracle).
+fn token_gone() -> ApiError {
+    ApiError::new(
+        StatusCode::GONE,
+        "token_gone",
+        "this link is no longer valid — request a fresh one",
+    )
+}
+
+async fn auth_verify(
+    parts: Parts,
+    State(app): State<App>,
+    J(req): J<VerifyReq>,
+) -> Result<Response, ApiError> {
+    check_request_origin(&parts)?;
+    AuthLimits::check(&app.auth_limits.redeem, client(&parts))?;
+    let Some(store) = app.keyring.store.clone() else {
+        return Err(ApiError::new(
+            StatusCode::NOT_FOUND,
+            "unauthenticated",
+            "no account store is configured",
+        ));
+    };
+    let Some(hash) = email_token_hash(&req.token) else {
+        return Err(token_gone());
+    };
+    // The consume marks the token, installs the pending password hash,
+    // sets verified_at and revokes every session — atomically, in the
+    // store's single transaction (replay and takeover both die there).
+    // ATTACK(token-replay)
+    let account = store
+        .consume_verify_token(&hash)
+        .await
+        .map_err(|_| accounts_unavailable())?
+        .ok_or_else(token_gone)?;
+    // The store revoked every session in that transaction — the cache
+    // must agree immediately, not at grant TTL.
+    app.sessions.bump_account(account.id);
+    Ok(no_store(
+        finish_redeem(
+            &parts,
+            &app,
+            &store,
+            &account,
+            // ATTACK(verify-sets-cookie)
+            TokenCookie::Never,
+            Json(serde_json::json!({"verified": true})).into_response(),
+        )
+        .await?,
+    ))
+}
+
+/// Always-202 envelope for the email-keyed routes: the response and its
+/// timing must not leak whether the address is registered (review #3).
+fn accepted_sent() -> Response {
+    no_store(
+        (
+            StatusCode::ACCEPTED,
+            Json(serde_json::json!({"status": "sent"})),
+        )
+            .into_response(),
+    )
+}
+
+async fn auth_resend_verification(
+    parts: Parts,
+    State(app): State<App>,
+    J(req): J<EmailReq>,
+) -> Result<Response, ApiError> {
+    check_request_origin(&parts)?;
+    AuthLimits::check(&app.auth_limits.mail_req, client(&parts))?;
+    let res = accepted_sent();
+    let (Some(store), Some(email)) = (app.keyring.store.clone(), normalize_email(&req.email))
+    else {
+        return Ok(res);
+    };
+    // The store supersedes the pending verify token, inserts the fresh
+    // one (carrying the account's current hash) and enqueues the mail
+    // in one transaction — `None` (unknown / already verified) and the
+    // 202 already chosen keep the envelope sealed.
+    let token = mint_email_token();
+    let hash = sha256(token.as_bytes());
+    let expires = unix_ms() + VERIFY_TOKEN_TTL_MS;
+    let origin = app.public_origin.as_deref().unwrap_or("http://localhost");
+    let (text, html) = verify_mail_body(origin, &token);
+    let _ = store
+        .reissue_verify(
+            &email,
+            &hash,
+            expires,
+            &Mail {
+                kind: "verify",
+                send_to: email.clone(),
+                subject: SUBJECT_VERIFY.to_string(),
+                text,
+                html,
+                idempotency_key: format!("verify:{email}:{}", hex(&hash[..8])),
+                expires_at_ms: Some(expires),
+            },
+        )
+        .await
+        .map_err(|_| accounts_unavailable())?;
+    Ok(res)
+}
+
+async fn auth_forgot(
+    parts: Parts,
+    State(app): State<App>,
+    J(req): J<EmailReq>,
+) -> Result<Response, ApiError> {
+    check_request_origin(&parts)?;
+    AuthLimits::check(&app.auth_limits.mail_req, client(&parts))?;
+    let res = accepted_sent();
+    let (Some(store), Some(email)) = (app.keyring.store.clone(), normalize_email(&req.email))
+    else {
+        return Ok(res);
+    };
+    let token = mint_email_token();
+    let hash = sha256(token.as_bytes());
+    let expires = unix_ms() + RESET_TOKEN_TTL_MS;
+    let origin = app.public_origin.as_deref().unwrap_or("http://localhost");
+    let (text, html) = reset_mail_body(origin, &token);
+    // Token + mail commit in one store transaction; `None` (unknown or
+    // unverified address) enqueues nothing — the 202 went out either
+    // way, so the envelope never registers (review #3).
+    let issued = store
+        .issue_reset_token(
+            &email,
+            &hash,
+            expires,
+            &Mail {
+                kind: "reset",
+                send_to: email.clone(),
+                subject: SUBJECT_RESET.to_string(),
+                text,
+                html,
+                idempotency_key: format!("reset:{email}:{}", hex(&hash[..8])),
+                expires_at_ms: Some(expires),
+            },
+        )
+        .await
+        .map_err(|_| accounts_unavailable())?
+        .is_some();
+    // `issued` is deliberately dropped — whether a mail was enqueued
+    // must never shape the response.
+    // ATTACK(enumeration)
+    let _ = issued;
+    Ok(res)
+}
+
+async fn auth_reset(
+    parts: Parts,
+    State(app): State<App>,
+    J(req): J<ResetReq>,
+) -> Result<Response, ApiError> {
+    check_request_origin(&parts)?;
+    let addr = client(&parts);
+    AuthLimits::check(&app.auth_limits.redeem, addr)?;
+    if let Some(why) = durable_accounts::password::policy_refusal(&req.password) {
+        return Err(ApiError::new(StatusCode::BAD_REQUEST, "bad_input", why));
+    }
+    let Some(store) = app.keyring.store.clone() else {
+        return Err(ApiError::new(
+            StatusCode::NOT_FOUND,
+            "unauthenticated",
+            "no account store is configured",
+        ));
+    };
+    let Some(hash) = email_token_hash(&req.token) else {
+        return Err(token_gone());
+    };
+    // Hash BEFORE the consume: a dead token still costs the work, and
+    // the store only sees the digest.
+    let password = req.password.clone();
+    let phc = app
+        .argon
+        .run(addr, false, move || {
+            durable_accounts::password::hash_password(&password)
+        })
+        .await?
+        .map_err(|e| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "internal", e.to_string()))?;
+    // One transaction: install the hash, consume the token, kill the
+    // account's other pending tokens, revoke every session.
+    // ATTACK(token-replay)
+    let account = store
+        .consume_reset_token(&hash, &phc)
+        .await
+        .map_err(|_| accounts_unavailable())?
+        .ok_or_else(token_gone)?;
+    // Every session died in that transaction — the cache agrees at
+    // once, so a just-reset account's stolen cookie dies mid-flight.
+    app.sessions.bump_account(account.id);
+    app.lockouts.clear_email(&account.email);
+    Ok(no_store(
+        finish_redeem(
+            &parts,
+            &app,
+            &store,
+            &account,
+            TokenCookie::UnlessForeignSession,
+            Json(serde_json::json!({"reset": true})).into_response(),
+        )
+        .await?,
+    ))
+}
+
+async fn auth_session(SessionAuth(grant): SessionAuth) -> Result<Response, ApiError> {
+    Ok(no_store(
+        Json(serde_json::json!({
+            "account": {
+                "public_id": grant.account.public_id,
+                "email": grant.account.email,
+                "verified": grant.account.email_verified,
+            },
+            "csrf": csrf_token(&grant.csrf_seed),
+            "workspaces": [],
+        }))
+        .into_response(),
+    ))
+}
+
+async fn me_account(SessionAuth(grant): SessionAuth) -> Result<Response, ApiError> {
+    Ok(no_store(
+        Json(serde_json::json!({
+            "account": {
+                "public_id": grant.account.public_id,
+                "email": grant.account.email,
+                "verified": grant.account.email_verified,
+            },
+        }))
+        .into_response(),
+    ))
+}
+
+async fn me_sessions(
+    SessionAuth(grant): SessionAuth,
+    State(app): State<App>,
+) -> Result<Response, ApiError> {
+    let Some(store) = app.keyring.store.clone() else {
+        return Err(accounts_unavailable());
+    };
+    let sessions = store
+        .sessions_for_account(
+            grant.account.id,
+            durable_accounts::MAX_SESSIONS_PER_ACCOUNT as u32,
+        )
+        .await
+        .map_err(|_| accounts_unavailable())?;
+    let list: Vec<serde_json::Value> = sessions
+        .iter()
+        .map(|s| {
+            serde_json::json!({
+                // The opaque public_id is the only id that crosses —
+                // the internal row id never does (S3-2).
+                "id": s.public_id,
+                "current": s.public_id == grant.public_id,
+                "created_at_ms": s.created_at_ms,
+                "last_seen_at_ms": s.last_seen_at_ms,
+                "expires_at_ms": s.expires_at_ms,
+                "idle_expires_at_ms": s.idle_expires_at_ms,
+                "user_agent": s.user_agent,
+                "ip": s.ip,
+            })
+        })
+        .collect();
+    Ok(no_store(
+        Json(serde_json::json!({"sessions": list})).into_response(),
+    ))
+}
+
+/// Revoke one session by its opaque public_id — the account binding
+/// lives inside the store query, so a foreign (or unknown) id answers
+/// the same 404 either way: no cross-account oracle (S3-2).
+async fn me_revoke_one(
+    SessionWrite(grant): SessionWrite,
+    State(app): State<App>,
+    axum::extract::Path(public_id): axum::extract::Path<uuid::Uuid>,
+) -> Result<Response, ApiError> {
+    let Some(store) = app.keyring.store.clone() else {
+        return Err(accounts_unavailable());
+    };
+    match store
+        .revoke_session_public(grant.account.id, public_id)
+        .await
+        .map_err(|_| accounts_unavailable())?
+    {
+        Some(hash) => {
+            app.sessions.bump(hash);
+            Ok(no_store(StatusCode::NO_CONTENT.into_response()))
+        }
+        None => Err(ApiError::new(
+            StatusCode::NOT_FOUND,
+            "not_found",
+            "no such session",
+        )),
+    }
+}
+
+/// Revoke every session except the requester's — sign-out-everywhere-
+/// else. The account bump kills the victims' cached grants at once;
+/// the survivor is re-warmed so the caller stays signed in.
+async fn me_revoke_all(
+    SessionWrite(grant): SessionWrite,
+    State(app): State<App>,
+    parts: Parts,
+) -> Result<Response, ApiError> {
+    let Some(store) = app.keyring.store.clone() else {
+        return Err(accounts_unavailable());
+    };
+    let revoked = store
+        .revoke_sessions_except(grant.account.id, grant.public_id)
+        .await
+        .map_err(|_| accounts_unavailable())?;
+    app.sessions.bump_account(grant.account.id);
+    // The bump also shadows this session's entry — re-warm it.
+    if let Some(token) = session_cookie(&parts) {
+        app.sessions
+            .put(sha256(token.as_bytes()), grant.clone(), Instant::now());
+    }
+    Ok(no_store(
+        Json(serde_json::json!({"revoked": revoked})).into_response(),
+    ))
+}
+
+#[derive(serde::Deserialize)]
+struct PasswordChangeReq {
+    current_password: String,
+    new_password: String,
+}
+
+/// Password change with re-auth (S3-2): the current password is
+/// verified through the same bounded argon queue as sign-in, then one
+/// transaction installs the hash, supersedes every pending token and
+/// revokes every session — the caller gets a fresh rotated session
+/// (`replaces` links the old row for audit).
+async fn me_password(
+    SessionWrite(grant): SessionWrite,
+    State(app): State<App>,
+    parts: Parts,
+    J(req): J<PasswordChangeReq>,
+) -> Result<Response, ApiError> {
+    let Some(store) = app.keyring.store.clone() else {
+        return Err(accounts_unavailable());
+    };
+    if let Some(why) = durable_accounts::password::policy_refusal(&req.new_password) {
+        return Err(ApiError::new(StatusCode::BAD_REQUEST, "bad_input", why));
+    }
+    let addr = client(&parts);
+    // Re-auth: a found laptop can't rotate the password. One failure
+    // shape — no "wrong current password" oracle beyond the 403.
+    let phc = grant
+        .account
+        .password_hash
+        .clone()
+        .unwrap_or_else(|| durable_accounts::password::DUMMY_PHC.to_string());
+    let password = req.current_password.clone();
+    let ok = app
+        .argon
+        .run(addr, false, move || {
+            durable_accounts::password::verify_password(&phc, &password)
+        })
+        .await?;
+    if !ok || grant.account.password_hash.is_none() {
+        return Err(ApiError::new(
+            StatusCode::FORBIDDEN,
+            "invalid_credentials",
+            "current password does not match",
+        ));
+    }
+    let password = req.new_password.clone();
+    let new_phc = app
+        .argon
+        .run(addr, false, move || {
+            durable_accounts::password::hash_password(&password)
+        })
+        .await?
+        .map_err(|e| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "internal", e.to_string()))?;
+    // One transaction: new hash, pending tokens superseded, every
+    // session revoked — then the cache agrees.
+    store
+        .change_password(grant.account.id, &new_phc)
+        .await
+        .map_err(|_| accounts_unavailable())?;
+    app.sessions.bump_account(grant.account.id);
+    app.lockouts.clear_email(&grant.account.email);
+    // Rotation on privilege change (S3-2): a fresh session linked to
+    // the one it replaces — the old token is dead in the same tx.
+    let token = mint_session_token(&app.session_key);
+    let hash = sha256(token.as_bytes());
+    let mut seed = [0u8; 32];
+    ring::rand::SecureRandom::fill(&ring::rand::SystemRandom::new(), &mut seed)
+        .unwrap_or_else(|_| panic!("rng"));
+    let now = app.now_ms();
+    store
+        .create_session(&durable_accounts::NewSession {
+            account: grant.account.id,
+            token_hash: hash,
+            csrf_seed: seed,
+            expires_at_ms: now + SESSION_ABS_MS,
+            idle_expires_at_ms: now + SESSION_IDLE_MS,
+            replaces: Some(grant.session_id),
+            user_agent: parts
+                .headers
+                .get(header::USER_AGENT)
+                .and_then(|v| v.to_str().ok())
+                .map(|s| s[..s.len().min(256)].to_string()),
+            ip: Some(addr),
+        })
+        .await
+        .map_err(|_| accounts_unavailable())?;
+    let mut res = no_store(
+        Json(serde_json::json!({
+            "changed": true,
+            "csrf": csrf_token(&seed),
+        }))
+        .into_response(),
+    );
+    res.headers_mut().append(
+        header::SET_COOKIE,
+        header::HeaderValue::from_str(&session_set_cookie(&token))
+            .unwrap_or_else(|_| header::HeaderValue::from_static("")),
+    );
+    res.headers_mut().append(
+        header::SET_COOKIE,
+        header::HeaderValue::from_str(&known_device_set_cookie(&mint_known_device(
+            &app.session_key,
+            &grant.account.public_id,
+        )))
+        .unwrap_or_else(|_| header::HeaderValue::from_static("")),
+    );
+    Ok(res)
+}
+
+// ---- S3-3: workspaces, members, invites (D-066, D-072) --------------
+
+const INVITE_PREFIX: &str = "dri_";
+const INVITE_TTL_MS: i64 = 7 * 24 * 3600 * 1000;
+
+/// Resolve membership for a `/workspaces/{pid}/*` route (D-066): the
+/// path pid is the only authority — an `x-durable-workspace` header
+/// that names another workspace is a 400. A deleted workspace answers
+/// 410 `workspace_closed`; a non-member answers 404 (never 403 — the
+/// workspace's existence is itself member knowledge); a role below
+/// `need` answers 403.
+async fn member_access(
+    app: &App,
+    grant: &durable_accounts::SessionGrant,
+    pid: uuid::Uuid,
+    parts: &Parts,
+    need: Role,
+) -> Result<(durable_accounts::Workspace, Role), ApiError> {
+    if let Some(h) = parts
+        .headers
+        .get("x-durable-workspace")
+        .and_then(|v| v.to_str().ok())
+    {
+        if h != pid.to_string() {
+            return Err(ApiError::new(
+                StatusCode::BAD_REQUEST,
+                "workspace_mismatch",
+                "x-durable-workspace does not match the path workspace",
+            ));
+        }
+    }
+    let store = accounts(app)?;
+    let Some(ws) = store.workspace_by_public_id(pid).await.map_err(store_err)? else {
+        return Err(ApiError::new(
+            StatusCode::NOT_FOUND,
+            "not_found",
+            "no such workspace",
+        ));
+    };
+    if ws.deleted_at_ms.is_some() {
+        return Err(ApiError::new(
+            StatusCode::GONE,
+            "workspace_closed",
+            "this workspace is deleted",
+        ));
+    }
+    let account = grant.account.id;
+    let role = match app.members.get(account, ws.id) {
+        Some(role) => role,
+        None => {
+            let fill_start = Instant::now();
+            let Some(role) = store.member_role(account, ws.id).await.map_err(store_err)? else {
+                return Err(ApiError::new(
+                    StatusCode::NOT_FOUND,
+                    "not_found",
+                    "no such workspace",
+                ));
+            };
+            app.members.put(account, ws.id, role, fill_start);
+            role
+        }
+    };
+    if role < need {
+        return Err(ApiError::new(
+            StatusCode::FORBIDDEN,
+            "forbidden",
+            "this role may not do that",
+        ));
+    }
+    Ok((ws, role))
+}
+
+/// A session's workspace on a FLAT route (`/handlers*` — D-066): the
+/// `x-durable-workspace` header names it; absent or unparseable is 400
+/// `workspace_required`, deleted is 410, non-member 404, low role 403.
+async fn flat_member(
+    app: &App,
+    grant: &durable_accounts::SessionGrant,
+    parts: &Parts,
+    need: Role,
+) -> Result<(durable_accounts::Workspace, Role), ApiError> {
+    let raw = parts
+        .headers
+        .get("x-durable-workspace")
+        .and_then(|v| v.to_str().ok())
+        .ok_or_else(|| {
+            ApiError::new(
+                StatusCode::BAD_REQUEST,
+                "workspace_required",
+                "session callers name the workspace in x-durable-workspace",
+            )
+        })?;
+    let pid = raw.parse::<uuid::Uuid>().map_err(|_| {
+        ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "workspace_required",
+            "x-durable-workspace must be a workspace public id",
+        )
+    })?;
+    let store = accounts(app)?;
+    let Some(ws) = store.workspace_by_public_id(pid).await.map_err(store_err)? else {
+        return Err(ApiError::new(
+            StatusCode::NOT_FOUND,
+            "not_found",
+            "no such workspace",
+        ));
+    };
+    if ws.deleted_at_ms.is_some() {
+        return Err(ApiError::new(
+            StatusCode::GONE,
+            "workspace_closed",
+            "this workspace is deleted",
+        ));
+    }
+    let account = grant.account.id;
+    let role = match app.members.get(account, ws.id) {
+        Some(role) => role,
+        None => {
+            let fill_start = Instant::now();
+            let Some(role) = store.member_role(account, ws.id).await.map_err(store_err)? else {
+                return Err(ApiError::new(
+                    StatusCode::NOT_FOUND,
+                    "not_found",
+                    "no such workspace",
+                ));
+            };
+            app.members.put(account, ws.id, role, fill_start);
+            role
+        }
+    };
+    if role < need {
+        return Err(ApiError::new(
+            StatusCode::FORBIDDEN,
+            "forbidden",
+            "this role may not do that",
+        ));
+    }
+    Ok((ws, role))
+}
+
+/// The `--ops-listen` gate around `keyring.verify`: with the flag set,
+/// an env-key grant is honoured only on the ops socket — on `--listen`
+/// the same bearer answers `Denied`, indistinguishable from a bad key
+/// (finding 18). Store keys and sessions are unaffected everywhere.
+/// Without the flag nothing changes.
+async fn verify_key(app: &App, parts: &Parts, key: &str) -> Verified {
+    match app.keyring.verify(key).await {
+        Verified::Granted(p)
+            if app.ops_gate
+                && matches!(p, Principal::OpsKey | Principal::OpsRead)
+                && parts.extensions.get::<OpsListener>().is_none() =>
+        {
+            Verified::Denied
+        }
+        v => v,
+    }
+}
+
+/// The dual-auth resolution for flat tenant routes (D-066/D-073): a
+/// bearer takes the key path (workspace from the grant, `key_need` the
+/// permission the call requires); a session takes the member path
+/// (workspace from `x-durable-workspace`, `role_need` the role the call
+/// requires, `write` also binds the CSRF + Origin checks). Neither
+/// credential answers 401.
+async fn flat_access(
+    app: &App,
+    parts: &Parts,
+    key_need: Permission,
+    role_need: Role,
+    write: bool,
+) -> Result<u64, ApiError> {
+    if let Some(key) = bearer(parts) {
+        // ATTACK(auth)
+        return match verify_key(app, parts, key).await {
+            Verified::Granted(Principal::OpsKey) => Ok(0),
+            Verified::Granted(Principal::OpsRead) if key_need == Permission::Read => Ok(0),
+            Verified::Granted(Principal::StoreKey { ws, permission })
+                if key_need == Permission::Read || permission == Permission::Write =>
+            {
+                Ok(ws)
+            }
+            Verified::Granted(_) => Err(ApiError::new(
+                StatusCode::FORBIDDEN,
+                "forbidden",
+                "this key may only read; this route needs write",
+            )),
+            Verified::Denied => Err(unauthorized()),
+            Verified::Unavailable => Err(accounts_unavailable()),
+        };
+    }
+    let Some(store) = app.keyring.store.clone() else {
+        return Err(ApiError::new(
+            StatusCode::NOT_FOUND,
+            "unauthenticated",
+            "no account store is configured",
+        ));
+    };
+    let grant = session_grant_for(app, parts, &store).await?;
+    if write {
+        let presented = parts
+            .headers
+            .get("x-durable-csrf")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or_default();
+        if !csrf_ok(&grant.csrf_seed, presented) {
+            return Err(csrf_failed());
+        }
+        check_request_origin(parts)?;
+    }
+    let (ws, _) = flat_member(app, &grant, parts, role_need).await?;
+    Ok(ws.id)
+}
+
+/// Tiny shim: the flat handlers below were written against
+/// `Authorized(auth)`'s `auth.ws()` accessor — resolved now by
+/// `flat_access`/`flat_admin_access` into the same shape.
+struct FlatWs(u64);
+impl FlatWs {
+    fn ws(&self) -> u64 {
+        self.0
+    }
+}
+
+/// `/handler-secret` (D-073): the ops key or a session admin/owner —
+/// a data-plane key is refused outright even when it can write.
+async fn flat_admin_access(app: &App, parts: &Parts) -> Result<u64, ApiError> {
+    if let Some(key) = bearer(parts) {
+        return match verify_key(app, parts, key).await {
+            Verified::Granted(Principal::OpsKey) => Ok(0),
+            Verified::Granted(_) => Err(ApiError::new(
+                StatusCode::FORBIDDEN,
+                "forbidden",
+                "handler-secret needs a session admin; data-plane keys cannot mint it",
+            )),
+            Verified::Denied => Err(unauthorized()),
+            Verified::Unavailable => Err(accounts_unavailable()),
+        };
+    }
+    let Some(store) = app.keyring.store.clone() else {
+        return Err(ApiError::new(
+            StatusCode::NOT_FOUND,
+            "unauthenticated",
+            "no account store is configured",
+        ));
+    };
+    let grant = session_grant_for(app, parts, &store).await?;
+    let presented = parts
+        .headers
+        .get("x-durable-csrf")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or_default();
+    if !csrf_ok(&grant.csrf_seed, presented) {
+        return Err(csrf_failed());
+    }
+    check_request_origin(parts)?;
+    let (ws, _) = flat_member(app, &grant, parts, Role::Admin).await?;
+    Ok(ws.id)
+}
+
+/// `dri_` + hex(32 B random). The store keeps sha256 only — the token
+/// crosses once, in the inviter's response.
+fn mint_invite_token() -> String {
+    let mut raw = [0u8; 32];
+    ring::rand::SecureRandom::fill(&ring::rand::SystemRandom::new(), &mut raw)
+        .unwrap_or_else(|_| panic!("rng"));
+    format!("{INVITE_PREFIX}{}", hex(&raw))
+}
+
+fn valid_ws_name(name: &str) -> bool {
+    let n = name.trim();
+    !n.is_empty() && n.len() <= 128 && n.chars().all(|c| c != '\u{0}')
+}
+
+async fn ws_create(
+    SessionAuth(grant): SessionAuth,
+    State(app): State<App>,
+    J(req): J<serde_json::Value>,
+) -> Result<Response, ApiError> {
+    if !grant.account.email_verified {
+        return Err(ApiError::new(
+            StatusCode::FORBIDDEN,
+            "email_unverified",
+            "verify the account's email first",
+        ));
+    }
+    let name = req.get("name").and_then(|v| v.as_str()).unwrap_or_default();
+    if !valid_ws_name(name) {
+        return Err(ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "bad_input",
+            "name must be 1-128 chars",
+        ));
+    }
+    let store = accounts(&app)?;
+    let ws = store
+        .create_workspace_for(grant.account.id, name.trim())
+        .await
+        .map_err(store_err)?;
+    Ok(no_store(
+        Json(serde_json::json!({
+            "public_id": ws.public_id,
+            "name": ws.name,
+            "role": "owner",
+            "handler_secret": hex(&ws.handler_secret),
+        }))
+        .into_response(),
+    ))
+}
+
+async fn ws_list_mine(
+    SessionAuth(grant): SessionAuth,
+    State(app): State<App>,
+) -> Result<Response, ApiError> {
+    let store = accounts(&app)?;
+    let rows = store
+        .workspaces_for_account(grant.account.id)
+        .await
+        .map_err(store_err)?;
+    let list: Vec<serde_json::Value> = rows
+        .iter()
+        .map(|(ws, role)| {
+            serde_json::json!({
+                "public_id": ws.public_id,
+                "name": ws.name,
+                "role": role.as_str(),
+            })
+        })
+        .collect();
+    Ok(no_store(
+        Json(serde_json::json!({ "workspaces": list })).into_response(),
+    ))
+}
+
+async fn ws_get(
+    SessionAuth(grant): SessionAuth,
+    State(app): State<App>,
+    axum::extract::Path(pid): axum::extract::Path<uuid::Uuid>,
+    parts: Parts,
+) -> Result<Response, ApiError> {
+    let (ws, role) = member_access(&app, &grant, pid, &parts, Role::Viewer).await?;
+    Ok(no_store(
+        Json(serde_json::json!({
+            "public_id": ws.public_id,
+            "name": ws.name,
+            "role": role.as_str(),
+        }))
+        .into_response(),
+    ))
+}
+
+async fn ws_patch(
+    SessionWrite(grant): SessionWrite,
+    State(app): State<App>,
+    axum::extract::Path(pid): axum::extract::Path<uuid::Uuid>,
+    parts: Parts,
+    J(req): J<serde_json::Value>,
+) -> Result<Response, ApiError> {
+    // PATCH is UPDATE-only: `{name}` and nothing else.
+    let name = req.get("name").and_then(|v| v.as_str()).unwrap_or_default();
+    if !valid_ws_name(name)
+        || req
+            .as_object()
+            .is_none_or(|o| o.keys().any(|k| k != "name"))
+    {
+        return Err(ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "bad_input",
+            "PATCH carries {name} only",
+        ));
+    }
+    let (ws, _) = member_access(&app, &grant, pid, &parts, Role::Admin).await?;
+    accounts(&app)?
+        .rename_workspace(ws.id, name.trim())
+        .await
+        .map_err(store_err)?;
+    Ok(no_store(
+        Json(serde_json::json!({ "public_id": ws.public_id, "name": name.trim() })).into_response(),
+    ))
+}
+
+async fn ws_delete(
+    SessionWrite(grant): SessionWrite,
+    State(app): State<App>,
+    axum::extract::Path(pid): axum::extract::Path<uuid::Uuid>,
+    parts: Parts,
+    J(req): J<serde_json::Value>,
+) -> Result<Response, ApiError> {
+    let (ws, _) = member_access(&app, &grant, pid, &parts, Role::Owner).await?;
+    let confirm = req
+        .get("confirm")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default();
+    if confirm != format!("delete {}", ws.name) {
+        return Err(ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "bad_input",
+            "confirm must be \"delete <name>\"",
+        ));
+    }
+    let store = accounts(&app)?;
+    store
+        .delete_workspace(ws.id, app.now_ms())
+        .await
+        .map_err(store_err)?;
+    // Keys die now, not at the cache TTL (D-072): drop every cached
+    // grant of this workspace, then every cached member role in it.
+    app.keyring.invalidate_ws(ws.id);
+    app.members.bump_ws(ws.id);
+    // Live runs are cancelled, finished history untouched (D-072).
+    if let Ok(page) = app
+        .engine
+        .list_in(ws.id, Order::Oldest { after: None }, usize::MAX)
+        .await
+    {
+        for run in page.runs {
+            if !run.state.is_terminal() {
+                let _ = app.engine.cancel(run.id).await;
+            }
+        }
+    }
+    Ok(no_store(StatusCode::NO_CONTENT.into_response()))
+}
+
+async fn ws_members(
+    SessionAuth(grant): SessionAuth,
+    State(app): State<App>,
+    axum::extract::Path(pid): axum::extract::Path<uuid::Uuid>,
+    parts: Parts,
+) -> Result<Response, ApiError> {
+    let (ws, _) = member_access(&app, &grant, pid, &parts, Role::Viewer).await?;
+    let rows = accounts(&app)?
+        .list_members(ws.id)
+        .await
+        .map_err(store_err)?;
+    let list: Vec<serde_json::Value> = rows
+        .iter()
+        .map(|m| {
+            serde_json::json!({
+                "account": { "public_id": m.account_public_id, "email": m.email },
+                "role": m.role.as_str(),
+                "since": m.since_ms,
+            })
+        })
+        .collect();
+    Ok(no_store(
+        Json(serde_json::json!({ "members": list })).into_response(),
+    ))
+}
+
+async fn ws_invite_member(
+    SessionWrite(grant): SessionWrite,
+    State(app): State<App>,
+    axum::extract::Path(pid): axum::extract::Path<uuid::Uuid>,
+    parts: Parts,
+    J(req): J<serde_json::Value>,
+) -> Result<Response, ApiError> {
+    let (ws, _) = member_access(&app, &grant, pid, &parts, Role::Admin).await?;
+    let email = req
+        .get("email")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default()
+        .to_lowercase();
+    let role = req
+        .get("role")
+        .and_then(|v| v.as_str())
+        .and_then(Role::parse);
+    // Members join only by invite, and owner rows only from POST
+    // /workspaces — `owner` is never a valid invite role.
+    let Some(role) = role.filter(|r| *r != Role::Owner) else {
+        return Err(ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "bad_input",
+            "role must be admin, member or viewer",
+        ));
+    };
+    if !durable_accounts::mail::valid_addr_spec(&email) {
+        return Err(ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "bad_input",
+            "not an email address",
+        ));
+    }
+    let store = accounts(&app)?;
+    let token = mint_invite_token();
+    let expires = app.now_ms() + INVITE_TTL_MS;
+    let Some(invite) = store
+        .create_invite(
+            ws.id,
+            &email,
+            role,
+            grant.account.id,
+            &sha256(token.as_bytes()),
+            expires,
+        )
+        .await
+        .map_err(store_err)?
+    else {
+        return Err(ApiError::new(
+            StatusCode::CONFLICT,
+            "invite_pending",
+            "a live invite already covers this address",
+        ));
+    };
+    // If the address already belongs to a member, refuse rather than
+    // mail a meaningless invite (409 already-member per review).
+    if let Some(acc) = store.account_by_email(&email).await.map_err(store_err)? {
+        if store
+            .member_role(acc.id, ws.id)
+            .await
+            .map_err(store_err)?
+            .is_some()
+        {
+            let _ = store.revoke_invite(ws.id, invite.public_id).await;
+            return Err(ApiError::new(
+                StatusCode::CONFLICT,
+                "already_member",
+                "this account is already a member",
+            ));
+        }
+    }
+    let (subject, body) = (
+        format!("Invitation to {}", ws.name),
+        format!(
+            "You were invited to {} as {}. Accept: /invites/accept with this token.",
+            ws.name,
+            role.as_str()
+        ),
+    );
+    let mail = Mail {
+        kind: "workspace-invite",
+        send_to: email.clone(),
+        subject,
+        text: body,
+        html: String::new(),
+        idempotency_key: format!("invite-{}", invite.public_id),
+        expires_at_ms: Some(expires),
+    };
+    let _ = store.enqueue_mail(&mail).await.map_err(store_err)?;
+    Ok(no_store(
+        Json(serde_json::json!({
+            "invite": {
+                "public_id": invite.public_id,
+                "email": invite.email,
+                "role": invite.role.as_str(),
+                "expires_at": invite.expires_at_ms,
+            },
+            "invite_url": format!("/invites/accept?token={token}"),
+        }))
+        .into_response(),
+    ))
+}
+
+async fn ws_member_patch(
+    SessionWrite(grant): SessionWrite,
+    State(app): State<App>,
+    axum::extract::Path((pid, account_pid)): axum::extract::Path<(uuid::Uuid, uuid::Uuid)>,
+    parts: Parts,
+    J(req): J<serde_json::Value>,
+) -> Result<Response, ApiError> {
+    let (ws, _) = member_access(&app, &grant, pid, &parts, Role::Admin).await?;
+    let role = req
+        .get("role")
+        .and_then(|v| v.as_str())
+        .and_then(Role::parse)
+        .filter(|r| *r != Role::Owner);
+    let Some(role) = role else {
+        return Err(ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "bad_input",
+            "role must be admin, member or viewer",
+        ));
+    };
+    let store = accounts(&app)?;
+    let Some(acc) = store
+        .account_by_public_id(account_pid)
+        .await
+        .map_err(store_err)?
+    else {
+        return Err(ApiError::new(
+            StatusCode::NOT_FOUND,
+            "not_found",
+            "no such member",
+        ));
+    };
+    match store
+        .set_member_role(ws.id, acc.id, role)
+        .await
+        .map_err(store_err)?
+    {
+        durable_accounts::MemberChange::Changed => {
+            app.members.bump_ws(ws.id);
+            Ok(no_store(
+                Json(serde_json::json!({ "account": { "public_id": account_pid }, "role": role.as_str() }))
+                    .into_response(),
+            ))
+        }
+        durable_accounts::MemberChange::NotFound => Err(ApiError::new(
+            StatusCode::NOT_FOUND,
+            "not_found",
+            "no such member",
+        )),
+        durable_accounts::MemberChange::LastOwner => Err(ApiError::new(
+            StatusCode::CONFLICT,
+            "last_owner",
+            "the owner row cannot be changed",
+        )),
+    }
+}
+
+async fn ws_member_remove(
+    SessionWrite(grant): SessionWrite,
+    State(app): State<App>,
+    axum::extract::Path((pid, account_pid)): axum::extract::Path<(uuid::Uuid, uuid::Uuid)>,
+    parts: Parts,
+) -> Result<Response, ApiError> {
+    let (ws, _) = member_access(&app, &grant, pid, &parts, Role::Admin).await?;
+    let store = accounts(&app)?;
+    let Some(acc) = store
+        .account_by_public_id(account_pid)
+        .await
+        .map_err(store_err)?
+    else {
+        return Err(ApiError::new(
+            StatusCode::NOT_FOUND,
+            "not_found",
+            "no such member",
+        ));
+    };
+    match store
+        .remove_member(ws.id, acc.id)
+        .await
+        .map_err(store_err)?
+    {
+        durable_accounts::MemberChange::Changed => {
+            app.members.bump_ws(ws.id);
+            Ok(no_store(StatusCode::NO_CONTENT.into_response()))
+        }
+        durable_accounts::MemberChange::NotFound => Err(ApiError::new(
+            StatusCode::NOT_FOUND,
+            "not_found",
+            "no such member",
+        )),
+        durable_accounts::MemberChange::LastOwner => Err(ApiError::new(
+            StatusCode::CONFLICT,
+            "last_owner",
+            "the owner row cannot be removed",
+        )),
+    }
+}
+
+async fn ws_invites(
+    SessionAuth(grant): SessionAuth,
+    State(app): State<App>,
+    axum::extract::Path(pid): axum::extract::Path<uuid::Uuid>,
+    parts: Parts,
+) -> Result<Response, ApiError> {
+    let (ws, _) = member_access(&app, &grant, pid, &parts, Role::Viewer).await?;
+    let rows = accounts(&app)?
+        .list_invites(ws.id)
+        .await
+        .map_err(store_err)?;
+    let list: Vec<serde_json::Value> = rows
+        .iter()
+        .map(|i| {
+            serde_json::json!({
+                "public_id": i.public_id,
+                "email": i.email,
+                "role": i.role.as_str(),
+                "expires_at": i.expires_at_ms,
+            })
+        })
+        .collect();
+    Ok(no_store(
+        Json(serde_json::json!({ "invites": list })).into_response(),
+    ))
+}
+
+async fn ws_invite_revoke(
+    SessionWrite(grant): SessionWrite,
+    State(app): State<App>,
+    axum::extract::Path((pid, iid)): axum::extract::Path<(uuid::Uuid, uuid::Uuid)>,
+    parts: Parts,
+) -> Result<Response, ApiError> {
+    let (ws, _) = member_access(&app, &grant, pid, &parts, Role::Admin).await?;
+    if !accounts(&app)?
+        .revoke_invite(ws.id, iid)
+        .await
+        .map_err(store_err)?
+    {
+        return Err(ApiError::new(
+            StatusCode::NOT_FOUND,
+            "not_found",
+            "no such invite",
+        ));
+    }
+    Ok(no_store(StatusCode::NO_CONTENT.into_response()))
+}
+
+// ---- S3-5: member-facing API keys -----------------------------------
+
+/// A key as the member API shows it: `public_id` is the only id (the
+/// sequential `id` never leaves the process), the secret never appears —
+/// only its stored prefix.
+fn key_json(k: &ApiKeyInfo) -> serde_json::Value {
+    serde_json::json!({
+        "public_id": k.public_id,
+        "name": k.name,
+        "prefix": k.prefix,
+        "permission": k.permission.api_str(),
+        "revoked": k.revoked,
+        "last_used_at_ms": k.last_used_at_ms,
+        "created_by": k.created_by,
+    })
+}
+
+/// `GET /workspaces/{pid}/keys` — every member may list; the response
+/// carries prefix + metadata only, never secret material.
+async fn ws_keys(
+    SessionAuth(grant): SessionAuth,
+    State(app): State<App>,
+    axum::extract::Path(pid): axum::extract::Path<uuid::Uuid>,
+    parts: Parts,
+) -> Result<Response, ApiError> {
+    let (ws, _) = member_access(&app, &grant, pid, &parts, Role::Viewer).await?;
+    let keys = accounts(&app)?.list_keys(ws.id).await.map_err(store_err)?;
+    let keys: Vec<serde_json::Value> = keys.iter().map(key_json).collect();
+    Ok(no_store(
+        Json(serde_json::json!({ "keys": keys })).into_response(),
+    ))
+}
+
+#[derive(Deserialize)]
+struct WsKeyReq {
+    name: String,
+    /// `write` (submit + cancel + read) or `read`.
+    permission: String,
+}
+
+fn key_permission(raw: &str) -> Result<Permission, ApiError> {
+    match raw {
+        "admin" | "write" => Ok(Permission::Write),
+        "read" => Ok(Permission::Read),
+        other => Err(ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "bad_input",
+            format!("permission must be write or read, not {other:?}"),
+        )),
+    }
+}
+
+/// `POST /workspaces/{pid}/keys` — admin+; mints a `drk_` secret shown
+/// exactly once in this response.
+async fn ws_key_create(
+    SessionWrite(grant): SessionWrite,
+    State(app): State<App>,
+    axum::extract::Path(pid): axum::extract::Path<uuid::Uuid>,
+    parts: Parts,
+    J(req): J<WsKeyReq>,
+) -> Result<Response, ApiError> {
+    let (ws, _) = member_access(&app, &grant, pid, &parts, Role::Admin).await?;
+    let permission = key_permission(&req.permission)?;
+    if req.name.trim().is_empty() || req.name.len() > 128 {
+        return Err(ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "bad_input",
+            "name must be 1..=128 characters",
+        ));
+    }
+    let secret = new_key_secret();
+    if secret.is_empty() {
+        return Err(ApiError::new(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "internal",
+            "could not draw a key secret",
+        ));
+    }
+    let prefix = &secret[..secret.len().min(11)];
+    let info = accounts(&app)?
+        .create_key(
+            ws.id,
+            req.name.trim(),
+            permission,
+            &sha256(secret.as_bytes()),
+            prefix,
+            Some(grant.account.id),
+        )
+        .await
+        .map_err(store_err)?;
+    let mut out = key_json(&info);
+    out["key"] = serde_json::Value::String(secret);
+    Ok(no_store(Json(out).into_response()))
+}
+
+/// `DELETE /workspaces/{pid}/keys/{key_pid}` — admin+; a foreign or
+/// already-dead key answers 404 and the store row stays untouched.
+async fn ws_key_delete(
+    SessionWrite(grant): SessionWrite,
+    State(app): State<App>,
+    axum::extract::Path((pid, key_pid)): axum::extract::Path<(uuid::Uuid, uuid::Uuid)>,
+    parts: Parts,
+) -> Result<Response, ApiError> {
+    let (ws, _) = member_access(&app, &grant, pid, &parts, Role::Admin).await?;
+    let store = accounts(&app)?;
+    let Some(info) = store
+        .key_by_public_id(ws.id, key_pid)
+        .await
+        .map_err(store_err)?
+    else {
+        return Err(ApiError::new(
+            StatusCode::NOT_FOUND,
+            "not_found",
+            "no such key",
+        ));
+    };
+    let Some(hash) = store.revoke_key(ws.id, info.id).await.map_err(store_err)? else {
+        return Err(ApiError::new(
+            StatusCode::NOT_FOUND,
+            "not_found",
+            "no such key",
+        ));
+    };
+    app.keyring.invalidate(hash);
+    Ok(no_store(StatusCode::NO_CONTENT.into_response()))
+}
+
+/// `POST /workspaces/{pid}/keys/{key_pid}/rotate` — admin+; the store
+/// retires the old key and mints its replacement (same name + scope) in
+/// one transaction, then the old hash is invalidated write-through so
+/// it 401s on the very next call.
+async fn ws_key_rotate(
+    SessionWrite(grant): SessionWrite,
+    State(app): State<App>,
+    axum::extract::Path((pid, key_pid)): axum::extract::Path<(uuid::Uuid, uuid::Uuid)>,
+    parts: Parts,
+) -> Result<Response, ApiError> {
+    let (ws, _) = member_access(&app, &grant, pid, &parts, Role::Admin).await?;
+    let secret = new_key_secret();
+    if secret.is_empty() {
+        return Err(ApiError::new(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "internal",
+            "could not draw a key secret",
+        ));
+    }
+    let prefix = &secret[..secret.len().min(11)];
+    let store = accounts(&app)?;
+    let Some(info) = store
+        .key_by_public_id(ws.id, key_pid)
+        .await
+        .map_err(store_err)?
+    else {
+        return Err(ApiError::new(
+            StatusCode::NOT_FOUND,
+            "not_found",
+            "no such key",
+        ));
+    };
+    let Some((new_info, old_hash)) = store
+        .rotate_key(
+            ws.id,
+            info.id,
+            &sha256(secret.as_bytes()),
+            prefix,
+            Some(grant.account.id),
+        )
+        .await
+        .map_err(store_err)?
+    else {
+        return Err(ApiError::new(
+            StatusCode::NOT_FOUND,
+            "not_found",
+            "no such key",
+        ));
+    };
+    app.keyring.invalidate(old_hash);
+    let mut out = key_json(&new_info);
+    out["key"] = serde_json::Value::String(secret);
+    Ok(no_store(Json(out).into_response()))
+}
+
+/// `POST /invites/accept` — any verified session whose email matches
+/// the invite's bound address; a mismatch is 403 `invite_email_mismatch`
+/// before the token is consumed (the row is only revealed to the
+/// address it was mailed to).
+async fn invite_accept(
+    SessionWrite(grant): SessionWrite,
+    State(app): State<App>,
+    J(req): J<serde_json::Value>,
+) -> Result<Response, ApiError> {
+    if !grant.account.email_verified {
+        return Err(ApiError::new(
+            StatusCode::FORBIDDEN,
+            "email_unverified",
+            "verify the account's email first",
+        ));
+    }
+    let token = req
+        .get("token")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default();
+    if !token.starts_with(INVITE_PREFIX) {
+        return Err(ApiError::new(
+            StatusCode::NOT_FOUND,
+            "not_found",
+            "no such invite",
+        ));
+    }
+    let store = accounts(&app)?;
+    let hash = sha256(token.as_bytes());
+    let Some(live) = store
+        .invite_grant(&hash, app.now_ms())
+        .await
+        .map_err(store_err)?
+    else {
+        return Err(ApiError::new(
+            StatusCode::NOT_FOUND,
+            "not_found",
+            "no such invite",
+        ));
+    };
+    if !live.email.eq_ignore_ascii_case(&grant.account.email) {
+        return Err(ApiError::new(
+            StatusCode::FORBIDDEN,
+            "invite_email_mismatch",
+            "this invite was mailed to a different address",
+        ));
+    }
+    let Some((ws, role)) = store
+        .accept_invite(&hash, grant.account.id, app.now_ms())
+        .await
+        .map_err(store_err)?
+    else {
+        return Err(ApiError::new(
+            StatusCode::NOT_FOUND,
+            "not_found",
+            "no such invite",
+        ));
+    };
+    app.members.bump_ws(ws);
+    let ws = store
+        .workspace_by_id(ws)
+        .await
+        .map_err(store_err)?
+        .unwrap_or_else(|| unreachable!("an invite's workspace exists"));
+    Ok(no_store(
+        Json(serde_json::json!({
+            "workspace": {
+                "public_id": ws.public_id,
+                "name": ws.name,
+                "role": role.as_str(),
+            }
+        }))
+        .into_response(),
+    ))
+}
+
+async fn invite_decline(
+    SessionWrite(_grant): SessionWrite,
+    State(app): State<App>,
+    J(req): J<serde_json::Value>,
+) -> Result<Response, ApiError> {
+    let token = req
+        .get("token")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default();
+    if !token.starts_with(INVITE_PREFIX) {
+        return Err(ApiError::new(
+            StatusCode::NOT_FOUND,
+            "not_found",
+            "no such invite",
+        ));
+    }
+    let store = accounts(&app)?;
+    store
+        .decline_invite(&sha256(token.as_bytes()), app.now_ms())
+        .await
+        .map_err(store_err)?;
+    Ok(no_store(StatusCode::NO_CONTENT.into_response()))
+}
+
+/// `Cache-Control: no-store` + `Vary: Cookie` on every session-surface
+/// response (review #18) — shared caches can never serve one tenant's
+/// body to another.
+fn no_store(mut res: Response) -> Response {
+    res.headers_mut().insert(
+        header::CACHE_CONTROL,
+        header::HeaderValue::from_static("no-store"),
+    );
+    res.headers_mut()
+        .append(header::VARY, header::HeaderValue::from_static("Cookie"));
+    res
+}
 
 impl FromRequestParts<App> for Authorized {
     type Rejection = ApiError;
@@ -1685,8 +4918,12 @@ impl FromRequestParts<App> for Authorized {
             return Err(unauthorized());
         };
         // ATTACK(auth)
-        match app.keyring.verify(key).await {
-            Verified::Granted(auth) if auth.permission == Permission::Admin => Ok(Authorized(auth)),
+        match verify_key(app, parts, key).await {
+            Verified::Granted(auth)
+                if auth.may_write() && !matches!(auth, Principal::Member { .. }) =>
+            {
+                Ok(Authorized(auth))
+            }
             Verified::Granted(_) => Err(ApiError::new(
                 StatusCode::FORBIDDEN,
                 "forbidden",
@@ -1701,7 +4938,7 @@ impl FromRequestParts<App> for Authorized {
 /// Proof that the request may read: any verified key, or the server runs
 /// with `--open-reads` (loopback only, resolving to workspace 0). Taken
 /// first by every handler that shows runs (D-037) — the workspace in
-/// `auth.ws` scopes what the read may see.
+/// `auth.ws()` scopes what the read may see.
 struct ReadAuthorized(Auth);
 
 impl FromRequestParts<App> for ReadAuthorized {
@@ -1712,14 +4949,11 @@ impl FromRequestParts<App> for ReadAuthorized {
         // page in the operator's browser can rebind its own name to
         // 127.0.0.1, and its requests then carry that name as Host (D-047).
         if app.open_reads && loopback_host(parts) {
-            return Ok(ReadAuthorized(Auth {
-                ws: 0,
-                permission: Permission::Read,
-            }));
+            return Ok(ReadAuthorized(Principal::OpsRead));
         }
         match bearer(parts) {
             // ATTACK(auth)
-            Some(key) => match app.keyring.verify(key).await {
+            Some(key) => match verify_key(app, parts, key).await {
                 Verified::Granted(auth) => Ok(ReadAuthorized(auth)),
                 Verified::Denied => Err(unauthorized()),
                 Verified::Unavailable => Err(accounts_unavailable()),
@@ -1822,6 +5056,7 @@ struct ApiError {
     status: StatusCode,
     code: &'static str,
     message: String,
+    retry_after: Option<u64>,
 }
 
 impl ApiError {
@@ -1830,6 +5065,7 @@ impl ApiError {
             status,
             code,
             message: message.into(),
+            retry_after: None,
         }
     }
 }
@@ -1847,6 +5083,13 @@ impl IntoResponse for ApiError {
             res.headers_mut().insert(
                 header::WWW_AUTHENTICATE,
                 header::HeaderValue::from_static("Bearer"),
+            );
+        }
+        if let Some(secs) = self.retry_after {
+            res.headers_mut().insert(
+                header::RETRY_AFTER,
+                header::HeaderValue::try_from(secs.max(1).to_string())
+                    .unwrap_or_else(|_| header::HeaderValue::from_static("1")),
             );
         }
         res
@@ -1995,19 +5238,19 @@ async fn submit(
     let key = OperationKey(req.op_key);
     let submitted = match app
         .engine
-        .submit_in(auth.ws, key, spec, req.not_before)
+        .submit_in(auth.ws(), key, spec, req.not_before)
         .await
     {
         Ok(s) => s,
         Err(e) => {
             if admission_refusal(&e) {
-                app.obs.refused(Some(auth.ws), observe::wall_ms());
+                app.obs.refused(Some(auth.ws()), observe::wall_ms());
             }
             return Err(e.into());
         }
     };
     if submitted.deduplicated {
-        app.obs.deduplicated(auth.ws, observe::wall_ms());
+        app.obs.deduplicated(auth.ws(), observe::wall_ms());
     }
     // The id leaves only in its opaque form (S2 #7).
     Ok(Json(
@@ -2059,10 +5302,10 @@ fn single_param<'a>(pairs: &'a [(String, String)], name: &str) -> Result<Option<
 /// states and handlers, never another tenant's or the totals.
 fn metrics_scope(auth: &Auth) -> observe::Scope {
     // ATTACK(obs-metrics-scope)
-    if auth.ws == 0 {
+    if auth.ws() == 0 {
         observe::Scope::All
     } else {
-        observe::Scope::Ws(auth.ws)
+        observe::Scope::Ws(auth.ws())
     }
 }
 
@@ -2103,10 +5346,10 @@ async fn run_events(
     State(app): State<App>,
     P(id): P<String>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let id = RunId(decode_id(&app, auth.ws, &id)?);
+    let id = RunId(decode_id(&app, auth.ws(), &id)?);
     let run = match app.engine.summary(id).await? {
         // ATTACK(obs-run-scope)
-        Some(run) if run.ws == auth.ws => run,
+        Some(run) if run.ws == auth.ws() => run,
         _ => return Err(not_found()),
     };
     let t = app.obs.timeline(id);
@@ -2156,13 +5399,13 @@ async fn feed(
             .ok_or_else(invalid)?,
     };
     // ATTACK(obs-feed-scope)
-    let (since, events) = app.obs.feed(auth.ws, limit, observe::wall_ms());
+    let (since, events) = app.obs.feed(auth.ws(), limit, observe::wall_ms());
     // Keys come from the index at read time: the observer holds no keys,
     // so its memory stays fixed per event (D-058).
     let mut runs: Vec<RunId> = events.iter().map(|(r, _)| *r).collect();
     runs.sort_unstable();
     runs.dedup();
-    let keys = app.engine.keys(auth.ws, runs.clone()).await?;
+    let keys = app.engine.keys(auth.ws(), runs.clone()).await?;
     let key_of = |run: RunId| {
         runs.binary_search(&run)
             .ok()
@@ -2186,7 +5429,7 @@ async fn feed(
 }
 
 /// The observability routes answer `Cache-Control: no-store`, errors too.
-async fn no_store(mut res: Response) -> Response {
+async fn obs_no_store(mut res: Response) -> Response {
     res.headers_mut().insert(
         header::CACHE_CONTROL,
         header::HeaderValue::from_static("no-store"),
@@ -2241,7 +5484,7 @@ fn decode_id(app: &App, ws: u64, s: &str) -> Result<u64, ApiError> {
 async fn scoped_run(app: &App, auth: &Auth, id: u64) -> Result<durable_domain::Run, ApiError> {
     match app.engine.inspect(RunId(id)).await? {
         // ATTACK(tenant-scope)
-        Some(run) if run.ws == auth.ws => Ok(run),
+        Some(run) if run.ws == auth.ws() => Ok(run),
         _ => Err(not_found()),
     }
 }
@@ -2251,7 +5494,7 @@ async fn inspect(
     State(app): State<App>,
     P(id): P<String>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let run = scoped_run(&app, &auth, decode_id(&app, auth.ws, &id)?).await?;
+    let run = scoped_run(&app, &auth, decode_id(&app, auth.ws(), &id)?).await?;
     Ok(Json(serde_json::json!({
         "id": app.pubid.encode(run.id),
         "key": run.key.0,
@@ -2270,7 +5513,7 @@ async fn spec(
     P(id): P<String>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     use base64::Engine as _;
-    let run = scoped_run(&app, &auth, decode_id(&app, auth.ws, &id)?).await?;
+    let run = scoped_run(&app, &auth, decode_id(&app, auth.ws(), &id)?).await?;
     Ok(Json(serde_json::json!({
         "id": app.pubid.encode(run.id),
         "key": run.key.0,
@@ -2289,7 +5532,7 @@ async fn cancel(
 ) -> Result<Json<serde_json::Value>, ApiError> {
     // The scope check happens before the cancel: a run's workspace is
     // fixed at acceptance, so inspecting first cannot race.
-    let internal = decode_id(&app, auth.ws, &id)?;
+    let internal = decode_id(&app, auth.ws(), &id)?;
     scoped_run(&app, &auth, internal).await?;
     app.engine.cancel(RunId(internal)).await?;
     Ok(Json(serde_json::json!({ "cancelled": id })))
@@ -2327,7 +5570,7 @@ async fn list(
     // Cursors are public ids like every other boundary value (S2 #7):
     // a malformed one is a client bug — 400, never a lookup.
     let decode_cursor = |s: Option<String>| -> Result<Option<u64>, ApiError> {
-        s.map(|c| decode_id(&app, auth.ws, &c))
+        s.map(|c| decode_id(&app, auth.ws(), &c))
             .transpose()
             .map_err(|_| ApiError::new(StatusCode::BAD_REQUEST, "bad_query", "malformed cursor"))
     };
@@ -2343,7 +5586,7 @@ async fn list(
     let page = app
         .engine
         // ATTACK(list-scope)
-        .list_in(auth.ws, order, q.limit.unwrap_or(100))
+        .list_in(auth.ws(), order, q.limit.unwrap_or(100))
         .await?;
     let items: Vec<serde_json::Value> = page
         .runs
@@ -2405,12 +5648,12 @@ async fn diagnostics(
 
 // ---- S2: the account graph (workspaces + API keys) ----------------
 
-/// Workspace management is an ops surface: it takes a workspace-0 admin
-/// key (the env key, or a store key scoped to ws 0). Tenant self-service
-/// is the S3 slice's member/role surface.
+/// Workspace management is an ops surface (review #4c): only the env
+/// ops key — a store key scoped to ws 0 can no longer reach `/admin/*`.
+/// Tenant self-service is the member/role surface.
 fn ops_admin(auth: &Auth) -> Result<(), ApiError> {
     // ATTACK(ops-scope)
-    if auth.ws != 0 || auth.permission != Permission::Admin {
+    if !matches!(auth, Principal::OpsKey) {
         return Err(ApiError::new(
             StatusCode::FORBIDDEN,
             "forbidden",
@@ -2429,7 +5672,7 @@ async fn workspace_diagnostics(
     State(app): State<App>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     // ATTACK(diag-scope)
-    let d = app.engine.diag_ws(auth.ws).await?;
+    let d = app.engine.diag_ws(auth.ws()).await?;
     Ok(Json(serde_json::to_value(d).unwrap_or_default()))
 }
 
@@ -2532,7 +5775,7 @@ fn new_key_secret() -> String {
     // SystemRandom::fill only fails on catastrophic RNG loss; map it to a
     // zeroed buffer refusal rather than issuing a weak key.
     match ring::rand::SystemRandom::new().fill(&mut b) {
-        Ok(()) => format!("dr_{}", hex(&b)),
+        Ok(()) => format!("drk_{}", hex(&b)),
         Err(_) => String::new(),
     }
 }
@@ -2545,7 +5788,7 @@ async fn whoami(
     State(app): State<App>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let public_id = match &app.keyring.store {
-        Some(store) => match store.workspace_by_id(auth.ws).await {
+        Some(store) => match store.workspace_by_id(auth.ws()).await {
             Ok(Some(ws)) => ws.public_id.to_string(),
             Ok(None) => uuid::Uuid::nil().to_string(),
             Err(e) => return Err(store_err(e)),
@@ -2554,7 +5797,12 @@ async fn whoami(
     };
     Ok(Json(serde_json::json!({
         "workspace": public_id,
-        "permission": auth.permission.as_str(),
+        "permission": match &auth {
+            Principal::OpsKey => "admin",
+            Principal::OpsRead => "read",
+            Principal::StoreKey { permission, .. } => permission.api_str(),
+            Principal::Member { role, .. } => role.as_str(),
+        },
     })))
 }
 
@@ -2639,7 +5887,7 @@ async fn list_workspace_keys(
                 "id": k.id,
                 "name": k.name,
                 "prefix": k.prefix,
-                "permission": k.permission.as_str(),
+                "permission": k.permission.api_str(),
                 "revoked": k.revoked,
             })
         })
@@ -2663,7 +5911,7 @@ async fn create_workspace_key(
 ) -> Result<Json<serde_json::Value>, ApiError> {
     ops_admin(&auth)?;
     let permission = match req.permission.as_str() {
-        "admin" => Permission::Admin,
+        "admin" | "write" => Permission::Write,
         "read" => Permission::Read,
         other => {
             return Err(ApiError::new(
@@ -2698,6 +5946,7 @@ async fn create_workspace_key(
             permission,
             &sha256(secret.as_bytes()),
             prefix,
+            None,
         )
         .await
         .map_err(store_err)?;
@@ -2705,7 +5954,7 @@ async fn create_workspace_key(
         "id": info.id,
         "name": info.name,
         "prefix": info.prefix,
-        "permission": info.permission.as_str(),
+        "permission": info.permission.api_str(),
         // Shown exactly once: only its sha256 is stored.
         "key": secret,
     })))
@@ -2738,13 +5987,32 @@ async fn delete_workspace_key(
 /// admin permission required (Authorized). The store is authoritative;
 /// each write lands in the engine's dispatch registry and the snapshot.
 async fn list_handlers(
-    Authorized(auth): Authorized,
     State(app): State<App>,
+    parts: Parts,
 ) -> Result<Json<serde_json::Value>, ApiError> {
+    let ws = flat_access(&app, &parts, Permission::Read, Role::Viewer, false).await?;
     let store = accounts(&app)?;
-    let regs = store.list_handlers(auth.ws).await.map_err(store_err)?;
+    let regs = store.list_handlers(ws).await.map_err(store_err)?;
+    // Health percentiles ride the ws-scoped observer ring (1 h window) —
+    // the test-call columns come from the store row.
+    let index = app
+        .engine
+        .metrics_index(observe::Scope::Ws(ws))
+        .await
+        .unwrap_or_else(|_| durable_engine::shell::MetricsIndex {
+            counts: observe::IndexCounts::default(),
+            handlers: Vec::new(),
+        });
+    let names: Vec<String> = regs.iter().map(|r| r.name.clone()).collect();
+    let m = app.obs.metrics(
+        observe::Scope::Ws(ws),
+        Window::H1,
+        observe::wall_ms(),
+        index.counts,
+        &names,
+    );
     let mut handlers: Vec<serde_json::Value> = Vec::new();
-    if auth.ws == 0 {
+    if ws == 0 {
         // Flag handlers are ws 0's too; a store row shadows them on a
         // name conflict (store rows push after, the map keeps the last).
         for (name, _) in app.flag_handlers.iter() {
@@ -2753,7 +6021,18 @@ async fn list_handlers(
     }
     for r in regs {
         handlers.retain(|h| h["name"] != r.name);
-        handlers.push(serde_json::json!({ "name": r.name, "url": r.url }));
+        let mstats = m.handlers.iter().find(|x| x.name == r.name);
+        handlers.push(serde_json::json!({
+            "name": r.name,
+            "url": r.url,
+            "health": {
+                "last_test_at_ms": r.last_test_at_ms,
+                "last_test_status": r.last_test_status,
+                "last_test_latency_ms": r.last_test_latency_ms,
+                "p50_ms": mstats.and_then(|x| x.step_ms.p50),
+                "p95_ms": mstats.and_then(|x| x.step_ms.p95),
+            },
+        }));
     }
     Ok(Json(serde_json::json!({ "handlers": handlers })))
 }
@@ -2821,11 +6100,13 @@ async fn registry_file_replace_ws(
 }
 
 async fn put_handler(
-    Authorized(auth): Authorized,
     State(app): State<App>,
+    parts: Parts,
     P(name): P<String>,
     Json(body): Json<PutHandlerReq>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
+    let ws_id = flat_access(&app, &parts, Permission::Write, Role::Member, true).await?;
+    let auth = FlatWs(ws_id);
     let store = accounts(&app)?;
     let name = name.trim();
     if name.is_empty() || name.len() > 128 || name.chars().any(char::is_control) {
@@ -2836,16 +6117,28 @@ async fn put_handler(
         ));
     }
     // ATTACK(tenant-register-policy)
-    let url = valid_handler_url(body.url.trim(), &app.handler_factory.store_policy)?;
-    registry_rate(&app, auth.ws)?;
+    let url = if name == BUILTIN_ECHO {
+        let u = body.url.trim();
+        if !u.is_empty() && u != BUILTIN_ECHO {
+            return Err(ApiError::new(
+                StatusCode::BAD_REQUEST,
+                "bad_handler_url",
+                "builtin:echo registers with url \"builtin:echo\" or an empty url",
+            ));
+        }
+        BUILTIN_ECHO.to_string()
+    } else {
+        valid_handler_url(body.url.trim(), &app.handler_factory.store_policy)?
+    };
+    registry_rate(&app, auth.ws())?;
     // Finding 4: the bound check, the store write, the engine update and
     // the snapshot send are one critical section per workspace — a
     // reconcile's list+apply cannot interleave between them.
-    let _ws_guard = app.registry_locks.stripe(auth.ws).lock().await;
+    let _ws_guard = app.registry_locks.stripe(auth.ws()).lock().await;
     // Re-review S2-4: exactly what is armed is a no-op — no store query,
     // no epoch bump, no engine update, no file write.
     // ATTACK(registry-noop-skip)
-    if app.registry.armed(auth.ws, name).as_deref() == Some(url.as_str()) {
+    if app.registry.armed(auth.ws(), name).as_deref() == Some(url.as_str()) {
         return Ok(Json(
             serde_json::json!({ "name": name, "url": url, "unchanged": true }),
         ));
@@ -2855,13 +6148,13 @@ async fn put_handler(
     // only once the writer acks the save — so a PUT that fails anywhere
     // below (store, engine, file) leaves nothing for a retry to skip on.
     // ATTACK(registry-view-invalidate)
-    app.registry.remove(auth.ws, name);
+    app.registry.remove(auth.ws(), name);
     // The 256 bound lives in the engine, but the store must never hold a
     // row the engine refuses: one over-limit row would poison every
     // later reconcile of this workspace's set. Check before writing —
     // a concurrent PUT can still race past it, which the engine's own
     // bound catches and a DELETE or the next reconcile heals.
-    let regs = store.list_handlers(auth.ws).await.map_err(store_err)?;
+    let regs = store.list_handlers(auth.ws()).await.map_err(store_err)?;
     if !regs.iter().any(|r| r.name == name) && regs.len() >= MAX_HANDLERS_PER_WS {
         return Err(ApiError::new(
             StatusCode::CONFLICT,
@@ -2879,18 +6172,18 @@ async fn put_handler(
     app.registry_epoch
         .fetch_add(1, std::sync::atomic::Ordering::Release);
     store
-        .put_handler(auth.ws, name, &url)
+        .put_handler(auth.ws(), name, &url)
         .await
         .map_err(store_err)?;
     let secret = store
-        .workspace_by_id(auth.ws)
+        .workspace_by_id(auth.ws())
         .await
         .map_err(store_err)?
         .map(|w| Arc::new(w.handler_secret));
     // S3: a missing workspace row must not arm the handler *unsigned* —
     // the row stays in the store (the reconcile re-arms it if the
     // workspace heals), but this process refuses to dispatch unsigned.
-    if auth.ws != 0 && secret.is_none() {
+    if auth.ws() != 0 && secret.is_none() {
         return Err(ApiError::new(
             StatusCode::CONFLICT,
             "registry_unavailable",
@@ -2899,15 +6192,15 @@ async fn put_handler(
     }
     app.engine
         .put_handler(
-            auth.ws,
+            auth.ws(),
             name,
-            app.handler_factory.make_signed(&url, secret.clone()),
+            arm_url(&app.handler_factory, &url, secret.clone()),
         )
         .await?;
     let saved = registry_file_upsert(
         &app,
         RegistryEntry {
-            ws: auth.ws,
+            ws: auth.ws(),
             name: name.to_string(),
             url: url.clone(),
             secret: secret.as_deref().map(|s| hex(s)),
@@ -2916,7 +6209,7 @@ async fn put_handler(
     .await;
     // ATTACK(registry-set-after-save)
     if saved.is_ok() {
-        app.registry.set(auth.ws, name, &url);
+        app.registry.set(auth.ws(), name, &url);
     }
     saved?;
     Ok(Json(serde_json::json!({ "name": name, "url": url })))
@@ -2928,23 +6221,25 @@ async fn put_handler(
 /// rotate takes effect without waiting for the reconciler. The secret
 /// is returned exactly once — verification needs it on the handler side.
 async fn rotate_handler_secret(
-    Authorized(auth): Authorized,
     State(app): State<App>,
+    parts: Parts,
 ) -> Result<Json<serde_json::Value>, ApiError> {
+    let ws_id = flat_admin_access(&app, &parts).await?;
+    let auth = FlatWs(ws_id);
     let store = accounts(&app)?;
-    registry_rate(&app, auth.ws)?;
+    registry_rate(&app, auth.ws())?;
     // Bump before the store write — same epoch ordering as PUT (S3).
     app.registry_epoch
         .fetch_add(1, std::sync::atomic::Ordering::Release);
     // Finding 4: rotate + re-arm + snapshot under the ws stripe, same
     // section as PUT/DELETE and the reconciler's list+apply.
-    let _ws_guard = app.registry_locks.stripe(auth.ws).lock().await;
+    let _ws_guard = app.registry_locks.stripe(auth.ws()).lock().await;
     // Same rule as PUT: nothing claims armed until the new set is saved
     // (a failed save left the view whole, so a retried PUT skipped and
     // the file kept the dead secret).
-    app.registry.replace_ws(auth.ws, std::iter::empty());
+    app.registry.replace_ws(auth.ws(), std::iter::empty());
     let Some(secret) = store
-        .rotate_handler_secret(auth.ws)
+        .rotate_handler_secret(auth.ws())
         .await
         .map_err(store_err)?
     else {
@@ -2956,9 +6251,9 @@ async fn rotate_handler_secret(
     };
     // Rebuild this workspace's engine set signed with the new secret —
     // the same shape as a reconcile pass for one workspace.
-    let regs = store.list_handlers(auth.ws).await.map_err(store_err)?;
+    let regs = store.list_handlers(auth.ws()).await.map_err(store_err)?;
     let shared = Some(Arc::new(secret));
-    let mut set: Vec<(String, Arc<dyn StepHandler>)> = if auth.ws == 0 {
+    let mut set: Vec<(String, Arc<dyn StepHandler>)> = if auth.ws() == 0 {
         app.flag_handlers.to_vec()
     } else {
         Vec::new()
@@ -2967,44 +6262,53 @@ async fn rotate_handler_secret(
     for r in &regs {
         set.push((
             r.name.clone(),
-            app.handler_factory.make_signed(&r.url, shared.clone()),
+            arm_url(&app.handler_factory, &r.url, shared.clone()),
         ));
         entries.push(RegistryEntry {
-            ws: auth.ws,
+            ws: auth.ws(),
             name: r.name.clone(),
             url: r.url.clone(),
             secret: Some(hex(&secret)),
         });
     }
-    app.engine.set_workspace_handlers(auth.ws, set).await?;
+    app.engine.set_workspace_handlers(auth.ws(), set).await?;
     let view: Vec<(String, String)> = entries
         .iter()
         .map(|e| (e.name.clone(), e.url.clone()))
         .collect();
-    let saved = registry_file_replace_ws(&app, auth.ws, entries).await;
+    let saved = registry_file_replace_ws(&app, auth.ws(), entries).await;
     // ATTACK(rotate-set-after-save)
     if saved.is_ok() {
-        app.registry.replace_ws(auth.ws, view);
+        app.registry.replace_ws(auth.ws(), view);
     }
     saved?;
     Ok(Json(serde_json::json!({ "secret": hex(&secret) })))
 }
 
 async fn delete_handler(
-    Authorized(auth): Authorized,
     State(app): State<App>,
+    parts: Parts,
     P(name): P<String>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
+    let ws_id = flat_access(&app, &parts, Permission::Write, Role::Member, true).await?;
+    let auth = FlatWs(ws_id);
     let store = accounts(&app)?;
-    registry_rate(&app, auth.ws)?;
+    registry_rate(&app, auth.ws())?;
     // Bump before the store write — same epoch ordering as PUT (S3).
     app.registry_epoch
         .fetch_add(1, std::sync::atomic::Ordering::Release);
     // Finding 4: the delete holds the ws stripe across store + engine +
     // file, so a reconcile pass can never be mid-list for this row.
-    let _ws_guard = app.registry_locks.stripe(auth.ws).lock().await;
+    let _ws_guard = app.registry_locks.stripe(auth.ws()).lock().await;
+    // Forget FIRST — PUT's "drop before anything changes" rule (S3
+    // re-review 2, S2-3): a view kept past a store 404, an engine refusal
+    // or a failed save made the next PUT of that URL answer `unchanged`
+    // over a row the store no longer holds. A missing entry only ever
+    // costs a PUT its no-op skip.
+    // ATTACK(registry-delete-forgets)
+    app.registry.remove(auth.ws(), &name);
     let existed = store
-        .delete_handler(auth.ws, &name)
+        .delete_handler(auth.ws(), &name)
         .await
         .map_err(store_err)?;
     if !existed {
@@ -3014,15 +6318,132 @@ async fn delete_handler(
             "no such handler registration",
         ));
     }
-    app.engine.delete_handler(auth.ws, &name)?;
-    // Forget BEFORE the save, not after (S3 re-review 2): the engine has
-    // already dropped the handler, so a view kept on a failed save would
-    // make a later PUT of the same URL answer `unchanged` while nothing
-    // is armed. A missing entry only ever costs a PUT its no-op skip.
-    // ATTACK(registry-delete-forgets)
-    app.registry.remove(auth.ws, &name);
-    registry_file_remove(&app, auth.ws, &name).await?;
+    app.engine.delete_handler(auth.ws(), &name)?;
+    registry_file_remove(&app, auth.ws(), &name).await?;
     Ok(Json(serde_json::json!({ "deleted": name })))
+}
+
+#[derive(Deserialize)]
+struct TestCallReq {
+    input_b64: String,
+}
+
+/// The D-070 probe, shared by the flat and member routes: ONE call
+/// through the armed handler's own test path — the signed, SSRF-guarded
+/// HTTP request for an HTTP handler, `execute` in-process for
+/// `builtin:echo`, an honest `in_process` for anything else. Never
+/// journaled, never a run. Budgets: 30/hour per workspace (Free's
+/// bound; S3-4 reads the plan) + 10/minute per client address; the
+/// second strike 429s.
+async fn test_call_run(
+    app: &App,
+    ws: u64,
+    name: &str,
+    addr: std::net::IpAddr,
+    body: &[u8],
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let req: TestCallReq = serde_json::from_slice(body).map_err(|_| {
+        ApiError::new(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "bad_json",
+            "malformed JSON",
+        )
+    })?;
+    let input = base64_decode(&req.input_b64)
+        .map_err(|e| ApiError::new(StatusCode::UNPROCESSABLE_ENTITY, "bad_input", e))?;
+    if input.len() > 8 * 1024 {
+        return Err(ApiError::new(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "input_too_large",
+            "test input exceeds 8 KiB",
+        ));
+    }
+    {
+        let mut per = app.test_calls_ws.lock().unwrap_or_else(|e| e.into_inner());
+        let now = Instant::now();
+        if let Some(q) = per.get_mut(&ws) {
+            while q
+                .front()
+                .is_some_and(|t| now.duration_since(*t) > Duration::from_secs(3600))
+            {
+                q.pop_front();
+            }
+        }
+        if per.get(&ws).is_some_and(|q| q.len() >= 30) {
+            return Err(ApiError::new(
+                StatusCode::TOO_MANY_REQUESTS,
+                "test_call_limited",
+                "test calls are bounded to 30 per workspace per hour",
+            ));
+        }
+        if per.len() >= 10_000 && !per.contains_key(&ws) {
+            return Err(ApiError::new(
+                StatusCode::TOO_MANY_REQUESTS,
+                "test_call_limited",
+                "the probe budget table is full; retry",
+            ));
+        }
+        per.entry(ws).or_default().push_back(now);
+    }
+    if let Err(wait) = app
+        .test_calls_addr
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .check(addr, Instant::now())
+    {
+        return Err(ApiError::new(
+            StatusCode::TOO_MANY_REQUESTS,
+            "test_call_limited",
+            format!(
+                "test calls are bounded to 10 per client per minute; retry in {}s",
+                wait.as_secs().max(1)
+            ),
+        ));
+    }
+    let Some(handler) = app.engine.handler(ws, name).await else {
+        return Err(ApiError::new(
+            StatusCode::NOT_FOUND,
+            "not_found",
+            "no such handler in this workspace",
+        ));
+    };
+    let step = StepSpec {
+        name: "test".to_string(),
+        handler: name.to_string(),
+    };
+    let idem = format!("probe/{ws}/{name}/{}", observe::wall_ms());
+    let reply = handler.test_call(&step, &input, &idem).await;
+    // The row's test columns update when the registry knows the name —
+    // flag-registered names have no store row to write.
+    if let Ok(store) = accounts(app) {
+        let _ = store
+            .record_handler_test(
+                ws,
+                name,
+                observe::wall_ms() as i64,
+                reply.status,
+                reply.latency_ms as i64,
+            )
+            .await;
+    }
+    Ok(Json(serde_json::json!({
+        "status": reply.status,
+        "http_status": reply.http_status,
+        "latency_ms": reply.latency_ms,
+        "reply_excerpt_b64": base64::engine::general_purpose::STANDARD.encode(&reply.excerpt),
+    })))
+}
+
+/// `POST /handlers/{name}/test` — flat: ops key, ws key, or a session
+/// member of the `x-durable-workspace` workspace.
+async fn test_call_flat(
+    State(app): State<App>,
+    axum::extract::Path(name): axum::extract::Path<String>,
+    parts: Parts,
+    body: axum::body::Bytes,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let ws = flat_access(&app, &parts, Permission::Write, Role::Member, true).await?;
+    test_call_run(&app, ws, &name, client(&parts), &body).await
 }
 
 async fn compact(
@@ -3097,7 +6518,7 @@ fn base64_decode(s: &str) -> Result<Vec<u8>, String> {
         .map_err(|_| "input_b64 must be canonical standard base64 (RFC 4648, padded)".to_string())
 }
 
-/// Every route. `/health`, `/ready` and the inspector's static files are
+/// Every route. `/health`, `/ready` and the dashboard's static files are
 /// open (they show no runs). `GET /jobs` and `GET /jobs/{id}` take
 /// `ReadAuthorized` (either key, or `--open-reads`); every mutating and
 /// admin handler takes `Authorized`, so it is unreachable without the API
@@ -3108,7 +6529,7 @@ fn router(app: App, ui_dir: Option<&Path>) -> Router {
         .route("/metrics", get(metrics))
         .route("/events", get(feed))
         .route("/jobs/{id}/events", get(run_events))
-        .layer(axum::middleware::map_response(no_store));
+        .layer(axum::middleware::map_response(obs_no_store));
     let mut router = Router::new()
         .route("/health", get(health))
         .route("/ready", get(ready))
@@ -3116,6 +6537,58 @@ fn router(app: App, ui_dir: Option<&Path>) -> Router {
         .route("/jobs/{id}", get(inspect))
         .route("/jobs/{id}/spec", get(spec))
         .route("/jobs/{id}/cancel", post(cancel))
+        .route("/auth/signup", post(auth_signup))
+        .route("/auth/login", post(auth_login))
+        .route("/auth/logout", post(auth_logout))
+        .route("/auth/session", get(auth_session))
+        .route("/auth/verify", post(auth_verify))
+        .route("/auth/resend-verification", post(auth_resend_verification))
+        .route("/auth/forgot", post(auth_forgot))
+        .route("/auth/reset", post(auth_reset))
+        .route("/me", get(me_account))
+        .route("/me/password", post(me_password))
+        .route("/me/sessions", get(me_sessions).delete(me_revoke_all))
+        .route("/me/sessions/{public_id}", delete(me_revoke_one))
+        // S3-3: the tenant control plane. Path pid is the only workspace
+        // authority on these routes; an x-durable-workspace header that
+        // disagrees is a 400 (D-066). Members join by invite only.
+        .route("/workspaces", get(ws_list_mine).post(ws_create))
+        .route(
+            "/workspaces/{pid}",
+            get(ws_get).patch(ws_patch).delete(ws_delete),
+        )
+        .route(
+            "/workspaces/{pid}/members",
+            get(ws_members).post(ws_invite_member),
+        )
+        .route(
+            "/workspaces/{pid}/members/{account_pid}",
+            axum::routing::patch(ws_member_patch).delete(ws_member_remove),
+        )
+        .route("/workspaces/{pid}/invites", get(ws_invites))
+        .route(
+            "/workspaces/{pid}/invites/{iid}",
+            axum::routing::delete(ws_invite_revoke),
+        )
+        // S3-5: members manage their own workspace's keys — list shows
+        // prefix + metadata only, secrets are shown once at mint/rotate.
+        .route("/workspaces/{pid}/keys", get(ws_keys).post(ws_key_create))
+        .route(
+            "/workspaces/{pid}/keys/{key_pid}",
+            axum::routing::delete(ws_key_delete),
+        )
+        .route(
+            "/workspaces/{pid}/keys/{key_pid}/rotate",
+            post(ws_key_rotate),
+        )
+        .route("/invites/accept", post(invite_accept))
+        .route("/invites/decline", post(invite_decline))
+        // The old inspector mount: every URL under it lives at the same
+        // tail under /app now — 308, query preserved. Nothing is served
+        // under /inspector itself.
+        .route("/inspector", get(inspector_redirect))
+        .route("/inspector/", get(inspector_redirect))
+        .route("/inspector/{*tail}", get(inspector_redirect))
         .route("/admin/compact", post(compact))
         .route("/admin/backup", post(backup))
         .route("/admin/diagnostics", get(diagnostics))
@@ -3145,6 +6618,7 @@ fn router(app: App, ui_dir: Option<&Path>) -> Router {
             "/handlers/{name}",
             axum::routing::put(put_handler).delete(delete_handler),
         )
+        .route("/handlers/{name}/test", post(test_call_flat))
         .merge(observability)
         // A submit is at most 64 KiB of input (base64: ~88 KiB) plus its
         // spec; nothing legitimate comes near this.
@@ -3152,12 +6626,12 @@ fn router(app: App, ui_dir: Option<&Path>) -> Router {
         .layer(DefaultBodyLimit::max(MAX_REQUEST_BYTES))
         .with_state(app);
     if let Some(ui) = ui_dir {
-        let csp = header::HeaderValue::from_str(&inspector_csp(ui)).unwrap_or(
+        let csp = header::HeaderValue::from_str(&ui_csp(ui)).unwrap_or(
             header::HeaderValue::from_static("default-src 'none'; frame-ancestors 'none'"),
         );
         let ui_routes = Router::new()
             .nest_service(
-                "/inspector",
+                "/app",
                 tower_http::services::ServeDir::new(ui)
                     .append_index_html_on_directories(true)
                     .not_found_service(tower_http::services::ServeFile::new(ui.join("index.html"))),
@@ -3187,10 +6661,10 @@ fn router(app: App, ui_dir: Option<&Path>) -> Router {
     router
 }
 
-/// The inspector's Content-Security-Policy: only its own files, and the
+/// The dashboard's Content-Security-Policy: only its own files, and the
 /// inline bootstrap script SvelteKit writes into `index.html` by hash (no
 /// `'unsafe-inline'` scripts), calls to this origin only, no framing.
-fn inspector_csp(ui: &Path) -> String {
+fn ui_csp(ui: &Path) -> String {
     use base64::Engine as _;
     let mut hashes = String::new();
     match std::fs::read_to_string(ui.join("index.html")) {
@@ -3210,7 +6684,7 @@ fn inspector_csp(ui: &Path) -> String {
             }
         }
         Err(e) => eprintln!(
-            "durable-server: cannot read {}/index.html ({e}); the inspector will not run",
+            "durable-server: cannot read {}/index.html ({e}); the dashboard will not run",
             ui.display()
         ),
     }
@@ -3219,6 +6693,17 @@ fn inspector_csp(ui: &Path) -> String {
          img-src 'self' data:; font-src 'self'; connect-src 'self'; base-uri 'none'; \
          form-action 'none'; frame-ancestors 'none'"
     )
+}
+
+/// `/inspector` and every tail under it answer 308 to the same tail under
+/// `/app`, query string preserved — `/inspector/x?y=1` -> `/app/x?y=1`,
+/// `/inspector` -> `/app`. Nothing else under /inspector is served.
+async fn inspector_redirect(uri: Uri) -> Response {
+    let tail = uri
+        .path_and_query()
+        .map(|pq| pq.as_str().strip_prefix("/inspector").unwrap_or(""))
+        .unwrap_or("");
+    axum::response::Redirect::permanent(&format!("/app{tail}")).into_response()
 }
 
 fn api_key_from_env() -> Result<ApiKey> {
@@ -3321,6 +6806,45 @@ fn loopback_host(parts: &Parts) -> bool {
 /// `--open-reads` is allowed only where nothing but this host can connect:
 /// a loopback IP address (a name such as `localhost` is not trusted to
 /// resolve to one).
+/// `--ops-listen` must be a loopback socket address (finding 18): the
+/// flag exists to keep env keys off the public socket, so a non-loopback
+/// value would re-publish them — refuse the boot with the reason.
+fn check_ops_listen(ops_listen: &Option<String>) -> Result<()> {
+    let Some(addr) = ops_listen else {
+        return Ok(());
+    };
+    match addr.parse::<std::net::SocketAddr>() {
+        Ok(sa) if sa.ip().is_loopback() => Ok(()),
+        Ok(_) => anyhow::bail!(
+            "--ops-listen must be a loopback address (127.0.0.1 or [::1]);              {addr} would re-publish the env keys it exists to keep private"
+        ),
+        Err(e) => anyhow::bail!("--ops-listen {addr:?} is not a socket address: {e}"),
+    }
+}
+
+/// `DURABLE_INVITE_ONLY` is a value, not a presence flag (deploy review):
+/// `1/true/yes/on` turns the gate on, `0/false/no/off`/empty off; any
+/// other spelling refuses the boot rather than silently gating sign-up.
+fn invite_only_env() -> Result<bool> {
+    invite_only_value(
+        std::env::var_os("DURABLE_INVITE_ONLY")
+            .map(|v| v.to_string_lossy().into_owned())
+            .as_deref(),
+    )
+}
+
+fn invite_only_value(raw: Option<&str>) -> Result<bool> {
+    let Some(raw) = raw else { return Ok(false) };
+    let v = raw.trim().to_ascii_lowercase();
+    match v.as_str() {
+        "1" | "true" | "yes" | "on" => Ok(true),
+        "" | "0" | "false" | "no" | "off" => Ok(false),
+        _ => anyhow::bail!(
+            "DURABLE_INVITE_ONLY={v:?} is not a boolean; use 1/true/yes/on or 0/false/no/off (or unset)"
+        ),
+    }
+}
+
 fn check_open_reads(listen: &str, open_reads: bool) -> Result<()> {
     if !open_reads {
         return Ok(());
@@ -3377,7 +6901,15 @@ async fn main() -> Result<()> {
     let api_key = api_key_from_env()?;
     let read_key = read_key_from_env(&api_key)?;
     let store = account_store_from_env().await?;
+    if store.is_some() && args.public_origin.is_none() {
+        // Without the configured origin, mailed links would be built
+        // from the request Host — attacker-controlled on the open auth
+        // routes (review #18). Refuse rather than mint Host-derived
+        // links.
+        anyhow::bail!("--public-origin is required when an account store is configured");
+    }
     check_open_reads(&args.listen, args.open_reads)?;
+    check_ops_listen(&args.ops_listen)?;
     let backup_root = args
         .backup_root
         .as_deref()
@@ -3472,6 +7004,7 @@ async fn main() -> Result<()> {
             registry.set(ws, &name, &url);
         }
     }
+    let mailer = mailout::mailer_from_env()?;
     let stopped = engine.clone();
     let registry_stale = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let registry_epoch = Arc::new(std::sync::atomic::AtomicU64::new(0));
@@ -3484,6 +7017,7 @@ async fn main() -> Result<()> {
     let app = App {
         engine,
         keyring: Arc::new(Keyring::new(api_key, read_key, store.clone())),
+        ops_gate: args.ops_listen.is_some(),
         open_reads: args.open_reads,
         backup_root,
         handler_factory: factory,
@@ -3494,11 +7028,34 @@ async fn main() -> Result<()> {
         registry_epoch,
         registry_locks: Arc::new(RegistryLocks::default()),
         registry,
+        session_key: std::sync::Arc::new(pubid.derive_key(b"session-token-v1")),
+        sessions: std::sync::Arc::new(SessionCache::new()),
+        members: std::sync::Arc::new(MemberCache::new()),
+        test_calls_ws: std::sync::Arc::new(Mutex::new(HashMap::new())),
+        test_calls_addr: std::sync::Arc::new(Mutex::new(SlidingWindow::new(
+            10,
+            Duration::from_secs(60),
+        ))),
+        argon: std::sync::Arc::new(ArgonQueue::new()),
+        auth_limits: std::sync::Arc::new(AuthLimits::new()),
+        lockouts: std::sync::Arc::new(LoginLockouts::new()),
+        mailer: mailer.clone(),
+        mail_budget: std::sync::Arc::new(MailBudget::new(mailout::mail_budget_from_env(
+            MAIL_DAILY_BUDGET,
+        ))),
+        invite_only: invite_only_env()?,
+        public_origin: args.public_origin.clone(),
+        now_override_ms: std::sync::Arc::new(std::sync::atomic::AtomicI64::new(0)),
         pubid,
         obs: obs.clone(),
     };
     if let Some(store) = &store {
         spawn_registry_reconcile(store.clone(), &app, registry_stale);
+        // The outbox drain owns every send — the mail row committed in
+        // the same transaction as its fact is the only truth (D-068).
+        spawn_mail_drain(app.clone());
+        // Idle-expiry slides in one batched store write per tick (D-071).
+        spawn_session_flush(app.clone());
     }
     let router = router(app.clone(), args.ui_dir.as_deref());
     let listener = tokio::net::TcpListener::bind(&args.listen)
@@ -3538,7 +7095,7 @@ async fn main() -> Result<()> {
             eprintln!("durable-server liveness listening on {addr}");
             Some((
                 hs_stop,
-                tokio::spawn(serve_http(l, r, health_limits(), None, hs_rx)),
+                tokio::spawn(serve_http(l, r, health_limits(), None, hs_rx, false)),
             ))
         }
         None => None,
@@ -3557,7 +7114,30 @@ async fn main() -> Result<()> {
         trusted_proxies: TrustedProxies(args.trusted_proxies),
         ..HttpLimits::default()
     };
-    let serve = serve_http(listener, router, limits, Some(obs), http_stopped);
+    let serve = serve_http(
+        listener,
+        router.clone(),
+        limits.clone(),
+        Some(obs.clone()),
+        http_stopped,
+        false,
+    );
+    // The ops listener (finding 18): same router, same bounds, plus the
+    // `OpsListener` request extension the env-key gate checks for.
+    let ops_serve = match &args.ops_listen {
+        Some(addr) => {
+            let l = tokio::net::TcpListener::bind(addr)
+                .await
+                .with_context(|| format!("bind ops listener {addr}"))?;
+            let (os_stop, os_rx) = tokio::sync::oneshot::channel::<()>();
+            eprintln!("durable-server ops listening on {addr}");
+            Some((
+                os_stop,
+                tokio::spawn(serve_http(l, router, limits, Some(obs), os_rx, true)),
+            ))
+        }
+        None => None,
+    };
     tokio::pin!(serve);
     tokio::select! {
         r = &mut serve => return r.context("serve"),
@@ -3579,6 +7159,10 @@ async fn main() -> Result<()> {
     if let Some((hs_stop, hs_task)) = health_serve {
         let _ = hs_stop.send(());
         let _ = hs_task.await;
+    }
+    if let Some((os_stop, os_task)) = ops_serve {
+        let _ = os_stop.send(());
+        let _ = os_task.await;
     }
     let cut = match tokio::time::timeout(limit, &mut serve).await {
         Ok(r) => {
@@ -3861,6 +7445,7 @@ async fn serve_http(
     limits: HttpLimits,
     obs: Option<Arc<Observer>>,
     mut stop: tokio::sync::oneshot::Receiver<()>,
+    ops_side: bool,
 ) -> std::io::Result<()> {
     use hyper_util::rt::{TokioIo, TokioTimer};
     let permits = Arc::new(tokio::sync::Semaphore::new(limits.max_connections.max(1)));
@@ -4187,17 +7772,25 @@ async fn serve_http(
                     let (svc, served, in_flight, idle_ms) = &*per_conn;
                     let _flight = FlightGuard::enter(in_flight, idle_ms);
                     let n = served.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+                    // The client address once — the global limiter and
+                    // the /auth limiters share it (an extension so route
+                    // extractors never re-derive it differently).
+                    let client = client_addr(
+                        peer_ip,
+                        &trusted,
+                        req.headers()
+                            .get("cf-connecting-ip")
+                            .and_then(|v| v.to_str().ok()),
+                    );
+                    let mut req = req;
+                    req.extensions_mut().insert(ClientAddr(client));
+                    if ops_side {
+                        req.extensions_mut().insert(OpsListener);
+                    }
                     // The per-address request rate. Refused before auth:
                     // a flood without a key is still a flood, and the
                     // check is cheaper than the work behind it.
                     let mut res = if let Some(lim) = rate_limiter.as_ref() {
-                        let client = client_addr(
-                            peer_ip,
-                            &trusted,
-                            req.headers()
-                                .get("cf-connecting-ip")
-                                .and_then(|v| v.to_str().ok()),
-                        );
                         let refused = lim
                             .lock()
                             .unwrap_or_else(|p| p.into_inner())
@@ -4659,6 +8252,29 @@ mod tests {
         free: Option<Arc<std::sync::atomic::AtomicU64>>,
         store: Option<Arc<dyn AccountStore>>,
     ) -> Harness {
+        harness_store_local(with_backup_root, free, store, true, false)
+    }
+
+    /// `harness_store` with the shipped strict SSRF policy — every other
+    /// test wants loopback fixture handlers, this one wants the guard.
+    fn harness_strict(store: Option<Arc<dyn AccountStore>>) -> Harness {
+        harness_store_local(false, None, store, false, false)
+    }
+
+    /// `harness_store` with the `--ops-listen` gate armed (finding 18):
+    /// env-key grants hold only when the request carries the
+    /// `OpsListener` extension (`raw_ops`); everywhere else they 401.
+    fn harness_ops(store: Option<Arc<dyn AccountStore>>) -> Harness {
+        harness_store_local(false, None, store, true, true)
+    }
+
+    fn harness_store_local(
+        with_backup_root: bool,
+        free: Option<Arc<std::sync::atomic::AtomicU64>>,
+        store: Option<Arc<dyn AccountStore>>,
+        allow_local: bool,
+        ops_gate: bool,
+    ) -> Harness {
         let journal = tempfile::tempdir().unwrap_or_else(|e| panic!("{e}"));
         let backups = tempfile::tempdir().unwrap_or_else(|e| panic!("{e}"));
         let mut reg = Registry::default();
@@ -4691,7 +8307,8 @@ mod tests {
             false,
             backup_root,
             journal.path(),
-            true,
+            allow_local,
+            ops_gate,
         );
         Harness {
             router: router(app.clone(), None),
@@ -4805,6 +8422,7 @@ mod tests {
                 None,
                 journal.path(),
                 true,
+                false,
             ),
             None,
         );
@@ -5219,12 +8837,12 @@ mod tests {
             .await
             .unwrap_or_else(|e| panic!("b: {e}"));
         for (ws, key, perm) in [
-            (a.id, OBS_KEY_A, Permission::Admin),
+            (a.id, OBS_KEY_A, Permission::Write),
             (a.id, OBS_READ_A, Permission::Read),
-            (b.id, OBS_KEY_B, Permission::Admin),
+            (b.id, OBS_KEY_B, Permission::Write),
         ] {
             store
-                .create_key(ws, "k", perm, &sha256(key.as_bytes()), &key[..6])
+                .create_key(ws, "k", perm, &sha256(key.as_bytes()), &key[..6], None)
                 .await
                 .unwrap_or_else(|e| panic!("key: {e}"));
         }
@@ -5771,9 +9389,10 @@ mod tests {
             .create_key(
                 ws.id,
                 "main",
-                Permission::Admin,
+                Permission::Write,
                 &sha256(token.as_bytes()),
                 "dr_al",
+                None,
             )
             .await
             .unwrap_or_else(|e| panic!("key: {e}"));
@@ -5841,9 +9460,10 @@ mod tests {
             .create_key(
                 ws.id,
                 "main",
-                Permission::Admin,
+                Permission::Write,
                 &sha256(token.as_bytes()),
                 "dr_be",
+                None,
             )
             .await
             .unwrap_or_else(|e| panic!("key: {e}"));
@@ -5901,9 +9521,10 @@ mod tests {
             .create_key(
                 ws.id,
                 "main",
-                Permission::Admin,
+                Permission::Write,
                 &sha256(token.as_bytes()),
                 "dr_ga",
+                None,
             )
             .await
             .unwrap_or_else(|e| panic!("key: {e}"));
@@ -5982,9 +9603,10 @@ mod tests {
             .create_key(
                 a.id,
                 "k",
-                Permission::Admin,
+                Permission::Write,
                 &sha256(key_a.as_bytes()),
                 "dr_a",
+                None,
             )
             .await
             .unwrap_or_else(|e| panic!("ka: {e}"));
@@ -5992,9 +9614,10 @@ mod tests {
             .create_key(
                 b.id,
                 "k",
-                Permission::Admin,
+                Permission::Write,
                 &sha256(key_b.as_bytes()),
                 "dr_b",
+                None,
             )
             .await
             .unwrap_or_else(|e| panic!("kb: {e}"));
@@ -6103,7 +9726,14 @@ mod tests {
         let key_b = "dr_1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d";
         for (ws, k) in [(a.id, key_a), (b.id, key_b)] {
             store
-                .create_key(ws, "k", Permission::Admin, &sha256(k.as_bytes()), "dr_t")
+                .create_key(
+                    ws,
+                    "k",
+                    Permission::Write,
+                    &sha256(k.as_bytes()),
+                    "dr_t",
+                    None,
+                )
                 .await
                 .unwrap_or_else(|e| panic!("{e}"));
         }
@@ -6197,9 +9827,10 @@ mod tests {
             .create_key(
                 ws.id,
                 "k",
-                Permission::Admin,
+                Permission::Write,
                 &sha256(token.as_bytes()),
                 "dr_s",
+                None,
             )
             .await
             .unwrap_or_else(|e| panic!("{e}"));
@@ -6297,6 +9928,7 @@ mod tests {
                 Permission::Read,
                 &sha256(token.as_bytes()),
                 "dr_w",
+                None,
             )
             .await
             .unwrap_or_else(|e| panic!("{e}"));
@@ -6364,7 +9996,7 @@ mod tests {
             .unwrap_or_else(|| panic!("workspace {pid}"))
             .id;
         register_step(&store, ws_id, &h.app.engine).await;
-        assert!(issued.starts_with("dr_"));
+        assert!(issued.starts_with("drk_"));
 
         let (status, v) = call(
             &h.router,
@@ -6419,9 +10051,10 @@ mod tests {
             .create_key(
                 ws.id,
                 "k",
-                Permission::Admin,
+                Permission::Write,
                 &sha256(token.as_bytes()),
                 "dr_t",
+                None,
             )
             .await
             .unwrap_or_else(|e| panic!("{e}"));
@@ -6504,9 +10137,10 @@ mod tests {
             .create_key(
                 a.id,
                 "k",
-                Permission::Admin,
+                Permission::Write,
                 &sha256(key_a.as_bytes()),
                 "dr_a",
+                None,
             )
             .await
             .unwrap_or_else(|e| panic!("{e}"));
@@ -6514,9 +10148,10 @@ mod tests {
             .create_key(
                 b.id,
                 "k",
-                Permission::Admin,
+                Permission::Write,
                 &sha256(key_b.as_bytes()),
                 "dr_b",
+                None,
             )
             .await
             .unwrap_or_else(|e| panic!("{e}"));
@@ -6614,9 +10249,10 @@ mod tests {
             .create_key(
                 a.id,
                 "k",
-                Permission::Admin,
+                Permission::Write,
                 &sha256(key_a.as_bytes()),
                 "dr_a",
+                None,
             )
             .await
             .unwrap_or_else(|e| panic!("{e}"));
@@ -6696,9 +10332,10 @@ mod tests {
             .create_key(
                 a.id,
                 "k",
-                Permission::Admin,
+                Permission::Write,
                 &sha256(key_a.as_bytes()),
                 "dr_a",
+                None,
             )
             .await
             .unwrap_or_else(|e| panic!("{e}"));
@@ -6750,18 +10387,21 @@ mod tests {
             .create_key(
                 a.id,
                 "k",
-                Permission::Admin,
+                Permission::Write,
                 &sha256(key_a.as_bytes()),
                 "dr_c",
+                None,
             )
             .await
             .unwrap_or_else(|e| panic!("{e}"));
-        let h = harness_store(true, None, Some(store));
+        let h = harness_store(true, None, Some(store.clone()));
         let epoch = || {
             h.app
                 .registry_epoch
                 .load(std::sync::atomic::Ordering::Acquire)
         };
+        // D-073: rotate is session-admin only — seat one on ws `a`.
+        let (cookie, csrf, pid) = session_admin_on(&h.router, &store, &a, "adm@x.co").await;
         let e0 = epoch();
         for (method, uri, body) in [
             (
@@ -6770,11 +10410,19 @@ mod tests {
                 Some(json!({ "url": "http://127.0.0.1:9/x" })),
             ),
             ("DELETE", "/handlers/h", None),
-            ("POST", "/handler-secret", None),
         ] {
             let (status, v) = call(&h.router, method, uri, Some(key_a), body).await;
             assert_eq!(status, StatusCode::OK, "{method} {uri}: {v}");
         }
+        let (status, _, v) = raw(
+            &h.router,
+            "POST",
+            "/handler-secret",
+            &ws_headers(&cookie, &csrf, &pid),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{v}");
         assert_eq!(epoch() - e0, 3, "PUT + DELETE + rotate each bump once");
     }
 
@@ -6800,9 +10448,10 @@ mod tests {
             .create_key(
                 a.id,
                 "k",
-                Permission::Admin,
+                Permission::Write,
                 &sha256(key.as_bytes()),
                 "dr_9",
+                None,
             )
             .await
             .unwrap_or_else(|e| panic!("{e}"));
@@ -6827,7 +10476,7 @@ mod tests {
         .unwrap_or_else(|e| panic!("{e}"));
         let keyring = Arc::new(Keyring::new(ApiKey::new(KEY), None, Some(store)));
         // The shipped store policy: strict.
-        let app = test_app(engine, keyring, false, None, journal.path(), false);
+        let app = test_app(engine, keyring, false, None, journal.path(), false, false);
         (app.clone(), router(app, None), key, a, journal)
     }
 
@@ -6913,9 +10562,10 @@ mod tests {
             .create_key(
                 a.id,
                 "k",
-                Permission::Admin,
+                Permission::Write,
                 &sha256(key_a.as_bytes()),
                 "dr_a",
+                None,
             )
             .await
             .unwrap_or_else(|e| panic!("{e}"));
@@ -7059,7 +10709,10 @@ mod tests {
         deleting: Gate,
     }
 
-    use durable_accounts::{ApiKeyInfo, HandlerRegistration, KeyGrant, Workspace};
+    use durable_accounts::{
+        ApiKeyInfo, HandlerRegistration, InviteGrant, KeyGrant, Mail, MailOutcome, OutboxMail,
+        SessionGrant, SignupOutcome, Workspace,
+    };
 
     #[async_trait::async_trait]
     impl AccountStore for GateStore {
@@ -7092,10 +10745,36 @@ mod tests {
             permission: Permission,
             key_hash: &[u8; 32],
             prefix: &str,
+            created_by: Option<u64>,
         ) -> Result<ApiKeyInfo, AccountError> {
             self.inner
-                .create_key(workspace, name, permission, key_hash, prefix)
+                .create_key(workspace, name, permission, key_hash, prefix, created_by)
                 .await
+        }
+        async fn key_by_public_id(
+            &self,
+            workspace: u64,
+            public_id: uuid::Uuid,
+        ) -> Result<Option<ApiKeyInfo>, AccountError> {
+            self.inner.key_by_public_id(workspace, public_id).await
+        }
+        async fn rotate_key(
+            &self,
+            workspace: u64,
+            key_id: u64,
+            new_key_hash: &[u8; 32],
+            new_prefix: &str,
+            created_by: Option<u64>,
+        ) -> Result<Option<(ApiKeyInfo, [u8; 32])>, AccountError> {
+            self.inner
+                .rotate_key(workspace, key_id, new_key_hash, new_prefix, created_by)
+                .await
+        }
+        async fn touch_keys(
+            &self,
+            touches: &[durable_accounts::KeyTouch],
+        ) -> Result<(), AccountError> {
+            self.inner.touch_keys(touches).await
         }
         async fn revoke_key(
             &self,
@@ -7125,6 +10804,18 @@ mod tests {
         ) -> Result<(), AccountError> {
             self.inner.put_handler(workspace, name, url).await
         }
+        async fn record_handler_test(
+            &self,
+            workspace: u64,
+            name: &str,
+            at_ms: i64,
+            status: &str,
+            latency_ms: i64,
+        ) -> Result<bool, AccountError> {
+            self.inner
+                .record_handler_test(workspace, name, at_ms, status, latency_ms)
+                .await
+        }
         async fn delete_handler(&self, workspace: u64, name: &str) -> Result<bool, AccountError> {
             if workspace == self.ws {
                 self.deleting.trip().await;
@@ -7136,6 +10827,251 @@ mod tests {
             workspace: u64,
         ) -> Result<Option<[u8; 32]>, AccountError> {
             self.inner.rotate_handler_secret(workspace).await
+        }
+        async fn signup(
+            &self,
+            email: &str,
+            password_hash: &str,
+            token_hash: &[u8; 32],
+            token_expires_at_ms: i64,
+            verify_mail: &Mail,
+            notice_mail: &Mail,
+        ) -> Result<SignupOutcome, AccountError> {
+            self.inner
+                .signup(
+                    email,
+                    password_hash,
+                    token_hash,
+                    token_expires_at_ms,
+                    verify_mail,
+                    notice_mail,
+                )
+                .await
+        }
+        async fn account_by_email(
+            &self,
+            email: &str,
+        ) -> Result<Option<durable_accounts::Account>, AccountError> {
+            self.inner.account_by_email(email).await
+        }
+        async fn session_grant(
+            &self,
+            token_hash: &[u8; 32],
+        ) -> Result<Option<SessionGrant>, AccountError> {
+            self.inner.session_grant(token_hash).await
+        }
+        async fn create_session(
+            &self,
+            session: &durable_accounts::NewSession,
+        ) -> Result<(), AccountError> {
+            self.inner.create_session(session).await
+        }
+        async fn revoke_session(&self, token_hash: &[u8; 32]) -> Result<bool, AccountError> {
+            self.inner.revoke_session(token_hash).await
+        }
+        async fn revoke_sessions_for_account(&self, account: u64) -> Result<(), AccountError> {
+            self.inner.revoke_sessions_for_account(account).await
+        }
+        async fn member_role(
+            &self,
+            account: u64,
+            workspace: u64,
+        ) -> Result<Option<Role>, AccountError> {
+            self.inner.member_role(account, workspace).await
+        }
+        async fn create_workspace_for(
+            &self,
+            account: u64,
+            name: &str,
+        ) -> Result<Workspace, AccountError> {
+            self.inner.create_workspace_for(account, name).await
+        }
+        async fn rename_workspace(&self, id: u64, name: &str) -> Result<bool, AccountError> {
+            self.inner.rename_workspace(id, name).await
+        }
+        async fn delete_workspace(&self, id: u64, now_ms: i64) -> Result<bool, AccountError> {
+            self.inner.delete_workspace(id, now_ms).await
+        }
+        async fn workspaces_for_account(
+            &self,
+            account: u64,
+        ) -> Result<Vec<(Workspace, Role)>, AccountError> {
+            self.inner.workspaces_for_account(account).await
+        }
+        async fn list_members(
+            &self,
+            workspace: u64,
+        ) -> Result<Vec<durable_accounts::MemberInfo>, AccountError> {
+            self.inner.list_members(workspace).await
+        }
+        async fn set_member_role(
+            &self,
+            workspace: u64,
+            account: u64,
+            role: Role,
+        ) -> Result<durable_accounts::MemberChange, AccountError> {
+            self.inner.set_member_role(workspace, account, role).await
+        }
+        async fn remove_member(
+            &self,
+            workspace: u64,
+            account: u64,
+        ) -> Result<durable_accounts::MemberChange, AccountError> {
+            self.inner.remove_member(workspace, account).await
+        }
+        async fn account_by_public_id(
+            &self,
+            public_id: uuid::Uuid,
+        ) -> Result<Option<durable_accounts::Account>, AccountError> {
+            self.inner.account_by_public_id(public_id).await
+        }
+        async fn create_invite(
+            &self,
+            workspace: u64,
+            email: &str,
+            role: Role,
+            invited_by: u64,
+            token_hash: &[u8; 32],
+            expires_at_ms: i64,
+        ) -> Result<Option<durable_accounts::WorkspaceInvite>, AccountError> {
+            self.inner
+                .create_invite(
+                    workspace,
+                    email,
+                    role,
+                    invited_by,
+                    token_hash,
+                    expires_at_ms,
+                )
+                .await
+        }
+        async fn list_invites(
+            &self,
+            workspace: u64,
+        ) -> Result<Vec<durable_accounts::WorkspaceInvite>, AccountError> {
+            self.inner.list_invites(workspace).await
+        }
+        async fn revoke_invite(
+            &self,
+            workspace: u64,
+            public_id: uuid::Uuid,
+        ) -> Result<bool, AccountError> {
+            self.inner.revoke_invite(workspace, public_id).await
+        }
+        async fn accept_invite(
+            &self,
+            token_hash: &[u8; 32],
+            account: u64,
+            now_ms: i64,
+        ) -> Result<Option<(u64, Role)>, AccountError> {
+            self.inner.accept_invite(token_hash, account, now_ms).await
+        }
+        async fn decline_invite(
+            &self,
+            token_hash: &[u8; 32],
+            now_ms: i64,
+        ) -> Result<bool, AccountError> {
+            self.inner.decline_invite(token_hash, now_ms).await
+        }
+        async fn outbox_mark(&self, id: u64, outcome: MailOutcome) -> Result<(), AccountError> {
+            self.inner.outbox_mark(id, outcome).await
+        }
+        async fn sessions_for_account(
+            &self,
+            account: u64,
+            limit: u32,
+        ) -> Result<Vec<durable_accounts::SessionInfo>, AccountError> {
+            self.inner.sessions_for_account(account, limit).await
+        }
+        async fn revoke_session_public(
+            &self,
+            account: u64,
+            public_id: uuid::Uuid,
+        ) -> Result<Option<[u8; 32]>, AccountError> {
+            self.inner.revoke_session_public(account, public_id).await
+        }
+        async fn revoke_sessions_except(
+            &self,
+            account: u64,
+            keep_public_id: uuid::Uuid,
+        ) -> Result<u64, AccountError> {
+            self.inner
+                .revoke_sessions_except(account, keep_public_id)
+                .await
+        }
+        async fn change_password(
+            &self,
+            account: u64,
+            new_password_hash: &str,
+        ) -> Result<(), AccountError> {
+            self.inner.change_password(account, new_password_hash).await
+        }
+        async fn touch_sessions(
+            &self,
+            touches: &[durable_accounts::SessionTouch],
+        ) -> Result<(), AccountError> {
+            self.inner.touch_sessions(touches).await
+        }
+        async fn consume_verify_token(
+            &self,
+            token_hash: &[u8; 32],
+        ) -> Result<Option<durable_accounts::Account>, AccountError> {
+            self.inner.consume_verify_token(token_hash).await
+        }
+        async fn consume_reset_token(
+            &self,
+            token_hash: &[u8; 32],
+            new_password_hash: &str,
+        ) -> Result<Option<durable_accounts::Account>, AccountError> {
+            self.inner
+                .consume_reset_token(token_hash, new_password_hash)
+                .await
+        }
+        async fn issue_reset_token(
+            &self,
+            email: &str,
+            token_hash: &[u8; 32],
+            expires_at_ms: i64,
+            reset_mail: &Mail,
+        ) -> Result<Option<u64>, AccountError> {
+            self.inner
+                .issue_reset_token(email, token_hash, expires_at_ms, reset_mail)
+                .await
+        }
+        async fn reissue_verify(
+            &self,
+            email: &str,
+            token_hash: &[u8; 32],
+            expires_at_ms: i64,
+            verify_mail: &Mail,
+        ) -> Result<Option<u64>, AccountError> {
+            self.inner
+                .reissue_verify(email, token_hash, expires_at_ms, verify_mail)
+                .await
+        }
+        async fn invite_grant(
+            &self,
+            token_hash: &[u8; 32],
+            now_ms: i64,
+        ) -> Result<Option<InviteGrant>, AccountError> {
+            self.inner.invite_grant(token_hash, now_ms).await
+        }
+        async fn enqueue_mail(&self, mail: &Mail) -> Result<Option<u64>, AccountError> {
+            self.inner.enqueue_mail(mail).await
+        }
+        async fn outbox_claim(
+            &self,
+            now_ms: i64,
+            limit: u32,
+            claim_ms: i64,
+        ) -> Result<Vec<OutboxMail>, AccountError> {
+            self.inner.outbox_claim(now_ms, limit, claim_ms).await
+        }
+        async fn outbox_sweep(&self, now_ms: i64) -> Result<u64, AccountError> {
+            self.inner.outbox_sweep(now_ms).await
+        }
+        async fn outbox_purge(&self, now_ms: i64) -> Result<u64, AccountError> {
+            self.inner.outbox_purge(now_ms).await
         }
     }
 
@@ -7188,10 +11124,36 @@ mod tests {
             permission: Permission,
             key_hash: &[u8; 32],
             prefix: &str,
+            created_by: Option<u64>,
         ) -> Result<ApiKeyInfo, AccountError> {
             self.inner
-                .create_key(workspace, name, permission, key_hash, prefix)
+                .create_key(workspace, name, permission, key_hash, prefix, created_by)
                 .await
+        }
+        async fn key_by_public_id(
+            &self,
+            workspace: u64,
+            public_id: uuid::Uuid,
+        ) -> Result<Option<ApiKeyInfo>, AccountError> {
+            self.inner.key_by_public_id(workspace, public_id).await
+        }
+        async fn rotate_key(
+            &self,
+            workspace: u64,
+            key_id: u64,
+            new_key_hash: &[u8; 32],
+            new_prefix: &str,
+            created_by: Option<u64>,
+        ) -> Result<Option<(ApiKeyInfo, [u8; 32])>, AccountError> {
+            self.inner
+                .rotate_key(workspace, key_id, new_key_hash, new_prefix, created_by)
+                .await
+        }
+        async fn touch_keys(
+            &self,
+            touches: &[durable_accounts::KeyTouch],
+        ) -> Result<(), AccountError> {
+            self.inner.touch_keys(touches).await
         }
         async fn revoke_key(
             &self,
@@ -7219,6 +11181,18 @@ mod tests {
             self.bump();
             self.inner.put_handler(workspace, name, url).await
         }
+        async fn record_handler_test(
+            &self,
+            workspace: u64,
+            name: &str,
+            at_ms: i64,
+            status: &str,
+            latency_ms: i64,
+        ) -> Result<bool, AccountError> {
+            self.inner
+                .record_handler_test(workspace, name, at_ms, status, latency_ms)
+                .await
+        }
         async fn delete_handler(&self, workspace: u64, name: &str) -> Result<bool, AccountError> {
             self.bump();
             self.inner.delete_handler(workspace, name).await
@@ -7229,6 +11203,251 @@ mod tests {
         ) -> Result<Option<[u8; 32]>, AccountError> {
             self.bump();
             self.inner.rotate_handler_secret(workspace).await
+        }
+        async fn signup(
+            &self,
+            email: &str,
+            password_hash: &str,
+            token_hash: &[u8; 32],
+            token_expires_at_ms: i64,
+            verify_mail: &Mail,
+            notice_mail: &Mail,
+        ) -> Result<SignupOutcome, AccountError> {
+            self.inner
+                .signup(
+                    email,
+                    password_hash,
+                    token_hash,
+                    token_expires_at_ms,
+                    verify_mail,
+                    notice_mail,
+                )
+                .await
+        }
+        async fn account_by_email(
+            &self,
+            email: &str,
+        ) -> Result<Option<durable_accounts::Account>, AccountError> {
+            self.inner.account_by_email(email).await
+        }
+        async fn session_grant(
+            &self,
+            token_hash: &[u8; 32],
+        ) -> Result<Option<SessionGrant>, AccountError> {
+            self.inner.session_grant(token_hash).await
+        }
+        async fn create_session(
+            &self,
+            session: &durable_accounts::NewSession,
+        ) -> Result<(), AccountError> {
+            self.inner.create_session(session).await
+        }
+        async fn revoke_session(&self, token_hash: &[u8; 32]) -> Result<bool, AccountError> {
+            self.inner.revoke_session(token_hash).await
+        }
+        async fn revoke_sessions_for_account(&self, account: u64) -> Result<(), AccountError> {
+            self.inner.revoke_sessions_for_account(account).await
+        }
+        async fn member_role(
+            &self,
+            account: u64,
+            workspace: u64,
+        ) -> Result<Option<Role>, AccountError> {
+            self.inner.member_role(account, workspace).await
+        }
+        async fn create_workspace_for(
+            &self,
+            account: u64,
+            name: &str,
+        ) -> Result<Workspace, AccountError> {
+            self.inner.create_workspace_for(account, name).await
+        }
+        async fn rename_workspace(&self, id: u64, name: &str) -> Result<bool, AccountError> {
+            self.inner.rename_workspace(id, name).await
+        }
+        async fn delete_workspace(&self, id: u64, now_ms: i64) -> Result<bool, AccountError> {
+            self.inner.delete_workspace(id, now_ms).await
+        }
+        async fn workspaces_for_account(
+            &self,
+            account: u64,
+        ) -> Result<Vec<(Workspace, Role)>, AccountError> {
+            self.inner.workspaces_for_account(account).await
+        }
+        async fn list_members(
+            &self,
+            workspace: u64,
+        ) -> Result<Vec<durable_accounts::MemberInfo>, AccountError> {
+            self.inner.list_members(workspace).await
+        }
+        async fn set_member_role(
+            &self,
+            workspace: u64,
+            account: u64,
+            role: Role,
+        ) -> Result<durable_accounts::MemberChange, AccountError> {
+            self.inner.set_member_role(workspace, account, role).await
+        }
+        async fn remove_member(
+            &self,
+            workspace: u64,
+            account: u64,
+        ) -> Result<durable_accounts::MemberChange, AccountError> {
+            self.inner.remove_member(workspace, account).await
+        }
+        async fn account_by_public_id(
+            &self,
+            public_id: uuid::Uuid,
+        ) -> Result<Option<durable_accounts::Account>, AccountError> {
+            self.inner.account_by_public_id(public_id).await
+        }
+        async fn create_invite(
+            &self,
+            workspace: u64,
+            email: &str,
+            role: Role,
+            invited_by: u64,
+            token_hash: &[u8; 32],
+            expires_at_ms: i64,
+        ) -> Result<Option<durable_accounts::WorkspaceInvite>, AccountError> {
+            self.inner
+                .create_invite(
+                    workspace,
+                    email,
+                    role,
+                    invited_by,
+                    token_hash,
+                    expires_at_ms,
+                )
+                .await
+        }
+        async fn list_invites(
+            &self,
+            workspace: u64,
+        ) -> Result<Vec<durable_accounts::WorkspaceInvite>, AccountError> {
+            self.inner.list_invites(workspace).await
+        }
+        async fn revoke_invite(
+            &self,
+            workspace: u64,
+            public_id: uuid::Uuid,
+        ) -> Result<bool, AccountError> {
+            self.inner.revoke_invite(workspace, public_id).await
+        }
+        async fn accept_invite(
+            &self,
+            token_hash: &[u8; 32],
+            account: u64,
+            now_ms: i64,
+        ) -> Result<Option<(u64, Role)>, AccountError> {
+            self.inner.accept_invite(token_hash, account, now_ms).await
+        }
+        async fn decline_invite(
+            &self,
+            token_hash: &[u8; 32],
+            now_ms: i64,
+        ) -> Result<bool, AccountError> {
+            self.inner.decline_invite(token_hash, now_ms).await
+        }
+        async fn outbox_mark(&self, id: u64, outcome: MailOutcome) -> Result<(), AccountError> {
+            self.inner.outbox_mark(id, outcome).await
+        }
+        async fn sessions_for_account(
+            &self,
+            account: u64,
+            limit: u32,
+        ) -> Result<Vec<durable_accounts::SessionInfo>, AccountError> {
+            self.inner.sessions_for_account(account, limit).await
+        }
+        async fn revoke_session_public(
+            &self,
+            account: u64,
+            public_id: uuid::Uuid,
+        ) -> Result<Option<[u8; 32]>, AccountError> {
+            self.inner.revoke_session_public(account, public_id).await
+        }
+        async fn revoke_sessions_except(
+            &self,
+            account: u64,
+            keep_public_id: uuid::Uuid,
+        ) -> Result<u64, AccountError> {
+            self.inner
+                .revoke_sessions_except(account, keep_public_id)
+                .await
+        }
+        async fn change_password(
+            &self,
+            account: u64,
+            new_password_hash: &str,
+        ) -> Result<(), AccountError> {
+            self.inner.change_password(account, new_password_hash).await
+        }
+        async fn touch_sessions(
+            &self,
+            touches: &[durable_accounts::SessionTouch],
+        ) -> Result<(), AccountError> {
+            self.inner.touch_sessions(touches).await
+        }
+        async fn consume_verify_token(
+            &self,
+            token_hash: &[u8; 32],
+        ) -> Result<Option<durable_accounts::Account>, AccountError> {
+            self.inner.consume_verify_token(token_hash).await
+        }
+        async fn consume_reset_token(
+            &self,
+            token_hash: &[u8; 32],
+            new_password_hash: &str,
+        ) -> Result<Option<durable_accounts::Account>, AccountError> {
+            self.inner
+                .consume_reset_token(token_hash, new_password_hash)
+                .await
+        }
+        async fn issue_reset_token(
+            &self,
+            email: &str,
+            token_hash: &[u8; 32],
+            expires_at_ms: i64,
+            reset_mail: &Mail,
+        ) -> Result<Option<u64>, AccountError> {
+            self.inner
+                .issue_reset_token(email, token_hash, expires_at_ms, reset_mail)
+                .await
+        }
+        async fn reissue_verify(
+            &self,
+            email: &str,
+            token_hash: &[u8; 32],
+            expires_at_ms: i64,
+            verify_mail: &Mail,
+        ) -> Result<Option<u64>, AccountError> {
+            self.inner
+                .reissue_verify(email, token_hash, expires_at_ms, verify_mail)
+                .await
+        }
+        async fn invite_grant(
+            &self,
+            token_hash: &[u8; 32],
+            now_ms: i64,
+        ) -> Result<Option<InviteGrant>, AccountError> {
+            self.inner.invite_grant(token_hash, now_ms).await
+        }
+        async fn enqueue_mail(&self, mail: &Mail) -> Result<Option<u64>, AccountError> {
+            self.inner.enqueue_mail(mail).await
+        }
+        async fn outbox_claim(
+            &self,
+            now_ms: i64,
+            limit: u32,
+            claim_ms: i64,
+        ) -> Result<Vec<OutboxMail>, AccountError> {
+            self.inner.outbox_claim(now_ms, limit, claim_ms).await
+        }
+        async fn outbox_sweep(&self, now_ms: i64) -> Result<u64, AccountError> {
+            self.inner.outbox_sweep(now_ms).await
+        }
+        async fn outbox_purge(&self, now_ms: i64) -> Result<u64, AccountError> {
+            self.inner.outbox_purge(now_ms).await
         }
     }
 
@@ -7247,9 +11466,10 @@ mod tests {
                 .create_key(
                     w.id,
                     "k",
-                    Permission::Admin,
+                    Permission::Write,
                     &sha256(key.as_bytes()),
                     "dr_3",
+                    None,
                 )
                 .await
                 .unwrap_or_else(|e| panic!("{e}"));
@@ -7424,6 +11644,66 @@ mod tests {
         );
     }
 
+    /// Re-review S2-3: a DELETE the store answers not-found (the row went
+    /// behind the API) still forgets the view — the next PUT of the same
+    /// URL writes instead of confirming a registration the store lacks.
+    #[tokio::test]
+    async fn a_delete_the_store_did_not_find_still_forgets_the_view() {
+        let (h, store, key_a, _) = two_tenant_registry().await;
+        let (status, v) = put_h(&h, key_a, "http://127.0.0.1:9/a").await;
+        assert_eq!(status, StatusCode::OK, "{v}");
+        let ws = load_registry_file(&h.app.registry_file)
+            .unwrap_or_else(|e| panic!("{e}"))
+            .into_iter()
+            .find(|e| e.name == "h")
+            .map(|e| e.ws)
+            .unwrap_or_else(|| panic!("the PUT saved its row"));
+        assert!(store
+            .delete_handler(ws, "h")
+            .await
+            .unwrap_or_else(|e| panic!("{e}")));
+        let (status, v) = call(&h.router, "DELETE", "/handlers/h", Some(key_a), None).await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{v}");
+        let (status, v) = put_h(&h, key_a, "http://127.0.0.1:9/a").await;
+        assert_eq!(status, StatusCode::OK, "{v}");
+        assert_ne!(
+            v["unchanged"],
+            json!(true),
+            "the PUT was skipped on the view a 404 DELETE left behind"
+        );
+        let rows = store
+            .list_handlers(ws)
+            .await
+            .unwrap_or_else(|e| panic!("{e}"));
+        assert!(
+            rows.iter().any(|r| r.name == "h"),
+            "the API confirmed a registration the store does not hold"
+        );
+    }
+
+    /// Re-review S2-3: a DELETE whose engine call failed after the store
+    /// row went still forgets the view — a later PUT of the same URL is
+    /// never a no-op over a row the store no longer has.
+    #[tokio::test]
+    async fn a_delete_the_engine_refused_still_forgets_the_view() {
+        let (h, _store, key_a, _) = two_tenant_registry().await;
+        let (status, v) = put_h(&h, key_a, "http://127.0.0.1:9/a").await;
+        assert_eq!(status, StatusCode::OK, "{v}");
+        h.app
+            .engine
+            .shutdown(Duration::from_secs(5))
+            .await
+            .unwrap_or_else(|e| panic!("{e}"));
+        let (status, v) = call(&h.router, "DELETE", "/handlers/h", Some(key_a), None).await;
+        assert_ne!(status, StatusCode::OK, "control: the engine refused: {v}");
+        let (_, v) = put_h(&h, key_a, "http://127.0.0.1:9/a").await;
+        assert_ne!(
+            v["unchanged"],
+            json!(true),
+            "the PUT was skipped on the view a failed DELETE left behind"
+        );
+    }
+
     /// S3 re-review 2: a rotate whose save failed keeps nothing in the
     /// view, so the next PUT writes the new secret instead of skipping
     /// and leaving the dead one in the file.
@@ -7440,9 +11720,29 @@ mod tests {
                 .and_then(|e| e.secret)
         };
         let old = secret_in_file();
+        // D-073: rotate is session-admin only — seat one on ws A.
+        let a_ws = {
+            let inner = &_store.inner;
+            inner
+                .list_workspaces(100, None)
+                .await
+                .unwrap_or_else(|e| panic!("{e}"))
+                .into_iter()
+                .find(|w| w.name == "ra")
+                .unwrap_or_else(|| panic!("ws A"))
+        };
+        let (cookie, csrf, pid) =
+            session_admin_on(&h.router, &_store.inner, &a_ws, "adm@x.co").await;
         {
             let _block = SaveBlock::on(&h);
-            let (status, v) = call(&h.router, "POST", "/handler-secret", Some(key_a), None).await;
+            let (status, _, v) = raw(
+                &h.router,
+                "POST",
+                "/handler-secret",
+                &ws_headers(&cookie, &csrf, &pid),
+                None,
+            )
+            .await;
             assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{v}");
         }
         let (status, v) = put_h(&h, key_a, "http://127.0.0.1:9/a").await;
@@ -7663,9 +11963,10 @@ mod tests {
             .create_key(
                 a.id,
                 "k",
-                Permission::Admin,
+                Permission::Write,
                 &sha256(key_a.as_bytes()),
                 "dr_c",
+                None,
             )
             .await
             .unwrap_or_else(|e| panic!("{e}"));
@@ -7801,9 +12102,10 @@ mod tests {
             .create_key(
                 ws.id,
                 "k",
-                Permission::Admin,
+                Permission::Write,
                 &sha256(key.as_bytes()),
                 "dr_a",
+                None,
             )
             .await
             .unwrap_or_else(|e| panic!("{e}"));
@@ -8173,9 +12475,10 @@ mod tests {
             .create_key(
                 a.id,
                 "k",
-                Permission::Admin,
+                Permission::Write,
                 &sha256(key_a.as_bytes()),
                 "dr_a",
+                None,
             )
             .await
             .unwrap_or_else(|e| panic!("{e}"));
@@ -8192,7 +12495,7 @@ mod tests {
         // The strict app — allow_local false, as the shipped default runs.
         let keyring = Arc::new(Keyring::new(ApiKey::new(KEY), None, Some(store)));
         let r = router(
-            test_app(engine, keyring, false, None, journal.path(), false),
+            test_app(engine, keyring, false, None, journal.path(), false, false),
             None,
         );
         for bad in [
@@ -8256,6 +12559,7 @@ mod tests {
                 None,
                 journal.path(),
                 true,
+                false,
             ),
             None,
         );
@@ -8967,9 +13271,10 @@ mod tests {
         );
     }
 
-    /// Checklist: the inspector holds a key and renders op_keys. Its pages
-    /// are served with a CSP that allows only its own scripts (the inline
-    /// bootstrap by hash), no framing, nosniff and no referrer.
+    /// Checklist: the dashboard at /app holds a key and renders op_keys.
+    /// Its pages are served with a CSP that allows only its own scripts
+    /// (the inline bootstrap by hash), no framing, nosniff and no
+    /// referrer; /inspector now 308s to it and is never served.
     #[tokio::test]
     async fn the_inspector_is_served_with_security_headers() {
         let ui = tempfile::tempdir().unwrap_or_else(|e| panic!("{e}"));
@@ -8991,16 +13296,13 @@ mod tests {
                 None,
                 journal.path(),
                 true,
+                false,
             ),
             Some(ui.path()),
         );
         use base64::Engine as _;
         let hash = base64::engine::general_purpose::STANDARD.encode(sha256(script.as_bytes()));
-        for uri in [
-            "/inspector/",
-            "/inspector/app.js",
-            "/inspector/runs/deep-link",
-        ] {
+        for uri in ["/app/", "/app/app.js", "/app/runs/deep-link"] {
             let res = r
                 .clone()
                 .oneshot(
@@ -9040,6 +13342,131 @@ mod tests {
                 "{uri}: scripts must not be unsafe-inline: {csp}"
             );
         }
+
+        // The CSP hashes match the inline script bytes on disk.
+        let csp_uri = r
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/app/")
+                    .body(Body::empty())
+                    .unwrap_or_else(|e| panic!("{e}")),
+            )
+            .await
+            .unwrap_or_else(|e| panic!("{e}"));
+        let csp = csp_uri
+            .headers()
+            .get(header::CONTENT_SECURITY_POLICY)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("")
+            .to_string();
+        assert!(
+            csp.contains(&format!("'sha256-{hash}'")),
+            "CSP must hash the file's inline script: {csp}"
+        );
+
+        // /inspector[/tail] 308s to /app[/tail] with the query preserved.
+        for (uri, want) in [
+            ("/inspector", "/app"),
+            ("/inspector/", "/app/"),
+            ("/inspector/x?y=1", "/app/x?y=1"),
+            (
+                "/inspector/runs/deep?key=abc&p=2",
+                "/app/runs/deep?key=abc&p=2",
+            ),
+        ] {
+            let res = r
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri(uri)
+                        .body(Body::empty())
+                        .unwrap_or_else(|e| panic!("{e}")),
+                )
+                .await
+                .unwrap_or_else(|e| panic!("{e}"));
+            assert_eq!(res.status(), StatusCode::PERMANENT_REDIRECT, "{uri}");
+            assert_eq!(
+                res.headers()
+                    .get(header::LOCATION)
+                    .and_then(|v| v.to_str().ok()),
+                Some(want),
+                "{uri}"
+            );
+        }
+
+        // A traversal tail cannot escape the ui dir.
+        for uri in [
+            "/app/../Cargo.toml",
+            "/app/%2e%2e/%2e%2e/Cargo.toml",
+            "/app/..%2f..%2fetc%2fpasswd",
+        ] {
+            let res = r
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri(uri)
+                        .body(Body::empty())
+                        .unwrap_or_else(|e| panic!("{e}")),
+                )
+                .await
+                .unwrap_or_else(|e| panic!("{e}"));
+            let body = res
+                .into_body()
+                .collect()
+                .await
+                .unwrap_or_else(|e| panic!("{e}"))
+                .to_bytes();
+            let text = String::from_utf8_lossy(&body);
+            assert!(
+                !text.contains("[package]") && !text.contains("root:"),
+                "{uri} escaped the ui dir"
+            );
+        }
+    }
+
+    /// Without `--ui-dir` there is no /app at all — 404, not an empty
+    /// mount; /inspector still redirects so old links land on an honest
+    /// 404 rather than a hang.
+    #[tokio::test]
+    async fn app_without_ui_dir_is_404() {
+        let journal = tempfile::tempdir().unwrap_or_else(|e| panic!("{e}"));
+        let engine = spawn(journal.path(), Registry::default(), ShellConfig::default())
+            .unwrap_or_else(|e| panic!("{e}"));
+        let r = router(
+            test_app(
+                engine,
+                Arc::new(Keyring::new(ApiKey::new(KEY), None, None)),
+                false,
+                None,
+                journal.path(),
+                true,
+                false,
+            ),
+            None,
+        );
+        let res = r
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/app/")
+                    .body(Body::empty())
+                    .unwrap_or_else(|e| panic!("{e}")),
+            )
+            .await
+            .unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(res.status(), StatusCode::NOT_FOUND);
+        let res = r
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/inspector/x")
+                    .body(Body::empty())
+                    .unwrap_or_else(|e| panic!("{e}")),
+            )
+            .await
+            .unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(res.status(), StatusCode::PERMANENT_REDIRECT);
     }
 
     /// The per-address bounds lifted the way the load battery lifts them
@@ -9090,6 +13517,7 @@ mod tests {
             limits,
             Some(h.obs.clone()),
             stopped,
+            false,
         ));
         (addr, stop, h)
     }
@@ -9719,7 +14147,7 @@ mod tests {
         );
         // Dry the work pool and all four reserve slots, one per bucket —
         // every further accept must take the primary lane arm.
-        let mut pinned = connect_from(addrs[0].to_string())
+        let mut pinned = connect_from(addrs[0].parse().unwrap_or_else(|_| panic!("addr")))
             .await
             .unwrap_or_else(|| panic!("the pinned conn failed to connect"));
         pinned
@@ -9728,7 +14156,7 @@ mod tests {
             .unwrap_or_else(|e| panic!("{e}"));
         let mut held = Vec::new();
         for src in &addrs {
-            let mut s = connect_from(src.to_string())
+            let mut s = connect_from(src.parse().unwrap_or_else(|_| panic!("{src}")))
                 .await
                 .unwrap_or_else(|| panic!("{src}: reserve conn failed to connect"));
             s.write_all(b"GET /health HTTP/1.1\r\n")
@@ -9740,7 +14168,7 @@ mod tests {
         // must READ `503 overloaded` + `Retry-After` — never an
         // unanswered close.
         for src in &addrs {
-            let mut probe = connect_from(src.to_string())
+            let mut probe = connect_from(src.parse().unwrap_or_else(|_| panic!("{src}")))
                 .await
                 .unwrap_or_else(|| panic!("{src}: probe conn failed to connect"));
             probe
@@ -10393,6 +14821,7 @@ mod tests {
                 None,
                 journal.path(),
                 true,
+                false,
             ),
             None,
         );
@@ -10428,6 +14857,7 @@ mod tests {
                 None,
                 journal.path(),
                 true,
+                false,
             ),
             None,
         );
@@ -10788,9 +15218,10 @@ mod tests {
             .create_key(
                 a.id,
                 "k",
-                Permission::Admin,
+                Permission::Write,
                 &sha256(key_a.as_bytes()),
                 "dr_a",
+                None,
             )
             .await
             .unwrap_or_else(|e| panic!("{e}"));
@@ -11018,9 +15449,10 @@ mod tests {
             .create_key(
                 a.id,
                 "k",
-                Permission::Admin,
+                Permission::Write,
                 &sha256(key_a.as_bytes()),
                 "dr_a",
+                None,
             )
             .await
             .unwrap_or_else(|e| panic!("{e}"));
@@ -11036,8 +15468,17 @@ mod tests {
         .await;
         assert_eq!(status, StatusCode::OK, "{v}");
 
-        // Rotate: the new secret comes back once, and differs.
-        let (status, v) = call(&h.router, "POST", "/handler-secret", Some(key_a), None).await;
+        // Rotate (D-073: session admin on ws `a`): the new secret comes
+        // back once, and differs.
+        let (cookie, csrf, pid) = session_admin_on(&h.router, &store, &a, "adm@x.co").await;
+        let (status, _, v) = raw(
+            &h.router,
+            "POST",
+            "/handler-secret",
+            &ws_headers(&cookie, &csrf, &pid),
+            None,
+        )
+        .await;
         assert_eq!(status, StatusCode::OK, "{v}");
         let new_secret = unhex(v["secret"].as_str().unwrap_or(""))
             .unwrap_or_else(|| panic!("rotation must return the new secret once: {v}"));
@@ -11300,9 +15741,10 @@ mod tests {
             .create_key(
                 ws.id,
                 "main",
-                Permission::Admin,
+                Permission::Write,
                 &sha256(token.as_bytes()),
                 "dr_te",
+                None,
             )
             .await
             .unwrap_or_else(|e| panic!("key: {e}"));
@@ -11418,6 +15860,7 @@ mod tests {
                 None,
                 journal.path(),
                 true,
+                false,
             );
             for s in corpus_str("decode-id") {
                 decode_id_at(&app, &s);
@@ -11582,5 +16025,3086 @@ mod tests {
                 registry_file_bytes(&bytes);
             }
         }
+    }
+
+    // ---- S3-0: session + auth surface ------------------------------
+    use durable_accounts::Memory;
+
+    /// `call` plus arbitrary headers and the full response (cookie and
+    /// cache-header assertions need more than status+body).
+    async fn raw(
+        router: &Router,
+        method: &str,
+        uri: &str,
+        headers: &[(&str, String)],
+        body: Option<Value>,
+    ) -> (StatusCode, header::HeaderMap, Value) {
+        let mut req = Request::builder().method(method).uri(uri);
+        for (k, v) in headers {
+            req = req.header(*k, v.as_str());
+        }
+        let req = match body {
+            Some(b) => req
+                .header("content-type", "application/json")
+                .body(Body::from(b.to_string())),
+            None => req.body(Body::empty()),
+        }
+        .unwrap_or_else(|e| panic!("{e}"));
+        let res = router
+            .clone()
+            .oneshot(req)
+            .await
+            .unwrap_or_else(|e| panic!("{e}"));
+        let status = res.status();
+        let heads = res.headers().clone();
+        let bytes = res
+            .into_body()
+            .collect()
+            .await
+            .unwrap_or_else(|e| panic!("{e}"))
+            .to_bytes();
+        (
+            status,
+            heads,
+            serde_json::from_slice(&bytes).unwrap_or(Value::Null),
+        )
+    }
+
+    /// `raw` carrying the `OpsListener` extension — what a request on
+    /// the `--ops-listen` socket looks like to the router.
+    async fn raw_ops(
+        router: &Router,
+        method: &str,
+        uri: &str,
+        headers: &[(&str, String)],
+        body: Option<Value>,
+    ) -> (StatusCode, header::HeaderMap, Value) {
+        let mut req = Request::builder().method(method).uri(uri);
+        for (k, v) in headers {
+            req = req.header(*k, v.as_str());
+        }
+        let req = match body {
+            Some(b) => req
+                .header("content-type", "application/json")
+                .body(Body::from(b.to_string())),
+            None => req.body(Body::empty()),
+        }
+        .unwrap_or_else(|e| panic!("{e}"));
+        let res = router
+            .clone()
+            .oneshot({
+                let mut req = req;
+                req.extensions_mut().insert(OpsListener);
+                req
+            })
+            .await
+            .unwrap_or_else(|e| panic!("{e}"));
+        let status = res.status();
+        let heads = res.headers().clone();
+        let bytes = res
+            .into_body()
+            .collect()
+            .await
+            .unwrap_or_else(|e| panic!("{e}"))
+            .to_bytes();
+        (
+            status,
+            heads,
+            serde_json::from_slice(&bytes).unwrap_or(Value::Null),
+        )
+    }
+
+    fn cookie_header(set_cookie: &str) -> String {
+        set_cookie.split(';').next().unwrap_or_default().to_string()
+    }
+
+    /// Sign up then sign in; returns `(cookie_value, csrf)` for a live
+    /// session. The password must satisfy the policy.
+    async fn sign_in(router: &Router, email: &str, password: &str) -> (String, String) {
+        let (st, _, _) = raw(
+            router,
+            "POST",
+            "/auth/signup",
+            &[],
+            Some(json!({"email": email, "password": password})),
+        )
+        .await;
+        assert_eq!(st, StatusCode::ACCEPTED, "signup");
+        let (st, heads, v) = raw(
+            router,
+            "POST",
+            "/auth/login",
+            &[],
+            Some(json!({"email": email, "password": password})),
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK, "login: {v}");
+        let set = heads
+            .get(header::SET_COOKIE)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or_default()
+            .to_string();
+        (
+            cookie_header(&set),
+            v["csrf"].as_str().unwrap_or_default().to_string(),
+        )
+    }
+
+    /// The whole S3-0 round trip: sign-up → 202 + unverified account +
+    /// a queued verify mail; login → cookie + csrf; the cookie
+    /// resolves `GET /auth/session`; logout revokes.
+    #[tokio::test]
+    async fn s30_signup_login_session_round_trip() {
+        let store = Arc::new(Memory::new());
+        let h = harness_store(false, None, Some(store.clone()));
+
+        let (st, _, v) = raw(
+            &h.router,
+            "POST",
+            "/auth/signup",
+            &[],
+            Some(json!({"email": "User@Example.com", "password": "a-long-enough-passphrase"})),
+        )
+        .await;
+        assert_eq!(st, StatusCode::ACCEPTED);
+        assert_eq!(v, json!({"status": "verification_sent"}));
+        let acct = store
+            .account_by_email("user@example.com")
+            .await
+            .unwrap_or_else(|e| panic!("{e}"))
+            .unwrap_or_else(|| panic!("account row"));
+        assert!(!acct.email_verified, "unverified until the link is used");
+        assert_eq!(
+            store
+                .outbox()
+                .iter()
+                .filter(|r| r.mail.kind == "verify")
+                .count(),
+            1,
+            "one verify mail queued"
+        );
+
+        // The same address again: identical answer, identical work —
+        // every branch pays the hash (review S3).
+        let ran_before = h.app.argon.ran.load(std::sync::atomic::Ordering::Relaxed);
+        let (st, _, v2) = raw(
+            &h.router,
+            "POST",
+            "/auth/signup",
+            &[],
+            Some(json!({"email": "user@example.com", "password": "another-long-passphrase"})),
+        )
+        .await;
+        assert_eq!(st, StatusCode::ACCEPTED);
+        assert_eq!(v2, v, "identical 202 envelope, no oracle");
+        let ran_after = h.app.argon.ran.load(std::sync::atomic::Ordering::Relaxed);
+        assert!(ran_after > ran_before, "the re-sign-up still paid the hash");
+
+        let (cookie, csrf) =
+            sign_in(&h.router, "user@example.com", "another-long-passphrase").await;
+        let (st, heads, v) = raw(
+            &h.router,
+            "GET",
+            "/auth/session",
+            &[("cookie", cookie.clone())],
+            None,
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK, "{v}");
+        assert_eq!(v["account"]["email"], "user@example.com");
+        assert!(v["csrf"].is_string());
+        assert_eq!(
+            heads
+                .get(header::CACHE_CONTROL)
+                .and_then(|v| v.to_str().ok()),
+            Some("no-store"),
+            "session responses are never cached"
+        );
+        assert!(
+            heads
+                .get_all(header::VARY)
+                .iter()
+                .any(|v| v.to_str().is_ok_and(|s| s.contains("Cookie"))),
+            "Vary: Cookie"
+        );
+        // Logout without the synchroniser token → 403 csrf_failed…
+        let (st, _, v) = raw(
+            &h.router,
+            "POST",
+            "/auth/logout",
+            &[("cookie", cookie.clone())],
+            None,
+        )
+        .await;
+        assert_eq!(st, StatusCode::FORBIDDEN, "{v}");
+        assert_eq!(v["code"], "csrf_failed");
+        // …and with a wrong one → same; with the right one → 204.
+        let (st, _, _) = raw(
+            &h.router,
+            "POST",
+            "/auth/logout",
+            &[
+                ("cookie", cookie.clone()),
+                ("x-durable-csrf", "drc_bad".into()),
+            ],
+            None,
+        )
+        .await;
+        assert_eq!(st, StatusCode::FORBIDDEN);
+        let (st, heads, _) = raw(
+            &h.router,
+            "POST",
+            "/auth/logout",
+            &[("cookie", cookie.clone()), ("x-durable-csrf", csrf)],
+            None,
+        )
+        .await;
+        // DECISIVE(csrf)
+        assert_eq!(st, StatusCode::NO_CONTENT);
+        let expired = heads
+            .get(header::SET_COOKIE)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or_default();
+        assert!(expired.contains("Max-Age=0"), "the cookie is cleared");
+        let (st, _, _) = raw(
+            &h.router,
+            "GET",
+            "/auth/session",
+            &[("cookie", cookie)],
+            None,
+        )
+        .await;
+        assert_eq!(st, StatusCode::UNAUTHORIZED, "the session is dead");
+    }
+
+    /// Cookie attributes are asserted exactly: HttpOnly, Secure,
+    /// SameSite=Lax, Path=/, no Domain.
+    #[tokio::test]
+    async fn s30_cookie_attributes() {
+        let h = harness_store(false, None, Some(Arc::new(Memory::new())));
+        let (st, _, _) = raw(
+            &h.router,
+            "POST",
+            "/auth/signup",
+            &[],
+            Some(json!({"email": "a@b.co", "password": "a-long-enough-passphrase"})),
+        )
+        .await;
+        assert_eq!(st, StatusCode::ACCEPTED);
+        let (st, heads, _) = raw(
+            &h.router,
+            "POST",
+            "/auth/login",
+            &[],
+            Some(json!({"email": "a@b.co", "password": "a-long-enough-passphrase"})),
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK);
+        let set = heads
+            .get(header::SET_COOKIE)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or_default();
+        for attr in [
+            "__Host-drs=drs_",
+            "Secure",
+            "HttpOnly",
+            "SameSite=Lax",
+            "Path=/",
+        ] {
+            // DECISIVE(cookie-attrs)
+            assert!(set.contains(attr), "Set-Cookie missing {attr}: {set}");
+        }
+        assert!(!set.contains("Domain"), "__Host- forbids Domain: {set}");
+    }
+
+    /// A forged `drs_` value dies on the tag check — before any store
+    /// I/O (review #8). Proved at the check itself: the mutation that
+    /// removes it makes this assertion red.
+    #[test]
+    fn s30_session_forge_dies_before_the_store() {
+        let pubid = pubid::PubId::ephemeral();
+        let key = pubid.derive_key(b"session-token-v1");
+        let forged = format!("drs_{}", hex(&[0xabu8; 32]));
+        // DECISIVE(session-forge)
+        assert!(
+            session_token_hash(&key, &forged).is_none(),
+            "a token this process never minted must fail the tag"
+        );
+        let minted = mint_session_token(&key);
+        assert!(session_token_hash(&key, &minted).is_some());
+    }
+
+    /// Unknown `drs_` values — even well-formed ones — answer 401, and
+    /// `GET /auth/session` answers 404 when no store is configured
+    /// (the dashboard's compat-mode signal).
+    #[tokio::test]
+    async fn s30_session_unknown_and_no_store() {
+        let store = Arc::new(Memory::new());
+        let h = harness_store(false, None, Some(store));
+        let forged = format!("drs_{}", hex(&[7u8; 32]));
+        let (st, _, _) = raw(
+            &h.router,
+            "GET",
+            "/auth/session",
+            &[("cookie", format!("__Host-drs={forged}"))],
+            None,
+        )
+        .await;
+        assert_eq!(st, StatusCode::UNAUTHORIZED);
+
+        let h2 = harness_store(false, None, None);
+        let (st, _, _) = raw(&h2.router, "GET", "/auth/session", &[], None).await;
+        assert_eq!(st, StatusCode::NOT_FOUND, "no store → 404, not 401");
+    }
+
+    /// The origin checks guard the unauthenticated POSTs too (review
+    /// #17): cross-site fetch metadata or a foreign Origin refuse 403.
+    #[tokio::test]
+    async fn s30_csrf_open_post() {
+        let h = harness_store(false, None, Some(Arc::new(Memory::new())));
+        for bad in [
+            ("sec-fetch-site", "cross-site"),
+            ("sec-fetch-site", "same-site"),
+            ("origin", "https://evil.example"),
+        ] {
+            let hs = [
+                ("host", "durablerunnerapp.404human.dev".to_string()),
+                (bad.0, bad.1.to_string()),
+            ];
+            let (st, _, v) = raw(
+                &h.router,
+                "POST",
+                "/auth/login",
+                &hs,
+                Some(json!({"email": "a@b.co", "password": "x"})),
+            )
+            .await;
+            // DECISIVE(csrf-open-post)
+            assert_eq!(st, StatusCode::FORBIDDEN, "{bad:?}: {v}");
+            assert_eq!(v["code"], "csrf_failed");
+        }
+        // Same-origin metadata passes the gate (then fails the login).
+        let (st, _, _) = raw(
+            &h.router,
+            "POST",
+            "/auth/login",
+            &[
+                ("host", "durablerunnerapp.404human.dev".to_string()),
+                ("sec-fetch-site", "same-origin".to_string()),
+                (
+                    "origin",
+                    "https://durablerunnerapp.404human.dev".to_string(),
+                ),
+            ],
+            Some(json!({"email": "a@b.co", "password": "x"})),
+        )
+        .await;
+        assert_eq!(st, StatusCode::UNAUTHORIZED);
+    }
+
+    /// Re-sign-up of an unverified address kills sessions minted with
+    /// the earlier credential and installs the new password — the
+    /// pre-registration takeover's second leg (review #2).
+    #[tokio::test]
+    async fn s30_prereg_resignup_revokes() {
+        let h = harness_store(false, None, Some(Arc::new(Memory::new())));
+        // Attacker signs up the victim's address and logs in.
+        let (attacker_cookie, _) =
+            sign_in(&h.router, "victim@example.com", "attacker-passphrase").await;
+        // The victim re-signs up with their own password.
+        let (st, _, _) = raw(
+            &h.router,
+            "POST",
+            "/auth/signup",
+            &[],
+            Some(json!({"email": "victim@example.com", "password": "victim-passphrase-ok"})),
+        )
+        .await;
+        assert_eq!(st, StatusCode::ACCEPTED);
+        // The attacker's session is dead and their password no longer
+        // works; the victim's does.
+        let (st, _, _) = raw(
+            &h.router,
+            "GET",
+            "/auth/session",
+            &[("cookie", attacker_cookie)],
+            None,
+        )
+        .await;
+        assert_eq!(st, StatusCode::UNAUTHORIZED);
+        let (st, _, v) = raw(
+            &h.router,
+            "POST",
+            "/auth/login",
+            &[],
+            Some(json!({"email": "victim@example.com", "password": "attacker-passphrase"})),
+        )
+        .await;
+        assert_eq!(st, StatusCode::UNAUTHORIZED, "{v}");
+        let (st, _, _) = raw(
+            &h.router,
+            "POST",
+            "/auth/login",
+            &[],
+            Some(json!({"email": "victim@example.com", "password": "victim-passphrase-ok"})),
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK);
+    }
+
+    /// The argon2 queue is bounded (review #9): a second concurrent job
+    /// from the same address is refused 503 busy + Retry-After.
+    #[tokio::test]
+    async fn s30_argon_queue_is_bounded() {
+        let h = harness_store(false, None, Some(Arc::new(Memory::new())));
+        let (st, _, _) = raw(
+            &h.router,
+            "POST",
+            "/auth/signup",
+            &[],
+            Some(json!({"email": "q@q.co", "password": "a-long-enough-passphrase"})),
+        )
+        .await;
+        assert_eq!(st, StatusCode::ACCEPTED);
+        let body = || Some(json!({"email": "q@q.co", "password": "a-long-enough-passphrase"}));
+        let r1 = h.router.clone();
+        let r2 = h.router.clone();
+        let (a, b) = tokio::join!(
+            raw(&r1, "POST", "/auth/login", &[], body()),
+            raw(&r2, "POST", "/auth/login", &[], body())
+        );
+        let mut busy = [a, b]
+            .into_iter()
+            .filter(|(st, heads, _)| {
+                *st == StatusCode::SERVICE_UNAVAILABLE && heads.contains_key(header::RETRY_AFTER)
+            })
+            .count();
+        assert!(busy <= 1, "at most one concurrent job may be refused");
+        // Saturate directly: two queued calls from the same address
+        // always refuse the second.
+        let slow = || std::thread::sleep(Duration::from_millis(50));
+        let addr = std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST);
+        let (r1, r2) = tokio::join!(
+            h.app.argon.run(addr, false, slow),
+            h.app.argon.run(addr, false, slow)
+        );
+        busy = [r1, r2].into_iter().filter(|r| r.is_err()).count();
+        assert_eq!(busy, 1, "one job per address");
+    }
+
+    /// Store-down drill: a cached session keeps working through an
+    /// outage; an uncached token fails closed 503 accounts_unavailable
+    /// (never a silent deny).
+    #[tokio::test]
+    async fn s30_store_down_cached_sessions_survive() {
+        let store = Arc::new(Memory::new());
+        let h = harness_store(false, None, Some(store.clone()));
+        let (cookie, _) = sign_in(&h.router, "d@d.co", "a-long-enough-passphrase").await;
+        // Prime the cache, then drop the store.
+        let (st, _, _) = raw(
+            &h.router,
+            "GET",
+            "/auth/session",
+            &[("cookie", cookie.clone())],
+            None,
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK);
+        store.set_unavailable(true);
+        let (st, _, _) = raw(
+            &h.router,
+            "GET",
+            "/auth/session",
+            &[("cookie", cookie)],
+            None,
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK, "cached grant survives the outage");
+        // A real (well-tagged) token the cache has never seen → 503.
+        let other = mint_session_token(&h.app.session_key.clone());
+        let (st, _, v) = raw(
+            &h.router,
+            "GET",
+            "/auth/session",
+            &[("cookie", format!("__Host-drs={other}"))],
+            None,
+        )
+        .await;
+        assert_eq!(st, StatusCode::SERVICE_UNAVAILABLE, "{v}");
+        assert_eq!(v["code"], "accounts_unavailable");
+    }
+
+    // ---- S3-1: verify / reset / outbox drain / lockout -------------
+
+    /// The `drt_` token out of the newest pending outbox row of `kind`
+    /// for `email` — the link the mailbox owner would click.
+    fn mailed_token(store: &Memory, kind: &'static str, email: &str) -> String {
+        store
+            .outbox()
+            .into_iter()
+            .rev()
+            .find(|r| r.status == "pending" && r.kind == kind && r.send_to == email)
+            .and_then(|r| {
+                r.mail.text.split("token=").nth(1).map(|t| {
+                    t.chars()
+                        .take_while(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_')
+                        .collect()
+                })
+            })
+            .unwrap_or_else(|| panic!("no pending {kind} mail for {email}"))
+    }
+
+    async fn signup_only(router: &Router, email: &str, password: &str) {
+        let (st, _, v) = raw(
+            router,
+            "POST",
+            "/auth/signup",
+            &[],
+            Some(json!({"email": email, "password": password})),
+        )
+        .await;
+        assert_eq!(st, StatusCode::ACCEPTED, "{v}");
+    }
+
+    /// Sign up, then click the mailed verify link.
+    async fn signup_and_verify(router: &Router, store: &Memory, email: &str, password: &str) {
+        signup_only(router, email, password).await;
+        let token = mailed_token(store, "verify", email);
+        let (st, _, v) = raw(
+            router,
+            "POST",
+            "/auth/verify",
+            &[],
+            Some(json!({"token": token})),
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK, "{v}");
+    }
+
+    /// Verify: the mailed link verifies the account, answers
+    /// `{verified: true}` — and NEVER sets a session cookie: the
+    /// mailbox owner signs in fresh (review #2/#17). Proves
+    /// `verify-sets-cookie`.
+    #[tokio::test]
+    async fn s31_verify_round_trip() {
+        let store = Arc::new(Memory::new());
+        let h = harness_store(false, None, Some(store.clone()));
+        signup_only(&h.router, "v@v.co", "a-long-enough-passphrase").await;
+        // A session minted before verify dies with it (prereg proof's
+        // other half — the revoke lives in the consume).
+        let (cookie, _) = sign_in(&h.router, "v@v.co", "a-long-enough-passphrase").await;
+        let token = mailed_token(&store, "verify", "v@v.co");
+        let (st, heads, v) = raw(
+            &h.router,
+            "POST",
+            "/auth/verify",
+            &[("cookie", cookie.clone())],
+            Some(json!({"token": token})),
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK, "{v}");
+        assert_eq!(v["verified"], true);
+        // DECISIVE(verify-sets-cookie)
+        assert!(
+            heads.get_all(header::SET_COOKIE).iter().next().is_none(),
+            "verify must never set a cookie: {heads:?}"
+        );
+        let acct = store
+            .account_by_email("v@v.co")
+            .await
+            .unwrap_or_else(|e| panic!("{e}"))
+            .unwrap_or_else(|| panic!("account"));
+        assert!(acct.email_verified);
+        // The pre-verify session is dead; a fresh login works.
+        let (st, _, _) = raw(
+            &h.router,
+            "GET",
+            "/auth/session",
+            &[("cookie", cookie)],
+            None,
+        )
+        .await;
+        assert_eq!(st, StatusCode::UNAUTHORIZED);
+        let (_, _) = sign_in(&h.router, "v@v.co", "a-long-enough-passphrase").await;
+    }
+
+    /// A used `drt_` token is dead — consumed, superseded, expired and
+    /// unknown all read as the one 410. Proves `token-replay`.
+    #[tokio::test]
+    async fn s31_verify_token_replay_410() {
+        let store = Arc::new(Memory::new());
+        let h = harness_store(false, None, Some(store.clone()));
+        signup_only(&h.router, "r@r.co", "a-long-enough-passphrase").await;
+        let token = mailed_token(&store, "verify", "r@r.co");
+        let body = || Some(json!({"token": token}));
+        let (st, _, _) = raw(&h.router, "POST", "/auth/verify", &[], body()).await;
+        assert_eq!(st, StatusCode::OK);
+        let (st, _, v) = raw(&h.router, "POST", "/auth/verify", &[], body()).await;
+        // DECISIVE(token-replay)
+        assert_eq!(st, StatusCode::GONE, "{v}");
+        assert_eq!(v["code"], "token_gone");
+        // Garbage shaped nothing like a token: same 410, no oracle.
+        let (st, _, _) = raw(
+            &h.router,
+            "POST",
+            "/auth/verify",
+            &[],
+            Some(json!({"token": "not-a-token"})),
+        )
+        .await;
+        assert_eq!(st, StatusCode::GONE);
+    }
+
+    /// A `reset` token presented to `/auth/verify` is a dead verify
+    /// token — the kind is bound inside the consume. Proves
+    /// `token-kind-confusion`.
+    #[tokio::test]
+    async fn s31_reset_token_cannot_verify() {
+        let store = Arc::new(Memory::new());
+        let h = harness_store(false, None, Some(store.clone()));
+        signup_and_verify(&h.router, &store, "k@k.co", "a-long-enough-passphrase").await;
+        let (st, _, _) = raw(
+            &h.router,
+            "POST",
+            "/auth/forgot",
+            &[],
+            Some(json!({"email": "k@k.co"})),
+        )
+        .await;
+        assert_eq!(st, StatusCode::ACCEPTED);
+        let reset = mailed_token(&store, "reset", "k@k.co");
+        let (st, _, v) = raw(
+            &h.router,
+            "POST",
+            "/auth/verify",
+            &[],
+            Some(json!({"token": reset})),
+        )
+        .await;
+        // DECISIVE(token-kind-confusion)
+        assert_eq!(st, StatusCode::GONE, "{v}");
+        // And the reset link still works for its own route.
+        let (st, _, v) = raw(
+            &h.router,
+            "POST",
+            "/auth/reset",
+            &[],
+            Some(json!({"token": reset, "password": "another-long-passphrase"})),
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK, "{v}");
+    }
+
+    /// Forgot → mailed reset link → reset installs the password,
+    /// revokes every session and sibling token, and mints a fresh
+    /// session only for an unaffiliated requester.
+    #[tokio::test]
+    async fn s31_forgot_reset_round_trip() {
+        let store = Arc::new(Memory::new());
+        let h = harness_store(false, None, Some(store.clone()));
+        signup_and_verify(&h.router, &store, "f@f.co", "first-long-passphrase").await;
+        let (cookie, _) = sign_in(&h.router, "f@f.co", "first-long-passphrase").await;
+        let (st, _, v) = raw(
+            &h.router,
+            "POST",
+            "/auth/forgot",
+            &[],
+            Some(json!({"email": "f@f.co"})),
+        )
+        .await;
+        assert_eq!(st, StatusCode::ACCEPTED, "{v}");
+        assert_eq!(v, json!({"status": "sent"}));
+        let token = mailed_token(&store, "reset", "f@f.co");
+        // Unaffiliated requester (no cookie) → fresh session minted.
+        let (st, heads, v) = raw(
+            &h.router,
+            "POST",
+            "/auth/reset",
+            &[],
+            Some(json!({"token": token, "password": "second-long-passphrase"})),
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK, "{v}");
+        let fresh = heads
+            .get_all(header::SET_COOKIE)
+            .iter()
+            .filter_map(|v| v.to_str().ok())
+            .find(|s| s.starts_with("__Host-drs="))
+            .map(cookie_header)
+            .unwrap_or_else(|| panic!("reset mints a session: {heads:?}"));
+        // The pre-reset session is dead; the fresh one resolves.
+        let (st, _, _) = raw(
+            &h.router,
+            "GET",
+            "/auth/session",
+            &[("cookie", cookie)],
+            None,
+        )
+        .await;
+        assert_eq!(st, StatusCode::UNAUTHORIZED);
+        let (st, _, v) = raw(
+            &h.router,
+            "GET",
+            "/auth/session",
+            &[("cookie", fresh)],
+            None,
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK, "{v}");
+        assert_eq!(v["account"]["email"], "f@f.co");
+        // Old password dead, new password live, replay dead.
+        let (st, _, _) = raw(
+            &h.router,
+            "POST",
+            "/auth/login",
+            &[],
+            Some(json!({"email": "f@f.co", "password": "first-long-passphrase"})),
+        )
+        .await;
+        assert_eq!(st, StatusCode::UNAUTHORIZED);
+        let (st, _, _) = raw(
+            &h.router,
+            "POST",
+            "/auth/login",
+            &[],
+            Some(json!({"email": "f@f.co", "password": "second-long-passphrase"})),
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK);
+        let (st, _, _) = raw(
+            &h.router,
+            "POST",
+            "/auth/reset",
+            &[],
+            Some(json!({"token": token, "password": "third-long-passphrase"})),
+        )
+        .await;
+        assert_eq!(st, StatusCode::GONE);
+    }
+
+    /// A foreign session is never signed over by someone else's reset
+    /// link (review #17): B's browser redeeming A's link keeps B's
+    /// session — no new cookie is issued.
+    #[tokio::test]
+    async fn s31_reset_keeps_foreign_session() {
+        let store = Arc::new(Memory::new());
+        let h = harness_store(false, None, Some(store.clone()));
+        signup_and_verify(&h.router, &store, "a@a.co", "a-first-passphrase").await;
+        signup_and_verify(&h.router, &store, "b@b.co", "b-first-passphrase").await;
+        let (cookie_b, _) = sign_in(&h.router, "b@b.co", "b-first-passphrase").await;
+        let (st, _, _) = raw(
+            &h.router,
+            "POST",
+            "/auth/forgot",
+            &[],
+            Some(json!({"email": "a@a.co"})),
+        )
+        .await;
+        assert_eq!(st, StatusCode::ACCEPTED);
+        let token = mailed_token(&store, "reset", "a@a.co");
+        let (st, heads, v) = raw(
+            &h.router,
+            "POST",
+            "/auth/reset",
+            &[("cookie", cookie_b.clone())],
+            Some(json!({"token": token, "password": "a-second-passphrase"})),
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK, "{v}");
+        assert!(
+            heads
+                .get_all(header::SET_COOKIE)
+                .iter()
+                .filter_map(|v| v.to_str().ok())
+                .all(|s| !s.starts_with("__Host-drs=")),
+            "a foreign session must not be signed over: {heads:?}"
+        );
+        // B's session survives and still resolves as B.
+        let (st, _, v) = raw(
+            &h.router,
+            "GET",
+            "/auth/session",
+            &[("cookie", cookie_b)],
+            None,
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK, "{v}");
+        assert_eq!(v["account"]["email"], "b@b.co");
+    }
+
+    /// forgot + resend-verification answer one envelope for known,
+    /// unverified and unknown addresses (review #3). Proves
+    /// `enumeration` — the response may not depend on `issued`.
+    #[tokio::test]
+    async fn s31_forgot_resend_envelopes_match() {
+        let store = Arc::new(Memory::new());
+        let h = harness_store(false, None, Some(store.clone()));
+        signup_and_verify(&h.router, &store, "known@k.co", "a-long-enough-passphrase").await;
+        signup_only(&h.router, "unverified@u.co", "a-long-enough-passphrase").await;
+        let forgot = |email: &'static str| {
+            let r = h.router.clone();
+            async move {
+                raw(
+                    &r,
+                    "POST",
+                    "/auth/forgot",
+                    &[],
+                    Some(json!({"email": email})),
+                )
+                .await
+            }
+        };
+        let (st1, _, v1) = forgot("known@k.co").await;
+        let (st2, _, v2) = forgot("nobody@nowhere.co").await;
+        // DECISIVE(enumeration)
+        assert_eq!((st1, &v1), (st2, &v2), "forgot must not register");
+        assert_eq!(st1, StatusCode::ACCEPTED);
+        // And the outbox really did differ — a mail went only to the
+        // known address (the envelope hid it).
+        assert!(
+            store
+                .outbox()
+                .iter()
+                .any(|r| r.kind == "reset" && r.send_to == "known@k.co"),
+            "a reset mail was enqueued for the known address"
+        );
+        let resend = |email: &'static str| {
+            let r = h.router.clone();
+            async move {
+                raw(
+                    &r,
+                    "POST",
+                    "/auth/resend-verification",
+                    &[],
+                    Some(json!({"email": email})),
+                )
+                .await
+            }
+        };
+        let (st1, _, v1) = resend("unverified@u.co").await;
+        let (st2, _, v2) = resend("ghost@nowhere.co").await;
+        assert_eq!((st1, &v1), (st2, &v2), "resend must not register");
+        let (st3, _, v3) = resend("known@k.co").await;
+        assert_eq!(
+            (st1, &v1),
+            (st3, &v3),
+            "an already-verified address reads the same"
+        );
+    }
+
+    /// `invite_only`: the gate asks the store for a live invite whose
+    /// bound email matches the sign-up's — anything less is 403
+    /// `invite_required`. Proves `invite-required`.
+    #[tokio::test]
+    async fn s31_invite_only_gate() {
+        let store = Arc::new(Memory::new());
+        let h = harness_store(false, None, Some(store.clone()));
+        let mut app = h.app.clone();
+        app.invite_only = true;
+        let r = router(app, None);
+        let body = |tok: Option<&str>| {
+            let mut b = json!({"email": "inv@i.co", "password": "a-long-enough-passphrase"});
+            if let Some(t) = tok {
+                b["invite_token"] = json!(t);
+            }
+            Some(b)
+        };
+        let (st, _, v) = raw(&r, "POST", "/auth/signup", &[], body(None)).await;
+        // DECISIVE(invite-required)
+        assert_eq!(st, StatusCode::FORBIDDEN, "{v}");
+        assert_eq!(v["code"], "invite_required");
+        let (st, _, _) = raw(&r, "POST", "/auth/signup", &[], body(Some("drt_bogus"))).await;
+        assert_eq!(st, StatusCode::FORBIDDEN);
+        // A live invite for a DIFFERENT email is not a grant for this one.
+        let ws = store
+            .create_workspace("w")
+            .await
+            .unwrap_or_else(|e| panic!("{e}"));
+        let other = mint_email_token();
+        store.add_invite(
+            ws.id,
+            "other@o.co",
+            durable_accounts::Role::Member,
+            email_token_hash(&other).unwrap_or_else(|| panic!("shape")),
+            unix_ms() + 86_400_000,
+        );
+        let (st, _, _) = raw(&r, "POST", "/auth/signup", &[], body(Some(&other))).await;
+        assert_eq!(st, StatusCode::FORBIDDEN, "the invite binds its email");
+        // A live invite for THIS email opens the gate.
+        let tok = mint_email_token();
+        store.add_invite(
+            ws.id,
+            "inv@i.co",
+            durable_accounts::Role::Member,
+            email_token_hash(&tok).unwrap_or_else(|| panic!("shape")),
+            unix_ms() + 86_400_000,
+        );
+        let (st, _, v) = raw(&r, "POST", "/auth/signup", &[], body(Some(&tok))).await;
+        assert_eq!(st, StatusCode::ACCEPTED, "{v}");
+    }
+
+    /// The mailbox owner's click kills the pre-registration attacker's
+    /// session (review #2): sign up a victim address, hold a session,
+    /// verify — the held session dies. Proves `prereg-takeover`.
+    #[tokio::test]
+    async fn s31_verify_revokes_prereg_session() {
+        let store = Arc::new(Memory::new());
+        let h = harness_store(false, None, Some(store.clone()));
+        signup_only(&h.router, "victim@x.co", "attacker-passphrase").await;
+        let (attacker, _) = sign_in(&h.router, "victim@x.co", "attacker-passphrase").await;
+        // The victim clicks the mailed link.
+        let token = mailed_token(&store, "verify", "victim@x.co");
+        let (st, _, _) = raw(
+            &h.router,
+            "POST",
+            "/auth/verify",
+            &[],
+            Some(json!({"token": token})),
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK);
+        let (st, _, _) = raw(
+            &h.router,
+            "GET",
+            "/auth/session",
+            &[("cookie", attacker)],
+            None,
+        )
+        .await;
+        // DECISIVE(prereg-takeover)
+        assert_eq!(
+            st,
+            StatusCode::UNAUTHORIZED,
+            "the prereg session dies at verify"
+        );
+    }
+
+    /// Failures on a (normalized email, client prefix) pair cool off at
+    /// the 10th: the next attempt — right or wrong, and whether or not
+    /// the account exists — answers the same 429 + Retry-After (review
+    /// #13). Proves `lockout-shape`.
+    #[tokio::test]
+    async fn s31_lockout_cools_off() {
+        let store = Arc::new(Memory::new());
+        let h = harness_store(false, None, Some(store.clone()));
+        signup_and_verify(&h.router, &store, "l@l.co", "a-long-enough-passphrase").await;
+        let login = |email: &'static str, pw: &'static str| {
+            let r = h.router.clone();
+            async move {
+                raw(
+                    &r,
+                    "POST",
+                    "/auth/login",
+                    &[],
+                    Some(json!({"email": email, "password": pw})),
+                )
+                .await
+            }
+        };
+        for i in 0..10 {
+            let (st, _, _) = login("l@l.co", "wrong-passphrase").await;
+            assert_eq!(st, StatusCode::UNAUTHORIZED, "attempt {i}");
+        }
+        // The ten failures were recorded — the lockout's state, not
+        // its answer (lockout-shape's own decisive line).
+        // DECISIVE(lockout-shape)
+        assert!(
+            !h.app
+                .lockouts
+                .map
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .is_empty(),
+            "the ten failures were recorded"
+        );
+        // The 11th cools off — even the right password — and the
+        // Retry-After is the lockout's minutes, not the window's ~60 s.
+        let (st, heads, v) = login("l@l.co", "a-long-enough-passphrase").await;
+        // DECISIVE(cooloff)
+        assert_eq!(st, StatusCode::TOO_MANY_REQUESTS, "{v}");
+        assert_eq!(v["code"], "rate_limited");
+        let retry: u64 = heads
+            .get(header::RETRY_AFTER)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|s| s.parse().ok())
+            .unwrap_or_default();
+        assert!(retry > 60, "the lockout's cool-off, not the addr window");
+        // An address that does not exist cools off identically — a 429
+        // cannot answer "is this email registered" (review #13).
+        for _ in 0..10 {
+            let (st, _, _) = login("ghost@nowhere.co", "wrong-passphrase").await;
+            assert_eq!(st, StatusCode::UNAUTHORIZED);
+        }
+        let (st, _, v) = login("ghost@nowhere.co", "wrong-passphrase").await;
+        assert_eq!(st, StatusCode::TOO_MANY_REQUESTS, "{v}");
+    }
+
+    /// The HMAC-tagged known-device cookie is the owner's bypass (review
+    /// #13): it skips the cool-off but never the password check — and a
+    /// cookie minted for another account skips nothing.
+    #[tokio::test]
+    async fn s31_known_device_bypasses_cooloff() {
+        let store = Arc::new(Memory::new());
+        let h = harness_store(false, None, Some(store.clone()));
+        signup_and_verify(&h.router, &store, "d@d.co", "a-long-enough-passphrase").await;
+        signup_and_verify(&h.router, &store, "e@e.co", "a-long-enough-passphrase").await;
+        // Sign in and capture the device cookie the login minted.
+        let (st, heads, _) = raw(
+            &h.router,
+            "POST",
+            "/auth/login",
+            &[],
+            Some(json!({"email": "d@d.co", "password": "a-long-enough-passphrase"})),
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK);
+        let drd = heads
+            .get_all(header::SET_COOKIE)
+            .iter()
+            .filter_map(|v| v.to_str().ok())
+            .find(|s| s.starts_with("__Host-drd="))
+            .map(cookie_header)
+            .unwrap_or_else(|| panic!("login mints __Host-drd: {heads:?}"));
+        assert!(drd.starts_with("__Host-drd=drd_"));
+        for _ in 0..10 {
+            let (st, _, _) = raw(
+                &h.router,
+                "POST",
+                "/auth/login",
+                &[],
+                Some(json!({"email": "d@d.co", "password": "wrong-passphrase"})),
+            )
+            .await;
+            assert_eq!(st, StatusCode::UNAUTHORIZED);
+        }
+        // Without the device cookie the pair is in cool-off…
+        let (st, _, _) = raw(
+            &h.router,
+            "POST",
+            "/auth/login",
+            &[],
+            Some(json!({"email": "d@d.co", "password": "a-long-enough-passphrase"})),
+        )
+        .await;
+        assert_eq!(st, StatusCode::TOO_MANY_REQUESTS);
+        // …the device cookie carries them through — but still must
+        // answer the password, it is no auth factor.
+        let (st, _, v) = raw(
+            &h.router,
+            "POST",
+            "/auth/login",
+            &[("cookie", drd.clone())],
+            Some(json!({"email": "d@d.co", "password": "wrong-passphrase"})),
+        )
+        .await;
+        assert_eq!(st, StatusCode::UNAUTHORIZED, "{v}");
+        let (st, _, v) = raw(
+            &h.router,
+            "POST",
+            "/auth/login",
+            &[("cookie", drd.clone())],
+            Some(json!({"email": "d@d.co", "password": "a-long-enough-passphrase"})),
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK, "{v}");
+        // Another account's lockout is untouched by d@d.co's cookie.
+        let (st, _, _) = raw(
+            &h.router,
+            "POST",
+            "/auth/login",
+            &[("cookie", drd)],
+            Some(json!({"email": "e@e.co", "password": "a-long-enough-passphrase"})),
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK, "e@e.co was never locked");
+    }
+
+    /// A bad addr-spec never reaches the outbox — CRLF, display names,
+    /// second `@`s are refused at enqueue (review #14). Proves
+    /// `addr-spec-injection`.
+    #[tokio::test]
+    async fn s31_addr_spec_refused() {
+        let store = Arc::new(Memory::new());
+        let mail = |to: &str| Mail {
+            kind: "notice",
+            send_to: to.to_string(),
+            subject: "s".into(),
+            text: "t".into(),
+            html: "h".into(),
+            idempotency_key: format!("k:{to}"),
+            expires_at_ms: None,
+        };
+        for bad in [
+            "a@b.co\r\nBcc: x@y.co",
+            "a@b.co\nBcc: x@y.co",
+            "Display <a@b.co>",
+            "a@b.co, x@y.co",
+            "a@@b.co",
+            "a b@c.co",
+            "",
+        ] {
+            let r = store.enqueue_mail(&mail(bad)).await;
+            // DECISIVE(addr-spec-injection)
+            assert!(matches!(r, Ok(None)), "{bad:?} must be refused");
+        }
+        assert!(store.outbox().is_empty(), "nothing enqueued");
+        assert_eq!(store.outbox().len(), 0);
+        assert!(
+            store
+                .enqueue_mail(&mail("a+b@sub.d.co"))
+                .await
+                .is_ok_and(|id| id.is_some()),
+            "a real addr-spec enqueues"
+        );
+    }
+
+    /// The drain claims due rows, sends through the Mailer under the
+    /// deadline and marks `sent` — never re-claims a sent row (D-068).
+    #[tokio::test]
+    async fn s31_outbox_drain_sends() {
+        let store = Arc::new(Memory::new());
+        let h = harness_store(false, None, Some(store.clone()));
+        signup_only(&h.router, "o@o.co", "a-long-enough-passphrase").await;
+        assert_eq!(
+            store
+                .outbox()
+                .iter()
+                .filter(|r| r.status == "pending")
+                .count(),
+            1
+        );
+        let sent = drain_outbox_once(&h.app).await;
+        assert_eq!(sent, 1);
+        let mailer = h
+            .app
+            .mailer
+            .as_any()
+            .downcast_ref::<durable_accounts::MemoryMailer>()
+            .unwrap_or_else(|| panic!("memory mailer"));
+        let captured = mailer.captured();
+        assert_eq!(captured.len(), 1);
+        assert_eq!(captured[0].kind, "verify");
+        assert_eq!(captured[0].send_to, "o@o.co");
+        assert!(
+            store.outbox().iter().all(|r| r.status == "sent"),
+            "the row closed"
+        );
+        assert_eq!(
+            drain_outbox_once(&h.app).await,
+            0,
+            "a sent row is never re-claimed"
+        );
+    }
+
+    /// The global send budget stops the drain mid-batch (review #14):
+    /// a claimed row waits for budget rather than send uncapped.
+    /// Proves `mail-global`.
+    #[tokio::test]
+    async fn s31_mail_global_budget_stops_drain() {
+        let store = Arc::new(Memory::new());
+        let h = harness_store(false, None, Some(store.clone()));
+        let mut app = h.app.clone();
+        app.mail_budget = std::sync::Arc::new(MailBudget::new(0));
+        let r = router(app.clone(), None);
+        signup_only(&r, "cap@c.co", "a-long-enough-passphrase").await;
+        let sent = drain_outbox_once(&app).await;
+        // DECISIVE(mail-global)
+        assert_eq!(sent, 0, "a zero budget sends nothing");
+        let mailer = app
+            .mailer
+            .as_any()
+            .downcast_ref::<durable_accounts::MemoryMailer>()
+            .unwrap_or_else(|| panic!("memory mailer"));
+        assert!(mailer.captured().is_empty());
+    }
+
+    /// The per-(address, kind) hourly cap coalesces a spam loop: the
+    /// 4th mail inside the hour is dropped at enqueue — newest still
+    /// replaces a pending row for free (review #14). Proves
+    /// `mail-budget`.
+    #[tokio::test]
+    async fn s31_outbox_hourly_cap() {
+        let store = Arc::new(Memory::new());
+        let mail = |n: u32| Mail {
+            kind: "notice",
+            send_to: "cap@d.co".into(),
+            subject: "s".into(),
+            text: "t".into(),
+            html: "h".into(),
+            idempotency_key: format!("n:{n}"),
+            expires_at_ms: None,
+        };
+        // Three enqueues land when each prior row is no longer pending.
+        for n in 0..3 {
+            let id = store
+                .enqueue_mail(&mail(n))
+                .await
+                .unwrap_or_else(|e| panic!("{e}"))
+                .unwrap_or_else(|| panic!("enqueue {n}"));
+            store
+                .outbox_mark(id, durable_accounts::MailOutcome::Sent)
+                .await
+                .unwrap_or_else(|e| panic!("{e}"));
+        }
+        let fourth = store
+            .enqueue_mail(&mail(3))
+            .await
+            .unwrap_or_else(|e| panic!("{e}"));
+        // DECISIVE(mail-budget)
+        assert_eq!(fourth, None, "the 4th mail inside the hour coalesces");
+        assert_eq!(store.outbox().len(), 3);
+    }
+
+    /// resend-verification supersedes the pending token and mails a
+    /// fresh link — the old link 410s, the new one verifies.
+    #[tokio::test]
+    async fn s31_resend_verification_supersedes() {
+        let store = Arc::new(Memory::new());
+        let h = harness_store(false, None, Some(store.clone()));
+        signup_only(&h.router, "rs@r.co", "a-long-enough-passphrase").await;
+        let first = mailed_token(&store, "verify", "rs@r.co");
+        let (st, _, v) = raw(
+            &h.router,
+            "POST",
+            "/auth/resend-verification",
+            &[],
+            Some(json!({"email": "rs@r.co"})),
+        )
+        .await;
+        assert_eq!(st, StatusCode::ACCEPTED, "{v}");
+        let second = mailed_token(&store, "verify", "rs@r.co");
+        assert_ne!(first, second, "a fresh token was mailed");
+        let (st, _, _) = raw(
+            &h.router,
+            "POST",
+            "/auth/verify",
+            &[],
+            Some(json!({"token": first})),
+        )
+        .await;
+        assert_eq!(st, StatusCode::GONE, "the superseded link is dead");
+        let (st, _, _) = raw(
+            &h.router,
+            "POST",
+            "/auth/verify",
+            &[],
+            Some(json!({"token": second})),
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK);
+    }
+
+    // ---- S3-2: session lifecycle + /me ------------------------------
+
+    /// A pure login (no signup) — the second+ session on one account.
+    async fn login_only(router: &Router, email: &str, password: &str) -> (String, String) {
+        let (st, heads, v) = raw(
+            router,
+            "POST",
+            "/auth/login",
+            &[],
+            Some(json!({"email": email, "password": password})),
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK, "login: {v}");
+        let set = heads
+            .get(header::SET_COOKIE)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or_default()
+            .to_string();
+        (
+            cookie_header(&set),
+            v["csrf"].as_str().unwrap_or_default().to_string(),
+        )
+    }
+
+    /// The opaque ids the sessions list reports for `cookie`.
+    async fn session_public_ids(router: &Router, cookie: &str) -> Vec<String> {
+        let (st, _, v) = raw(
+            router,
+            "GET",
+            "/me/sessions",
+            &[("cookie", cookie.to_string())],
+            None,
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK, "{v}");
+        v["sessions"]
+            .as_array()
+            .unwrap_or_else(|| panic!("sessions array: {v}"))
+            .iter()
+            .map(|s| s["id"].as_str().unwrap_or_default().to_string())
+            .collect()
+    }
+
+    /// `/me` needs a session (401 without); the mutation routes need
+    /// the synchroniser CSRF (403 csrf_failed without it).
+    #[tokio::test]
+    async fn s32_me_requires_session_and_csrf() {
+        let store = Arc::new(Memory::new());
+        let h = harness_store(false, None, Some(store.clone()));
+        let (st, _, _) = raw(&h.router, "GET", "/me", &[], None).await;
+        assert_eq!(st, StatusCode::UNAUTHORIZED);
+        let (st, _, _) = raw(&h.router, "GET", "/me/sessions", &[], None).await;
+        assert_eq!(st, StatusCode::UNAUTHORIZED);
+        signup_only(&h.router, "me@me.co", "a-long-enough-passphrase").await;
+        let (cookie, _) = login_only(&h.router, "me@me.co", "a-long-enough-passphrase").await;
+        let (st, _, v) = raw(&h.router, "GET", "/me", &[("cookie", cookie.clone())], None).await;
+        assert_eq!(st, StatusCode::OK, "{v}");
+        assert_eq!(v["account"]["email"], "me@me.co");
+        // No CSRF header on the mutations → 403.
+        let (st, _, v) = raw(
+            &h.router,
+            "DELETE",
+            "/me/sessions",
+            &[("cookie", cookie.clone())],
+            None,
+        )
+        .await;
+        assert_eq!(st, StatusCode::FORBIDDEN, "{v}");
+        assert_eq!(v["code"], "csrf_failed");
+        let (st, _, v) = raw(
+            &h.router,
+            "POST",
+            "/me/password",
+            &[("cookie", cookie)],
+            Some(json!({"current_password": "x", "new_password": "y"})),
+        )
+        .await;
+        assert_eq!(st, StatusCode::FORBIDDEN, "{v}");
+        assert_eq!(v["code"], "csrf_failed");
+    }
+
+    /// The sessions list carries opaque public_ids only — the internal
+    /// row id never serializes — and `current` marks the requester's
+    /// own row.
+    #[tokio::test]
+    async fn s32_me_lists_sessions() {
+        let store = Arc::new(Memory::new());
+        let h = harness_store(false, None, Some(store.clone()));
+        signup_only(&h.router, "l@l.co", "a-long-enough-passphrase").await;
+        let (c1, _) = login_only(&h.router, "l@l.co", "a-long-enough-passphrase").await;
+        let (c2, _) = login_only(&h.router, "l@l.co", "a-long-enough-passphrase").await;
+        let (st, _, v) = raw(&h.router, "GET", "/me/sessions", &[("cookie", c1)], None).await;
+        assert_eq!(st, StatusCode::OK, "{v}");
+        let rows = v["sessions"]
+            .as_array()
+            .unwrap_or_else(|| panic!("list: {v}"));
+        assert_eq!(rows.len(), 2, "two live sessions");
+        assert!(
+            rows.iter()
+                .all(|r| uuid::Uuid::parse_str(r["id"].as_str().unwrap_or_default()).is_ok()),
+            "opaque public ids only: {rows:?}"
+        );
+        assert!(
+            rows.iter().all(|r| r.get("session_id").is_none()),
+            "the internal id never serializes: {rows:?}"
+        );
+        let currents: Vec<String> = rows
+            .iter()
+            .filter(|r| r["current"] == true)
+            .map(|r| r["id"].as_str().unwrap_or_default().to_string())
+            .collect();
+        assert_eq!(currents.len(), 1, "exactly one row is the requester's");
+        // From c2's view a different row is current.
+        let (st, _, v) = raw(&h.router, "GET", "/me/sessions", &[("cookie", c2)], None).await;
+        assert_eq!(st, StatusCode::OK);
+        let other: Vec<String> = v["sessions"]
+            .as_array()
+            .unwrap_or_else(|| panic!("list: {v}"))
+            .iter()
+            .filter(|r| r["current"] == true)
+            .map(|r| r["id"].as_str().unwrap_or_default().to_string())
+            .collect();
+        assert_eq!(other.len(), 1);
+        assert_ne!(other[0], currents[0], "the flag follows the requester");
+    }
+
+    /// Revoke-one by public_id is bound to the account inside the
+    /// store's lookup: another account's id answers the same 404 as an
+    /// unknown one — and the foreign session lives on. Proves
+    /// `session-idor`.
+    #[tokio::test]
+    async fn s32_revoke_one_session() {
+        let store = Arc::new(Memory::new());
+        let h = harness_store(false, None, Some(store.clone()));
+        signup_only(&h.router, "a@a.co", "a-long-enough-passphrase").await;
+        signup_only(&h.router, "b@b.co", "a-long-enough-passphrase").await;
+        let (ca, csrf_a) = login_only(&h.router, "a@a.co", "a-long-enough-passphrase").await;
+        let (cb, csrf_b) = login_only(&h.router, "b@b.co", "a-long-enough-passphrase").await;
+        let sa = session_public_ids(&h.router, &ca).await;
+        let sb = session_public_ids(&h.router, &cb).await;
+        assert_eq!(sa.len(), 1);
+        assert_eq!(sb.len(), 1);
+        // A revoking B's id → 404, and B's session still resolves.
+        let (st, _, _) = raw(
+            &h.router,
+            "DELETE",
+            &format!("/me/sessions/{}", sb[0]),
+            &[("cookie", ca.clone()), ("x-durable-csrf", csrf_a.clone())],
+            None,
+        )
+        .await;
+        // DECISIVE(session-idor)
+        assert_eq!(st, StatusCode::NOT_FOUND, "no cross-account session write");
+        let (st, _, _) = raw(
+            &h.router,
+            "GET",
+            "/auth/session",
+            &[("cookie", cb.clone())],
+            None,
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK, "the victim session lives");
+        // An unknown id reads identically.
+        let (st, _, _) = raw(
+            &h.router,
+            "DELETE",
+            &format!("/me/sessions/{}", uuid::Uuid::now_v7()),
+            &[("cookie", ca), ("x-durable-csrf", csrf_a)],
+            None,
+        )
+        .await;
+        assert_eq!(st, StatusCode::NOT_FOUND);
+        // B revoking its own → 204 and B's cached grant dies at once.
+        let (st, _, _) = raw(
+            &h.router,
+            "DELETE",
+            &format!("/me/sessions/{}", sb[0]),
+            &[("cookie", cb.clone()), ("x-durable-csrf", csrf_b)],
+            None,
+        )
+        .await;
+        assert_eq!(st, StatusCode::NO_CONTENT);
+        let (st, _, _) = raw(&h.router, "GET", "/auth/session", &[("cookie", cb)], None).await;
+        assert_eq!(st, StatusCode::UNAUTHORIZED);
+    }
+
+    /// Revoke-all-but-current: the victims' cached grants die with the
+    /// account bump, the requester's is re-warmed and keeps working.
+    #[tokio::test]
+    async fn s32_revoke_all_but_current() {
+        let store = Arc::new(Memory::new());
+        let h = harness_store(false, None, Some(store.clone()));
+        signup_only(&h.router, "all@all.co", "a-long-enough-passphrase").await;
+        let (c1, csrf1) = login_only(&h.router, "all@all.co", "a-long-enough-passphrase").await;
+        let (c2, _) = login_only(&h.router, "all@all.co", "a-long-enough-passphrase").await;
+        let (c3, _) = login_only(&h.router, "all@all.co", "a-long-enough-passphrase").await;
+        // Prime every grant into the cache — the victims must die in
+        // cache too, not just in the store.
+        for c in [&c1, &c2, &c3] {
+            let (st, _, _) = raw(
+                &h.router,
+                "GET",
+                "/auth/session",
+                &[("cookie", c.clone())],
+                None,
+            )
+            .await;
+            assert_eq!(st, StatusCode::OK);
+        }
+        let (st, _, v) = raw(
+            &h.router,
+            "DELETE",
+            "/me/sessions",
+            &[("cookie", c1.clone()), ("x-durable-csrf", csrf1)],
+            None,
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK, "{v}");
+        assert_eq!(v["revoked"], 2);
+        for c in [c2, c3] {
+            let (st, _, _) = raw(&h.router, "GET", "/auth/session", &[("cookie", c)], None).await;
+            assert_eq!(st, StatusCode::UNAUTHORIZED, "the victim dies in cache too");
+        }
+        let (st, _, _) = raw(&h.router, "GET", "/auth/session", &[("cookie", c1)], None).await;
+        assert_eq!(st, StatusCode::OK, "the requester keeps its session");
+    }
+
+    /// Password change: re-auth gates it (wrong current → 403, nothing
+    /// mutated), then one transaction installs the hash and revokes
+    /// every session — the caller leaves with a rotated cookie and the
+    /// account's other session dies too.
+    #[tokio::test]
+    async fn s32_password_change_reauths_and_rotates() {
+        let store = Arc::new(Memory::new());
+        let h = harness_store(false, None, Some(store.clone()));
+        signup_and_verify(&h.router, &store, "pw@pw.co", "a-long-enough-passphrase").await;
+        let (c1, csrf1) = login_only(&h.router, "pw@pw.co", "a-long-enough-passphrase").await;
+        let (c2, _) = login_only(&h.router, "pw@pw.co", "a-long-enough-passphrase").await;
+        // Prime both grants in the cache.
+        for c in [&c1, &c2] {
+            let (st, _, _) = raw(
+                &h.router,
+                "GET",
+                "/auth/session",
+                &[("cookie", c.clone())],
+                None,
+            )
+            .await;
+            assert_eq!(st, StatusCode::OK);
+        }
+        // Re-auth: the wrong current password is refused and mutates
+        // nothing.
+        let (st, _, v) = raw(
+            &h.router,
+            "POST",
+            "/me/password",
+            &[("cookie", c1.clone()), ("x-durable-csrf", csrf1.clone())],
+            Some(json!({"current_password": "the-wrong-passphrase", "new_password": "a-new-long-passphrase"})),
+        )
+        .await;
+        assert_eq!(st, StatusCode::FORBIDDEN, "{v}");
+        assert_eq!(v["code"], "invalid_credentials");
+        let (st, _, _) = raw(
+            &h.router,
+            "GET",
+            "/auth/session",
+            &[("cookie", c1.clone())],
+            None,
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK, "a refused change mutates nothing");
+        // The right pair: new hash + every session revoked in one
+        // transaction; the response carries the rotated cookie.
+        let (st, heads, v) = raw(
+            &h.router,
+            "POST",
+            "/me/password",
+            &[("cookie", c1.clone()), ("x-durable-csrf", csrf1)],
+            Some(json!({"current_password": "a-long-enough-passphrase", "new_password": "a-new-long-passphrase"})),
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK, "{v}");
+        assert_eq!(v["changed"], true);
+        assert!(v["csrf"].is_string(), "the new session's csrf");
+        let new_cookie = heads
+            .get(header::SET_COOKIE)
+            .and_then(|v| v.to_str().ok())
+            .map(cookie_header)
+            .unwrap_or_else(|| panic!("a rotated cookie is set: {heads:?}"));
+        assert_ne!(new_cookie, c1, "the session token rotated");
+        let new_cookie_for_list = new_cookie.clone();
+        // Every old grant is dead — in store AND cache — immediately.
+        for c in [c1, c2] {
+            let (st, _, _) = raw(&h.router, "GET", "/auth/session", &[("cookie", c)], None).await;
+            assert_eq!(st, StatusCode::UNAUTHORIZED);
+        }
+        let (st, _, v) = raw(
+            &h.router,
+            "GET",
+            "/auth/session",
+            &[("cookie", new_cookie)],
+            None,
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK, "{v}");
+        // The old password can't sign in; the new one can.
+        let (st, _, _) = raw(
+            &h.router,
+            "POST",
+            "/auth/login",
+            &[],
+            Some(json!({"email": "pw@pw.co", "password": "a-long-enough-passphrase"})),
+        )
+        .await;
+        assert_eq!(st, StatusCode::UNAUTHORIZED);
+        let (_, _) = login_only(&h.router, "pw@pw.co", "a-new-long-passphrase").await;
+        // And the sessions list shows only the live rows — the revoked
+        // ones never list.
+        let ids = session_public_ids(&h.router, &new_cookie_for_list).await;
+        assert_eq!(ids.len(), 2, "the rotated session + the fresh login");
+    }
+
+    /// The injected clock proves idle expiry: use slides the deadline
+    /// (the flush lands it in the store), disuse lets it die — even
+    /// inside the absolute window. Proves `idle-timeout`.
+    #[tokio::test]
+    async fn s32_idle_slides_then_times_out() {
+        let store = Arc::new(Memory::new());
+        let h = harness_store(false, None, Some(store.clone()));
+        let t0 = 1_700_000_000_000i64;
+        h.app
+            .now_override_ms
+            .store(t0, std::sync::atomic::Ordering::Relaxed);
+        let (cookie, _) = sign_in(&h.router, "i@i.co", "a-long-enough-passphrase").await;
+        let set_now = |t: i64| {
+            h.app
+                .now_override_ms
+                .store(t, std::sync::atomic::Ordering::Relaxed)
+        };
+        let probe = |cookie: &str| {
+            let r = h.router.clone();
+            let c = cookie.to_string();
+            async move {
+                raw(&r, "GET", "/auth/session", &[("cookie", c)], None)
+                    .await
+                    .0
+            }
+        };
+        // Use at t0+1 keeps it alive to t0+IDLE+1 — a pending touch is
+        // a live floor before the store ever sees it.
+        set_now(t0 + 1);
+        assert_eq!(probe(&cookie).await, StatusCode::OK);
+        set_now(t0 + SESSION_IDLE_MS);
+        assert_eq!(
+            probe(&cookie).await,
+            StatusCode::OK,
+            "the touch slid the idle deadline"
+        );
+        // Flush lands the slide in the store.
+        flush_session_touches(&h.app).await;
+        let account = store
+            .account_by_email("i@i.co")
+            .await
+            .unwrap_or_else(|e| panic!("{e}"))
+            .unwrap_or_else(|| panic!("account"));
+        let rows = store
+            .sessions_for_account(account.id, 10)
+            .await
+            .unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            rows[0].idle_expires_at_ms,
+            t0 + 2 * SESSION_IDLE_MS,
+            "the flushed slide moved the store's deadline"
+        );
+        // Disuse past that deadline dies — inside the absolute window.
+        set_now(t0 + 2 * SESSION_IDLE_MS + 1);
+        // DECISIVE(idle-timeout)
+        assert_eq!(probe(&cookie).await, StatusCode::UNAUTHORIZED);
+    }
+
+    /// Absolute expiry caps the slide: use right up to the boundary
+    /// keeps a session alive, but past `expires_at` no amount of use
+    /// revives it.
+    #[tokio::test]
+    async fn s32_absolute_expiry_caps_the_slide() {
+        let store = Arc::new(Memory::new());
+        let h = harness_store(false, None, Some(store.clone()));
+        let t0 = 1_700_000_000_000i64;
+        h.app
+            .now_override_ms
+            .store(t0, std::sync::atomic::Ordering::Relaxed);
+        let (cookie, _) = sign_in(&h.router, "abs@abs.co", "a-long-enough-passphrase").await;
+        let probe = |cookie: &str, at: i64| {
+            h.app
+                .now_override_ms
+                .store(at, std::sync::atomic::Ordering::Relaxed);
+            let r = h.router.clone();
+            let c = cookie.to_string();
+            async move {
+                raw(&r, "GET", "/auth/session", &[("cookie", c)], None)
+                    .await
+                    .0
+            }
+        };
+        // Stay active in steps under the idle window until just inside
+        // the absolute deadline — each step lands strictly inside the
+        // slide floor the previous touch set (a deadline equal to now
+        // is dead).
+        for at in [
+            t0 + SESSION_IDLE_MS / 2,
+            t0 + SESSION_IDLE_MS * 3 / 2 - 1,
+            t0 + SESSION_ABS_MS - 1,
+        ] {
+            assert_eq!(probe(&cookie, at).await, StatusCode::OK, "at {at}");
+        }
+        // One millisecond past: the pending slide floor outlives the
+        // absolute deadline, and the absolute deadline wins.
+        assert_eq!(
+            probe(&cookie, t0 + SESSION_ABS_MS + 1).await,
+            StatusCode::UNAUTHORIZED
+        );
+    }
+
+    /// Sign-in always mints a fresh server-chosen token — a cookie the
+    /// client arrived with can never become the session. Proves
+    /// `session-fixation`.
+    #[tokio::test]
+    async fn s32_login_never_adopts_a_planted_cookie() {
+        let store = Arc::new(Memory::new());
+        let h = harness_store(false, None, Some(store.clone()));
+        signup_only(&h.router, "f@f.co", "a-long-enough-passphrase").await;
+        // A structurally valid drs_ token the attacker prepared — it
+        // passes the tag check but the server never minted it.
+        let planted = mint_session_token(&h.app.session_key);
+        assert!(
+            session_token_hash(&h.app.session_key, &planted).is_some(),
+            "a valid planted value for the fixation attempt"
+        );
+        let (st, heads, v) = raw(
+            &h.router,
+            "POST",
+            "/auth/login",
+            &[("cookie", format!("{SESSION_COOKIE}={planted}"))],
+            Some(json!({"email": "f@f.co", "password": "a-long-enough-passphrase"})),
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK, "{v}");
+        let issued = heads
+            .get(header::SET_COOKIE)
+            .and_then(|v| v.to_str().ok())
+            .map(cookie_header)
+            .unwrap_or_else(|| panic!("login mints a cookie: {heads:?}"));
+        // DECISIVE(session-fixation)
+        assert_ne!(
+            issued,
+            format!("{SESSION_COOKIE}={planted}"),
+            "the server chooses the session value"
+        );
+        // The planted value resolves no session — it was never minted
+        // server-side.
+        let (st, _, _) = raw(
+            &h.router,
+            "GET",
+            "/auth/session",
+            &[("cookie", format!("{SESSION_COOKIE}={planted}"))],
+            None,
+        )
+        .await;
+        assert_eq!(st, StatusCode::UNAUTHORIZED);
+    }
+
+    /// A reset revokes every session in the store's transaction and the
+    /// account bump makes the cache agree at once — the stale cookie
+    /// dies mid-flight, not at grant TTL. And the token is single-use:
+    /// the replay answers the one 410. Proves `reset-token-replay`.
+    #[tokio::test]
+    async fn s32_reset_kills_cached_sessions_and_replay_dies() {
+        let store = Arc::new(Memory::new());
+        let h = harness_store(false, None, Some(store.clone()));
+        signup_and_verify(&h.router, &store, "rs@rs.co", "a-long-enough-passphrase").await;
+        let (cookie, _) = login_only(&h.router, "rs@rs.co", "a-long-enough-passphrase").await;
+        // Prime the grant into the cache.
+        let (st, _, _) = raw(
+            &h.router,
+            "GET",
+            "/auth/session",
+            &[("cookie", cookie.clone())],
+            None,
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK);
+        let (st, _, _) = raw(
+            &h.router,
+            "POST",
+            "/auth/forgot",
+            &[],
+            Some(json!({"email": "rs@rs.co"})),
+        )
+        .await;
+        assert_eq!(st, StatusCode::ACCEPTED);
+        let token = mailed_token(&store, "reset", "rs@rs.co");
+        let (st, _, v) = raw(
+            &h.router,
+            "POST",
+            "/auth/reset",
+            &[],
+            Some(json!({"token": token, "password": "a-new-long-passphrase"})),
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK, "{v}");
+        // The cached grant died with the account bump — instantly.
+        let (st, _, _) = raw(
+            &h.router,
+            "GET",
+            "/auth/session",
+            &[("cookie", cookie)],
+            None,
+        )
+        .await;
+        assert_eq!(
+            st,
+            StatusCode::UNAUTHORIZED,
+            "reset kills the cached grant at once"
+        );
+        // And the consumed token replays to the one 410.
+        let (st, _, v) = raw(
+            &h.router,
+            "POST",
+            "/auth/reset",
+            &[],
+            Some(json!({"token": token, "password": "another-long-passphrase"})),
+        )
+        .await;
+        // DECISIVE(reset-token-replay)
+        assert_eq!(st, StatusCode::GONE, "{v}");
+        assert_eq!(v["code"], "token_gone");
+    }
+
+    // ---- S3-3: workspaces, members, roles, invites -------------------
+
+    /// Sign up + verify + log in `email`, then seat it as an ADMIN member
+    /// of `ws` — a store-level invite + accept, the D-073 way a rotate
+    /// targets a store-made workspace.
+    async fn session_admin_on(
+        router: &Router,
+        store: &Memory,
+        ws: &durable_accounts::Workspace,
+        email: &str,
+    ) -> (String, String, String) {
+        signup_and_verify(router, store, email, "a-long-enough-passphrase").await;
+        let (cookie, csrf) = login_only(router, email, "a-long-enough-passphrase").await;
+        let acc = store
+            .account_by_email(email)
+            .await
+            .unwrap_or_else(|e| panic!("{e}"))
+            .unwrap_or_else(|| panic!("account"));
+        let token = mint_invite_token();
+        let now = observe::wall_ms() as i64;
+        let invite = store
+            .create_invite(
+                ws.id,
+                email,
+                Role::Admin,
+                acc.id,
+                &sha256(token.as_bytes()),
+                now + 60_000,
+            )
+            .await
+            .unwrap_or_else(|e| panic!("{e}"));
+        assert!(invite.is_some(), "the invite row must mint");
+        let seated = store
+            .accept_invite(&sha256(token.as_bytes()), acc.id, now)
+            .await
+            .unwrap_or_else(|e| panic!("{e}"));
+        assert!(seated.is_some(), "the accept must seat the admin row");
+        (cookie, csrf, ws.public_id.to_string())
+    }
+
+    /// Create `name` as `cookie`'s workspace; returns its public_id.
+    async fn make_ws(router: &Router, cookie: &str, name: &str) -> String {
+        let (st, _, v) = raw(
+            router,
+            "POST",
+            "/workspaces",
+            &[("cookie", cookie.to_string())],
+            Some(json!({"name": name})),
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK, "{v}");
+        assert_eq!(v["role"], "owner");
+        assert!(v["handler_secret"].as_str().is_some_and(|s| s.len() == 64));
+        v["public_id"].as_str().unwrap_or_default().to_string()
+    }
+
+    /// Invite `email` to `pid` as `role` under `cookie`/`csrf`; returns
+    /// the mailed token string from the one-time invite_url.
+    async fn make_invite(
+        router: &Router,
+        cookie: &str,
+        csrf: &str,
+        pid: &str,
+        email: &str,
+        role: &str,
+    ) -> (StatusCode, String, String) {
+        let (st, _, v) = raw(
+            router,
+            "POST",
+            &format!("/workspaces/{pid}/members"),
+            &[
+                ("cookie", cookie.to_string()),
+                ("x-durable-csrf", csrf.to_string()),
+            ],
+            Some(json!({"email": email, "role": role})),
+        )
+        .await;
+        let iid = v["invite"]["public_id"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string();
+        let url = v["invite_url"].as_str().unwrap_or_default().to_string();
+        let token = url.split("token=").nth(1).unwrap_or_default().to_string();
+        (st, iid, token)
+    }
+
+    fn session_headers(cookie: &str, csrf: &str) -> [(&'static str, String); 2] {
+        [
+            ("cookie", cookie.to_string()),
+            ("x-durable-csrf", csrf.to_string()),
+        ]
+    }
+
+    #[tokio::test]
+    async fn s33_workspace_lifecycle() {
+        let store = Arc::new(Memory::new());
+        let h = harness_store(false, None, Some(store.clone()));
+        signup_and_verify(&h.router, &store, "o@o.co", "a-long-enough-passphrase").await;
+        let (cookie, csrf) = login_only(&h.router, "o@o.co", "a-long-enough-passphrase").await;
+        let pid = make_ws(&h.router, &cookie, "alpha").await;
+        // Lists it as owner; GET shows the same role.
+        let (st, _, v) = raw(
+            &h.router,
+            "GET",
+            "/workspaces",
+            &[("cookie", cookie.clone())],
+            None,
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK);
+        assert_eq!(v["workspaces"][0]["role"], "owner");
+        let (st, _, v) = raw(
+            &h.router,
+            "GET",
+            &format!("/workspaces/{pid}"),
+            &[("cookie", cookie.clone())],
+            None,
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK, "{v}");
+        let (st, _, v) = raw(
+            &h.router,
+            "PATCH",
+            &format!("/workspaces/{pid}"),
+            &session_headers(&cookie, &csrf),
+            Some(json!({"name": "beta"})),
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK, "{v}");
+        // Unverified account cannot create.
+        signup_only(&h.router, "u@u.co", "a-long-enough-passphrase").await;
+        let (uc, _) = login_only(&h.router, "u@u.co", "a-long-enough-passphrase").await;
+        let (st, _, v) = raw(
+            &h.router,
+            "POST",
+            "/workspaces",
+            &[("cookie", uc)],
+            Some(json!({"name": "nope"})),
+        )
+        .await;
+        assert_eq!(st, StatusCode::FORBIDDEN, "{v}");
+        assert_eq!(v["code"], "email_unverified");
+    }
+
+    /// idor-workspace: a member of A on B's pid answers 404 — never a
+    /// hint the workspace exists.
+    #[tokio::test]
+    async fn s33_idor_workspace() {
+        let store = Arc::new(Memory::new());
+        let h = harness_store(false, None, Some(store.clone()));
+        signup_and_verify(&h.router, &store, "a@a.co", "a-long-enough-passphrase").await;
+        signup_and_verify(&h.router, &store, "b@b.co", "a-long-enough-passphrase").await;
+        let (ac, _) = login_only(&h.router, "a@a.co", "a-long-enough-passphrase").await;
+        let (bc, _) = login_only(&h.router, "b@b.co", "a-long-enough-passphrase").await;
+        let pid_b = make_ws(&h.router, &bc, "bspace").await;
+        let (st, _, _) = raw(
+            &h.router,
+            "GET",
+            &format!("/workspaces/{pid_b}"),
+            &[("cookie", ac.clone())],
+            None,
+        )
+        .await;
+        assert_eq!(st, StatusCode::NOT_FOUND);
+        // Same answer for a pid that does not exist at all.
+        let ghost = uuid::Uuid::now_v7();
+        let (st2, _, _) = raw(
+            &h.router,
+            "GET",
+            &format!("/workspaces/{ghost}"),
+            &[("cookie", ac)],
+            None,
+        )
+        .await;
+        assert_eq!(st, st2, "non-member and missing must be indistinguishable");
+    }
+
+    /// ws-header-path-mismatch: a header naming another workspace is a
+    /// 400; matching the path is fine.
+    #[tokio::test]
+    async fn s33_ws_header_path_mismatch() {
+        let store = Arc::new(Memory::new());
+        let h = harness_store(false, None, Some(store.clone()));
+        signup_and_verify(&h.router, &store, "o@o.co", "a-long-enough-passphrase").await;
+        let (cookie, _) = login_only(&h.router, "o@o.co", "a-long-enough-passphrase").await;
+        let pid = make_ws(&h.router, &cookie, "alpha").await;
+        let other = make_ws(&h.router, &cookie, "beta").await;
+        let (st, _, v) = raw(
+            &h.router,
+            "GET",
+            &format!("/workspaces/{pid}"),
+            &[
+                ("cookie", cookie.clone()),
+                ("x-durable-workspace", other.clone()),
+            ],
+            None,
+        )
+        .await;
+        assert_eq!(st, StatusCode::BAD_REQUEST, "{v}");
+        assert_eq!(v["code"], "workspace_mismatch");
+        let (st, _, _) = raw(
+            &h.router,
+            "GET",
+            &format!("/workspaces/{pid}"),
+            &[
+                ("cookie", cookie.clone()),
+                ("x-durable-workspace", pid.clone()),
+            ],
+            None,
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK);
+    }
+
+    /// child-id-idor, one case per child kind under the path: a foreign
+    /// invite and a foreign member addressed under one's own pid answer
+    /// 404 and leave the foreign row untouched.
+    #[tokio::test]
+    async fn s33_child_id_idor() {
+        let store = Arc::new(Memory::new());
+        let h = harness_store(false, None, Some(store.clone()));
+        signup_and_verify(&h.router, &store, "a@a.co", "a-long-enough-passphrase").await;
+        signup_and_verify(&h.router, &store, "b@b.co", "a-long-enough-passphrase").await;
+        let (ac, acsrf) = login_only(&h.router, "a@a.co", "a-long-enough-passphrase").await;
+        let (bc, bcsrf) = login_only(&h.router, "b@b.co", "a-long-enough-passphrase").await;
+        let pid_a = make_ws(&h.router, &ac, "aspace").await;
+        let pid_b = make_ws(&h.router, &bc, "bspace").await;
+        // B holds a live invite for c@c.co; A tries to revoke it under A's pid.
+        let (ist, iid_b, _) = make_invite(&h.router, &bc, &bcsrf, &pid_b, "c@c.co", "member").await;
+        assert_eq!(ist, StatusCode::OK);
+        let (st, _, _) = raw(
+            &h.router,
+            "DELETE",
+            &format!("/workspaces/{pid_a}/invites/{iid_b}"),
+            &session_headers(&ac, &acsrf),
+            None,
+        )
+        .await;
+        assert_eq!(st, StatusCode::NOT_FOUND);
+        // B's invite is untouched — still listed for B.
+        let (st, _, v) = raw(
+            &h.router,
+            "GET",
+            &format!("/workspaces/{pid_b}/invites"),
+            &[("cookie", bc.clone())],
+            None,
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK);
+        assert_eq!(v["invites"][0]["public_id"], iid_b);
+        // Same for a member row: A tries to remove B's owner under A's pid.
+        let (st, _, v) = raw(
+            &h.router,
+            "GET",
+            &format!("/workspaces/{pid_b}/members"),
+            &[("cookie", bc.clone())],
+            None,
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK);
+        let owner_pid = v["members"][0]["account"]["public_id"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string();
+        let (st, _, _) = raw(
+            &h.router,
+            "DELETE",
+            &format!("/workspaces/{pid_a}/members/{owner_pid}"),
+            &session_headers(&ac, &acsrf),
+            None,
+        )
+        .await;
+        assert_eq!(st, StatusCode::NOT_FOUND);
+        let (st, _, v) = raw(
+            &h.router,
+            "GET",
+            &format!("/workspaces/{pid_b}/members"),
+            &[("cookie", bc.clone())],
+            None,
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK);
+        assert_eq!(
+            v["members"].as_array().map(|m| m.len()),
+            Some(1),
+            "foreign member row unchanged"
+        );
+    }
+
+    /// role-escalation: a viewer cannot PATCH a member, a member cannot
+    /// DELETE the workspace, and an admin cannot demote the owner.
+    #[tokio::test]
+    async fn s33_role_escalation() {
+        let store = Arc::new(Memory::new());
+        let h = harness_store(false, None, Some(store.clone()));
+        signup_and_verify(&h.router, &store, "o@o.co", "a-long-enough-passphrase").await;
+        signup_and_verify(&h.router, &store, "v@v.co", "a-long-enough-passphrase").await;
+        signup_and_verify(&h.router, &store, "m@m.co", "a-long-enough-passphrase").await;
+        signup_and_verify(&h.router, &store, "x@x.co", "a-long-enough-passphrase").await;
+        let (oc, ocsrf) = login_only(&h.router, "o@o.co", "a-long-enough-passphrase").await;
+        let pid = make_ws(&h.router, &oc, "alpha").await;
+        // Seat them: viewer, member, admin — via real invites.
+        for (email, role) in [
+            ("v@v.co", "viewer"),
+            ("m@m.co", "member"),
+            ("x@x.co", "admin"),
+        ] {
+            let (ist, _, token) = make_invite(&h.router, &oc, &ocsrf, &pid, email, role).await;
+            assert_eq!(ist, StatusCode::OK);
+            let (c, csrf) = login_only(&h.router, email, "a-long-enough-passphrase").await;
+            let (st, _, _) = raw(
+                &h.router,
+                "POST",
+                "/invites/accept",
+                &[("cookie", c), ("x-durable-csrf", csrf)],
+                Some(json!({"token": token})),
+            )
+            .await;
+            assert_eq!(st, StatusCode::OK);
+        }
+        let (vc, vcsrf) = login_only(&h.router, "v@v.co", "a-long-enough-passphrase").await;
+        let (mc, mcsrf) = login_only(&h.router, "m@m.co", "a-long-enough-passphrase").await;
+        let (xc, xcsrf) = login_only(&h.router, "x@x.co", "a-long-enough-passphrase").await;
+        let (st, _, v) = raw(
+            &h.router,
+            "GET",
+            &format!("/workspaces/{pid}/members"),
+            &[("cookie", vc.clone())],
+            None,
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK, "{v}");
+        let owner_pid = v["members"]
+            .as_array()
+            .unwrap_or_else(|| panic!("{v}"))
+            .iter()
+            .find(|m| m["role"] == "owner")
+            .unwrap_or_else(|| panic!("{v}"))["account"]["public_id"]
+            .as_str()
+            .unwrap_or_else(|| panic!("{v}"))
+            .to_string();
+        // Viewer PATCHes a member → 403.
+        let (st, _, _) = raw(
+            &h.router,
+            "PATCH",
+            &format!("/workspaces/{pid}/members/{owner_pid}"),
+            &session_headers(&vc, &vcsrf),
+            Some(json!({"role": "viewer"})),
+        )
+        .await;
+        assert_eq!(st, StatusCode::FORBIDDEN);
+        // Member DELETEs the workspace → 403.
+        let (st, _, _) = raw(
+            &h.router,
+            "DELETE",
+            &format!("/workspaces/{pid}"),
+            &session_headers(&mc, &mcsrf),
+            Some(json!({"confirm": "delete alpha"})),
+        )
+        .await;
+        assert_eq!(st, StatusCode::FORBIDDEN);
+        // Admin demotes the owner → 409 last_owner.
+        let (st, _, v) = raw(
+            &h.router,
+            "PATCH",
+            &format!("/workspaces/{pid}/members/{owner_pid}"),
+            &session_headers(&xc, &xcsrf),
+            Some(json!({"role": "member"})),
+        )
+        .await;
+        assert_eq!(st, StatusCode::CONFLICT, "{v}");
+        assert_eq!(v["code"], "last_owner");
+    }
+
+    /// invite-hijack: a session whose email is not the invite's bound
+    /// address answers 403 invite_email_mismatch; the invite stays live.
+    #[tokio::test]
+    async fn s33_invite_hijack() {
+        let store = Arc::new(Memory::new());
+        let h = harness_store(false, None, Some(store.clone()));
+        signup_and_verify(&h.router, &store, "o@o.co", "a-long-enough-passphrase").await;
+        signup_and_verify(&h.router, &store, "n@n.co", "a-long-enough-passphrase").await;
+        signup_and_verify(&h.router, &store, "w@w.co", "a-long-enough-passphrase").await;
+        let (oc, ocsrf) = login_only(&h.router, "o@o.co", "a-long-enough-passphrase").await;
+        let pid = make_ws(&h.router, &oc, "alpha").await;
+        let (ist, _, token) = make_invite(&h.router, &oc, &ocsrf, &pid, "w@w.co", "admin").await;
+        assert_eq!(ist, StatusCode::OK);
+        // The wrong account presents the token → 403, invite unconsumed.
+        let (nc, ncsrf) = login_only(&h.router, "n@n.co", "a-long-enough-passphrase").await;
+        let (st, _, v) = raw(
+            &h.router,
+            "POST",
+            "/invites/accept",
+            &session_headers(&nc, &ncsrf),
+            Some(json!({"token": token})),
+        )
+        .await;
+        assert_eq!(st, StatusCode::FORBIDDEN, "{v}");
+        assert_eq!(v["code"], "invite_email_mismatch");
+        // The bound account accepts → member with the invited role.
+        let (wc, wcsrf) = login_only(&h.router, "w@w.co", "a-long-enough-passphrase").await;
+        let (st, _, v) = raw(
+            &h.router,
+            "POST",
+            "/invites/accept",
+            &session_headers(&wc, &wcsrf),
+            Some(json!({"token": token})),
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK, "{v}");
+        assert_eq!(v["workspace"]["role"], "admin");
+    }
+
+    /// last-owner: removing the owner answers 409 and the row stays.
+    #[tokio::test]
+    async fn s33_last_owner() {
+        let store = Arc::new(Memory::new());
+        let h = harness_store(false, None, Some(store.clone()));
+        signup_and_verify(&h.router, &store, "o@o.co", "a-long-enough-passphrase").await;
+        let (oc, ocsrf) = login_only(&h.router, "o@o.co", "a-long-enough-passphrase").await;
+        let pid = make_ws(&h.router, &oc, "alpha").await;
+        let (st, _, v) = raw(
+            &h.router,
+            "GET",
+            &format!("/workspaces/{pid}/members"),
+            &[("cookie", oc.clone())],
+            None,
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK);
+        let owner_pid = v["members"][0]["account"]["public_id"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string();
+        let (st, _, v) = raw(
+            &h.router,
+            "DELETE",
+            &format!("/workspaces/{pid}/members/{owner_pid}"),
+            &session_headers(&oc, &ocsrf),
+            None,
+        )
+        .await;
+        assert_eq!(st, StatusCode::CONFLICT, "{v}");
+        assert_eq!(v["code"], "last_owner");
+        let (st, _, v) = raw(
+            &h.router,
+            "GET",
+            &format!("/workspaces/{pid}/members"),
+            &[("cookie", oc)],
+            None,
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK);
+        assert_eq!(v["members"].as_array().map(|m| m.len()), Some(1));
+    }
+
+    /// deleted-ws-key: a key of a deleted workspace answers 401 on the
+    /// very next request, even though it was granted moments ago; the
+    /// workspace's member surface answers 410.
+    #[tokio::test]
+    async fn s33_deleted_ws_key() {
+        let store = Arc::new(Memory::new());
+        let h = harness_store(false, None, Some(store.clone()));
+        signup_and_verify(&h.router, &store, "o@o.co", "a-long-enough-passphrase").await;
+        let (oc, ocsrf) = login_only(&h.router, "o@o.co", "a-long-enough-passphrase").await;
+        let pid = make_ws(&h.router, &oc, "alpha").await;
+        // A store key for this ws, warmed into the key cache.
+        let ws = store
+            .workspace_by_public_id(uuid::Uuid::parse_str(&pid).unwrap_or_else(|e| panic!("{e}")))
+            .await
+            .unwrap_or_else(|e| panic!("{e}"))
+            .unwrap_or_else(|| panic!("ws missing"));
+        let key = format!("dr_{}", "f".repeat(48));
+        store
+            .create_key(
+                ws.id,
+                "k",
+                Permission::Write,
+                &sha256(key.as_bytes()),
+                "dr_f",
+                None,
+            )
+            .await
+            .unwrap_or_else(|e| panic!("{e}"));
+        let (st, _) = call(&h.router, "GET", "/jobs", Some(&key), None).await;
+        assert_eq!(st, StatusCode::OK, "key live before delete");
+        let (st, _, _) = raw(
+            &h.router,
+            "DELETE",
+            &format!("/workspaces/{pid}"),
+            &session_headers(&oc, &ocsrf),
+            Some(json!({"confirm": "delete alpha"})),
+        )
+        .await;
+        assert_eq!(st, StatusCode::NO_CONTENT);
+        // The cached grant is gone — 401 on this same request.
+        let (st, _) = call(&h.router, "GET", "/jobs", Some(&key), None).await;
+        assert_eq!(
+            st,
+            StatusCode::UNAUTHORIZED,
+            "deleted ws's key is dead at once"
+        );
+        // Members see 410, outsiders still see nothing.
+        let (st, _, v) = raw(
+            &h.router,
+            "GET",
+            &format!("/workspaces/{pid}"),
+            &[("cookie", oc.clone())],
+            None,
+        )
+        .await;
+        assert_eq!(st, StatusCode::GONE, "{v}");
+        assert_eq!(v["code"], "workspace_closed");
+        // And it is gone from the list.
+        let (st, _, v) = raw(
+            &h.router,
+            "GET",
+            "/workspaces",
+            &[("cookie", oc.clone())],
+            None,
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK);
+        assert_eq!(v["workspaces"].as_array().map(|w| w.len()), Some(0), "{v}");
+    }
+
+    // ---- S3-5: member-facing keys -----------------------------------
+
+    /// Create a `write` key in `pid` as `cookie`; returns `(public_id,
+    /// plaintext)` — the plaintext appears in exactly this response.
+    async fn make_key(
+        router: &Router,
+        cookie: &str,
+        csrf: &str,
+        pid: &str,
+        perm: &str,
+    ) -> (String, String) {
+        let (st, _, v) = raw(
+            router,
+            "POST",
+            &format!("/workspaces/{pid}/keys"),
+            &session_headers(cookie, csrf),
+            Some(json!({"name": "cli", "permission": perm})),
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK, "{v}");
+        let key = v["key"].as_str().unwrap_or_default().to_string();
+        assert!(key.starts_with("drk_"), "new keys are tagged: {key}");
+        (v["public_id"].as_str().unwrap_or_default().to_string(), key)
+    }
+
+    /// Lifecycle: mint shows `drk_` once, the list carries prefix but
+    /// never secret material, rotate kills the old key on the next call
+    /// and DELETE does the same to the new one.
+    #[tokio::test]
+    async fn s35_key_lifecycle() {
+        let store = Arc::new(Memory::new());
+        let h = harness_store(false, None, Some(store.clone()));
+        signup_and_verify(&h.router, &store, "o@o.co", "a-long-enough-passphrase").await;
+        let (oc, ocsrf) = login_only(&h.router, "o@o.co", "a-long-enough-passphrase").await;
+        let pid = make_ws(&h.router, &oc, "alpha").await;
+        let (key_pid, key) = make_key(&h.router, &oc, &ocsrf, &pid, "write").await;
+        // The list shows prefix, never the secret.
+        let (st, _, v) = raw(
+            &h.router,
+            "GET",
+            &format!("/workspaces/{pid}/keys"),
+            &[("cookie", oc.clone())],
+            None,
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK);
+        assert_eq!(v["keys"][0]["prefix"], &key[..11]);
+        let body = serde_json::to_string(&v).unwrap_or_default();
+        assert!(
+            !body.contains(&key[4..]),
+            "list leaked key material: {body}"
+        );
+        // The key works on the data plane.
+        let (st, _) = call(&h.router, "GET", "/jobs", Some(&key), None).await;
+        assert_eq!(st, StatusCode::OK);
+        // Rotate: new secret once; the OLD key 401s on the next call.
+        let (st, _, v) = raw(
+            &h.router,
+            "POST",
+            &format!("/workspaces/{pid}/keys/{key_pid}/rotate"),
+            &session_headers(&oc, &ocsrf),
+            None,
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK, "{v}");
+        let key2 = v["key"].as_str().unwrap_or_default().to_string();
+        let new_pid = v["public_id"].as_str().unwrap_or_default().to_string();
+        assert!(key2.starts_with("drk_") && key2 != key);
+        assert_ne!(new_pid, key_pid, "rotate mints a fresh row");
+        let (st, _) = call(&h.router, "GET", "/jobs", Some(&key), None).await;
+        assert_eq!(
+            st,
+            StatusCode::UNAUTHORIZED,
+            "rotated-out key must 401 at once"
+        );
+        let (st, _) = call(&h.router, "GET", "/jobs", Some(&key2), None).await;
+        assert_eq!(st, StatusCode::OK);
+        // Delete: the new key 401s on its next call too.
+        let (st, _, _) = raw(
+            &h.router,
+            "DELETE",
+            &format!("/workspaces/{pid}/keys/{new_pid}"),
+            &session_headers(&oc, &ocsrf),
+            None,
+        )
+        .await;
+        assert_eq!(st, StatusCode::NO_CONTENT);
+        let (st, _) = call(&h.router, "GET", "/jobs", Some(&key2), None).await;
+        assert_eq!(st, StatusCode::UNAUTHORIZED, "deleted key must 401 at once");
+        // And a second delete is a 404 indistinguishable from IDOR.
+        let (st, _, _) = raw(
+            &h.router,
+            "DELETE",
+            &format!("/workspaces/{pid}/keys/{new_pid}"),
+            &session_headers(&oc, &ocsrf),
+            None,
+        )
+        .await;
+        assert_eq!(st, StatusCode::NOT_FOUND);
+    }
+
+    /// key-self-escalation: a data-plane key — even write — cannot reach
+    /// any member route; those need a session cookie.
+    #[tokio::test]
+    async fn s35_key_self_escalation() {
+        let store = Arc::new(Memory::new());
+        let h = harness_store(false, None, Some(store.clone()));
+        signup_and_verify(&h.router, &store, "o@o.co", "a-long-enough-passphrase").await;
+        let (oc, ocsrf) = login_only(&h.router, "o@o.co", "a-long-enough-passphrase").await;
+        let pid = make_ws(&h.router, &oc, "alpha").await;
+        let (_, key) = make_key(&h.router, &oc, &ocsrf, &pid, "write").await;
+        for (method, uri) in [
+            ("GET", "/workspaces".to_string()),
+            ("POST", "/workspaces".to_string()),
+            ("GET", format!("/workspaces/{pid}/keys")),
+            ("POST", format!("/workspaces/{pid}/keys")),
+            ("GET", format!("/workspaces/{pid}/members")),
+            ("DELETE", format!("/workspaces/{pid}")),
+            ("GET", "/auth/session".to_string()),
+            ("GET", "/me".to_string()),
+        ] {
+            let (st, _) = call(&h.router, method, &uri, Some(&key), None).await;
+            assert_eq!(
+                st,
+                StatusCode::UNAUTHORIZED,
+                "{method} {uri} answered {st} to a bare API key"
+            );
+        }
+    }
+
+    /// cross-ws-key-create: a member of A POSTing a key under B's pid
+    /// answers 404 — B's existence is not confirmed.
+    #[tokio::test]
+    async fn s35_cross_ws_key_create() {
+        let store = Arc::new(Memory::new());
+        let h = harness_store(false, None, Some(store.clone()));
+        signup_and_verify(&h.router, &store, "a@a.co", "a-long-enough-passphrase").await;
+        signup_and_verify(&h.router, &store, "b@b.co", "a-long-enough-passphrase").await;
+        let (ac, acsrf) = login_only(&h.router, "a@a.co", "a-long-enough-passphrase").await;
+        let (bc, _) = login_only(&h.router, "b@b.co", "a-long-enough-passphrase").await;
+        make_ws(&h.router, &ac, "aspace").await;
+        let pid_b = make_ws(&h.router, &bc, "bspace").await;
+        let (st, _, _) = raw(
+            &h.router,
+            "POST",
+            &format!("/workspaces/{pid_b}/keys"),
+            &session_headers(&ac, &acsrf),
+            Some(json!({"name": "stolen", "permission": "write"})),
+        )
+        .await;
+        assert_eq!(st, StatusCode::NOT_FOUND);
+        // B's key list is untouched.
+        let (st, _, v) = raw(
+            &h.router,
+            "GET",
+            &format!("/workspaces/{pid_b}/keys"),
+            &[("cookie", bc)],
+            None,
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK);
+        assert_eq!(v["keys"].as_array().map(|k| k.len()), Some(0));
+    }
+
+    /// Roles on the key routes: a viewer may list but POSTs/DELETEs are
+    /// 403; a member (non-admin) is refused the same way.
+    #[tokio::test]
+    async fn s35_key_roles() {
+        let store = Arc::new(Memory::new());
+        let h = harness_store(false, None, Some(store.clone()));
+        signup_and_verify(&h.router, &store, "o@o.co", "a-long-enough-passphrase").await;
+        signup_and_verify(&h.router, &store, "v@v.co", "a-long-enough-passphrase").await;
+        let (oc, ocsrf) = login_only(&h.router, "o@o.co", "a-long-enough-passphrase").await;
+        let pid = make_ws(&h.router, &oc, "alpha").await;
+        let (key_pid_owner, _) = make_key(&h.router, &oc, &ocsrf, &pid, "write").await;
+        // Seat v@v.co as a viewer via a real invite.
+        let (ist, _, token) = make_invite(&h.router, &oc, &ocsrf, &pid, "v@v.co", "viewer").await;
+        assert_eq!(ist, StatusCode::OK);
+        let (vc, vcsrf) = login_only(&h.router, "v@v.co", "a-long-enough-passphrase").await;
+        let (st, _, _) = raw(
+            &h.router,
+            "POST",
+            "/invites/accept",
+            &session_headers(&vc, &vcsrf),
+            Some(json!({"token": token})),
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK);
+        // Viewer lists.
+        let (st, _, _) = raw(
+            &h.router,
+            "GET",
+            &format!("/workspaces/{pid}/keys"),
+            &[("cookie", vc.clone())],
+            None,
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK);
+        // Viewer cannot mint or revoke.
+        let (st, _, _) = raw(
+            &h.router,
+            "POST",
+            &format!("/workspaces/{pid}/keys"),
+            &session_headers(&vc, &vcsrf),
+            Some(json!({"name": "esc", "permission": "write"})),
+        )
+        .await;
+        assert_eq!(st, StatusCode::FORBIDDEN);
+        let (st, _, _) = raw(
+            &h.router,
+            "DELETE",
+            &format!("/workspaces/{pid}/keys/{key_pid_owner}"),
+            &session_headers(&vc, &vcsrf),
+            None,
+        )
+        .await;
+        assert_eq!(st, StatusCode::FORBIDDEN);
+    }
+
+    /// last-used-amplification: N verifies through the hot path coalesce
+    /// to at most one last_used UPDATE per key per flush (D-071).
+    #[tokio::test]
+    async fn s35_last_used_amplification() {
+        let store = Arc::new(Memory::new());
+        let h = harness_store(false, None, Some(store.clone()));
+        signup_and_verify(&h.router, &store, "o@o.co", "a-long-enough-passphrase").await;
+        let (oc, ocsrf) = login_only(&h.router, "o@o.co", "a-long-enough-passphrase").await;
+        let pid = make_ws(&h.router, &oc, "alpha").await;
+        let (_, key) = make_key(&h.router, &oc, &ocsrf, &pid, "write").await;
+        // N verifies — cached or not, each lands <=1 pending touch.
+        for _ in 0..8 {
+            let (st, _) = call(&h.router, "GET", "/jobs", Some(&key), None).await;
+            assert_eq!(st, StatusCode::OK);
+        }
+        let pending = h.app.keyring.drain_key_touches();
+        assert_eq!(pending.len(), 1, "8 verifies coalesce to one touch");
+        store
+            .touch_keys(&pending)
+            .await
+            .unwrap_or_else(|e| panic!("{e}"));
+        let ws = store
+            .workspace_by_public_id(uuid::Uuid::parse_str(&pid).unwrap_or_else(|e| panic!("{e}")))
+            .await
+            .unwrap_or_else(|e| panic!("{e}"))
+            .unwrap_or_else(|| panic!("ws"));
+        let keys = store
+            .list_keys(ws.id)
+            .await
+            .unwrap_or_else(|e| panic!("{e}"));
+        assert!(keys[0].last_used_at_ms.is_some(), "the flush landed");
+    }
+
+    // ---- S3-6: handlers management + the builtin:echo test call ------
+
+    /// A session caller on a flat route names its workspace in
+    /// `x-durable-workspace`.
+    fn ws_headers(cookie: &str, csrf: &str, pid: &str) -> [(&'static str, String); 3] {
+        [
+            ("cookie", cookie.to_string()),
+            ("x-durable-csrf", csrf.to_string()),
+            ("x-durable-workspace", pid.to_string()),
+        ]
+    }
+
+    /// The D-070 probe on the in-process builtin: a member registers
+    /// `builtin:echo` by name, the test call echoes the input in-process
+    /// (no network hop), and a ws write key can probe the same handler.
+    #[tokio::test]
+    async fn s36_testcall_echo() {
+        let store = Arc::new(Memory::new());
+        let h = harness_store(false, None, Some(store.clone()));
+        signup_and_verify(&h.router, &store, "o@o.co", "a-long-enough-passphrase").await;
+        let (cookie, csrf) = login_only(&h.router, "o@o.co", "a-long-enough-passphrase").await;
+        let pid = make_ws(&h.router, &cookie, "alpha").await;
+
+        let (st, _, v) = raw(
+            &h.router,
+            "PUT",
+            "/handlers/builtin:echo",
+            &ws_headers(&cookie, &csrf, &pid),
+            Some(json!({"url": "builtin:echo"})),
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK, "{v}");
+        // GET lists it without any secret material.
+        let (st, _, v) = raw(
+            &h.router,
+            "GET",
+            "/handlers",
+            &[
+                ("cookie", cookie.clone()),
+                ("x-durable-workspace", pid.clone()),
+            ],
+            None,
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK, "{v}");
+        assert_eq!(v["handlers"][0]["name"], "builtin:echo");
+        assert!(v["handlers"][0].get("handler_secret").is_none(), "{v}");
+
+        // Session probe: echoes the input, bounded excerpt, no run.
+        let input = base64::engine::general_purpose::STANDARD.encode(b"ping-body");
+        let (st, _, v) = raw(
+            &h.router,
+            "POST",
+            "/handlers/builtin:echo/test",
+            &ws_headers(&cookie, &csrf, &pid),
+            Some(json!({"input_b64": input})),
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK, "{v}");
+        assert_eq!(v["status"], "ok", "{v}");
+        assert!(v["latency_ms"].is_number(), "{v}");
+        let excerpt = base64::engine::general_purpose::STANDARD
+            .decode(v["reply_excerpt_b64"].as_str().unwrap_or_default())
+            .unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(excerpt, b"ping-body");
+        // A write key probes the same armed handler.
+        let (_, key) = make_key(&h.router, &cookie, &csrf, &pid, "write").await;
+        let (st, _, v) = raw(
+            &h.router,
+            "POST",
+            "/handlers/builtin:echo/test",
+            &[("authorization", format!("Bearer {key}"))],
+            Some(json!({"input_b64": input})),
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK, "{v}");
+        assert_eq!(v["status"], "ok", "{v}");
+        // The row's test columns updated: GET shows last_test_status ok.
+        let (st, _, v) = raw(
+            &h.router,
+            "GET",
+            "/handlers",
+            &[("authorization", format!("Bearer {key}"))],
+            None,
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK, "{v}");
+        assert_eq!(v["handlers"][0]["health"]["last_test_status"], "ok", "{v}");
+        assert!(
+            v["handlers"][0]["health"]["last_test_at_ms"].is_number(),
+            "{v}"
+        );
+    }
+
+    /// ssrf-testcall: a private target is refused at registration —
+    /// nothing is ever armed, so zero packets can reach it — and a test
+    /// call on an unarmed name answers 404.
+    #[tokio::test]
+    async fn s36_ssrf_testcall() {
+        let store = Arc::new(Memory::new());
+        let h = harness_strict(Some(store.clone()));
+        signup_and_verify(&h.router, &store, "o@o.co", "a-long-enough-passphrase").await;
+        let (cookie, csrf) = login_only(&h.router, "o@o.co", "a-long-enough-passphrase").await;
+        let pid = make_ws(&h.router, &cookie, "alpha").await;
+
+        for target in [
+            "http://127.0.0.1:9/h",
+            "http://169.254.169.254/latest",
+            "http://[::1]:9/h",
+            "http://10.0.0.1/h",
+        ] {
+            let (st, _, v) = raw(
+                &h.router,
+                "PUT",
+                "/handlers/probe",
+                &ws_headers(&cookie, &csrf, &pid),
+                Some(json!({"url": target})),
+            )
+            .await;
+            assert_eq!(st, StatusCode::UNPROCESSABLE_ENTITY, "{target}: {v}");
+            assert_eq!(v["code"], "local_target_forbidden", "{target}: {v}");
+        }
+        let (st, _, v) = raw(
+            &h.router,
+            "GET",
+            "/handlers",
+            &[
+                ("cookie", cookie.clone()),
+                ("x-durable-workspace", pid.clone()),
+            ],
+            None,
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK, "{v}");
+        assert_eq!(v["handlers"].as_array().map(|x| x.len()), Some(0), "{v}");
+        let (st, _, v) = raw(
+            &h.router,
+            "POST",
+            "/handlers/probe/test",
+            &ws_headers(&cookie, &csrf, &pid),
+            Some(json!({"input_b64": "aGk="})),
+        )
+        .await;
+        assert_eq!(st, StatusCode::NOT_FOUND, "{v}");
+    }
+
+    /// testcall-abuse: the per-client bound strikes before the
+    /// workspace's hourly one — the 11th call in a burst 429s with a
+    /// Retry-After-shaped refusal, and an already-registered handler is
+    /// unaffected.
+    #[tokio::test]
+    async fn s36_testcall_abuse() {
+        let store = Arc::new(Memory::new());
+        let h = harness_store(false, None, Some(store.clone()));
+        signup_and_verify(&h.router, &store, "o@o.co", "a-long-enough-passphrase").await;
+        let (cookie, csrf) = login_only(&h.router, "o@o.co", "a-long-enough-passphrase").await;
+        let pid = make_ws(&h.router, &cookie, "alpha").await;
+        let (_, key) = make_key(&h.router, &cookie, &csrf, &pid, "write").await;
+        let (st, _, v) = raw(
+            &h.router,
+            "PUT",
+            "/handlers/builtin:echo",
+            &[("authorization", format!("Bearer {key}"))],
+            Some(json!({"url": "builtin:echo"})),
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK, "{v}");
+        for i in 0..10 {
+            let (st, _, v) = raw(
+                &h.router,
+                "POST",
+                "/handlers/builtin:echo/test",
+                &[("authorization", format!("Bearer {key}"))],
+                Some(json!({"input_b64": "aGk="})),
+            )
+            .await;
+            assert_eq!(st, StatusCode::OK, "call {i}: {v}");
+        }
+        let (st, _, v) = raw(
+            &h.router,
+            "POST",
+            "/handlers/builtin:echo/test",
+            &[("authorization", format!("Bearer {key}"))],
+            Some(json!({"input_b64": "aGk="})),
+        )
+        .await;
+        assert_eq!(st, StatusCode::TOO_MANY_REQUESTS, "{v}");
+        assert_eq!(v["code"], "test_call_limited", "{v}");
+    }
+
+    /// secret-in-get: the workspace signing secret is shown exactly once
+    /// (create/rotate); no GET surface can be made to carry it.
+    #[tokio::test]
+    async fn s36_secret_in_get() {
+        let store = Arc::new(Memory::new());
+        let h = harness_store(false, None, Some(store.clone()));
+        signup_and_verify(&h.router, &store, "o@o.co", "a-long-enough-passphrase").await;
+        let (cookie, csrf) = login_only(&h.router, "o@o.co", "a-long-enough-passphrase").await;
+        let pid = make_ws(&h.router, &cookie, "alpha").await;
+        // Rotate once so the live secret is a value we hold.
+        let (st, _, v) = raw(
+            &h.router,
+            "POST",
+            "/handler-secret",
+            &ws_headers(&cookie, &csrf, &pid),
+            None,
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK, "{v}");
+        let secret = v["secret"].as_str().unwrap_or_default().to_string();
+        assert!(secret.len() >= 32, "{v}");
+        for uri in ["/handlers", "/workspaces", &format!("/workspaces/{pid}")] {
+            let (st, _, v) = raw(
+                &h.router,
+                "GET",
+                uri,
+                &[
+                    ("cookie", cookie.clone()),
+                    ("x-durable-workspace", pid.clone()),
+                ],
+                None,
+            )
+            .await;
+            assert_eq!(st, StatusCode::OK, "{uri}: {v}");
+            assert!(
+                !v.to_string().contains(&secret),
+                "{uri} carried the signing secret"
+            );
+        }
+    }
+
+    /// handler-secret-key: data-plane keys — even write — can never
+    /// rotate the signing secret; a session admin can.
+    #[tokio::test]
+    async fn s36_handler_secret_key() {
+        let store = Arc::new(Memory::new());
+        let h = harness_store(false, None, Some(store.clone()));
+        signup_and_verify(&h.router, &store, "o@o.co", "a-long-enough-passphrase").await;
+        let (cookie, csrf) = login_only(&h.router, "o@o.co", "a-long-enough-passphrase").await;
+        let pid = make_ws(&h.router, &cookie, "alpha").await;
+        let (_, key) = make_key(&h.router, &cookie, &csrf, &pid, "write").await;
+        let (st, _, v) = raw(
+            &h.router,
+            "POST",
+            "/handler-secret",
+            &[("authorization", format!("Bearer {key}"))],
+            None,
+        )
+        .await;
+        assert_eq!(st, StatusCode::FORBIDDEN, "{v}");
+        // A read key gets the same refusal, not a weaker one.
+        let (_, rkey) = make_key(&h.router, &cookie, &csrf, &pid, "read").await;
+        let (st, _, _) = raw(
+            &h.router,
+            "POST",
+            "/handler-secret",
+            &[("authorization", format!("Bearer {rkey}"))],
+            None,
+        )
+        .await;
+        assert_eq!(st, StatusCode::FORBIDDEN);
+    }
+
+    /// Member roles on the flat surface: a member PUTs and GETs; a
+    /// viewer can GET but not PUT/DELETE; a non-member session gets 404
+    /// (the pid never leaks).
+    #[tokio::test]
+    async fn s36_member_handlers() {
+        let store = Arc::new(Memory::new());
+        let h = harness_store(false, None, Some(store.clone()));
+        signup_and_verify(&h.router, &store, "o@o.co", "a-long-enough-passphrase").await;
+        let (cookie, csrf) = login_only(&h.router, "o@o.co", "a-long-enough-passphrase").await;
+        let pid = make_ws(&h.router, &cookie, "alpha").await;
+
+        signup_and_verify(&h.router, &store, "m@m.co", "a-long-enough-passphrase").await;
+        let (mc, mcsrf) = login_only(&h.router, "m@m.co", "a-long-enough-passphrase").await;
+        let (_, _, token) = make_invite(&h.router, &cookie, &csrf, &pid, "m@m.co", "member").await;
+        let (st, _, v) = raw(
+            &h.router,
+            "POST",
+            "/invites/accept",
+            &[("cookie", mc.clone()), ("x-durable-csrf", mcsrf.clone())],
+            Some(json!({"token": token})),
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK, "{v}");
+        let (st, _, v) = raw(
+            &h.router,
+            "PUT",
+            "/handlers/builtin:echo",
+            &ws_headers(&mc, &mcsrf, &pid),
+            Some(json!({"url": "builtin:echo"})),
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK, "{v}");
+
+        signup_and_verify(&h.router, &store, "v@v.co", "a-long-enough-passphrase").await;
+        let (vc, vcsrf) = login_only(&h.router, "v@v.co", "a-long-enough-passphrase").await;
+        let (_, _, vtok) = make_invite(&h.router, &cookie, &csrf, &pid, "v@v.co", "viewer").await;
+        let (st, _, _) = raw(
+            &h.router,
+            "POST",
+            "/invites/accept",
+            &[("cookie", vc.clone()), ("x-durable-csrf", vcsrf.clone())],
+            Some(json!({"token": vtok})),
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK);
+        let (st, _, v) = raw(
+            &h.router,
+            "GET",
+            "/handlers",
+            &[("cookie", vc.clone()), ("x-durable-workspace", pid.clone())],
+            None,
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK, "{v}");
+        let (st, _, v) = raw(
+            &h.router,
+            "PUT",
+            "/handlers/viewer-put",
+            &ws_headers(&vc, &vcsrf, &pid),
+            Some(json!({"url": "builtin:echo"})),
+        )
+        .await;
+        assert_eq!(st, StatusCode::FORBIDDEN, "{v}");
+        let (st, _, v) = raw(
+            &h.router,
+            "DELETE",
+            "/handlers/builtin:echo",
+            &ws_headers(&vc, &vcsrf, &pid),
+            None,
+        )
+        .await;
+        assert_eq!(st, StatusCode::FORBIDDEN, "{v}");
+
+        // A session with no membership in pid: every flat route 404s the
+        // workspace, never 403s the route.
+        signup_and_verify(&h.router, &store, "x@x.co", "a-long-enough-passphrase").await;
+        let (xc, xcsrf) = login_only(&h.router, "x@x.co", "a-long-enough-passphrase").await;
+        for (method, uri) in [
+            ("GET", "/handlers"),
+            ("PUT", "/handlers/x"),
+            ("DELETE", "/handlers/builtin:echo"),
+        ] {
+            let (st, _, v) = raw(
+                &h.router,
+                method,
+                uri,
+                &ws_headers(&xc, &xcsrf, &pid),
+                if method == "PUT" {
+                    Some(json!({"url": "builtin:echo"}))
+                } else {
+                    None
+                },
+            )
+            .await;
+            assert_eq!(st, StatusCode::NOT_FOUND, "{method} {uri}: {v}");
+        }
+    }
+
+    // ---- finding 18: --ops-listen gates env keys to the ops socket ----
+
+    /// With the gate armed, an env key on the public socket answers 401
+    /// on every auth path it could take — flat member routes,
+    /// `Authorized` admin routes, read routes — indistinguishable from a
+    /// bad bearer, while the same key on the ops socket works and
+    /// store-key/session callers are unaffected on either side.
+    #[tokio::test]
+    async fn ops_listen_confines_env_keys_to_the_ops_socket() {
+        let store = Arc::new(Memory::new());
+        let a = store
+            .create_workspace("a")
+            .await
+            .unwrap_or_else(|e| panic!("{e}"));
+        let key_a = "dr_a51a51a51a51a51a51a51a51a51a51a51a51a51a51a51a51";
+        store
+            .create_key(
+                a.id,
+                "k",
+                Permission::Write,
+                &sha256(key_a.as_bytes()),
+                "dr_a",
+                None,
+            )
+            .await
+            .unwrap_or_else(|e| panic!("{e}"));
+        let h = harness_ops(Some(store));
+        let env = [("authorization", format!("Bearer {KEY}"))];
+
+        // Public side: env key is just a bad bearer — 401 everywhere it
+        // could authenticate.
+        for (method, uri) in [
+            ("GET", "/whoami"),
+            ("GET", "/admin/workspaces"),
+            ("GET", "/handlers"),
+            ("POST", "/handler-secret"),
+        ] {
+            let (st, _, _) = raw(&h.router, method, uri, &env, None).await;
+            assert_eq!(st, StatusCode::UNAUTHORIZED, "{method} {uri} on --listen");
+        }
+        // The ops socket answers the same key normally.
+        let (st, _, v) = raw_ops(&h.router, "GET", "/whoami", &env, None).await;
+        assert_eq!(st, StatusCode::OK, "{v}");
+        let (st, _, v) = raw_ops(&h.router, "GET", "/admin/workspaces", &env, None).await;
+        assert_eq!(st, StatusCode::OK, "{v}");
+        let (st, _, v) = raw_ops(&h.router, "GET", "/handlers", &env, None).await;
+        assert_eq!(st, StatusCode::OK, "{v}");
+        // The read env key is confined the same way.
+        let renv = [("authorization", format!("Bearer {READ_KEY}"))];
+        let (st, _, _) = raw(&h.router, "GET", "/whoami", &renv, None).await;
+        assert_eq!(st, StatusCode::UNAUTHORIZED);
+        let (st, _, _) = raw_ops(&h.router, "GET", "/whoami", &renv, None).await;
+        assert_eq!(st, StatusCode::OK);
+        // A store key is unaffected on the public side (data plane).
+        let (st, _, v) = raw(
+            &h.router,
+            "GET",
+            "/handlers",
+            &[("authorization", format!("Bearer {key_a}"))],
+            None,
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK, "{v}");
+    }
+
+    /// Without the flag nothing changes — env keys work on --listen as
+    /// always (the self-host shape).
+    #[tokio::test]
+    async fn no_ops_listen_leaves_env_keys_as_before() {
+        let h = harness_store(false, None, None);
+        let (st, _, v) = raw(
+            &h.router,
+            "GET",
+            "/whoami",
+            &[("authorization", format!("Bearer {KEY}"))],
+            None,
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK, "{v}");
+    }
+
+    /// Boot refuses a non-loopback --ops-listen and a non-address, and
+    /// takes every loopback spelling.
+    #[test]
+    fn ops_listen_must_be_loopback() {
+        for good in ["127.0.0.1:9100", "[::1]:9100", "127.42.0.9:1"] {
+            assert!(
+                check_ops_listen(&Some(good.to_string())).is_ok(),
+                "{good} must be accepted"
+            );
+        }
+        for bad in [
+            "0.0.0.0:9100",
+            "8.8.8.8:9100",
+            "[::]:9100",
+            "junk",
+            "127.0.0.1",
+        ] {
+            assert!(
+                check_ops_listen(&Some(bad.to_string())).is_err(),
+                "{bad} must be refused"
+            );
+        }
+        assert!(check_ops_listen(&None).is_ok());
+    }
+
+    /// `DURABLE_INVITE_ONLY` is parsed, not presence-checked: every on
+    /// spelling gates, every off spelling doesn't, junk refuses to boot.
+    #[test]
+    fn invite_only_env_parses_values() {
+        for (v, want) in [
+            ("1", true),
+            ("true", true),
+            ("TRUE", true),
+            ("yes", true),
+            ("on", true),
+            (" ON ", true),
+            ("0", false),
+            ("false", false),
+            ("no", false),
+            ("off", false),
+            ("", false),
+            ("  ", false),
+        ] {
+            let got = invite_only_value(Some(v));
+            assert_eq!(got.ok(), Some(want), "DURABLE_INVITE_ONLY={v:?}");
+        }
+        for bad in ["2", "enable", "enabled", "y", "n", "t", "f"] {
+            assert!(
+                invite_only_value(Some(bad)).is_err(),
+                "DURABLE_INVITE_ONLY={bad:?} must refuse the boot"
+            );
+        }
+        assert_eq!(invite_only_value(None).ok(), Some(false));
     }
 }

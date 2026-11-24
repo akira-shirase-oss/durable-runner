@@ -9,6 +9,7 @@
 #   sustained            the million-op sustained run
 #   workspaces-memory    4 workspaces x 275k, memory backend
 #   workspaces-postgres  4 workspaces x 275k, postgres backend
+#   auth                 S3-0: 1M cached session verifies, memory backend
 #   rest                 replay, submit ramps, stall, admission, compact
 #   all (default)        every group, as one battery — local runs
 #
@@ -57,6 +58,12 @@ full_workspaces_postgres() {
   DATABASE_URL="${PG_DATABASE_URL:-}" run workspaces --workspaces=4 --per=275000 --backend=postgres
 }
 
+full_auth() {
+  # S3-0: the dashboard's hottest route — session verify on the cached
+  # path (tag check + generation-checked cache, no store I/O per op).
+  run auth --ops=1000000 --backend=memory
+}
+
 full_rest() {
   run replay --events=100000
   run submit --rate=10 --seconds=60
@@ -75,15 +82,17 @@ case "$MODE" in
       sustained) full_sustained ;;
       workspaces-memory) full_workspaces_memory ;;
       workspaces-postgres) full_workspaces_postgres ;;
+      auth) full_auth ;;
       rest) full_rest ;;
       all)
         full_rest
         full_sustained
         full_workspaces_memory
         full_workspaces_postgres
+        full_auth
         ;;
       *)
-        echo "unknown --full group: $GROUP (want: sustained | workspaces-memory | workspaces-postgres | rest | all)" >&2
+        echo "unknown --full group: $GROUP (want: sustained | workspaces-memory | workspaces-postgres | auth | rest | all)" >&2
         exit 2
         ;;
     esac
@@ -99,6 +108,8 @@ case "$MODE" in
     # S2: memory backend is always available, so the smoke always
     # exercises the workspace path instead of skipping.
     run workspaces --smoke --backend=memory
+    # S3-0: session verify on the cached path — same always-runnable backend.
+    run auth --smoke --backend=memory
     ;;
 esac
 

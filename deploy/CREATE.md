@@ -1,5 +1,9 @@
 # Creating what the droplet needs (once, ~20 min)
 
+**Self-hosting only** (one product on its own droplet). The hosted service on
+the droplet shared with Colophon needs only a DNS record and an origin
+certificate: docs/DEPLOY.md, "The hosted service on the shared droplet".
+
 Everything here is clicked/created before `docs/DEPLOY.md` step 1. Secrets
 are typed only on the droplet, into root-only files.
 
@@ -8,10 +12,10 @@ are typed only on the droplet, into root-only files.
    Add a cloud firewall: inbound 22 from your IP only; 443 from anywhere
    (host ufw narrows it to Cloudflare's ranges); nothing else.
 
-2. **DNS + TLS mode.** Cloudflare zone: `durable.404human.dev` → A/AAAA to
+2. **DNS + TLS mode.** Cloudflare zone: `<your-host>` → A/AAAA to
    the droplet, proxied (orange). SSL/TLS → **Full (strict)**. SSL/TLS →
    Origin Server → Create Certificate → save `origin.pem`/`origin.key`
-   for DEPLOY.md step 4 (15-year, hostnames `durable.404human.dev`).
+   for DEPLOY.md step 4 (15-year, hostnames `<your-host>`).
 
 3. **Authenticated Origin Pulls, zone-level, with OUR certificate.**
    Cloudflare's global origin-pull certificate is the same for every
@@ -23,7 +27,7 @@ are typed only on the droplet, into root-only files.
    openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes -days 3650 \
      -subj '/CN=durable origin-pull CA' -keyout aop-ca.key -out aop-zone-ca.pem
    openssl req -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes \
-     -subj '/CN=cloudflare origin pull durable.404human.dev' -keyout aop-client.key -out aop-client.csr
+     -subj '/CN=cloudflare origin pull <your-host>' -keyout aop-client.key -out aop-client.csr
    openssl x509 -req -in aop-client.csr -CA aop-zone-ca.pem -CAkey aop-ca.key \
      -CAcreateserial -days 825 -out aop-client.pem
    ```

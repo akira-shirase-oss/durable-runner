@@ -7,16 +7,30 @@
 # the client, and CF-Connecting-IP is attacker-controlled.
 # shellcheck disable=SC2015  # ok and bad only print, so `t && ok || bad` is if-then-else here.
 set -uo pipefail
+# The shared droplet (deploy/droplet: Colophon's root Caddyfile, no Cloudflare ranges in
+# trusted-proxies) has its own checks; its env file starts with that kit's marker. So upgrade.sh's
+# and rollback.sh's `smoke.sh --local-only` judge the host they actually run on.
+if [[ "$(head -n 1 /etc/durable/durable.env 2>/dev/null)" == "# Durable Runner, shared droplet (deploy/droplet)" ]]; then
+  [[ "${1:-}" == --local-only ]] && exec "$(dirname "$0")/droplet/smoke.sh" --release
+  exec "$(dirname "$0")/droplet/smoke.sh"
+fi
 failures=0
 ok()  { printf '  ok    %s\n' "$1"; }
 bad() { printf '  FAIL  %s\n' "$1"; failures=$((failures + 1)); }
 
 echo "the binary"
-# A lab build turns the tenant SSRF guard off (S3 re-review 3).
-installed=${DURABLE_SERVER_BIN:-/usr/local/bin/durable-server}
-"$(dirname "$0")/lab-build-guard.sh" "$installed" 2>/dev/null \
-  && ok "$installed is a production build" \
-  || bad "$installed is a LAB build or unreadable — reinstall a plain cargo build --release"
+# A lab build turns the tenant SSRF guard off (S3 re-review 3). Judge the
+# binary systemd is RUNNING (/proc/<MainPID>/exe), never a path from the
+# environment. DURABLE_PROC_ROOT exists for deploy/test-lab-guard.sh only.
+proc=${DURABLE_PROC_ROOT:-/proc}
+pid=$(systemctl show -p MainPID --value durable-server 2>/dev/null || echo 0)
+if [[ "$pid" =~ ^[0-9]+$ ]] && (( pid > 0 )); then
+  "$(dirname "$0")/lab-build-guard.sh" "$proc/$pid/exe" 2>/dev/null \
+    && ok "the running durable-server is a production build" \
+    || bad "the running durable-server is a LAB build or unreadable — reinstall a plain cargo build --release"
+else
+  bad "no running durable-server to judge (MainPID $pid)"
+fi
 
 echo "services"
 for unit in durable-server caddy; do
@@ -54,10 +68,9 @@ if grep -q 'trusted_ca_cert_file /etc/caddy/aop-zone-ca.pem' /etc/caddy/Caddyfil
 else
   bad "Caddy does not require OUR zone AOP CA (/etc/caddy/aop-zone-ca.pem) — CREATE.md 3"
 fi
-pid=$(systemctl show -p MainPID --value durable-server 2>/dev/null || echo 0)
 argv=""
 if [[ "$pid" =~ ^[0-9]+$ ]] && (( pid > 0 )); then
-  argv=$(tr '\0' ' ' </proc/"$pid"/cmdline 2>/dev/null || true)
+  argv=$(tr '\0' ' ' <"$proc/$pid/cmdline" 2>/dev/null || true)
 fi
 if [[ "$argv" == *"--trusted-proxy 127.0.0.1/32"* ]]; then
   ok "durable-server trusts the loopback proxy hop"
@@ -86,9 +99,9 @@ if [[ "${1:-}" != --local-only ]]; then
   dom=${dom:-durable.404human.dev}
   code=$(curl -sS -o /dev/null -w '%{http_code} %{ssl_verify_result}' --max-time 10 "https://$dom/health" || echo "000 x")
   [[ "$code" == "200 0" ]] && ok "$dom/health 200 over valid TLS" || bad "$dom/health: $code"
-  headers=$(curl -sSI --max-time 10 "https://$dom/inspector/" || true)
+  headers=$(curl -sSI --max-time 10 "https://$dom/app/" || true)
   grep -qi '^server: cloudflare' <<<"$headers" && ok "served via Cloudflare" || bad "no server: cloudflare header"
-  grep -qi '^content-security-policy:' <<<"$headers" && ok "inspector has a CSP" || bad "no CSP on /inspector/"
+  grep -qi '^content-security-policy:' <<<"$headers" && ok "inspector has a CSP" || bad "no CSP on /app/"
   unauth=$(curl -sS -o /dev/null -w '%{http_code}' --max-time 10 -X POST "https://$dom/jobs" -d '{}' || echo 000)
   [[ "$unauth" == 401 ]] && ok "POST /jobs without a key is 401" || bad "POST /jobs without a key: $unauth"
 fi
