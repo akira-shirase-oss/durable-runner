@@ -5,9 +5,11 @@
 # docs/DEPLOY.md). On a failed smoke the previous binary is restored.
 #   sudo deploy/upgrade.sh path/to/durable-server[-new]
 set -euo pipefail
-[[ $EUID -eq 0 ]] || { echo "run as root" >&2; exit 1; }
 new=${1:?usage: upgrade.sh /path/to/new/durable-server}
 [[ -x $new ]] || { echo "$new not executable" >&2; exit 1; }
+# Before anything else, root or not: never swap in a lab build (S3).
+"$(dirname "$0")/lab-build-guard.sh" "$new" || exit 1
+[[ $EUID -eq 0 ]] || { echo "run as root" >&2; exit 1; }
 
 # D-056: never swap in a binary that cannot read this journal — it would
 # refuse startup and turn the upgrade into an outage. The journal must be

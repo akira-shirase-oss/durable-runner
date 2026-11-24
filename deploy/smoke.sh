@@ -11,6 +11,13 @@ failures=0
 ok()  { printf '  ok    %s\n' "$1"; }
 bad() { printf '  FAIL  %s\n' "$1"; failures=$((failures + 1)); }
 
+echo "the binary"
+# A lab build turns the tenant SSRF guard off (S3 re-review 3).
+installed=${DURABLE_SERVER_BIN:-/usr/local/bin/durable-server}
+"$(dirname "$0")/lab-build-guard.sh" "$installed" 2>/dev/null \
+  && ok "$installed is a production build" \
+  || bad "$installed is a LAB build or unreadable — reinstall a plain cargo build --release"
+
 echo "services"
 for unit in durable-server caddy; do
   systemctl is-active --quiet "$unit" && ok "$unit active" || bad "$unit not active"

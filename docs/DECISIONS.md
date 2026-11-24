@@ -1258,3 +1258,61 @@ Proved by `the_hosts_own_addresses_are_refused_by_both_layers`,
 `deploy/test-proxy-hop.sh` (with known-bad copies); `ATTACK(ssrf-own-address)`,
 `ATTACK(ssrf-deny-cidr)` and `ATTACK(peer-canonical)` have mutation rows.
 
+
+## D-062: the S3 round after the 2710d76..52e893b re-review
+
+*(four S3 findings of the independent re-review; two tracked)*
+
+- **A /48's cap frees itself.** The per-/48 cap of 256 /64 entries
+  (D-061's limiter) was decremented only by the table-wide reclaim, which
+  runs only on a full table — so 256 one-off /64s capped a /48 for good
+  and every never-seen /64 in it shared the `V6Shared` bucket an attacker
+  could drain until restart. Each /48 now keeps its own key set; a /48 at
+  its cap drops its own minute-idle /64 entries before refusing a
+  newcomer (O(256) for that /48 only, and only for a newcomer the /48's
+  aggregate bucket admitted — a refusing /48 returns before the scan).
+  The key sets hold one address per table entry, so at most 65,536 in
+  all; the worst case, every /64 in its own /48, is about 10 MiB
+  (estimated from the layout, not measured).
+- **The armed view claims only what is saved.** The view behind the
+  no-op PUT skip was set before the snapshot write, so a failed save
+  answered 503 while a retried PUT answered `unchanged` without writing.
+  The rule now: a mutation drops its view entry before it changes
+  anything and sets it only once the writer acks the save — for PUT,
+  the secret rotation and the reconcile pass (a pass whose snapshot does
+  not land, or is overtaken, forgets its views). DELETE forgets *before*
+  its save on purpose: the engine has already dropped the handler, so a
+  view kept on a failed save would make the next PUT of that URL a no-op
+  while nothing is armed. A missing entry only ever costs a PUT its skip.
+- **The deploy refuses a lab build.** A `--features lab` build shares
+  `target/release` with the production one; `deploy/lab-build-guard.sh`
+  refuses any binary whose `--help` lists `--allow-local-tenant-handlers`
+  (or fails, or is not durable-server's). `install.sh` and `upgrade.sh`
+  run it before anything else, and `smoke.sh` fails an installed lab build.
+- **Signed handlers' store pairing is proved.** `make_signed` takes the
+  store's client (its resolver judges names) and the store's policy (the
+  call-time check of literals); each has a mutation row against a factory
+  whose two pairs differ (strict store, open flag).
+
+Tracked, not built:
+
+- **The overflow bucket is one global bucket.** A newcomer that finds the
+  table full shares a single overflow bucket. Reaching it needs about 256
+  /48s each at its cap, or about 65k IPv4 addresses held active inside a
+  minute; past that, newcomers share it until entries idle out. Shard the
+  overflow by a keyed hash of the aggregate later.
+- **The observer's in-flight gauge can under-report after churn.** A
+  workspace evicted past the 256-tenant cap while its calls are in flight
+  comes back with a fresh entry; those calls' finishes saturate its
+  in-flight count at 0 rather than going negative, so the gauge reads low
+  until they drain. It never over-reports and never grows memory.
+
+Proved by `a_slash48_cap_frees_once_its_slash64s_go_idle`,
+`a_put_whose_save_failed_is_retried_not_skipped`,
+`a_failed_put_never_leaves_the_old_url_claiming_armed`,
+`a_delete_whose_save_failed_lets_the_same_put_rearm`,
+`a_rotate_whose_save_failed_lets_a_put_save_the_new_secret`,
+`a_reconcile_pass_that_did_not_land_forgets_its_views`,
+`a_signed_handler_uses_the_store_pair_not_the_flag_pair` and
+`deploy/test-lab-guard.sh` (with known-bad copies); each protection has an
+`ATTACK` row in `tests/attacks/prove-attacks.sh`.

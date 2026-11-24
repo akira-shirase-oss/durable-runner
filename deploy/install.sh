@@ -5,8 +5,10 @@
 # re-running replaces binaries and units, never the journal or env.
 set -euo pipefail
 cd "$(dirname "$0")/.."
-[[ $EUID -eq 0 ]] || { echo "run as root" >&2; exit 1; }
 [[ -f target/release/durable-server ]] || { echo "build first: cargo build --release" >&2; exit 1; }
+# Before anything else, root or not: never install a lab build (S3).
+deploy/lab-build-guard.sh target/release/durable-server || exit 1
+[[ $EUID -eq 0 ]] || { echo "run as root" >&2; exit 1; }
 
 id -u durable >/dev/null 2>&1 || useradd --system --no-create-home --shell /usr/sbin/nologin durable
 install -d -o durable -g durable -m 0750 /var/lib/durable /var/lib/durable/backups /var/lib/durable/journal

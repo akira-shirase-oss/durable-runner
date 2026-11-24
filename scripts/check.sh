@@ -112,6 +112,9 @@ deploy/test-format-guard.sh
 step "deploy proxy hop + deny-cidrs (white-hat A/B)"
 deploy/test-proxy-hop.sh
 
+step "deploy refuses a lab build (+ known-bad proof)"
+deploy/test-lab-guard.sh
+
 if [ "${SKIP_PILOT:-0}" != 1 ]; then
   step "pilot (release build)"
   examples/pilot/run.sh
