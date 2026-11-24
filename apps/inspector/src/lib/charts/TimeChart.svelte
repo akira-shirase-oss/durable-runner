@@ -250,8 +250,9 @@
 				{#if sinceX !== null}
 					<rect class="before" x={ML} y={MT} width={Math.max(0, sinceX - ML)} height={ph} />
 					<line class="start" x1={sinceX} x2={sinceX} y1={MT} y2={MT + ph} />
+					<!-- the label sits at the top of the region when the chart's "nothing here" note takes the middle -->
 					{#if sinceX - ML > 80}
-						<text class="start-lab" x={(ML + sinceX) / 2} y={MT + ph / 2} dy="0.32em" text-anchor="middle">before start</text>
+						<text class="start-lab" x={(ML + sinceX) / 2} y={hasData ? MT + ph / 2 : MT + 16} dy="0.32em" text-anchor="middle">before start</text>
 					{/if}
 				{/if}
 

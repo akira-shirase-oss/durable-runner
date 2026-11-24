@@ -23,10 +23,12 @@
 	let finished = false;
 	const runRes: Resource<RunItem> = new Resource((signal) => inspect(session.reader, id ?? '-', signal), {
 		interval: (): number => (finished ? 0 : POLL_MS),
+		goneOn404: true,
 	});
 	poll(runRes, () => id);
 	const tlRes: Resource<RunTimeline> = new Resource((signal) => runEvents(session.reader, id ?? '-', signal), {
 		interval: (): number => (finished && tlRes.data !== null && terminal(tlRes.data.state) ? 0 : POLL_MS),
+		goneOn404: true,
 	});
 	poll(tlRes, () => id);
 	$effect(() => {
