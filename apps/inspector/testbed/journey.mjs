@@ -319,8 +319,9 @@ await step(A, 'A makes B a viewer', async () => {
 	await A.waitForSelector('.banner.notice:has-text("viewer")', { timeout: 10_000 });
 }, { chain: 'b', needs: ['a', 'b'] });
 await step(B, 'B (viewer): no cancel, no spec, no handler changes', async () => {
+	// a full load (a same-document hash change followed by reload() races the router)
+	await B.goto('about:blank');
 	await B.goto(`${APP}#/handlers`, { waitUntil: 'networkidle' });
-	await B.reload({ waitUntil: 'networkidle' });
 	await B.waitForSelector('.rows li', { timeout: 10_000 });
 	if (await B.locator('#h-name').count()) throw new Error('a viewer sees the register form');
 	const r = await apiFromPage(B, 'PUT', '/handlers/sneaky', { url: 'https://example.com/x' }, wsA);
