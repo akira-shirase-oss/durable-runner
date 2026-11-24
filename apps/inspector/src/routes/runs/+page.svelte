@@ -26,7 +26,7 @@
 	let jumpError = $state<string | null>(null);
 	let actionError = $state<string | null>(null);
 
-	const res = new Resource((signal) => listRuns(session.readerKey, order, cursor, PAGE, signal));
+	const res = new Resource((signal) => listRuns(session.reader, order, cursor, PAGE, signal));
 	poll(res, () => [order, cursor]);
 
 	const runs = $derived(res.data?.runs ?? []);
@@ -70,7 +70,7 @@
 
 	async function cancel(id: string) {
 		try {
-			await cancelRun(id, session.apiKey);
+			await cancelRun(id, session.writer);
 			session.notice = `Run ${id} cancelled. A step already sent to its handler cannot be undone.`;
 			actionError = null;
 			void res.refresh(true);
@@ -83,7 +83,7 @@
 		e.preventDefault();
 		const id = parseRunId(jump);
 		if (id === null) {
-			jumpError = 'A run id is a whole number, like 10418';
+			jumpError = 'A run id is the 11-character id from the submit answer, like WBwXuaDUPWc';
 			return;
 		}
 		jumpError = null;
@@ -98,7 +98,7 @@
 	{#if actionError}
 		<p class="banner error"><Icon name="alert" size={16} /><span class="msg">{actionError}</span><button class="btn ghost sm act" onclick={() => (actionError = null)}>Dismiss</button></p>
 	{/if}
-	<Notice status={res.status} error={res.error} what="The run list" route="GET /jobs" stale={res.updatedAt} />
+	<Notice status={res.status} error={res.error} what="The run list" route="GET /jobs" stale={res.updatedAt} retry={() => res.refresh(true)} />
 
 	<section class="card" aria-labelledby="runs-title">
 		<div class="card-head toolbar">
@@ -114,7 +114,7 @@
 			<form class="jump" onsubmit={go}>
 				<label>
 					<span class="sr">Jump to run id</span>
-					<input class="mono" inputmode="numeric" placeholder="Run id" bind:value={jump} aria-invalid={jumpError ? 'true' : undefined} aria-describedby={jumpError ? 'jump-error' : undefined} />
+					<input class="mono" placeholder="Run id" bind:value={jump} aria-invalid={jumpError ? 'true' : undefined} aria-describedby={jumpError ? 'jump-error' : undefined} />
 				</label>
 				<button class="btn sm" type="submit">Open<Icon name="arrow-right" size={14} /></button>
 			</form>
@@ -143,7 +143,11 @@
 		{#if res.loading}
 			<p class="empty">Loading runs…</p>
 		{:else if runs.length === 0 && res.status === 'ok'}
-			<p class="empty">No runs yet. <a href="#/submit">Submit one</a></p>
+			{#if session.signedIn}
+				<p class="empty">No runs yet. <a href="#/workflows">Run a workflow</a>, send one from the <a href="#/overview">setup checklist</a>, or submit with an API key (<span class="mono">POST /jobs</span>).</p>
+			{:else}
+				<p class="empty">No runs yet. <a href="#/submit">Submit one</a></p>
+			{/if}
 		{:else if shown.length === 0 && runs.length > 0}
 			<p class="empty">No run on this page matches. <button class="link" onclick={() => { filter = 'all'; search = ''; }}>Clear filters</button></p>
 		{:else if shown.length > 0}
@@ -151,7 +155,7 @@
 				<RunsTable
 					runs={shown}
 					now={live.now}
-					canCancel={!!session.apiKey}
+					canCancel={session.canWrite}
 					oncancel={cancel}
 					caption="Runs, page {trail.length + 1}, {order === 'desc' ? 'newest' : 'oldest'} first"
 				/>
