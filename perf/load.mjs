@@ -1247,6 +1247,9 @@ async function runWorkspaces() {
         await put.arrayBuffer();
         const del = await fetch(`${API}/handlers/churn`, { method: 'DELETE', headers: keys[0].auth });
         await del.arrayBuffer();
+        // Registry mutations are limited per workspace (2/s, burst 20 —
+        // re-review S2-4): a 429 is the limit working, so wait it out.
+        if (put.status === 429 || del.status === 429) { await sleep(1000); continue; }
         if (put.status !== 200 || del.status !== 200) {
           console.error(`churn broke: put=${put.status} del=${del.status}`); return;
         }
@@ -1254,7 +1257,7 @@ async function runWorkspaces() {
       } catch {
         if (++churnErrors > 200) { console.error('churn abandoned: server unreachable'); return; }
       }
-      await sleep(5);
+      await sleep(1000); // one PUT + one DELETE per second: inside the limit
     }
   })();
   // Submit `per` runs per workspace, same op_key prefix in each — dedup is

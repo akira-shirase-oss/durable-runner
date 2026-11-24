@@ -764,76 +764,140 @@ enum RegistryWrite {
     },
 }
 
+/// The most queued writes one save covers.
+const REGISTRY_BATCH: usize = 512;
+
 /// The single writer of `handlers.json`. Mutations apply in send order;
 /// a reconcile snapshot lands only while the epoch it read still holds —
 /// the check is inside the serialization, so an overtaken pass can never
 /// overwrite a mutation that already won.
+///
+/// Re-review S2-4: the file is read once and kept in memory; each wake
+/// drains everything queued (up to `REGISTRY_BATCH`), applies it in order,
+/// and saves ONCE if anything changed — one tmp-write and two fsyncs per
+/// batch, none for a batch that changed nothing. A failed save answers
+/// every changing write in the batch with the error and keeps the last
+/// saved state, so memory never runs ahead of the disk.
 fn registry_writer(
     path: PathBuf,
     epoch: Arc<std::sync::atomic::AtomicU64>,
     rx: std::sync::mpsc::Receiver<RegistryWrite>,
+    saves: Arc<std::sync::atomic::AtomicU64>,
 ) {
-    while let Ok(op) = rx.recv() {
-        let mut all = match load_registry_file(&path) {
-            Ok(v) => v,
-            Err(e) => {
-                // Unreadable or corrupt last-known-good: never merge
-                // onto an empty view — the write would erase every
-                // workspace's rows. Report it; the caller's 503 is the
-                // honest answer (re-review #8).
-                eprintln!("durable-server: {e}");
-                let ack = match op {
-                    RegistryWrite::Upsert { ack, .. }
-                    | RegistryWrite::Remove { ack, .. }
-                    | RegistryWrite::ReplaceWs { ack, .. }
-                    | RegistryWrite::Snapshot { ack, .. } => ack,
-                };
-                let _ = ack.send(Err(e));
-                continue;
+    let mut saved: Option<Vec<RegistryEntry>> = None;
+    while let Ok(first) = rx.recv() {
+        let mut batch = vec![first];
+        // ATTACK(registry-batch)
+        while batch.len() < REGISTRY_BATCH {
+            match rx.try_recv() {
+                Ok(op) => batch.push(op),
+                Err(_) => break,
             }
-        };
-        let ack = match op {
-            RegistryWrite::Upsert { entry, ack } => {
-                all.retain(|e| !(e.ws == entry.ws && e.name == entry.name));
-                all.push(entry);
-                ack
-            }
-            RegistryWrite::Remove { ws, name, ack } => {
-                all.retain(|e| !(e.ws == ws && e.name == name));
-                ack
-            }
-            RegistryWrite::ReplaceWs { ws, entries, ack } => {
-                all.retain(|e| e.ws != ws);
-                all.extend(entries);
-                ack
-            }
-            RegistryWrite::Snapshot {
-                entries,
-                preserve_ws,
-                epoch_seen,
-                ack,
-            } => {
-                let r = if epoch.load(std::sync::atomic::Ordering::Acquire) == epoch_seen {
-                    all.retain(|e| preserve_ws.contains(&e.ws));
-                    all.extend(entries);
-                    save_registry_file(&path, &all)
-                        .map_err(|e| anyhow::anyhow!("cannot write {path:?}: {e}"))
-                } else {
-                    eprintln!(
-                        "durable-server: registry reconcile discarded a pass overtaken by a mutation"
-                    );
-                    Ok(())
-                };
-                let _ = ack.send(r);
-                continue;
-            }
-        };
-        let r = save_registry_file(&path, &all)
-            .map_err(|e| anyhow::anyhow!("cannot write {path:?}: {e}"));
-        if let Err(e) = &r {
-            eprintln!("durable-server: {e}");
         }
-        let _ = ack.send(r);
+        if saved.is_none() {
+            match load_registry_file(&path) {
+                Ok(v) => saved = Some(v),
+                Err(e) => {
+                    // Unreadable or corrupt last-known-good: never merge
+                    // onto an empty view — the write would erase every
+                    // workspace's rows. Report it; the caller's 503 is the
+                    // honest answer (re-review #8).
+                    eprintln!("durable-server: {e}");
+                    let msg = e.to_string();
+                    for op in batch {
+                        let _ = op.into_ack().send(Err(anyhow::anyhow!("{msg}")));
+                    }
+                    continue;
+                }
+            }
+        }
+        let Some(current) = saved.as_ref() else {
+            continue;
+        };
+        let mut all = current.clone();
+        // (ack, whether this write changed the file)
+        let mut acks = Vec::with_capacity(batch.len());
+        for op in batch {
+            let before = all.len();
+            let changed = match op {
+                RegistryWrite::Upsert { entry, ack } => {
+                    let same = all.iter().any(|e| {
+                        e.ws == entry.ws
+                            && e.name == entry.name
+                            && e.url == entry.url
+                            && e.secret == entry.secret
+                    });
+                    if !same {
+                        all.retain(|e| !(e.ws == entry.ws && e.name == entry.name));
+                        all.push(entry);
+                    }
+                    acks.push((ack, !same));
+                    continue;
+                }
+                RegistryWrite::Remove { ws, name, ack } => {
+                    all.retain(|e| !(e.ws == ws && e.name == name));
+                    acks.push((ack, all.len() != before));
+                    continue;
+                }
+                RegistryWrite::ReplaceWs { ws, entries, ack } => {
+                    all.retain(|e| e.ws != ws);
+                    all.extend(entries);
+                    acks.push((ack, true));
+                    continue;
+                }
+                RegistryWrite::Snapshot {
+                    entries,
+                    preserve_ws,
+                    epoch_seen,
+                    ack,
+                } => {
+                    if epoch.load(std::sync::atomic::Ordering::Acquire) == epoch_seen {
+                        all.retain(|e| preserve_ws.contains(&e.ws));
+                        all.extend(entries);
+                        (ack, true)
+                    } else {
+                        eprintln!(
+                            "durable-server: registry reconcile discarded a pass overtaken by a mutation"
+                        );
+                        (ack, false)
+                    }
+                }
+            };
+            acks.push(changed);
+        }
+        let any_change = acks.iter().any(|(_, c)| *c) && all != *current;
+        let result = if any_change {
+            let r = save_registry_file(&path, &all)
+                .map_err(|e| anyhow::anyhow!("cannot write {path:?}: {e}"));
+            match &r {
+                Ok(()) => {
+                    saves.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    saved = Some(all);
+                }
+                Err(e) => eprintln!("durable-server: {e}"),
+            }
+            r.map_err(|e| e.to_string())
+        } else {
+            Ok(())
+        };
+        for (ack, changed) in acks {
+            let r = match (&result, changed) {
+                (Err(msg), true) => Err(anyhow::anyhow!("{msg}")),
+                _ => Ok(()),
+            };
+            let _ = ack.send(r);
+        }
+    }
+}
+
+impl RegistryWrite {
+    fn into_ack(self) -> tokio::sync::oneshot::Sender<Result<()>> {
+        match self {
+            RegistryWrite::Upsert { ack, .. }
+            | RegistryWrite::Remove { ack, .. }
+            | RegistryWrite::ReplaceWs { ack, .. }
+            | RegistryWrite::Snapshot { ack, .. } => ack,
+        }
     }
 }
 
@@ -861,23 +925,134 @@ impl Default for RegistryLocks {
     }
 }
 
-/// Spawn the registry writer thread; the sender goes in `App`.
+/// Spawn the registry writer thread; the sender goes in `App`. `saves`
+/// counts the file saves it makes.
 fn spawn_registry_writer(
     path: Arc<Path>,
     epoch: Arc<std::sync::atomic::AtomicU64>,
+    saves: Arc<std::sync::atomic::AtomicU64>,
 ) -> std::sync::mpsc::SyncSender<RegistryWrite> {
     let (tx, rx) = std::sync::mpsc::sync_channel::<RegistryWrite>(512);
     let path = path.to_path_buf();
     std::thread::Builder::new()
         .name("registry-writer".into())
-        .spawn(move || registry_writer(path, epoch, rx))
+        .spawn(move || registry_writer(path, epoch, rx, saves))
         .unwrap_or_else(|e| panic!("registry writer thread: {e}"));
     tx
+}
+
+/// API registry mutations (PUT/DELETE a handler, rotate the secret) a
+/// workspace may make per second, and its burst (re-review S2-4: one
+/// tenant at 100/s cost 200 fsyncs/s on the journal's disk and three
+/// store queries each).
+const REGISTRY_MUTATIONS_PER_SEC: f64 = 2.0;
+const REGISTRY_MUTATION_BURST: f64 = 20.0;
+/// Workspaces whose mutation buckets are kept at once (full, idle ones
+/// are dropped first; past it every newcomer waits a second).
+const REGISTRY_RATE_TABLE: usize = 4096;
+
+/// The registry's per-process state beside the writer thread.
+#[derive(Debug, Default)]
+struct RegistryState {
+    /// What this process has armed from the API (store rows, not
+    /// `--handler` flags): ws → name → url. A PUT of exactly what is
+    /// armed is a no-op (re-review S2-4). Kept by every mutation, the
+    /// reconcile pass and the startup snapshot.
+    view: std::sync::Mutex<HashMap<u64, HashMap<String, String>>>,
+    /// Per-workspace mutation buckets: (tokens, refilled at).
+    rate: std::sync::Mutex<HashMap<u64, (f64, Instant)>>,
+    /// File saves the writer has made (tests and diagnostics).
+    saves: Arc<std::sync::atomic::AtomicU64>,
+}
+
+impl RegistryState {
+    fn armed(&self, ws: u64, name: &str) -> Option<String> {
+        self.view
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&ws)
+            .and_then(|m| m.get(name).cloned())
+    }
+
+    fn set(&self, ws: u64, name: &str, url: &str) {
+        self.view
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .entry(ws)
+            .or_default()
+            .insert(name.to_string(), url.to_string());
+    }
+
+    fn remove(&self, ws: u64, name: &str) {
+        let mut v = self.view.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(m) = v.get_mut(&ws) {
+            m.remove(name);
+            if m.is_empty() {
+                v.remove(&ws);
+            }
+        }
+    }
+
+    fn replace_ws(&self, ws: u64, rows: impl IntoIterator<Item = (String, String)>) {
+        let m: HashMap<String, String> = rows.into_iter().collect();
+        let mut v = self.view.lock().unwrap_or_else(|e| e.into_inner());
+        if m.is_empty() {
+            v.remove(&ws);
+        } else {
+            v.insert(ws, m);
+        }
+    }
+
+    /// Ok: `ws` may mutate its registry now. Err: refuse, retry after.
+    fn admit(&self, ws: u64, now: Instant) -> Result<(), Duration> {
+        let mut m = self.rate.lock().unwrap_or_else(|e| e.into_inner());
+        if !m.contains_key(&ws) && m.len() >= REGISTRY_RATE_TABLE {
+            m.retain(|_, (tokens, at)| {
+                let refill =
+                    now.saturating_duration_since(*at).as_secs_f64() * REGISTRY_MUTATIONS_PER_SEC;
+                *tokens + refill < REGISTRY_MUTATION_BURST
+            });
+            if m.len() >= REGISTRY_RATE_TABLE {
+                return Err(Duration::from_secs(1));
+            }
+        }
+        let (tokens, at) = m.entry(ws).or_insert((REGISTRY_MUTATION_BURST, now));
+        let refill = now.saturating_duration_since(*at).as_secs_f64() * REGISTRY_MUTATIONS_PER_SEC;
+        *tokens = (*tokens + refill).min(REGISTRY_MUTATION_BURST);
+        *at = now;
+        if *tokens >= 1.0 {
+            *tokens -= 1.0;
+            Ok(())
+        } else {
+            Err(Duration::from_secs_f64(
+                (1.0 - *tokens) / REGISTRY_MUTATIONS_PER_SEC,
+            ))
+        }
+    }
+}
+
+/// The per-workspace registry-mutation limit, as the API's refusal.
+fn registry_rate(app: &App, ws: u64) -> Result<(), ApiError> {
+    // ATTACK(registry-rate)
+    app.registry.admit(ws, Instant::now()).map_err(|wait| {
+        ApiError::new(
+            StatusCode::TOO_MANY_REQUESTS,
+            "registry_rate_limited",
+            format!(
+                "this workspace changes its handler registry too often; retry in {} s",
+                wait.as_secs().max(1)
+            ),
+        )
+    })
 }
 
 /// One reconcile pass: store truth → engine registry + snapshot file.
 /// `flags` are the ws-0 `--handler` registrations — they union with the
 /// store's ws-0 rows (a store row shadows a flag on a name conflict).
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the pass's collaborators are App's registry fields; tests drive it with each one"
+)]
 async fn registry_sync(
     store: &Arc<dyn AccountStore>,
     engine: &Engine,
@@ -886,6 +1061,7 @@ async fn registry_sync(
     tx: &std::sync::mpsc::SyncSender<RegistryWrite>,
     epoch: &std::sync::atomic::AtomicU64,
     locks: &RegistryLocks,
+    view: &RegistryState,
 ) -> Result<(), AccountError> {
     // A mutation anywhere in the pass's read window makes its applies
     // stale — bail out; the mutation applied itself and the next pass
@@ -972,8 +1148,13 @@ async fn registry_sync(
             preserve_ws.push(ws.id);
             continue;
         }
-        // The snapshot file mirrors what the engine actually armed — a
-        // refused set (over the per-ws bound, dead channel) never lands.
+        // The snapshot file and the armed view mirror what the engine
+        // actually armed — a refused set (over the per-ws bound, dead
+        // channel) never lands.
+        view.replace_ws(
+            ws.id,
+            accepted.iter().map(|e| (e.name.clone(), e.url.clone())),
+        );
         all.extend(accepted);
     }
     if refused > 0 {
@@ -1033,9 +1214,14 @@ fn spawn_registry_reconcile(
     let tx = app.registry_tx.clone();
     let epoch = Arc::clone(&app.registry_epoch);
     let locks = Arc::clone(&app.registry_locks);
+    let view = Arc::clone(&app.registry);
     tokio::spawn(async move {
         loop {
-            match registry_sync(&store, &engine, &factory, &flags, &tx, &epoch, &locks).await {
+            match registry_sync(
+                &store, &engine, &factory, &flags, &tx, &epoch, &locks, &view,
+            )
+            .await
+            {
                 Ok(()) => stale.store(false, std::sync::atomic::Ordering::Relaxed),
                 Err(e) => {
                     stale.store(true, std::sync::atomic::Ordering::Relaxed);
@@ -1293,6 +1479,8 @@ struct App {
     /// Per-workspace stripes serializing route mutations against the
     /// reconciler's read+apply of the same workspace (finding 4).
     registry_locks: Arc<RegistryLocks>,
+    /// The armed view, the per-workspace mutation limit, the save count.
+    registry: Arc<RegistryState>,
     /// Opaque public run ids (S2 #7): every run id crosses the API
     /// through this keyed permutation, so no response reveals the
     /// global sequence or another workspace's volume.
@@ -1310,8 +1498,8 @@ async fn arm_snapshot(
     entries: Vec<RegistryEntry>,
     factory: &HandlerFactory,
     engine: &Engine,
-) -> usize {
-    let mut armed = 0;
+) -> Vec<(u64, String, String)> {
+    let mut armed = Vec::new();
     for entry in entries {
         // ATTACK(startup-recheck)
         let ok = reqwest::Url::parse(&entry.url)
@@ -1340,7 +1528,7 @@ async fn arm_snapshot(
         }
         let h = factory.make_signed(&entry.url, secret);
         match engine.put_handler(entry.ws, &entry.name, h).await {
-            Ok(()) => armed += 1,
+            Ok(()) => armed.push((entry.ws, entry.name, entry.url)),
             Err(e) => eprintln!(
                 "durable-server: snapshot handler {:?} refused at startup: {e}",
                 entry.name
@@ -1387,9 +1575,11 @@ fn test_app(
 ) -> App {
     let pubid = pubid::PubId::load_or_generate(journal_dir).unwrap_or_else(|e| panic!("{e}"));
     let registry_epoch = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let registry = Arc::new(RegistryState::default());
     let registry_tx = spawn_registry_writer(
         Arc::from(journal_dir.join("handlers.json").as_path()),
         Arc::clone(&registry_epoch),
+        Arc::clone(&registry.saves),
     );
     let obs = engine.observer().clone();
     App {
@@ -1413,6 +1603,7 @@ fn test_app(
         registry_tx,
         registry_epoch,
         registry_locks: Arc::new(RegistryLocks::default()),
+        registry,
         pubid,
         obs,
     }
@@ -1614,6 +1805,11 @@ impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
         let body = Json(serde_json::json!({ "error": self.message, "code": self.code }));
         let mut res = (self.status, body).into_response();
+        if self.status == StatusCode::TOO_MANY_REQUESTS {
+            // A refusal the server chooses carries Retry-After (S2 N4).
+            res.headers_mut()
+                .insert(header::RETRY_AFTER, header::HeaderValue::from_static("1"));
+        }
         if self.status == StatusCode::UNAUTHORIZED {
             res.headers_mut().insert(
                 header::WWW_AUTHENTICATE,
@@ -2605,10 +2801,19 @@ async fn put_handler(
     }
     // ATTACK(tenant-register-policy)
     let url = valid_handler_url(body.url.trim(), &app.handler_factory.store_policy)?;
+    registry_rate(&app, auth.ws)?;
     // Finding 4: the bound check, the store write, the engine update and
     // the snapshot send are one critical section per workspace — a
     // reconcile's list+apply cannot interleave between them.
     let _ws_guard = app.registry_locks.stripe(auth.ws).lock().await;
+    // Re-review S2-4: exactly what is armed is a no-op — no store query,
+    // no epoch bump, no engine update, no file write.
+    // ATTACK(registry-noop-skip)
+    if app.registry.armed(auth.ws, name).as_deref() == Some(url.as_str()) {
+        return Ok(Json(
+            serde_json::json!({ "name": name, "url": url, "unchanged": true }),
+        ));
+    }
     // The 256 bound lives in the engine, but the store must never hold a
     // row the engine refuses: one over-limit row would poison every
     // later reconcile of this workspace's set. Check before writing —
@@ -2657,6 +2862,7 @@ async fn put_handler(
             app.handler_factory.make_signed(&url, secret.clone()),
         )
         .await?;
+    app.registry.set(auth.ws, name, &url);
     registry_file_upsert(
         &app,
         RegistryEntry {
@@ -2680,6 +2886,7 @@ async fn rotate_handler_secret(
     State(app): State<App>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let store = accounts(&app)?;
+    registry_rate(&app, auth.ws)?;
     // Bump before the store write — same epoch ordering as PUT (S3).
     app.registry_epoch
         .fetch_add(1, std::sync::atomic::Ordering::Release);
@@ -2720,6 +2927,10 @@ async fn rotate_handler_secret(
         });
     }
     app.engine.set_workspace_handlers(auth.ws, set).await?;
+    app.registry.replace_ws(
+        auth.ws,
+        entries.iter().map(|e| (e.name.clone(), e.url.clone())),
+    );
     registry_file_replace_ws(&app, auth.ws, entries).await?;
     Ok(Json(serde_json::json!({ "secret": hex(&secret) })))
 }
@@ -2730,6 +2941,7 @@ async fn delete_handler(
     P(name): P<String>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let store = accounts(&app)?;
+    registry_rate(&app, auth.ws)?;
     // Bump before the store write — same epoch ordering as PUT (S3).
     app.registry_epoch
         .fetch_add(1, std::sync::atomic::Ordering::Release);
@@ -2748,6 +2960,7 @@ async fn delete_handler(
         ));
     }
     app.engine.delete_handler(auth.ws, &name)?;
+    app.registry.remove(auth.ws, &name);
     registry_file_remove(&app, auth.ws, &name).await?;
     Ok(Json(serde_json::json!({ "deleted": name })))
 }
@@ -3191,15 +3404,22 @@ async fn main() -> Result<()> {
             );
         }
     }
+    let registry = Arc::new(RegistryState::default());
     if store.is_some() {
         let entries = load_registry_file(&registry_file)
             .with_context(|| format!("loading {registry_file:?}"))?;
-        arm_snapshot(entries, &factory, &engine).await;
+        for (ws, name, url) in arm_snapshot(entries, &factory, &engine).await {
+            registry.set(ws, &name, &url);
+        }
     }
     let stopped = engine.clone();
     let registry_stale = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let registry_epoch = Arc::new(std::sync::atomic::AtomicU64::new(0));
-    let registry_tx = spawn_registry_writer(registry_file.clone(), Arc::clone(&registry_epoch));
+    let registry_tx = spawn_registry_writer(
+        registry_file.clone(),
+        Arc::clone(&registry_epoch),
+        Arc::clone(&registry.saves),
+    );
     let obs = engine.observer().clone();
     let app = App {
         engine,
@@ -3213,6 +3433,7 @@ async fn main() -> Result<()> {
         registry_tx,
         registry_epoch,
         registry_locks: Arc::new(RegistryLocks::default()),
+        registry,
         pubid,
         obs: obs.clone(),
     };
@@ -6566,6 +6787,7 @@ mod tests {
             &app.registry_tx,
             &app.registry_epoch,
             &app.registry_locks,
+            &app.registry,
         )
         .await
         .unwrap_or_else(|e| panic!("{e}"));
@@ -6604,7 +6826,7 @@ mod tests {
             StatusCode::CONFLICT,
             "a planted local snapshot row was armed at startup"
         );
-        assert_eq!(armed, 1);
+        assert_eq!(armed.len(), 1);
     }
 
     /// The reconciler's outage path: with the store down the engine keeps
@@ -6648,6 +6870,7 @@ mod tests {
             &h.app.registry_tx,
             &h.app.registry_epoch,
             &h.app.registry_locks,
+            &h.app.registry,
         )
         .await
         .unwrap_or_else(|e| panic!("{e}"));
@@ -6679,6 +6902,7 @@ mod tests {
                 &h.app.registry_tx,
                 &h.app.registry_epoch,
                 &h.app.registry_locks,
+                &h.app.registry,
             )
             .await
             .is_err(),
@@ -6847,6 +7071,284 @@ mod tests {
         }
     }
 
+    /// A `Memory` store that counts the registry's store work.
+    struct CountStore {
+        inner: Arc<durable_accounts::Memory>,
+        registry_calls: std::sync::atomic::AtomicU64,
+    }
+
+    impl CountStore {
+        fn bump(&self) {
+            self.registry_calls
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+        fn calls(&self) -> u64 {
+            self.registry_calls
+                .load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl AccountStore for CountStore {
+        async fn verify_key(&self, h: &[u8; 32]) -> Result<Option<KeyGrant>, AccountError> {
+            self.inner.verify_key(h).await
+        }
+        async fn workspace_by_id(&self, id: u64) -> Result<Option<Workspace>, AccountError> {
+            self.bump();
+            self.inner.workspace_by_id(id).await
+        }
+        async fn workspace_by_public_id(
+            &self,
+            public_id: uuid::Uuid,
+        ) -> Result<Option<Workspace>, AccountError> {
+            self.inner.workspace_by_public_id(public_id).await
+        }
+        async fn create_workspace(&self, name: &str) -> Result<Workspace, AccountError> {
+            self.inner.create_workspace(name).await
+        }
+        async fn list_workspaces(
+            &self,
+            limit: u32,
+            after: Option<u64>,
+        ) -> Result<Vec<Workspace>, AccountError> {
+            self.inner.list_workspaces(limit, after).await
+        }
+        async fn create_key(
+            &self,
+            workspace: u64,
+            name: &str,
+            permission: Permission,
+            key_hash: &[u8; 32],
+            prefix: &str,
+        ) -> Result<ApiKeyInfo, AccountError> {
+            self.inner
+                .create_key(workspace, name, permission, key_hash, prefix)
+                .await
+        }
+        async fn revoke_key(
+            &self,
+            workspace: u64,
+            key_id: u64,
+        ) -> Result<Option<[u8; 32]>, AccountError> {
+            self.inner.revoke_key(workspace, key_id).await
+        }
+        async fn list_keys(&self, workspace: u64) -> Result<Vec<ApiKeyInfo>, AccountError> {
+            self.inner.list_keys(workspace).await
+        }
+        async fn list_handlers(
+            &self,
+            workspace: u64,
+        ) -> Result<Vec<HandlerRegistration>, AccountError> {
+            self.bump();
+            self.inner.list_handlers(workspace).await
+        }
+        async fn put_handler(
+            &self,
+            workspace: u64,
+            name: &str,
+            url: &str,
+        ) -> Result<(), AccountError> {
+            self.bump();
+            self.inner.put_handler(workspace, name, url).await
+        }
+        async fn delete_handler(&self, workspace: u64, name: &str) -> Result<bool, AccountError> {
+            self.bump();
+            self.inner.delete_handler(workspace, name).await
+        }
+        async fn rotate_handler_secret(
+            &self,
+            workspace: u64,
+        ) -> Result<Option<[u8; 32]>, AccountError> {
+            self.bump();
+            self.inner.rotate_handler_secret(workspace).await
+        }
+    }
+
+    /// A Memory-backed harness with two tenants, A and B, each with an
+    /// admin key, behind a store that counts registry work.
+    async fn two_tenant_registry() -> (Harness, Arc<CountStore>, &'static str, &'static str) {
+        let inner = Arc::new(durable_accounts::Memory::new());
+        let key_a = "dr_3c13c13c13c13c13c13c13c13c13c13c13c13c13c13c13c1";
+        let key_b = "dr_3c23c23c23c23c23c23c23c23c23c23c23c23c23c23c23c2";
+        for (name, key) in [("ra", key_a), ("rb", key_b)] {
+            let w = inner
+                .create_workspace(name)
+                .await
+                .unwrap_or_else(|e| panic!("{e}"));
+            inner
+                .create_key(
+                    w.id,
+                    "k",
+                    Permission::Admin,
+                    &sha256(key.as_bytes()),
+                    "dr_3",
+                )
+                .await
+                .unwrap_or_else(|e| panic!("{e}"));
+        }
+        let store = Arc::new(CountStore {
+            inner,
+            registry_calls: std::sync::atomic::AtomicU64::new(0),
+        });
+        let h = harness_store(true, None, Some(store.clone()));
+        (h, store, key_a, key_b)
+    }
+
+    /// Re-review S2-4: a PUT of exactly what is armed is a no-op — no
+    /// store query, no epoch bump, no file save; a changed URL is not.
+    #[tokio::test]
+    async fn a_noop_put_does_no_store_epoch_or_disk_work() {
+        let (h, store, key_a, _) = two_tenant_registry().await;
+        let put = |url: &'static str| {
+            let r = h.router.clone();
+            async move {
+                call(
+                    &r,
+                    "PUT",
+                    "/handlers/h",
+                    Some(key_a),
+                    Some(json!({ "url": url })),
+                )
+                .await
+            }
+        };
+        let (status, v) = put("http://127.0.0.1:9/a").await;
+        assert_eq!(status, StatusCode::OK, "{v}");
+        let saves = || {
+            h.app
+                .registry
+                .saves
+                .load(std::sync::atomic::Ordering::SeqCst)
+        };
+        let epoch = || {
+            h.app
+                .registry_epoch
+                .load(std::sync::atomic::Ordering::SeqCst)
+        };
+        let (calls0, epoch0, saves0) = (store.calls(), epoch(), saves());
+        assert_eq!(saves0, 1, "the first PUT saved once");
+        for _ in 0..5 {
+            let (status, v) = put("http://127.0.0.1:9/a").await;
+            assert_eq!(
+                (status, v["unchanged"].clone()),
+                (StatusCode::OK, json!(true))
+            );
+        }
+        assert_eq!(
+            (store.calls(), epoch(), saves()),
+            (calls0, epoch0, saves0),
+            "a no-op PUT did store, epoch or disk work"
+        );
+        let (status, _) = put("http://127.0.0.1:9/b").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(saves(), saves0 + 1, "a changed URL is saved");
+    }
+
+    /// Re-review S2-4: each workspace's registry mutations are rate
+    /// limited (2/s, burst 20) — the 21st in a burst is 429 with
+    /// Retry-After; another workspace is unaffected.
+    #[tokio::test]
+    async fn registry_mutations_are_rate_limited_per_workspace() {
+        let (h, store, key_a, key_b) = two_tenant_registry().await;
+        let mut refused = None;
+        for i in 0..25 {
+            let (status, v) = call(
+                &h.router,
+                "PUT",
+                &format!("/handlers/h{i}"),
+                Some(key_a),
+                Some(json!({ "url": format!("http://127.0.0.1:9/{i}") })),
+            )
+            .await;
+            if status != StatusCode::OK {
+                refused = Some((i, status, v["code"].clone()));
+                break;
+            }
+        }
+        assert_eq!(
+            refused,
+            Some((
+                20,
+                StatusCode::TOO_MANY_REQUESTS,
+                json!("registry_rate_limited")
+            )),
+            "the burst is 20"
+        );
+        let calls = store.calls();
+        let (status, headers, _) = {
+            let req = Request::builder()
+                .method("DELETE")
+                .uri("/handlers/h0")
+                .header("authorization", format!("Bearer {key_a}"))
+                .body(Body::empty())
+                .unwrap_or_else(|e| panic!("{e}"));
+            let res = h
+                .router
+                .clone()
+                .oneshot(req)
+                .await
+                .unwrap_or_else(|e| panic!("{e}"));
+            (res.status(), res.headers().clone(), ())
+        };
+        assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+        assert!(headers.get(header::RETRY_AFTER).is_some(), "Retry-After");
+        assert_eq!(store.calls(), calls, "a refused mutation did store work");
+        let (status, v) = call(
+            &h.router,
+            "PUT",
+            "/handlers/x",
+            Some(key_b),
+            Some(json!({ "url": "http://127.0.0.1:9/x" })),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "another workspace is unaffected: {v}"
+        );
+    }
+
+    /// Re-review S2-4: the writer saves once per batch of queued writes —
+    /// 100 upserts queued before it wakes are one tmp-write and two fsyncs.
+    #[test]
+    fn the_registry_writer_saves_once_per_batch() {
+        let d = tempfile::tempdir().unwrap_or_else(|e| panic!("{e}"));
+        let path = d.path().join("handlers.json");
+        let (tx, rx) = std::sync::mpsc::sync_channel::<RegistryWrite>(512);
+        let mut acks = Vec::new();
+        for i in 0..100u64 {
+            let (ack, rx_ack) = tokio::sync::oneshot::channel();
+            tx.send(RegistryWrite::Upsert {
+                entry: RegistryEntry {
+                    ws: 1,
+                    name: format!("h{i}"),
+                    url: format!("http://example.com/{i}"),
+                    secret: None,
+                },
+                ack,
+            })
+            .unwrap_or_else(|e| panic!("{e}"));
+            acks.push(rx_ack);
+        }
+        drop(tx);
+        let saves = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        registry_writer(
+            path.clone(),
+            Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            rx,
+            Arc::clone(&saves),
+        );
+        assert_eq!(
+            saves.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "one save per batch"
+        );
+        assert_eq!(load_registry_file(&path).map(|v| v.len()).ok(), Some(100));
+        for mut a in acks {
+            assert!(matches!(a.try_recv(), Ok(Ok(()))));
+        }
+    }
+
     /// Finding 4 (S2): the epoch bumps *before* the store write, so a
     /// pass that read the new epoch could still list the pre-commit row
     /// — its apply then re-armed a deleted handler in the engine and
@@ -6931,8 +7433,12 @@ mod tests {
             let tx = h.app.registry_tx.clone();
             let epoch = Arc::clone(&h.app.registry_epoch);
             let locks = Arc::clone(&h.app.registry_locks);
+            let view = Arc::clone(&h.app.registry);
             tokio::spawn(async move {
-                registry_sync(&dyn_store, &engine, &factory, &flags, &tx, &epoch, &locks).await
+                registry_sync(
+                    &dyn_store, &engine, &factory, &flags, &tx, &epoch, &locks, &view,
+                )
+                .await
             })
         };
         if held {
@@ -7012,10 +7518,6 @@ mod tests {
             )
             .await
             .unwrap_or_else(|e| panic!("{e}"));
-        store
-            .put_handler(ws.id, "h", "http://127.0.0.1:9/h")
-            .await
-            .unwrap_or_else(|e| panic!("{e}"));
         assert!(
             store
                 .verify_key(&sha256(key.as_bytes()))
@@ -7024,6 +7526,17 @@ mod tests {
                 .is_some(),
             "probe: the store does not see the seeded key"
         );
+        // The row is in the file (the writer skips a write that changes
+        // nothing — re-review S2-4 — so the DELETE must change it).
+        let (status, v) = call(
+            &h.router,
+            "PUT",
+            "/handlers/h",
+            Some(key),
+            Some(json!({ "url": "http://127.0.0.1:9/h" })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{v}");
         // The writer cannot persist: the file's directory refuses writes.
         let dir = h
             .app

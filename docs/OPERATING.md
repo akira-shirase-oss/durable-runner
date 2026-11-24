@@ -172,6 +172,16 @@ target/release/durable-server \
   in flight are abandoned and reconcile after the restart. Give the
   supervisor at least twice the drain timeout (systemd
   `TimeoutStopSec=70`).
+- **Registry mutations are bounded per workspace** (re-review S2-4):
+  `PUT`/`DELETE /handlers/{name}` and `POST /handler-secret` admit 2 per
+  second per workspace with a burst of 20, else `429
+  registry_rate_limited` with `Retry-After` (before any store query). A
+  `PUT` of exactly the URL already armed is a no-op (`"unchanged": true`:
+  no store query, no file write). `handlers.json` is written by one thread
+  that keeps the file in memory, drains every queued change and saves once
+  per batch (one tmp-write and two fsyncs), none for a batch that changed
+  nothing. A row edited in the store outside the API is reconciled within
+  30 s.
 - A handler call is `POST URL` with `{"input": [bytes], "idem_key":
   "<op_key>/<step index>"}` and the headers `x-idempotency-key` (the same
   key), `x-durable-run-id`, `x-durable-step` (the step's index) and
