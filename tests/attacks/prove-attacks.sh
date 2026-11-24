@@ -16,6 +16,7 @@
 #   tests/attacks/prove-attacks.sh [--out FILE]   (FILE: a JSON record)
 #   tests/attacks/prove-attacks.sh --discover     (print where each
 #                                                  mutant's test fails)
+#   PROVE_ONLY=row,row tests/attacks/prove-attacks.sh   (chosen rows)
 #
 # Unit rows (`unit:<crate>`) name the test by its full path and run it
 # with --exact. The attacks suite itself compiles once (into
@@ -148,8 +149,14 @@ fi
 
 failures=0
 results=()
+ran=0
 for row in "${mutations[@]}"; do
   IFS='|' read -r name file target test subst <<<"$row"
+  # PROVE_ONLY=name,name re-proves chosen rows (a CI run proves all).
+  if [ -n "${PROVE_ONLY:-}" ] && [[ ",$PROVE_ONLY," != *",$name,"* ]]; then
+    continue
+  fi
+  ran=$((ran + 1))
   pattern="${subst%%~~>*}"
   replacement="${subst#*~~>}"
   cp "$here/$file" "$work/$file"
@@ -214,6 +221,10 @@ for row in "${mutations[@]}"; do
   results+=("{\"name\":\"$name\",\"test\":\"$test\",\"seconds\":$seconds,\"verdict\":\"$verdict\"}")
 done
 
+if [ "$ran" -eq 0 ]; then
+  echo "prove-attacks: no row ran (PROVE_ONLY=${PROVE_ONLY:-} names none)" >&2
+  exit 1
+fi
 if [ -n "$out" ]; then
   printf '{\n  "mutations": [\n    %s\n  ]\n}\n' "$(IFS=,; echo "${results[*]}")" > "$out"
 fi

@@ -4261,7 +4261,7 @@ mod tests {
                 .submit_at(
                     OperationKey("ghost".into()),
                     spec1("gone"),
-                    wall_ms() + 1_500,
+                    wall_ms() + 2_500,
                 )
                 .await
                 .unwrap_or_else(|e| panic!("{e}"));

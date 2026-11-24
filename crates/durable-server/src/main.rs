@@ -7257,13 +7257,13 @@ mod tests {
     }
 
     /// Re-review S2-4: each workspace's registry mutations are rate
-    /// limited (2/s, burst 20) — the 21st in a burst is 429 with
-    /// Retry-After; another workspace is unaffected.
+    /// limited (2/s, burst 20) — past the burst a mutation is 429 with
+    /// Retry-After and no store work; another workspace is unaffected.
     #[tokio::test]
     async fn registry_mutations_are_rate_limited_per_workspace() {
         let (h, store, key_a, key_b) = two_tenant_registry().await;
         let mut refused = None;
-        for i in 0..25 {
+        for i in 0..100 {
             let (status, v) = call(
                 &h.router,
                 "PUT",
@@ -7277,15 +7277,14 @@ mod tests {
                 break;
             }
         }
+        // The exact count is the unit test's (an injected clock); here the
+        // clock is real, so tokens may refill while the burst runs.
         // DECISIVE(registry-rate)
-        assert_eq!(
-            refused,
-            Some((
-                20,
-                StatusCode::TOO_MANY_REQUESTS,
-                json!("registry_rate_limited")
-            )),
-            "the burst is 20"
+        assert!(
+            matches!(&refused, Some((i, s, c))
+                if *i >= 20 && *s == StatusCode::TOO_MANY_REQUESTS
+                    && *c == json!("registry_rate_limited")),
+            "the burst is 20, then 429 registry_rate_limited: {refused:?}"
         );
         let calls = store.calls();
         let (status, headers, _) = {
@@ -7319,6 +7318,30 @@ mod tests {
             StatusCode::OK,
             "another workspace is unaffected: {v}"
         );
+    }
+
+    /// The registry limiter's arithmetic on an injected clock: a burst of
+    /// 20, then 2 per second, per workspace; idle full buckets make room
+    /// at the table's cap.
+    #[test]
+    fn the_registry_limiter_is_a_per_workspace_bucket() {
+        let r = RegistryState::default();
+        let t0 = Instant::now();
+        for i in 0..20 {
+            assert!(r.admit(7, t0).is_ok(), "burst {i}");
+        }
+        let wait = r.admit(7, t0).err().unwrap_or_default();
+        assert!(
+            wait > Duration::ZERO && wait <= Duration::from_millis(500),
+            "{wait:?}"
+        );
+        assert!(
+            r.admit(8, t0).is_ok(),
+            "another workspace has its own bucket"
+        );
+        let t1 = t0 + Duration::from_millis(500);
+        assert!(r.admit(7, t1).is_ok(), "one token per 500 ms");
+        assert!(r.admit(7, t1).is_err());
     }
 
     /// Re-review S2-4: the writer saves once per batch of queued writes —
