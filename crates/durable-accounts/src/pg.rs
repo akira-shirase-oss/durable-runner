@@ -1885,10 +1885,10 @@ impl AccountStore for Pg {
         let exhausted = bounded(
             sqlx::query(
                 "UPDATE email_outbox SET status = 'failed', \
-                     last_error = COALESCE(last_error, 'attempts exhausted') \
-                 WHERE status IN ('pending', 'sending') AND attempts >= $2",
+                     last_error = COALESCE(last_error, 'attempts exhausted'), \
+                     text = '', html = '' \
+                 WHERE status IN ('pending', 'sending') AND attempts >= $1",
             )
-            .bind(ts(now_ms))
             .bind(crate::mail::OUTBOX_MAX_ATTEMPTS)
             .execute(&self.pool),
         )
@@ -1927,7 +1927,7 @@ impl AccountStore for Pg {
                 bounded(
                     sqlx::query(
                         "UPDATE email_outbox SET status = 'sent', sent_at = now(), \
-                         last_error = NULL, mail_text = '', mail_html = '' \
+                         last_error = NULL, text = '', html = '' \
                          WHERE id = $1 AND status IN ('pending', 'sending')",
                     )
                     .bind(to_i64(id, "outbox")?)
@@ -1956,7 +1956,7 @@ impl AccountStore for Pg {
                 bounded(
                     sqlx::query(
                         "UPDATE email_outbox SET status = 'failed', last_error = $2, \
-                         mail_text = '', mail_html = '' \
+                         text = '', html = '' \
                          WHERE id = $1 AND status IN ('pending', 'sending')",
                     )
                     .bind(to_i64(id, "outbox")?)
@@ -1967,6 +1967,346 @@ impl AccountStore for Pg {
             }
         }
         Ok(())
+    }
+
+    // --- S3-7: workflows + the purge ---------------------------------
+
+    async fn create_workflow(
+        &self,
+        workspace: u64,
+        name: &str,
+        created_by: Option<u64>,
+    ) -> Result<crate::Workflow, AccountError> {
+        // The cap check and the insert serialize on a per-ws advisory
+        // lock — a racing pair of creates can't both pass (D-067).
+        let mut tx = bounded(self.pool.begin()).await?;
+        bounded(
+            sqlx::query("SELECT pg_advisory_xact_lock($1)")
+                .bind(to_i64(workspace, "workspace")?)
+                .execute(&mut *tx),
+        )
+        .await?;
+        let live: i64 = bounded(
+            sqlx::query(
+                "SELECT COUNT(*) FROM workflows                  WHERE workspace_id = $1 AND archived_at IS NULL",
+            )
+            .bind(to_i64(workspace, "workspace")?)
+            .fetch_one(&mut *tx),
+        )
+        .await?
+        .try_get(0)?;
+        if live as u64 >= ws_limits_tx(&mut tx, workspace).await?.workflows {
+            return Err(AccountError::PlanLimit("workflows"));
+        }
+        let row = bounded(
+            sqlx::query(
+                "INSERT INTO workflows (workspace_id, name, created_by)                  VALUES ($1, $2, $3)                  RETURNING id, public_id, created_at",
+            )
+            .bind(to_i64(workspace, "workspace")?)
+            .bind(name)
+            .bind(created_by.map(|a| to_i64(a, "account")).transpose()?)
+            .fetch_one(&mut *tx),
+        )
+        .await?;
+        bounded(tx.commit()).await?;
+        Ok(crate::Workflow {
+            id: to_u64(row.try_get("id")?, "workflow")?,
+            public_id: row.try_get("public_id")?,
+            workspace,
+            name: name.to_string(),
+            archived_at_ms: None,
+            created_by: None,
+            created_at_ms: ms(row.try_get("created_at")?),
+        })
+    }
+
+    async fn workflows_for(&self, workspace: u64) -> Result<Vec<crate::Workflow>, AccountError> {
+        let rows = bounded(
+            sqlx::query(
+                "SELECT w.id, w.public_id, w.name, w.created_at, w.archived_at, a.public_id AS creator                  FROM workflows w LEFT JOIN accounts a ON a.id = w.created_by                  WHERE w.workspace_id = $1 AND w.archived_at IS NULL                  ORDER BY w.id",
+            )
+            .bind(to_i64(workspace, "workspace")?)
+            .fetch_all(&self.pool),
+        )
+        .await?;
+        rows.iter()
+            .map(|r| {
+                Ok(crate::Workflow {
+                    id: to_u64(r.try_get("id")?, "workflow")?,
+                    public_id: r.try_get("public_id")?,
+                    workspace,
+                    name: r.try_get("name")?,
+                    archived_at_ms: r
+                        .try_get::<Option<time::OffsetDateTime>, _>("archived_at")?
+                        .map(ms),
+                    created_by: r.try_get("creator")?,
+                    created_at_ms: ms(r.try_get("created_at")?),
+                })
+            })
+            .collect()
+    }
+
+    async fn count_live_workflows(&self, workspace: u64) -> Result<u64, AccountError> {
+        let n: i64 = bounded(
+            sqlx::query(
+                "SELECT COUNT(*) FROM workflows                  WHERE workspace_id = $1 AND archived_at IS NULL",
+            )
+            .bind(to_i64(workspace, "workspace")?)
+            .fetch_one(&self.pool),
+        )
+        .await?
+        .try_get(0)?;
+        Ok(n as u64)
+    }
+
+    async fn workflow_by_public_id(
+        &self,
+        workspace: u64,
+        public_id: uuid::Uuid,
+    ) -> Result<Option<crate::Workflow>, AccountError> {
+        let row = bounded(
+            sqlx::query(
+                "SELECT w.id, w.name, w.created_at, w.archived_at, a.public_id AS creator                  FROM workflows w LEFT JOIN accounts a ON a.id = w.created_by                  WHERE w.workspace_id = $1 AND w.public_id = $2",
+            )
+            .bind(to_i64(workspace, "workspace")?)
+            .bind(public_id)
+            .fetch_optional(&self.pool),
+        )
+        .await?;
+        row.map(|r| {
+            Ok(crate::Workflow {
+                id: to_u64(r.try_get("id")?, "workflow")?,
+                public_id,
+                workspace,
+                name: r.try_get("name")?,
+                archived_at_ms: r
+                    .try_get::<Option<time::OffsetDateTime>, _>("archived_at")?
+                    .map(ms),
+                created_by: r.try_get("creator")?,
+                created_at_ms: ms(r.try_get("created_at")?),
+            })
+        })
+        .transpose()
+    }
+
+    async fn add_workflow_version(
+        &self,
+        workspace: u64,
+        workflow_id: u64,
+        spec: &serde_json::Value,
+    ) -> Result<crate::WorkflowVersion, AccountError> {
+        // version = max+1 inside the workflow's advisory lock — two
+        // racing patches land as v_n, v_n+1, never the same row.
+        let mut tx = bounded(self.pool.begin()).await?;
+        bounded(
+            sqlx::query("SELECT pg_advisory_xact_lock($1)")
+                .bind(to_i64(workflow_id, "workflow")?)
+                .execute(&mut *tx),
+        )
+        .await?;
+        let count: i64 = bounded(
+            sqlx::query("SELECT COUNT(*) FROM workflow_versions WHERE workflow_id = $1")
+                .bind(to_i64(workflow_id, "workflow")?)
+                .fetch_one(&mut *tx),
+        )
+        .await?
+        .try_get(0)?;
+        if count as u64 >= crate::MAX_WORKFLOW_VERSIONS {
+            return Err(AccountError::PlanLimit("workflow_versions"));
+        }
+        let version = count + 1;
+        let row = bounded(
+            sqlx::query(
+                "INSERT INTO workflow_versions (workflow_id, version, spec)                  SELECT $1, $2, $3                  WHERE EXISTS (SELECT 1 FROM workflows                                WHERE id = $1 AND workspace_id = $4)                  RETURNING created_at",
+            )
+            .bind(to_i64(workflow_id, "workflow")?)
+            .bind(version as i32)
+            .bind(spec)
+            .bind(to_i64(workspace, "workspace")?)
+            .fetch_optional(&mut *tx),
+        )
+        .await?
+        .ok_or_else(|| {
+            AccountError::Store(format!("workflow {workflow_id} is not in workspace {workspace}"))
+        })?;
+        bounded(tx.commit()).await?;
+        Ok(crate::WorkflowVersion {
+            version: version as u64,
+            spec: spec.clone(),
+            created_at_ms: ms(row.try_get("created_at")?),
+        })
+    }
+
+    async fn latest_workflow_version(
+        &self,
+        workflow_id: u64,
+    ) -> Result<Option<crate::WorkflowVersion>, AccountError> {
+        let row = bounded(
+            sqlx::query(
+                "SELECT version, spec, created_at FROM workflow_versions                  WHERE workflow_id = $1 ORDER BY version DESC LIMIT 1",
+            )
+            .bind(to_i64(workflow_id, "workflow")?)
+            .fetch_optional(&self.pool),
+        )
+        .await?;
+        row.map(|r| {
+            Ok(crate::WorkflowVersion {
+                version: to_u64(r.try_get::<i32, _>("version")? as i64, "version")?,
+                spec: r.try_get("spec")?,
+                created_at_ms: ms(r.try_get("created_at")?),
+            })
+        })
+        .transpose()
+    }
+
+    async fn rename_workflow(
+        &self,
+        workspace: u64,
+        workflow_id: u64,
+        name: &str,
+    ) -> Result<bool, AccountError> {
+        let done = bounded(
+            sqlx::query(
+                "UPDATE workflows SET name = $1                  WHERE id = $2 AND workspace_id = $3 AND archived_at IS NULL",
+            )
+            .bind(name)
+            .bind(to_i64(workflow_id, "workflow")?)
+            .bind(to_i64(workspace, "workspace")?)
+            .execute(&self.pool),
+        )
+        .await?;
+        Ok(done.rows_affected() == 1)
+    }
+
+    async fn archive_workflow(
+        &self,
+        workspace: u64,
+        workflow_id: u64,
+    ) -> Result<bool, AccountError> {
+        let done = bounded(
+            sqlx::query(
+                "UPDATE workflows SET archived_at = now()                  WHERE id = $1 AND workspace_id = $2 AND archived_at IS NULL",
+            )
+            .bind(to_i64(workflow_id, "workflow")?)
+            .bind(to_i64(workspace, "workspace")?)
+            .execute(&self.pool),
+        )
+        .await?;
+        Ok(done.rows_affected() == 1)
+    }
+
+    async fn record_workflow_run(
+        &self,
+        workspace: u64,
+        workflow_id: u64,
+        version: u64,
+        op_key: &str,
+        run_id: u64,
+    ) -> Result<(), AccountError> {
+        bounded(
+            sqlx::query(
+                "INSERT INTO workflow_runs (workflow_id, workspace_id, version, op_key, run_id)                  VALUES ($1, $2, $3, $4, $5) ON CONFLICT (workflow_id, op_key) DO NOTHING",
+            )
+            .bind(to_i64(workflow_id, "workflow")?)
+            .bind(to_i64(workspace, "workspace")?)
+            .bind(version as i32)
+            .bind(op_key)
+            .bind(to_i64(run_id, "run")?)
+            .execute(&self.pool),
+        )
+        .await?;
+        Ok(())
+    }
+
+    async fn workflow_run_by_op(
+        &self,
+        workflow_id: u64,
+        op_key: &str,
+    ) -> Result<Option<crate::WorkflowRun>, AccountError> {
+        let row = bounded(
+            sqlx::query(
+                "SELECT run_id, version, op_key, created_at FROM workflow_runs                  WHERE workflow_id = $1 AND op_key = $2",
+            )
+            .bind(to_i64(workflow_id, "workflow")?)
+            .bind(op_key)
+            .fetch_optional(&self.pool),
+        )
+        .await?;
+        row.map(|r| {
+            Ok(crate::WorkflowRun {
+                run_id: to_u64(r.try_get("run_id")?, "run")?,
+                version: to_u64(r.try_get::<i32, _>("version")? as i64, "version")?,
+                op_key: r.try_get("op_key")?,
+                created_at_ms: ms(r.try_get("created_at")?),
+            })
+        })
+        .transpose()
+    }
+
+    async fn workflow_runs(
+        &self,
+        workflow_id: u64,
+        limit: u64,
+    ) -> Result<Vec<crate::WorkflowRun>, AccountError> {
+        let rows = bounded(
+            sqlx::query(
+                "SELECT run_id, version, op_key, created_at FROM workflow_runs                  WHERE workflow_id = $1 ORDER BY id DESC LIMIT $2",
+            )
+            .bind(to_i64(workflow_id, "workflow")?)
+            .bind(limit.min(i64::MAX as u64) as i64)
+            .fetch_all(&self.pool),
+        )
+        .await?;
+        rows.iter()
+            .map(|r| {
+                Ok(crate::WorkflowRun {
+                    run_id: to_u64(r.try_get("run_id")?, "run")?,
+                    version: to_u64(r.try_get::<i32, _>("version")? as i64, "version")?,
+                    op_key: r.try_get("op_key")?,
+                    created_at_ms: ms(r.try_get("created_at")?),
+                })
+            })
+            .collect()
+    }
+
+    async fn purge(&self, now_ms: i64) -> Result<crate::PurgeStats, AccountError> {
+        let mut stats = crate::PurgeStats::default();
+        let wfr = bounded(
+            sqlx::query("DELETE FROM workflow_runs WHERE created_at < $1")
+                .bind(ts(now_ms - crate::WORKFLOW_RUNS_RETENTION_MS))
+                .execute(&self.pool),
+        )
+        .await?;
+        stats.workflow_runs = wfr.rows_affected();
+        let sess = bounded(
+            sqlx::query(
+                "DELETE FROM sessions                  WHERE revoked_at IS NOT NULL OR expires_at <= $1                     OR idle_expires_at <= $1",
+            )
+            .bind(ts(now_ms))
+            .execute(&self.pool),
+        )
+        .await?;
+        stats.sessions = sess.rows_affected();
+        let toks = bounded(
+            sqlx::query(
+                "DELETE FROM email_tokens                  WHERE consumed_at IS NOT NULL OR superseded_at IS NOT NULL                     OR expires_at <= $1",
+            )
+            .bind(ts(now_ms))
+            .execute(&self.pool),
+        )
+        .await?;
+        stats.tokens = toks.rows_affected();
+        let inv = bounded(
+            sqlx::query(
+                "DELETE FROM invites                  WHERE accepted_at IS NOT NULL OR revoked_at IS NOT NULL                     OR expires_at <= $1",
+            )
+            .bind(ts(now_ms))
+            .execute(&self.pool),
+        )
+        .await?;
+        stats.invites = inv.rows_affected();
+        stats.outbox = self.outbox_purge(now_ms).await?;
+        Ok(stats)
     }
 }
 
