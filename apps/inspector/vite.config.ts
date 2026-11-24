@@ -27,7 +27,9 @@ export default defineConfig({
 			// attribute-less scripts it finds there (inspector_csp). Assets load
 			// from the mount, whatever the path.
 			adapter: adapter({ pages: out, assets: out }),
-			paths: { base },
+			// relative: false — the bootstrap names the mount instead of deriving it from the page URL: a mailed
+			// link to /app#/verify (no trailing slash) would otherwise resolve the base to "" and boot nothing.
+			paths: { base, relative: false },
 			router: { type: 'hash' },
 		}),
 	],
