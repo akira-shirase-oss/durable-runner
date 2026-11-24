@@ -8,12 +8,12 @@
 .page {
   display: flex;
   flex-direction: column;
-  gap: 16px;
+  gap: 24px;
   min-width: 0;
 }
 .grid {
   display: grid;
-  gap: 16px;
+  gap: 24px;
   min-width: 0;
 }
 .grid.two {
@@ -61,14 +61,14 @@
   align-items: center;
   justify-content: space-between;
   gap: 8px 16px;
-  padding: 16px 18px 0;
+  padding: 22px 24px 0;
 }
 .card-head.ruled {
   padding-bottom: 14px;
   border-bottom: 1px solid var(--c-line);
 }
 .card-body {
-  padding: 14px 18px 18px;
+  padding: 18px 24px 24px;
 }
 .card h2,
 .section-title {

@@ -41,7 +41,7 @@
 		display: flex;
 		flex-direction: column;
 		min-width: 0;
-		padding: 14px 16px 12px;
+		padding: 18px 20px 16px;
 		border-radius: 16px;
 		background: var(--c-card);
 		box-shadow:
