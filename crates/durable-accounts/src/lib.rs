@@ -206,6 +206,13 @@ pub struct SessionInfo {
     pub ip: Option<String>,
 }
 
+/// The password-check target for a live `verify` token (S2-6).
+pub struct VerifyPeek {
+    /// What the presented password must argon-match: the token's
+    /// pending hash, else the account's current hash.
+    pub password_hash: Option<String>,
+}
+
 /// A pending idle slide (D-071): use of a session is recorded in memory
 /// and flushed on an interval rather than written per request — the
 /// store row lags by at most the flush interval.
@@ -684,6 +691,17 @@ pub trait AccountStore: Send + Sync {
         &self,
         token_hash: &[u8; 32],
     ) -> Result<Option<Account>, AccountError>;
+
+    /// Peek at a live `verify` token WITHOUT consuming it (S2-6): the
+    /// verify route argon-checks the presented password against
+    /// `VerifyPeek::password_hash` — the token's pending hash, else the
+    /// account's current one — and refuses mismatches while the token
+    /// stays alive. `Ok(None)` is the dead-token answer, identical to
+    /// `consume_verify_token`'s.
+    async fn peek_verify_token(
+        &self,
+        token_hash: &[u8; 32],
+    ) -> Result<Option<VerifyPeek>, AccountError>;
 
     /// Consume a live `reset` token atomically: mark it consumed,
     /// install `new_password_hash`, prove mailbox ownership (sets

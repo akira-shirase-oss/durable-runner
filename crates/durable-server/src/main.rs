@@ -3200,6 +3200,12 @@ struct LoginReq {
 #[derive(serde::Deserialize)]
 struct VerifyReq {
     token: String,
+    /// Checked against the token's pending password hash before the
+    /// token is consumed (S2-6): a mismatch is `invalid_credentials`
+    /// and the token stays live — a pre-registration attacker can
+    /// overwrite the pending hash but can never know the victim's.
+    #[serde(default)]
+    password: String,
 }
 
 #[derive(serde::Deserialize)]
@@ -3680,6 +3686,36 @@ async fn auth_verify(
     let Some(hash) = email_token_hash(&req.token) else {
         return Err(token_gone());
     };
+    // Peek first (S2-6): the caller's password must argon-match the
+    // token's pending hash — the pre-registration attacker's defence
+    // dies here. A mismatch refuses WITHOUT consuming the token; a
+    // dead token is still `token_gone`, never `invalid_credentials`
+    // (the dashboard keys on that contract).
+    let Some(peek) = store
+        .peek_verify_token(&hash)
+        .await
+        .map_err(|_| accounts_unavailable())?
+    else {
+        return Err(token_gone());
+    };
+    let phc = peek
+        .password_hash
+        .unwrap_or_else(|| durable_accounts::password::DUMMY_PHC.to_string());
+    let password = req.password.clone();
+    let addr = client(&parts);
+    let ok = app
+        .argon
+        .run(addr, false, move || {
+            durable_accounts::password::verify_password(&phc, &password)
+        })
+        .await?;
+    if !ok {
+        return Err(ApiError::new(
+            StatusCode::FORBIDDEN,
+            "invalid_credentials",
+            "password does not match the pending sign-up",
+        ));
+    }
     // The consume marks the token, installs the pending password hash,
     // sets verified_at and revokes every session — atomically, in the
     // store's single transaction (replay and takeover both die there).
@@ -11396,6 +11432,12 @@ mod tests {
         ) -> Result<Option<durable_accounts::Account>, AccountError> {
             self.inner.consume_verify_token(token_hash).await
         }
+        async fn peek_verify_token(
+            &self,
+            token_hash: &[u8; 32],
+        ) -> Result<Option<durable_accounts::VerifyPeek>, AccountError> {
+            self.inner.peek_verify_token(token_hash).await
+        }
         async fn consume_reset_token(
             &self,
             token_hash: &[u8; 32],
@@ -11771,6 +11813,12 @@ mod tests {
             token_hash: &[u8; 32],
         ) -> Result<Option<durable_accounts::Account>, AccountError> {
             self.inner.consume_verify_token(token_hash).await
+        }
+        async fn peek_verify_token(
+            &self,
+            token_hash: &[u8; 32],
+        ) -> Result<Option<durable_accounts::VerifyPeek>, AccountError> {
+            self.inner.peek_verify_token(token_hash).await
         }
         async fn consume_reset_token(
             &self,
@@ -17009,7 +17057,7 @@ mod tests {
             "POST",
             "/auth/verify",
             &[],
-            Some(json!({"token": token})),
+            Some(json!({"token": token, "password": password})),
         )
         .await;
         assert_eq!(st, StatusCode::OK, "{v}");
@@ -17033,7 +17081,7 @@ mod tests {
             "POST",
             "/auth/verify",
             &[("cookie", cookie.clone())],
-            Some(json!({"token": token})),
+            Some(json!({"token": token, "password": "a-long-enough-passphrase"})),
         )
         .await;
         assert_eq!(st, StatusCode::OK, "{v}");
@@ -17070,7 +17118,7 @@ mod tests {
         let h = harness_store(false, None, Some(store.clone()));
         signup_only(&h.router, "r@r.co", "a-long-enough-passphrase").await;
         let token = mailed_token(&store, "verify", "r@r.co");
-        let body = || Some(json!({"token": token}));
+        let body = || Some(json!({"token": token, "password": "a-long-enough-passphrase"}));
         let (st, _, _) = raw(&h.router, "POST", "/auth/verify", &[], body()).await;
         assert_eq!(st, StatusCode::OK);
         let (st, _, v) = raw(&h.router, "POST", "/auth/verify", &[], body()).await;
@@ -17406,7 +17454,7 @@ mod tests {
             "POST",
             "/auth/verify",
             &[],
-            Some(json!({"token": token})),
+            Some(json!({"token": token, "password": "attacker-passphrase"})),
         )
         .await;
         assert_eq!(st, StatusCode::OK);
@@ -17726,7 +17774,7 @@ mod tests {
             "POST",
             "/auth/verify",
             &[],
-            Some(json!({"token": first})),
+            Some(json!({"token": first, "password": "a-long-enough-passphrase"})),
         )
         .await;
         assert_eq!(st, StatusCode::GONE, "the superseded link is dead");
@@ -17735,7 +17783,7 @@ mod tests {
             "POST",
             "/auth/verify",
             &[],
-            Some(json!({"token": second})),
+            Some(json!({"token": second, "password": "a-long-enough-passphrase"})),
         )
         .await;
         assert_eq!(st, StatusCode::OK);
@@ -19372,7 +19420,7 @@ mod tests {
             "POST",
             "/invites/accept",
             &[("cookie", vc.clone()), ("x-durable-csrf", vcsrf.clone())],
-            Some(json!({"token": vtok})),
+            Some(json!({"token": vtok, "password": "a-long-enough-passphrase"})),
         )
         .await;
         assert_eq!(st, StatusCode::OK);
@@ -19508,6 +19556,104 @@ mod tests {
         )
         .await;
         assert_eq!(st, StatusCode::OK, "{v}");
+    }
+
+    /// S2-6: the pre-registration takeover sequence — victim signs up
+    /// with B, an attacker re-signs the same address with A (the
+    /// pending hash becomes A's), a resend lands a fresh token in the
+    /// victim's mailbox, and the victim verifies with B: the check
+    /// refuses WITHOUT consuming the token, and the account can never
+    /// become A's. A dead token still answers `token_gone`, never
+    /// `invalid_credentials` (the dashboard's contract).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn s2d_verify_password_stops_prereg_takeover() {
+        let store = Arc::new(Memory::new());
+        let h = harness_store(false, None, Some(store.clone()));
+        let email = "victim@x.co";
+        // Victim signs up B; attacker re-signs A; resend mails a fresh
+        // token to the victim's address.
+        signup_only(&h.router, email, "victim-passphrase-B").await;
+        signup_only(&h.router, email, "attacker-passphrase-A").await;
+        let (st, _, _) = raw(
+            &h.router,
+            "POST",
+            "/auth/resend-verification",
+            &[],
+            Some(json!({"email": email})),
+        )
+        .await;
+        assert_eq!(st, StatusCode::ACCEPTED);
+        let token = mailed_token(&store, "verify", email);
+
+        // Wrong password for the pending hash → 403, token alive.
+        let (st, _, v) = raw(
+            &h.router,
+            "POST",
+            "/auth/verify",
+            &[],
+            Some(json!({"token": token, "password": "victim-passphrase-B"})),
+        )
+        .await;
+        assert_eq!(st, StatusCode::FORBIDDEN, "{v}");
+        assert_eq!(v["code"], "invalid_credentials");
+        let (st, _, v) = raw(
+            &h.router,
+            "POST",
+            "/auth/verify",
+            &[],
+            Some(json!({"token": token, "password": "victim-passphrase-B"})),
+        )
+        .await;
+        assert_eq!(
+            st,
+            StatusCode::FORBIDDEN,
+            "the token survived the first mismatch: {v}"
+        );
+
+        // The mailbox owner re-signs with their own password — the
+        // pending hash is theirs again and the same token verifies.
+        signup_only(&h.router, email, "victim-passphrase-B").await;
+        let token2 = mailed_token(&store, "verify", email);
+        let (st, _, v) = raw(
+            &h.router,
+            "POST",
+            "/auth/verify",
+            &[],
+            Some(json!({"token": token2, "password": "victim-passphrase-B"})),
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK, "victim's own password verifies: {v}");
+        let (st, _, _) = raw(
+            &h.router,
+            "POST",
+            "/auth/login",
+            &[],
+            Some(json!({"email": email, "password": "victim-passphrase-B"})),
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK, "the account ends as B");
+        // And the attacker's A is dead — the verified hash is B's.
+        let (st, _, _) = raw(
+            &h.router,
+            "POST",
+            "/auth/login",
+            &[],
+            Some(json!({"email": email, "password": "attacker-passphrase-A"})),
+        )
+        .await;
+        assert_eq!(st, StatusCode::UNAUTHORIZED, "attacker's A never lands");
+
+        // Dead tokens keep the honest 410, never invalid_credentials.
+        let (st, _, v) = raw(
+            &h.router,
+            "POST",
+            "/auth/verify",
+            &[],
+            Some(json!({"token": "drt_zzzz", "password": "anything"})),
+        )
+        .await;
+        assert_eq!(st, StatusCode::GONE, "{v}");
+        assert_eq!(v["code"], "token_gone");
     }
 
     /// S2-5: an account store without --ops-listen refuses boot.

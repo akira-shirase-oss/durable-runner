@@ -1196,6 +1196,33 @@ impl AccountStore for Memory {
         Ok(inner.accounts.get(&account).cloned())
     }
 
+    async fn peek_verify_token(
+        &self,
+        token_hash: &[u8; 32],
+    ) -> Result<Option<crate::VerifyPeek>, AccountError> {
+        self.check_up()?;
+        let inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        let now = now_ms();
+        // The same live check consume_verify_token applies — a dead
+        // token peeks as nothing, so the route's 410 stays honest.
+        let Some(token) = inner.email_tokens.values().find(|t| {
+            t.hash == *token_hash
+                && t.kind == "verify"
+                && !t.consumed
+                && !t.superseded
+                && t.expires_at_ms > now
+        }) else {
+            return Ok(None);
+        };
+        let password_hash = token.password_hash.clone().or_else(|| {
+            inner
+                .accounts
+                .get(&token.account)
+                .and_then(|a| a.password_hash.clone())
+        });
+        Ok(Some(crate::VerifyPeek { password_hash }))
+    }
+
     async fn consume_reset_token(
         &self,
         token_hash: &[u8; 32],

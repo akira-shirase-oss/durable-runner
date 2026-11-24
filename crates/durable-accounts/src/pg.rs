@@ -1468,6 +1468,28 @@ impl AccountStore for Pg {
         Ok(Some(account))
     }
 
+    async fn peek_verify_token(
+        &self,
+        token_hash: &[u8; 32],
+    ) -> Result<Option<crate::VerifyPeek>, AccountError> {
+        // Same live predicate as consume_verify_token — a dead token
+        // peeks as nothing so the route's 410 stays honest.
+        let row = bounded(
+            sqlx::query(
+                "SELECT COALESCE(t.password_hash, a.password_hash) AS phc                  FROM email_tokens t JOIN accounts a ON a.id = t.account_id                  WHERE t.token_hash = $1 AND t.kind = 'verify'                    AND t.consumed_at IS NULL AND t.superseded_at IS NULL                    AND t.expires_at > now()",
+            )
+            .bind(token_hash.as_slice())
+            .fetch_optional(&self.pool),
+        )
+        .await?;
+        let Some(row) = row else {
+            return Ok(None);
+        };
+        Ok(Some(crate::VerifyPeek {
+            password_hash: row.try_get("phc")?,
+        }))
+    }
+
     async fn consume_reset_token(
         &self,
         token_hash: &[u8; 32],
