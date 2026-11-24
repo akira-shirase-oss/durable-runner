@@ -4136,6 +4136,12 @@ async fn flat_access(
             Verified::Unavailable => Err(accounts_unavailable()),
         };
     }
+    // No bearer and no session cookie is the old bearer-surface 401 —
+    // `unauthorized` names the scheme it wants. Only a presented cookie
+    // walks the session path.
+    if session_cookie(parts).is_none() {
+        return Err(unauthorized());
+    }
     let Some(store) = app.keyring.store.clone() else {
         return Err(ApiError::new(
             StatusCode::NOT_FOUND,
@@ -4195,6 +4201,9 @@ async fn flat_admin_access(app: &App, parts: &Parts) -> Result<u64, ApiError> {
             Verified::Denied => Err(unauthorized()),
             Verified::Unavailable => Err(accounts_unavailable()),
         };
+    }
+    if session_cookie(parts).is_none() {
+        return Err(unauthorized());
     }
     let Some(store) = app.keyring.store.clone() else {
         return Err(ApiError::new(
