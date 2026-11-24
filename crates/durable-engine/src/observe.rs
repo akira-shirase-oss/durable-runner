@@ -6,15 +6,17 @@
 //!
 //! - **metrics rings**: 360 × 10 s buckets (one hour) and 1440 × 60 s
 //!   buckets (one day) of counters, sampled gauges and a fixed log-bucket
-//!   latency histogram. One pair for every workspace together (the
-//!   operator's view), and one pair per tracked workspace (its own view).
-//!   They start empty at `since`: replay never backfills them.
+//!   latency histogram — for every workspace together (the operator's
+//!   view) and for workspace 0. A tenant's view keeps one ring of
+//!   [`TENANT_BUCKETS`] × 5-minute buckets (a sixth of the size, so
+//!   hundreds fit). They start empty at `since`: replay never backfills.
 //! - **per-workspace entries**: workspace 0 always, plus at most
-//!   [`MAX_TRACKED_WORKSPACES`] tenants (LRU on the last event or call),
-//!   each with its rings, its activity feed (the last [`FEED_CAP`]
-//!   events of its own runs) and stats for at most
-//!   [`MAX_HANDLER_STATS_PER_WS`] of its handlers (LRU on the last call;
-//!   workspace 0: [`MAX_WS0_HANDLER_STATS`]). A tenant's view never holds
+//!   [`MAX_TRACKED_WORKSPACES`] tenants (scan-resistant LRU on the last
+//!   event or call; evicted allocations are pooled and reused), each with
+//!   its rings, its activity feed (the last [`FEED_CAP`] events of its own
+//!   runs) and stats for at most [`MAX_HANDLER_STATS_PER_WS`] of its
+//!   handlers in 24 one-hour buckets (workspace 0:
+//!   [`MAX_WS0_HANDLER_STATS`], full rings). A tenant's view never holds
 //!   another workspace's runs, counts or handlers.
 //! - **run timelines**: at most [`MAX_TIMELINES`] runs, LRU on the last
 //!   event, each holding at most [`TIMELINE_HEAD`] + [`TIMELINE_TAIL`]
@@ -398,6 +400,13 @@ impl<T: Default + Copy> Ring<T> {
         Some(&mut slot.1)
     }
 
+    /// Forget every bucket: each slot reads as never written.
+    fn reset(&mut self) {
+        for slot in &mut self.slots {
+            slot.0 = EMPTY;
+        }
+    }
+
     /// The `n` buckets ending with the one holding `now`, oldest first:
     /// `(start, Some(data))`, or `None` for a bucket nothing was recorded in.
     fn window(&self, now: Millis, n: usize) -> Vec<(Millis, Option<T>)> {
@@ -483,23 +492,34 @@ struct Point {
     hist: Hist,
 }
 
-/// The fine and coarse rings, recorded together.
+/// The rings one view records into, together: the full geometry (fine
+/// 10 s + coarse 60 s, for the operator's views) or one coarser ring (a
+/// tenant's — D-060 re-review S2-3: small enough to keep hundreds).
 #[derive(Debug)]
 struct Rings<T> {
-    fine: Ring<T>,
+    fine: Option<Ring<T>>,
     coarse: Ring<T>,
 }
 
 impl<T: Default + Copy> Rings<T> {
+    /// 360 × 10 s + 1440 × 60 s: workspace 0 and the global view.
     fn new() -> Self {
         Self {
-            fine: Ring::new(FINE_BUCKET_MS, FINE_BUCKETS),
+            fine: Some(Ring::new(FINE_BUCKET_MS, FINE_BUCKETS)),
             coarse: Ring::new(COARSE_BUCKET_MS, COARSE_BUCKETS),
         }
     }
 
+    /// One ring of `len` buckets of `bucket_ms`.
+    fn single(bucket_ms: u64, len: usize) -> Self {
+        Self {
+            fine: None,
+            coarse: Ring::new(bucket_ms, len),
+        }
+    }
+
     fn record(&mut self, t: Millis, mut f: impl FnMut(&mut T)) {
-        if let Some(b) = self.fine.at(t) {
+        if let Some(b) = self.fine.as_mut().and_then(|r| r.at(t)) {
             f(b);
         }
         if let Some(b) = self.coarse.at(t) {
@@ -507,10 +527,32 @@ impl<T: Default + Copy> Rings<T> {
         }
     }
 
-    fn window(&self, w: Window, now: Millis) -> Vec<(Millis, Option<T>)> {
-        let ring = if w.fine() { &self.fine } else { &self.coarse };
-        ring.window(now, w.points())
+    /// The ring a window reads and its bucket size.
+    fn ring_for(&self, w: Window) -> &Ring<T> {
+        match &self.fine {
+            Some(fine) if w.fine() => fine,
+            _ => &self.coarse,
+        }
     }
+
+    fn window(&self, w: Window, now: Millis) -> Vec<(Millis, Option<T>)> {
+        let ring = self.ring_for(w);
+        ring.window(now, points_in(w, ring.bucket_ms))
+    }
+
+    /// Forget every bucket (an evicted view's allocation, reused).
+    fn reset(&mut self) {
+        if let Some(f) = self.fine.as_mut() {
+            f.reset();
+        }
+        self.coarse.reset();
+    }
+}
+
+/// Buckets of `bucket_ms` a window shows (at least one): the last of them
+/// is the one holding `now`.
+fn points_in(w: Window, bucket_ms: u64) -> usize {
+    ((w.window_ms() / bucket_ms.max(1)) as usize).max(1)
 }
 
 /// A handler call's result, as the executor saw it.
@@ -537,10 +579,13 @@ struct HandlerStats {
     rings: Rings<HandlerBucket>,
     last_ok_at: Option<Millis>,
     last_failure_at: Option<Millis>,
-    /// When these stats began (see [`WsObs::handler`]).
+    /// When these stats began (see [`Observer::ws_handler`]).
     since: Millis,
     /// The observer's LRU clock at the last call (eviction order).
     touched: u64,
+    /// Calls recorded (saturating): scan resistance — a handler called
+    /// once goes before one called again.
+    calls_seen: u32,
 }
 
 // ---------------------------------------------------------------- timelines
@@ -906,6 +951,10 @@ pub struct HandlerOut {
     /// later if its stats were dropped (LRU) and started again. A handler
     /// with no stats kept reports zeros counted from here.
     pub since: Millis,
+    /// The bucket these stats are kept in: the window's own bucket for
+    /// workspace 0, one hour for a tenant's handlers (a window counts the
+    /// last ⌈window / 1 h⌉ hour buckets, the current one included).
+    pub resolution_ms: u64,
 }
 
 /// The `GET /metrics` body.
@@ -923,15 +972,27 @@ pub struct MetricsOut {
 
 // ----------------------------------------------------------------- observer
 
-/// Tenant workspaces whose own metrics, feed and handler stats are kept at
-/// once (LRU on the last event or call). Workspace 0 (the operator's) is
-/// always kept and does not count toward the cap. An evicted workspace's
-/// view starts again, with a later `since`, at its next event.
-pub const MAX_TRACKED_WORKSPACES: usize = 16;
-/// Handlers per tenant workspace whose stats are kept (LRU on the last call).
-pub const MAX_HANDLER_STATS_PER_WS: usize = 8;
+/// Tenant workspaces whose own views are kept at once (D-060, re-review
+/// S2-3). Workspace 0 — the operator's — is always kept and does not count.
+/// Sized so every tenant a beta-scale server sees stays tracked and each
+/// lookup stays a hash hit; past it, eviction is scan-resistant (a tenant
+/// seen once goes before one seen again, then the least recent) and the
+/// evicted entry's allocations are reused. An evicted tenant's view starts
+/// again, with a later `since`, at its next event.
+pub const MAX_TRACKED_WORKSPACES: usize = 256;
+/// A tenant's metrics ring: 288 five-minute buckets (one day) — about a
+/// sixth of workspace 0's two rings, so hundreds of tenants fit.
+pub const TENANT_BUCKET_MS: u64 = 300_000;
+pub const TENANT_BUCKETS: usize = 288;
+/// Handlers per tenant whose stats are kept (scan-resistant LRU on calls).
+pub const MAX_HANDLER_STATS_PER_WS: usize = 16;
+/// A tenant handler's stats: 24 one-hour buckets.
+pub const TENANT_HANDLER_BUCKET_MS: u64 = 3_600_000;
+pub const TENANT_HANDLER_BUCKETS: usize = 24;
 /// Handlers of workspace 0 whose stats are kept: its whole registry bound.
 pub const MAX_WS0_HANDLER_STATS: usize = crate::shell::MAX_HANDLERS_PER_WS;
+/// Evicted ring allocations kept for reuse, per kind.
+const POOL_CAP: usize = 8;
 
 /// Which slice of the engine a metrics read covers.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -942,16 +1003,21 @@ pub enum Scope {
     Ws(u64),
 }
 
-/// One workspace's own observability: its metrics rings (allocated at its
-/// first live record, call or gauge sample: replay alone never allocates
-/// them), its activity feed, and its handlers' stats.
+/// One workspace's own observability: its metrics rings (allocated — or
+/// taken from the pool — at its first live record, call or gauge sample:
+/// replay alone never allocates them), its activity feed, and its
+/// handlers' stats.
 #[derive(Debug)]
 struct WsObs {
+    /// A tenant (the small geometry) rather than workspace 0.
+    tenant: bool,
     /// When this workspace's counting began.
     since: Millis,
-    /// The observer's LRU clock at the last event or call.
+    /// The observer's clock at the last event or call, and how many
+    /// touches this entry has had (scan resistance).
     touched: AtomicU64,
-    points: Mutex<Option<Box<Rings<Point>>>>,
+    hits: AtomicU64,
+    points: Mutex<Option<Rings<Point>>>,
     feed: Mutex<VecDeque<(RunId, ObsEvent)>>,
     handlers: Mutex<WsHandlers>,
     in_flight: AtomicU64,
@@ -965,19 +1031,26 @@ struct WsObs {
 struct WsHandlers {
     cap: usize,
     stats: HashMap<String, Arc<Mutex<HandlerStats>>>,
-    /// When stats were last dropped for the cap (`None`: never).
+    /// When stats were last dropped for the cap (`None`: never) — this
+    /// workspace's own handlers only.
     last_eviction_at: Option<Millis>,
 }
 
 impl WsObs {
-    fn new(since: Millis, handler_cap: usize, feed_cap: usize, tick: u64) -> Self {
+    fn new(tenant: bool, since: Millis, feed_cap: usize, tick: u64) -> Self {
         Self {
+            tenant,
             since,
             touched: AtomicU64::new(tick),
+            hits: AtomicU64::new(1),
             points: Mutex::new(None),
-            feed: Mutex::new(VecDeque::with_capacity(feed_cap)),
+            feed: Mutex::new(VecDeque::with_capacity(feed_cap.min(16))),
             handlers: Mutex::new(WsHandlers {
-                cap: handler_cap.max(1),
+                cap: if tenant {
+                    MAX_HANDLER_STATS_PER_WS
+                } else {
+                    MAX_WS0_HANDLER_STATS
+                },
                 stats: HashMap::new(),
                 last_eviction_at: None,
             }),
@@ -988,16 +1061,24 @@ impl WsObs {
         }
     }
 
-    /// Record into this workspace's rings, allocating them on first use.
-    fn rings(&self, f: impl FnOnce(&mut Rings<Point>)) {
-        let mut p = lock(&self.points);
-        f(p.get_or_insert_with(|| Box::new(Rings::new())));
+    fn touch(&self, tick: u64) {
+        self.touched.store(tick, Ordering::Relaxed);
+        self.hits.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// The bucket size this view's points use for `w`.
+    fn bucket_ms(&self, w: Window) -> u64 {
+        if self.tenant {
+            TENANT_BUCKET_MS
+        } else {
+            w.bucket_ms()
+        }
     }
 
     fn window(&self, w: Window, now: Millis) -> Vec<(Millis, Option<Point>)> {
         match lock(&self.points).as_ref() {
             Some(r) => r.window(w, now),
-            None => empty_window(w, now),
+            None => empty_window(w, now, self.bucket_ms(w)),
         }
     }
 
@@ -1009,65 +1090,41 @@ impl WsObs {
         f.push_back((run, ev));
     }
 
-    /// This workspace's stats for `name`, created at the first call: at
-    /// the cap, the least recently called handler's stats are dropped.
-    /// Stats created after any drop begin at `now` (they may be a dropped
-    /// handler's return), else at the workspace's `since`.
-    fn handler(&self, name: &str, now: Millis, tick: u64) -> Arc<Mutex<HandlerStats>> {
-        let mut h = lock(&self.handlers);
-        if let Some(s) = h.stats.get(name) {
-            return Arc::clone(s);
-        }
-        if h.stats.len() >= h.cap {
-            let victim = h
-                .stats
-                .iter()
-                .min_by_key(|(_, s)| lock(s).touched)
-                .map(|(k, _)| k.clone());
-            if let Some(v) = victim {
-                h.stats.remove(&v);
-                h.last_eviction_at = Some(now);
-            }
-        }
-        let since = if h.last_eviction_at.is_some() {
-            now.max(self.since)
-        } else {
-            self.since
-        };
-        let s = Arc::new(Mutex::new(HandlerStats {
-            rings: Rings::new(),
-            last_ok_at: None,
-            last_failure_at: None,
-            since,
-            touched: tick,
-        }));
-        h.stats.insert(name.to_string(), Arc::clone(&s));
-        s
-    }
-
     /// Where a handler with no stats kept counts from.
     fn untracked_handler_since(&self) -> Millis {
         let h = lock(&self.handlers);
         h.last_eviction_at.map_or(self.since, |e| e.max(self.since))
     }
+
+    fn release_in_flight(&self) {
+        self.in_flight
+            .update(Ordering::Relaxed, Ordering::Relaxed, |v| {
+                v.saturating_sub(1)
+            });
+    }
 }
 
-/// `n` empty buckets ending with the one holding `now` (a workspace whose
-/// rings were never allocated: nothing was recorded).
-fn empty_window(w: Window, now: Millis) -> Vec<(Millis, Option<Point>)> {
-    let b = w.bucket_ms();
+/// `n` empty buckets of `bucket_ms` ending with the one holding `now` (a
+/// view whose rings were never allocated: nothing was recorded).
+fn empty_window(w: Window, now: Millis, bucket_ms: u64) -> Vec<(Millis, Option<Point>)> {
+    let b = bucket_ms.max(1);
     let last = now - now % b;
-    let n = w.points() as u64;
+    let n = points_in(w, b) as u64;
     let first = last.saturating_sub(n.saturating_sub(1) * b);
     (0..n).map(|k| (first + k * b, None)).collect()
+}
+
+/// Evicted allocations kept for reuse (tenant geometry only).
+#[derive(Debug, Default)]
+struct Pools {
+    rings: Vec<Rings<Point>>,
+    handler_rings: Vec<Rings<HandlerBucket>>,
 }
 
 #[derive(Debug)]
 struct WsTable {
     map: HashMap<u64, Arc<WsObs>>,
     evictions: u64,
-    /// When a workspace was last evicted (`None`: never).
-    last_eviction_at: Option<Millis>,
 }
 
 /// The shared observer: one per engine, fed by the actor, the executor,
@@ -1083,11 +1140,16 @@ pub struct Observer {
     points: Mutex<Rings<Point>>,
     runs: Mutex<RunStore>,
     workspaces: Mutex<WsTable>,
+    pools: Mutex<Pools>,
     /// LRU clock for workspaces and handler stats.
     clock: AtomicU64,
     in_flight: AtomicU64,
     live_runs: AtomicU64,
     active_runs: AtomicU64,
+    /// Fresh tenant ring allocations so far (metrics, handler stats) — the
+    /// pool's reuse shows here as allocations that did not happen.
+    allocs: AtomicU64,
+    handler_allocs: AtomicU64,
 }
 
 impl Observer {
@@ -1100,25 +1162,21 @@ impl Observer {
         let feed_cap = feed_cap.max(1);
         let mut map = HashMap::new();
         // Workspace 0 is pinned: the compat deployment's only workspace.
-        map.insert(
-            0,
-            Arc::new(WsObs::new(since, MAX_WS0_HANDLER_STATS, feed_cap, 0)),
-        );
+        map.insert(0, Arc::new(WsObs::new(false, since, feed_cap, 0)));
         Self {
             since,
             feed_cap,
             max_tracked: max_tracked.max(1),
             points: Mutex::new(Rings::new()),
             runs: Mutex::new(RunStore::new(max_timelines)),
-            workspaces: Mutex::new(WsTable {
-                map,
-                evictions: 0,
-                last_eviction_at: None,
-            }),
+            workspaces: Mutex::new(WsTable { map, evictions: 0 }),
+            pools: Mutex::new(Pools::default()),
             clock: AtomicU64::new(1),
             in_flight: AtomicU64::new(0),
             live_runs: AtomicU64::new(0),
             active_runs: AtomicU64::new(0),
+            allocs: AtomicU64::new(0),
+            handler_allocs: AtomicU64::new(0),
         }
     }
 
@@ -1131,59 +1189,165 @@ impl Observer {
         self.clock.fetch_add(1, Ordering::Relaxed)
     }
 
-    /// The workspace's entry, created (evicting the least recently active
-    /// tenant at the cap) if it has none, and marked active.
+    /// The workspace's entry, created if it has none (at the cap, the
+    /// scan-resistant victim is evicted and its allocations pooled), and
+    /// marked active. A hit is one hash lookup.
     fn ws(&self, ws: u64, now: Millis) -> Arc<WsObs> {
         let tick = self.tick();
         let mut t = lock(&self.workspaces);
         if let Some(w) = t.map.get(&ws) {
-            w.touched.store(tick, Ordering::Relaxed);
+            w.touch(tick);
             return Arc::clone(w);
         }
-        let tenants = t.map.keys().filter(|k| **k != 0).count();
+        let tenants = t.map.len() - usize::from(t.map.contains_key(&0));
         if tenants >= self.max_tracked {
+            // Scan resistance: an entry touched once (a tenant passing
+            // through) goes before any entry seen again; among equals, the
+            // least recently touched.
             let victim = t
                 .map
                 .iter()
                 .filter(|(k, _)| **k != 0)
-                .min_by_key(|(_, w)| w.touched.load(Ordering::Relaxed))
+                // ATTACK(obs-scan-resistant)
+                .min_by_key(|(_, w)| {
+                    (
+                        w.hits.load(Ordering::Relaxed) >= 2,
+                        w.touched.load(Ordering::Relaxed),
+                    )
+                })
                 .map(|(k, _)| *k);
-            if let Some(v) = victim {
-                t.map.remove(&v);
+            if let Some(v) = victim.and_then(|v| t.map.remove(&v)) {
                 t.evictions += 1;
-                t.last_eviction_at = Some(now.max(t.last_eviction_at.unwrap_or(0)));
+                self.recycle(&v);
             }
         }
-        // Created after an eviction, this may be an evicted workspace
-        // coming back: its counting restarts now, and says so.
-        let since = if t.last_eviction_at.is_some() {
-            now.max(self.since)
-        } else {
-            self.since
-        };
-        let w = Arc::new(WsObs::new(
-            since,
-            MAX_HANDLER_STATS_PER_WS,
-            self.feed_cap,
-            tick,
-        ));
+        // Since its own creation: nothing about any other workspace's
+        // activity shows in it (re-review #6). Created by replay, its
+        // counting began with the observer.
+        let since = now.max(self.since);
+        let w = Arc::new(WsObs::new(true, since, self.feed_cap, tick));
         t.map.insert(ws, Arc::clone(&w));
         w
+    }
+
+    /// An evicted entry's allocations go to the pools (bounded); readers
+    /// still holding the entry see it empty.
+    fn recycle(&self, w: &WsObs) {
+        let rings = lock(&w.points).take();
+        let handler_rings: Vec<Rings<HandlerBucket>> = {
+            let mut h = lock(&w.handlers);
+            h.stats
+                .drain()
+                .map(|(_, s)| std::mem::replace(&mut lock(&s).rings, Rings::single(1, 1)))
+                .collect()
+        };
+        let mut p = lock(&self.pools);
+        if let Some(r) = rings {
+            if p.rings.len() < POOL_CAP {
+                p.rings.push(r);
+            }
+        }
+        for r in handler_rings {
+            if p.handler_rings.len() < POOL_CAP {
+                p.handler_rings.push(r);
+            }
+        }
+    }
+
+    /// Rings for a view: workspace 0's full geometry, or a tenant's from
+    /// the pool (reset) or freshly allocated.
+    fn new_rings(&self, tenant: bool) -> Rings<Point> {
+        if !tenant {
+            return Rings::new();
+        }
+        if let Some(mut r) = lock(&self.pools).rings.pop() {
+            r.reset();
+            return r;
+        }
+        self.allocs.fetch_add(1, Ordering::Relaxed);
+        Rings::single(TENANT_BUCKET_MS, TENANT_BUCKETS)
+    }
+
+    fn new_handler_rings(&self, tenant: bool) -> Rings<HandlerBucket> {
+        if !tenant {
+            return Rings::new();
+        }
+        if let Some(mut r) = lock(&self.pools).handler_rings.pop() {
+            r.reset();
+            return r;
+        }
+        self.handler_allocs.fetch_add(1, Ordering::Relaxed);
+        Rings::single(TENANT_HANDLER_BUCKET_MS, TENANT_HANDLER_BUCKETS)
+    }
+
+    /// Record into a view's rings, allocating them on first use.
+    fn ws_record(&self, w: &WsObs, f: impl FnOnce(&mut Rings<Point>)) {
+        let mut p = lock(&w.points);
+        if p.is_none() {
+            *p = Some(self.new_rings(w.tenant));
+        }
+        if let Some(r) = p.as_mut() {
+            f(r);
+        }
+    }
+
+    /// The view's stats for `name`, created at the first call: at the cap,
+    /// the scan-resistant victim's stats are dropped and their rings
+    /// reused. Stats created after a drop begin at `now` (they may be a
+    /// dropped handler's return), else at the view's `since`.
+    fn ws_handler(
+        &self,
+        w: &WsObs,
+        name: &str,
+        now: Millis,
+        tick: u64,
+    ) -> Arc<Mutex<HandlerStats>> {
+        let mut h = lock(&w.handlers);
+        if let Some(s) = h.stats.get(name) {
+            return Arc::clone(s);
+        }
+        let mut reuse = None;
+        if h.stats.len() >= h.cap {
+            let victim = h
+                .stats
+                .iter()
+                .min_by_key(|(_, s)| {
+                    let s = lock(s);
+                    (s.calls_seen >= 2, s.touched)
+                })
+                .map(|(k, _)| k.clone());
+            if let Some(v) = victim.and_then(|v| h.stats.remove(&v)) {
+                h.last_eviction_at = Some(now);
+                if w.tenant {
+                    let mut s = lock(&v);
+                    let mut r = std::mem::replace(&mut s.rings, Rings::single(1, 1));
+                    r.reset();
+                    reuse = Some(r);
+                }
+            }
+        }
+        let since = if h.last_eviction_at.is_some() {
+            now.max(w.since)
+        } else {
+            w.since
+        };
+        let rings = reuse.unwrap_or_else(|| self.new_handler_rings(w.tenant));
+        let s = Arc::new(Mutex::new(HandlerStats {
+            rings,
+            last_ok_at: None,
+            last_failure_at: None,
+            since,
+            touched: tick,
+            calls_seen: 0,
+        }));
+        h.stats.insert(name.to_string(), Arc::clone(&s));
+        s
     }
 
     /// The workspace's entry if it has one; never creates or touches it
     /// (a read is not activity).
     fn peek(&self, ws: u64) -> Option<Arc<WsObs>> {
         lock(&self.workspaces).map.get(&ws).cloned()
-    }
-
-    /// Where an untracked workspace counts from: nothing of it was kept
-    /// since the observer started, or since the last eviction (which may
-    /// have been its own).
-    fn untracked_since(&self) -> Millis {
-        lock(&self.workspaces)
-            .last_eviction_at
-            .map_or(self.since, |e| e.max(self.since))
     }
 
     // --- feeding ----------------------------------------------------------
@@ -1224,7 +1388,7 @@ impl Observer {
                 w.push_feed(self.feed_cap, o.run, ev);
             }
             if live {
-                w.rings(|r| r.record(o.at, |p| count(&mut p.c, o)));
+                self.ws_record(&w, |r| r.record(o.at, |p| count(&mut p.c, o)));
             }
         }
     }
@@ -1241,26 +1405,49 @@ impl Observer {
     pub fn refused(&self, ws: Option<u64>, now: Millis) {
         lock(&self.points).record(now, |p| p.c.refused += 1);
         if let Some(ws) = ws {
-            self.ws(ws, now)
-                .rings(|r| r.record(now, |p| p.c.refused += 1));
+            let w = self.ws(ws, now);
+            self.ws_record(&w, |r| r.record(now, |p| p.c.refused += 1));
         }
     }
 
     /// A submit in `ws` was answered with an existing run (its `op_key`).
     pub fn deduplicated(&self, ws: u64, now: Millis) {
         lock(&self.points).record(now, |p| p.c.deduplicated += 1);
-        self.ws(ws, now)
-            .rings(|r| r.record(now, |p| p.c.deduplicated += 1));
+        let w = self.ws(ws, now);
+        self.ws_record(&w, |r| r.record(now, |p| p.c.deduplicated += 1));
     }
 
-    /// One handler call of workspace `w` ended after `ms` (dispatch → answer).
-    fn call_finished(&self, w: &WsObs, handler: &str, result: CallResult, ms: u64, now: Millis) {
+    /// One call of workspace `ws` ended after `ms` (dispatch → answer).
+    /// The entry is looked up NOW, not pinned for the call's lifetime
+    /// (re-review S2-3): an evicted workspace's call lands in its current
+    /// entry, or starts a new one.
+    fn call_finished(
+        &self,
+        ws: u64,
+        handler: Option<&str>,
+        result: CallResult,
+        ms: u64,
+        now: Millis,
+    ) {
+        let w = match handler {
+            Some(_) => self.ws(ws, now),
+            // A probe only counted in flight: never create an entry for it.
+            None => match self.peek(ws) {
+                Some(w) => w,
+                None => return,
+            },
+        };
+        w.release_in_flight();
+        let Some(handler) = handler else {
+            return;
+        };
         lock(&self.points).record(now, |p| p.hist.add(ms));
-        w.rings(|r| r.record(now, |p| p.hist.add(ms)));
+        self.ws_record(&w, |r| r.record(now, |p| p.hist.add(ms)));
         let tick = self.tick();
-        let stats = w.handler(handler, now, tick);
+        let stats = self.ws_handler(&w, handler, now, tick);
         let mut s = lock(&stats);
         s.touched = tick;
+        s.calls_seen = s.calls_seen.saturating_add(1);
         s.rings.record(now, |b| {
             b.calls += 1;
             match result {
@@ -1325,7 +1512,7 @@ impl Observer {
                 active_runs: w.active_runs.load(Ordering::Relaxed),
                 in_flight: w.in_flight.load(Ordering::Relaxed),
             };
-            w.rings(|r| r.record(now, |p| p.gauges = Some(g)));
+            self.ws_record(&w, |r| r.record(now, |p| p.gauges = Some(g)));
         }
     }
 
@@ -1334,7 +1521,8 @@ impl Observer {
     /// The `GET /metrics` body for `scope` and `window` at `now`, with the
     /// engine's current state counts for that scope and the names of the
     /// handlers registered in it (workspace 0's for [`Scope::All`]): every
-    /// name is listed, with zeros when no stats are kept for it.
+    /// name is listed, with zeros when no stats are kept for it. A tenant's
+    /// view uses its own geometry (`bucket_ms` says which).
     pub fn metrics(
         &self,
         scope: Scope,
@@ -1343,15 +1531,25 @@ impl Observer {
         index: IndexCounts,
         handler_names: &[String],
     ) -> MetricsOut {
-        let (since, raw, hw) = match scope {
+        let (since, raw, bucket_ms, hw) = match scope {
             Scope::All => (
                 self.since,
                 lock(&self.points).window(window, now),
+                window.bucket_ms(),
                 self.peek(0),
             ),
             Scope::Ws(ws) => match self.peek(ws) {
-                Some(w) => (w.since, w.window(window, now), Some(w)),
-                None => (self.untracked_since(), empty_window(window, now), None),
+                Some(w) => (w.since, w.window(window, now), w.bucket_ms(window), Some(w)),
+                // Nothing kept: counting from now, a value that says
+                // nothing about any other workspace (re-review #6).
+                None => {
+                    let b = if ws == 0 {
+                        window.bucket_ms()
+                    } else {
+                        TENANT_BUCKET_MS
+                    };
+                    (now, empty_window(window, now, b), b, None)
+                }
             },
         };
         let mut totals = Counters::default();
@@ -1375,9 +1573,18 @@ impl Observer {
         let mut names: Vec<&String> = handler_names.iter().collect();
         names.sort();
         names.dedup();
-        let untracked_since = hw
-            .as_ref()
-            .map_or_else(|| self.untracked_since(), |w| w.untracked_handler_since());
+        let (untracked_since, resolution_ms) = match hw.as_ref() {
+            Some(w) if w.tenant => (w.untracked_handler_since(), TENANT_HANDLER_BUCKET_MS),
+            Some(w) => (w.untracked_handler_since(), window.bucket_ms()),
+            None => (
+                now,
+                if matches!(scope, Scope::Ws(ws) if ws != 0) {
+                    TENANT_HANDLER_BUCKET_MS
+                } else {
+                    window.bucket_ms()
+                },
+            ),
+        };
         let handlers = names
             .into_iter()
             .map(|name| {
@@ -1395,6 +1602,7 @@ impl Observer {
                         last_ok_at: None,
                         last_failure_at: None,
                         since: untracked_since,
+                        resolution_ms,
                     };
                 };
                 let (raw, last_ok_at, last_failure_at, since) = {
@@ -1424,6 +1632,7 @@ impl Observer {
                     last_ok_at,
                     last_failure_at,
                     since,
+                    resolution_ms,
                 }
             })
             .collect();
@@ -1431,7 +1640,7 @@ impl Observer {
             now,
             since,
             window_ms: window.window_ms(),
-            bucket_ms: window.bucket_ms(),
+            bucket_ms,
             points,
             totals: TotalsOut {
                 counters: totals,
@@ -1449,16 +1658,17 @@ impl Observer {
     }
 
     /// Workspace `ws`'s newest `limit` feed events (at most
-    /// [`MAX_FEED_PAGE`]), newest first, and when its counting began.
-    /// Only `ws`'s own runs are ever in its feed.
-    pub fn feed(&self, ws: u64, limit: usize) -> (Millis, Vec<(RunId, ObsEvent)>) {
+    /// [`MAX_FEED_PAGE`]), newest first, and when its counting began (`now`
+    /// when nothing of it is kept). Only `ws`'s own runs are ever in its
+    /// feed.
+    pub fn feed(&self, ws: u64, limit: usize, now: Millis) -> (Millis, Vec<(RunId, ObsEvent)>) {
         let limit = limit.clamp(1, MAX_FEED_PAGE);
         match self.peek(ws) {
             Some(w) => {
                 let events = lock(&w.feed).iter().rev().take(limit).copied().collect();
                 (w.since, events)
             }
-            None => (self.untracked_since(), Vec::new()),
+            None => (now, Vec::new()),
         }
     }
 
@@ -1472,6 +1682,15 @@ impl Observer {
     pub fn workspace_stats(&self) -> (usize, u64) {
         let t = lock(&self.workspaces);
         (t.map.keys().filter(|k| **k != 0).count(), t.evictions)
+    }
+
+    /// Fresh tenant allocations so far: (metrics rings, handler rings).
+    /// Bounded by the caps plus the pools however many tenants rotate.
+    pub fn allocation_stats(&self) -> (u64, u64) {
+        (
+            self.allocs.load(Ordering::Relaxed),
+            self.handler_allocs.load(Ordering::Relaxed),
+        )
     }
 }
 
@@ -1488,10 +1707,11 @@ fn count(c: &mut Counters, o: &Observed) {
 /// records its latency and result when it ends. Dropped without
 /// [`CallGuard::finish`] — the call was aborted at its deadline or
 /// abandoned at shutdown — it counts as a lost reply, which is what the
-/// engine journals for it.
+/// engine journals for it. It holds the workspace's id, not its entry
+/// (re-review S2-3): an entry evicted mid-call is never kept alive by it.
 pub struct CallGuard {
     obs: Arc<Observer>,
-    ws: Arc<WsObs>,
+    ws: u64,
     handler: Option<String>,
     started: Instant,
     result: Option<CallResult>,
@@ -1507,7 +1727,7 @@ impl CallGuard {
         w.in_flight.fetch_add(1, Ordering::Relaxed);
         Self {
             obs: Arc::clone(obs),
-            ws: w,
+            ws,
             handler: handler.map(str::to_string),
             started: Instant::now(),
             result: None,
@@ -1522,12 +1742,10 @@ impl CallGuard {
 impl Drop for CallGuard {
     fn drop(&mut self) {
         self.obs.in_flight.fetch_sub(1, Ordering::Relaxed);
-        self.ws.in_flight.fetch_sub(1, Ordering::Relaxed);
-        if let Some(h) = &self.handler {
-            let ms = u64::try_from(self.started.elapsed().as_millis()).unwrap_or(u64::MAX);
-            let result = self.result.unwrap_or(CallResult::Lost);
-            self.obs.call_finished(&self.ws, h, result, ms, wall_ms());
-        }
+        let ms = u64::try_from(self.started.elapsed().as_millis()).unwrap_or(u64::MAX);
+        let result = self.result.unwrap_or(CallResult::Lost);
+        self.obs
+            .call_finished(self.ws, self.handler.as_deref(), result, ms, wall_ms());
     }
 }
 
@@ -1539,24 +1757,27 @@ impl Drop for CallGuard {
 /// not measured; handler names are counted at 64 bytes).
 pub fn memory_bound(ws0_handlers: usize) -> usize {
     use std::mem::size_of;
-    let rings = |entry: usize| (FINE_BUCKETS + COARSE_BUCKETS) * entry;
-    let points = rings(size_of::<(Millis, Point)>());
-    let per_handler = rings(size_of::<(Millis, HandlerBucket)>())
-        + size_of::<HandlerStats>()
-        + size_of::<(String, Arc<Mutex<HandlerStats>>)>()
-        + 64;
+    let full = |entry: usize| (FINE_BUCKETS + COARSE_BUCKETS) * entry;
+    let points = full(size_of::<(Millis, Point)>());
+    let tenant_points = TENANT_BUCKETS * size_of::<(Millis, Point)>();
+    let handler_overhead =
+        size_of::<HandlerStats>() + size_of::<(String, Arc<Mutex<HandlerStats>>)>() + 64;
+    let ws0_handler = full(size_of::<(Millis, HandlerBucket)>()) + handler_overhead;
+    let tenant_handler =
+        TENANT_HANDLER_BUCKETS * size_of::<(Millis, HandlerBucket)>() + handler_overhead;
     let feed = FEED_CAP * size_of::<(RunId, ObsEvent)>();
-    let ws_entry = |handlers: usize| size_of::<WsObs>() + points + feed + handlers * per_handler;
+    let ws0 = size_of::<WsObs>() + points + feed + ws0_handlers * ws0_handler;
+    let tenant =
+        size_of::<WsObs>() + tenant_points + feed + MAX_HANDLER_STATS_PER_WS * tenant_handler;
+    let pools =
+        POOL_CAP * (tenant_points + TENANT_HANDLER_BUCKETS * size_of::<(Millis, HandlerBucket)>());
     // A full timeline: its slot, MAX_TIMELINE_EVENTS events, and an index
     // entry ((RunId, u32) padded to 16 bytes + a control byte, at most
     // doubled by hashbrown's power-of-two bucket count).
     let timeline = size_of::<Slot>()
         + MAX_TIMELINE_EVENTS * size_of::<ObsEvent>()
         + 2 * (size_of::<(RunId, u32)>() + 1);
-    points
-        + MAX_TIMELINES * timeline
-        + ws_entry(ws0_handlers)
-        + MAX_TRACKED_WORKSPACES * ws_entry(MAX_HANDLER_STATS_PER_WS)
+    points + MAX_TIMELINES * timeline + ws0 + MAX_TRACKED_WORKSPACES * tenant + pools
 }
 
 #[cfg(test)]
@@ -1610,8 +1831,7 @@ mod tests {
 
     /// A finished call of `handler` in `ws`, as the executor reports it.
     fn call(o: &Observer, ws: u64, handler: &str, r: CallResult, ms: u64, now: Millis) {
-        let w = o.ws(ws, now);
-        o.call_finished(&w, handler, r, ms, now);
+        o.call_finished(ws, Some(handler), r, ms, now);
     }
 
     #[test]
@@ -1864,7 +2084,7 @@ mod tests {
             Counters::default()
         );
         assert_eq!(r.timeline(RunId(1)).events.len(), 6);
-        assert_eq!(r.feed(0, 50).1.len(), 6);
+        assert_eq!(r.feed(0, 50, T0).1.len(), 6);
     }
 
     #[test]
@@ -1931,13 +2151,17 @@ mod tests {
         };
         assert_eq!(kept.len(), FEED_CAP);
         assert_eq!(kept.first(), Some(&6), "the five oldest left");
-        let page = o.feed(0, 50).1;
+        let page = o.feed(0, 50, T0).1;
         assert_eq!(page.len(), 50);
         let ids: Vec<u64> = page.iter().map(|(r, _)| r.0).collect();
         let want: Vec<u64> = (156..=205).rev().collect();
         assert_eq!(ids, want);
-        assert_eq!(o.feed(0, 10_000).1.len(), MAX_FEED_PAGE, "a page is capped");
-        assert_eq!(o.feed(0, 0).1.len(), 1, "clamped to at least one");
+        assert_eq!(
+            o.feed(0, 10_000, T0).1.len(),
+            MAX_FEED_PAGE,
+            "a page is capped"
+        );
+        assert_eq!(o.feed(0, 0, T0).1.len(), 1, "clamped to at least one");
     }
 
     #[test]
@@ -2204,7 +2428,8 @@ mod tests {
             v["handlers"][0],
             serde_json::json!({"name":"step","calls":0,"ok":0,"failed":0,"replies_lost":0,
                                "step_ms":{"p50":null,"p95":null,"max":null},
-                               "last_ok_at":null,"last_failure_at":null,"since":T0})
+                               "last_ok_at":null,"last_failure_at":null,"since":T0,
+                               "resolution_ms":10_000})
         );
     }
 
@@ -2238,9 +2463,9 @@ mod tests {
         assert_eq!(size_of::<Slot>(), 56);
         let none = memory_bound(0);
         let ten = memory_bound(10);
-        // Timelines + the operator's rings + workspace 0 + 16 tenants at
-        // their caps (OPERATING.md's table).
-        assert!(none < 132 * 1024 * 1024, "{none}");
+        // Timelines + the operator's rings + workspace 0 + 256 tenants at
+        // their caps + the pools (OPERATING.md's table): ~110 MiB.
+        assert!(none < 116 * 1024 * 1024, "{none}");
         assert!(ten - none < 5 * 1024 * 1024, "{}", ten - none);
     }
 
@@ -2279,7 +2504,7 @@ mod tests {
         assert_eq!((b.handlers[0].calls, b.handlers[0].failed), (2, 2));
         assert_eq!(a.totals.step_ms.max, Some(10), "B's latencies are not A's");
         assert_eq!(b.totals.step_ms.max, Some(700));
-        let runs = |ws| -> Vec<u64> { o.feed(ws, 200).1.iter().map(|(r, _)| r.0).collect() };
+        let runs = |ws| -> Vec<u64> { o.feed(ws, 200, T0).1.iter().map(|(r, _)| r.0).collect() };
         assert_eq!(runs(1), [10]);
         assert_eq!(runs(2), [21, 20]);
         assert!(
@@ -2288,10 +2513,15 @@ mod tests {
         );
         // A workspace with nothing kept answers an empty, well-formed view.
         let none = m(Scope::Ws(99));
-        assert_eq!(none.points.len(), 90);
+        assert_eq!(
+            none.points.len(),
+            3,
+            "15 min of a tenant's 5-minute buckets"
+        );
+        assert_eq!(none.bucket_ms, TENANT_BUCKET_MS);
         assert_eq!(none.totals.counters, Counters::default());
         assert_eq!(none.handlers[0].calls, 0);
-        assert!(o.feed(99, 50).1.is_empty());
+        assert!(o.feed(99, 50, T0).1.is_empty());
         assert_eq!(o.workspace_stats(), (2, 0), "a read never creates an entry");
     }
 
@@ -2311,15 +2541,32 @@ mod tests {
         assert_eq!(m(0).totals.counters.accepted, 1, "pinned");
         assert_eq!(m(1).totals.counters.accepted, 2);
         assert_eq!(m(3).totals.counters.accepted, 1);
-        assert_eq!(m(3).since, T0 + 4, "created after an eviction");
+        assert_eq!(m(3).since, T0 + 4, "a view counts from its own creation");
+        assert_eq!(
+            m(1).since,
+            T0 + 1,
+            "never another workspace's eviction time"
+        );
         let gone = m(2);
         assert_eq!(gone.totals.counters.accepted, 0);
-        assert_eq!(gone.since, T0 + 4, "counts from the eviction");
-        assert!(o.feed(2, 50).1.is_empty());
+        assert_eq!(gone.since, T0 + 9, "nothing kept: counting from the read");
+        assert!(o.feed(2, 50, T0).1.is_empty());
         // Back with a new event: a fresh entry that says when it began.
+        // Scan resistance: the victim is 3 (seen once), not 1 (seen twice,
+        // even though 1 was touched earlier).
         o.committed(&[accepted_in(2, 6, T0 + 5)], true);
         assert_eq!(m(2).since, T0 + 5);
         assert_eq!(m(2).totals.counters.accepted, 1);
+        assert_eq!(
+            m(1).totals.counters.accepted,
+            2,
+            "the twice-seen tenant stayed"
+        );
+        assert_eq!(
+            m(3).totals.counters.accepted,
+            0,
+            "the once-seen tenant went"
+        );
         // The operator's view lost nothing.
         assert_eq!(all(&o, Window::M15, T0 + 9).totals.counters.accepted, 6);
         assert_eq!(o.workspace_stats(), (2, 2));
@@ -2373,5 +2620,91 @@ mod tests {
         assert_eq!(last(Scope::All), Some((Some(100), Some(50), Some(1))));
         assert_eq!(last(Scope::Ws(5)), Some((None, None, None)), "untracked");
         drop(g); // records at the wall clock: after the reads at T0
+    }
+
+    // --- re-review S2-3: hundreds of tenants, no thrash ------------------
+
+    /// 17 tenants (the old cap's 17th) and then a full cap's worth rotate
+    /// record after record: no eviction, one allocation per tenant, ever.
+    #[test]
+    fn rotating_tenants_within_the_cap_never_evict_or_reallocate() {
+        let o = obs();
+        for n in [17u64, MAX_TRACKED_WORKSPACES as u64] {
+            for round in 0..20u64 {
+                for ws in 1..=n {
+                    let at = T0 + round * 1_000 + ws;
+                    o.committed(&[accepted_in(ws, round * 1_000 + ws, at)], true);
+                    call(&o, ws, "h", CallResult::Ok, 3, at);
+                }
+            }
+            assert_eq!(o.workspace_stats(), (n as usize, 0), "{n} tenants");
+            assert_eq!(o.allocation_stats(), (n, n), "one ring set per tenant");
+        }
+    }
+
+    /// One past the cap, rotating: the table and the allocations stay
+    /// bounded however long it runs — evicted rings are reused.
+    #[test]
+    fn rotating_past_the_cap_stays_bounded_and_reuses_allocations() {
+        let cap = 8;
+        let o = Observer::with_caps(T0, MAX_TIMELINES, FEED_CAP, cap);
+        for round in 0..200u64 {
+            for ws in 1..=(cap as u64 + 1) {
+                let at = T0 + round * 100 + ws;
+                o.committed(&[accepted_in(ws, round * 100 + ws, at)], true);
+                call(&o, ws, "h", CallResult::Ok, 3, at);
+            }
+        }
+        let (tracked, evictions) = o.workspace_stats();
+        assert!(tracked <= cap, "{tracked}");
+        assert!(evictions > 1_000, "it did rotate: {evictions}");
+        let (rings, handlers) = o.allocation_stats();
+        let bound = (cap + POOL_CAP + 1) as u64;
+        assert!(rings <= bound, "{rings} metrics rings for {cap} slots");
+        assert!(
+            handlers <= bound,
+            "{handlers} handler rings for {cap} slots"
+        );
+    }
+
+    /// A tenant rotating more handlers than its cap reuses the dropped
+    /// handler's rings instead of allocating per call.
+    #[test]
+    fn a_tenant_rotating_its_handlers_reuses_their_rings() {
+        let o = obs();
+        let names: Vec<String> = (0..=MAX_HANDLER_STATS_PER_WS)
+            .map(|i| format!("h{i}"))
+            .collect();
+        for round in 0..50u64 {
+            for (i, n) in names.iter().enumerate() {
+                call(&o, 3, n, CallResult::Ok, 3, T0 + round * 100 + i as u64);
+            }
+        }
+        let (_, handlers) = o.allocation_stats();
+        assert!(
+            handlers <= (MAX_HANDLER_STATS_PER_WS + POOL_CAP) as u64,
+            "{handlers} handler-ring allocations"
+        );
+    }
+
+    /// A call in flight never keeps an evicted workspace's entry alive:
+    /// the guard holds the id and looks the entry up when it ends.
+    #[test]
+    fn a_call_in_flight_does_not_pin_an_evicted_entry() {
+        let o = Arc::new(Observer::with_caps(T0, MAX_TIMELINES, FEED_CAP, 2));
+        let g = CallGuard::start(&o, 1, Some("h"));
+        let weak = Arc::downgrade(&o.peek(1).unwrap_or_else(|| panic!("ws 1")));
+        for ws in 2..=10u64 {
+            for k in 0..2 {
+                o.committed(&[accepted_in(ws, ws * 10 + k, T0 + ws)], true);
+            }
+        }
+        assert!(o.peek(1).is_none(), "ws 1 was evicted");
+        assert!(
+            weak.upgrade().is_none(),
+            "the call in flight pinned the evicted entry"
+        );
+        drop(g); // lands in a fresh entry for ws 1
+        assert_eq!(o.in_flight(), 0);
     }
 }

@@ -1142,23 +1142,40 @@ as `GET /jobs/{id}`.
   they are tenant data, and the global view has no per-workspace axis.
   Submits refused before authentication (the per-address 429) count in
   the global view only: no workspace is known yet.
-- **Bounds.** The global rings and the 20,000-timeline store are D-058's.
-  Per workspace: workspace 0 always, plus at most 16 tenants
-  (`MAX_TRACKED_WORKSPACES`, LRU on the last record or call; a read
-  never creates or refreshes an entry). Each entry holds its own pair of
-  rings (allocated at its first live record, call or gauge sample — never
-  by replay alone), a 200-event feed (one full page; D-058's 1,000-event
-  global feed is gone, no page could read past 200), and stats for its 8
-  most recently called handlers (`MAX_HANDLER_STATS_PER_WS`; workspace 0:
-  its whole 256-handler bound). An evicted workspace or handler starts
-  again at its next event with a later `since`, which the API reports, so
-  a restarted view never claims zeros it did not count. Memory at every
-  cap: about 124 MiB (D-058's ~61 MiB plus 16 × ~3.9 MiB of tenant views)
-  plus 0.4 MiB per workspace-0 handler — `observe::memory_bound`, pinned
-  by `memory_at_the_caps_is_bounded`; OPERATING.md has the table.
+- **Bounds** (re-sized after the re-review's S2-3: 16 tenants thrashed
+  at the 17th — every lookup a miss, ~590 KB allocated and filled per
+  miss, `since` and feeds restarting continuously). The global rings and
+  the 20,000-timeline store are D-058's; workspace 0 keeps D-058's full
+  geometry. Up to 256 tenants (`MAX_TRACKED_WORKSPACES`) are tracked at
+  once, each small: one ring of 288 five-minute buckets (≈ 94 KB; its
+  `/metrics` reports `bucket_ms` 300,000), a 200-event feed (one full
+  page; D-058's 1,000-event global feed is gone), and stats for its 16
+  most recently called handlers in 24 one-hour buckets (≈ 6 KB each;
+  `resolution_ms` says so). Lookups for up to 256 rotating tenants are
+  hash hits. Past 256, eviction is scan-resistant (a tenant seen once goes
+  before one seen again, then the least recent; one-shot tenants cannot
+  flush the active ones) and an evicted entry's rings go to a pool the
+  next entry reuses, so allocations stay bounded; a call in flight holds
+  only its workspace id, never the entry. A read never creates or
+  refreshes an entry. An entry's `since` is its own creation (or the
+  observer's start, for one built by replay); an untracked workspace
+  answers `since` = the read's own time — neither leaks when another
+  tenant was evicted (re-review #6). Memory at every cap: ~110 MiB by
+  `observe::memory_bound` (timelines ~60 MiB, 256 tenant views ~48 MiB,
+  workspace 0, the pools) plus 0.41 MiB per workspace-0 handler; measured
+  RSS growth with everything filled and 10 workspace-0 handlers: 124 MiB
+  against the 114.8 MiB size bound (allocator overhead), so plan ~125 MiB.
+  Measured costs (release, development laptop at load ~14, 2026-11-24 —
+  observations, not capacity): 17 or 256 rotating tenants 154-196 ns per
+  record and ~208 ns per call with no eviction (before: 169 ns → 11.7 µs
+  per record and 471 ns → 22.4 µs per call from the 17th tenant on); 257
+  rotating (every lookup a miss) 3.0 µs per record and 3.2 µs per call
+  with allocations staying at 256 + 256; one tenant rotating 17 handlers
+  449 ns per call (before: 9.7 µs with a 432 KB allocation each).
 - **Cost.** Each committed record also takes its workspace's feed lock
   and, live, its rings' lock; consecutive records of one workspace share
-  one table lookup. Per-workspace gauges are published by the actor at
+  one table lookup; a miss past the cap is O(256) (the victim scan) plus
+  a ring reset. Per-workspace gauges are published by the actor at
   most once a second (O(tracked workspaces)), never per iteration. The
   engine's handler registry is now keyed workspace → name, so listing one
   workspace's handlers for `/metrics` is O(its own registrations).

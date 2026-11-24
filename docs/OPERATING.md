@@ -50,12 +50,13 @@ target/release/durable-server \
   size, as the review saw on the HTTP server. The 512 MiB default keeps
   that within 1.5 GiB of a 2 GB host. On a bigger host raise
   `--max-index-bytes` in proportion, and leave the OS at least 0.5 GiB.
-  The observability layer (D-058, D-060) adds at most about 124 MiB plus
+  The observability layer (D-058, D-060) adds at most about 110 MiB by
+  its size bound (plan ~125 MiB with allocator overhead, measured) plus
   0.4 MiB per workspace-0 handler on top, whatever the traffic — see
   "Observability" below. In compat mode (workspace 0 only) the tenant
   views never allocate and it stays at about 61 MiB, inside the 100 MiB
-  term; with tenants, plan for the larger figure (it exceeds that term
-  by ~25 MiB once 16 tenants are each busy in every bucket).
+  term; with tenants, plan for the larger figure (it passes that term by
+  ~25 MiB once 256 tenants are each busy in every bucket).
 
   *Capacity arithmetic.* A run is charged `160 + key + Σ(48 + step name +
   handler name) + input` bytes while it is live. When it finishes its
@@ -309,10 +310,14 @@ its fsync returned.
   its deadline) and `step_ms` over the window, its latest `last_ok_at` /
   `last_failure_at`, and `since`: when its counting began — later than
   the view's `since` when a tenant's handler stats were dropped for the
-  cap (its 8 most recently called handlers are kept) and started again.
-  A tenant view's `since` is likewise when that workspace's counting
-  began: the server's start, or later if the workspace was evicted from
-  the 16 tracked tenants and came back.
+  cap (its 16 most recently called handlers are kept) and started again —
+  and `resolution_ms`, the bucket they are kept in: the window's own
+  bucket for workspace 0, one hour for a tenant (a window counts the last
+  ⌈window / 1 h⌉ hour buckets, the current one included). A tenant's own
+  view uses 5-minute buckets for every window (`bucket_ms` 300,000: 3
+  points for 15m, 288 for 24h). A tenant view's `since` is when its
+  entry was created (the server's start, for one rebuilt by replay); a
+  workspace with no entry answers the read's own time.
 - `GET /jobs/{id}/events`: one run's timeline in commit order — kinds
   `accepted`, `dispatched`, `checkpointed`, `step_failed`, `reply_lost`,
   `reconciled`, `cancel_requested`, and the derived `finished` (`outcome`
@@ -335,25 +340,28 @@ its fsync returned.
 | Structure | Cap | Memory |
 |---|---|---|
 | Metrics rings (global view) | 360 × 10 s + 1,440 × 60 s buckets | 1,800 × 328 B ≈ 0.6 MiB |
-| Workspace views | workspace 0 + at most 16 tenants (LRU on the last record or call); rings allocated at a workspace's first live record, call or gauge sample | ≈ 0.6 MiB of rings + a 200-event feed (8 KiB) each |
-| Per-handler stats | the same rings per handler, kept for workspace 0's registered handlers (≤ 256) and each tenant's 8 most recently called | 1,800 × 240 B ≈ 0.4 MiB each; at most 16 × 8 tenant handlers ≈ 53 MiB |
+| Workspace views | workspace 0 (full rings) + at most 256 tenants (scan-resistant LRU; evicted rings pooled, 8 kept); a tenant's ring is 288 × 5 min, allocated at its first live record, call or gauge sample | workspace 0 ≈ 0.6 MiB; a tenant 288 × 328 B ≈ 94 KB of ring + a 200-event feed (8 KB) |
+| Per-handler stats | workspace 0: full rings for each registered handler (≤ 256); a tenant: its 16 most recently called, 24 × 1 h buckets | 0.4 MiB each (workspace 0); 24 × 240 B ≈ 6 KB each (tenant), ≤ 256 × 16 ≈ 23 MiB |
 | Run timelines | 20,000 runs (LRU on the last event) × 96 events | 32 B per event + 90 B per run; at most ≈ 60 MiB (every run past 96 events), ≈ 4-12 MiB when runs carry 3-10 events |
 | Activity feeds | 200 events per workspace view (one full page) | 8 KiB each |
 | Not-yet-durable observations | one per record not yet fsynced: the actor's outbox (16,384 records before it stops taking commands) plus the writer's queue (8 × 1,024) | 72 B each, about 1.7 MiB at the default bounds (and a reused hand-over buffer of about the same size) |
 
-So the worst case is about **124 MiB + 0.4 MiB per workspace-0 handler**
-(`observe::memory_bound`: ~61 MiB of timelines and the global rings, plus
-16 tenant views at ~3.9 MiB each with all 8 handler slots filled), reached
-only when 20,000 runs each have more than 96 events and 16 tenants are
-active with 8 busy handlers each; it does not grow with traffic, uptime or
-the number of workspaces. A compat install (workspace 0 only) never
-allocates a tenant view: about 61 MiB. Before D-060 the bound was about
-65 MiB; the measured probe then grew about 66 MiB and feeding the observer
-cost about 66 ns per event (development laptop observations, not
-capacity). After D-060 the size-based bound with 10 workspace-0 handlers
-is 130,518 KiB; the probe in a debug build grew 86,800 KiB filling every
-structure (2026-11-24, a busy laptop; the per-event cost was not
-re-measured):
+So the worst case is about **110 MiB + 0.4 MiB per workspace-0 handler**
+by size (`observe::memory_bound` = 113,290 KiB with none: ~61 MiB of
+timelines and the global rings, 256 tenant views at ~190 KB each with all
+16 handler slots filled, workspace 0 and the pools), reached only when
+20,000 runs each have more than 96 events and 256 tenants are active with
+16 busy handlers each; it does not grow with traffic, uptime or the number
+of workspaces. Measured with every structure filled and 10 workspace-0
+handlers, the probe's resident size grew 124 MiB against the
+size bound (114.8 MiB) — allocator overhead — so plan about 125 MiB. A compat install
+(workspace 0 only) never allocates a tenant view: about 61 MiB. Costs
+(release build, development laptop at load ~5-14, 2026-11-24 —
+observations, not capacity): ~150 ns per event replayed or live; 17 or 256
+tenants rotating 154-196 ns per record and ~208 ns per call; 257 rotating
+(every lookup a miss past the cap) 3.0 µs per record and 3.2 µs per call
+with allocations staying at 256 rings + 256 handler rings; one tenant
+rotating 17 handlers 449 ns per call:
 
 ```sh
 cargo test --release -p durable-engine --test observe_probe -- --ignored --nocapture

@@ -9,8 +9,7 @@
 use durable_domain::RunId;
 use durable_engine::observe::{
     memory_bound, CallGuard, CallResult, Kind, Observed, Observer, Scope, Window, COARSE_BUCKETS,
-    COARSE_BUCKET_MS, MAX_HANDLER_STATS_PER_WS, MAX_TIMELINES, MAX_TIMELINE_EVENTS,
-    MAX_TRACKED_WORKSPACES,
+    COARSE_BUCKET_MS, MAX_TIMELINES, MAX_TIMELINE_EVENTS, MAX_TRACKED_WORKSPACES,
 };
 use std::sync::Arc;
 use std::time::Instant;
@@ -85,7 +84,7 @@ fn observer_memory_at_its_caps() {
         CallGuard::start(&obs, 0, Some(h)).finish(CallResult::Ok);
     }
     for ws in 1..=MAX_TRACKED_WORKSPACES as u64 {
-        for i in 0..MAX_HANDLER_STATS_PER_WS {
+        for i in 0..durable_engine::observe::MAX_HANDLER_STATS_PER_WS {
             CallGuard::start(&obs, ws, Some(&format!("t{i}"))).finish(CallResult::Ok);
         }
     }
@@ -140,4 +139,76 @@ fn observer_cost_per_event() {
             obs.timeline_stats().1
         );
     }
+}
+
+/// Re-review S2-3: what a record and a call cost the actor/executor with
+/// tenants rotating — 17 (the old cap's first miss), the cap, the cap + 1
+/// (every lookup a miss, allocations reused), and one tenant rotating one
+/// handler more than its cap.
+#[test]
+#[ignore = "probe: run in release with --nocapture"]
+fn rotating_tenant_cost() {
+    use durable_engine::observe::MAX_HANDLER_STATS_PER_WS;
+    let accepted = |ws: u64, run: u64, at: u64| Observed {
+        ws,
+        run: RunId(run),
+        at,
+        first: Kind::Accepted { not_before: at },
+        then: None,
+    };
+    for tenants in [
+        17u64,
+        MAX_TRACKED_WORKSPACES as u64,
+        MAX_TRACKED_WORKSPACES as u64 + 1,
+    ] {
+        let obs = Arc::new(Observer::new(T0));
+        let rounds = 400u64;
+        let started = Instant::now();
+        let mut n = 0u64;
+        for round in 0..rounds {
+            for ws in 1..=tenants {
+                n += 1;
+                obs.committed(&[accepted(ws, n, T0 + round * 10_000 + ws)], true);
+            }
+        }
+        let per_record = started.elapsed().as_nanos() as f64 / n as f64;
+        let started = Instant::now();
+        let mut calls = 0u64;
+        for _ in 0..rounds {
+            for ws in 1..=tenants {
+                calls += 1;
+                CallGuard::start(&obs, ws, Some("h")).finish(CallResult::Ok);
+            }
+        }
+        let per_call = started.elapsed().as_nanos() as f64 / calls as f64;
+        let (tracked, evictions) = obs.workspace_stats();
+        let (rings, handler_rings) = obs.allocation_stats();
+        println!(
+            "{tenants} rotating tenants: {per_record:.0} ns/record, {per_call:.0} ns/call; \
+             tracked {tracked}, evictions {evictions}, allocations {rings} rings + {handler_rings} handler rings"
+        );
+    }
+    let obs = Arc::new(Observer::new(T0));
+    let names: Vec<String> = (0..=MAX_HANDLER_STATS_PER_WS)
+        .map(|i| format!("h{i}"))
+        .collect();
+    let started = Instant::now();
+    let mut calls = 0u64;
+    for _ in 0..2_000 {
+        for n in &names {
+            calls += 1;
+            CallGuard::start(&obs, 7, Some(n)).finish(CallResult::Ok);
+        }
+    }
+    let per_call = started.elapsed().as_nanos() as f64 / calls as f64;
+    println!(
+        "one tenant rotating {} handlers: {per_call:.0} ns/call, {} handler-ring allocations",
+        names.len(),
+        obs.allocation_stats().1
+    );
+    println!(
+        "memory bound (0 / 10 workspace-0 handlers): {} / {} KiB",
+        memory_bound(0) / 1024,
+        memory_bound(10) / 1024
+    );
 }

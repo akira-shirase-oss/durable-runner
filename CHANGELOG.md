@@ -222,10 +222,12 @@ contract + reference verifier ship in `docs/HANDLERS.md`.
   workspace-0 key (the operator's env keys) keeps the global `/metrics`,
   with workspace 0's handlers; its event views show workspace 0's runs.
   Run ids in both event views are the opaque public ids. Per-workspace
-  views are kept for workspace 0 and the 16 most recently active tenants
-  (LRU; an evicted tenant's view restarts with a later `since`), each
-  tenant with stats for its 8 most recently called handlers. Memory at
-  every cap: about 124 MiB, plus 0.4 MiB per workspace-0 handler.
+  views are kept for workspace 0 and up to 256 tenants at once, each
+  small (5-minute buckets over a day, `bucket_ms` 300,000; stats for its
+  16 most recently called handlers in hour buckets, `resolution_ms`);
+  past 256 the least active go first, one-shot tenants before returning
+  ones. Memory at every cap: about 110 MiB by size (~125 MiB measured),
+  plus 0.4 MiB per workspace-0 handler.
 - `durable-cli metrics` and `durable-cli events [--run N]`.
 
 ### Changed

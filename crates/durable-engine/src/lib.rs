@@ -3165,7 +3165,7 @@ mod tests {
             kinds(&obs.timeline(gone)),
             ["accepted", "cancel_requested", "finished"]
         );
-        let feed = obs.feed(0, 50).1;
+        let feed = obs.feed(0, 50, 0).1;
         assert_eq!(feed.len(), 9);
         assert_eq!(feed[0].0, gone, "newest first");
         assert_eq!(feed[0].1.at, 1_005);

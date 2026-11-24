@@ -3183,7 +3183,7 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(50)).await;
         assert!(!submit.is_finished());
         assert!(
-            eng.observer().feed(0, 50).1.is_empty(),
+            eng.observer().feed(0, 50, wall_ms()).1.is_empty(),
             "nothing before the fsync"
         );
         assert_eq!(totals(&eng).totals.counters.accepted, 0);
@@ -3220,7 +3220,7 @@ mod tests {
         let t = eng.observer().timeline(run);
         assert!(t.complete, "{t:?}");
         assert_eq!(t.events.len(), 6);
-        assert_eq!(eng.observer().feed(0, 1).1[0].0, run);
+        assert_eq!(eng.observer().feed(0, 1, wall_ms()).1[0].0, run);
         assert_eq!(
             totals(&eng).totals.counters,
             crate::observe::Counters::default()

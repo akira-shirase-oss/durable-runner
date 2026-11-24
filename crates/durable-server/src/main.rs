@@ -1927,7 +1927,7 @@ async fn feed(
             .ok_or_else(invalid)?,
     };
     // ATTACK(obs-feed-scope)
-    let (since, events) = app.obs.feed(auth.ws, limit);
+    let (since, events) = app.obs.feed(auth.ws, limit, observe::wall_ms());
     // Keys come from the index at read time: the observer holds no keys,
     // so its memory stays fixed per event (D-058).
     let mut runs: Vec<RunId> = events.iter().map(|(r, _)| *r).collect();
