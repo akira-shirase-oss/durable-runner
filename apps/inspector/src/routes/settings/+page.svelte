@@ -1,7 +1,9 @@
 <script lang="ts">
-	// #/settings: compat keys and theme (the signed-in account settings land next).
+	// #/settings. Compat: the key-paste card, the theme and the page notes, as before. Signed in: the selected
+	// workspace (rename, delete) and the personal section (password, sessions, theme).
+	import AccountSettings from '../../lib/pages/AccountSettings.svelte';
 	import CompatSettings from '../../lib/pages/CompatSettings.svelte';
 	import { session } from '../../lib/session.svelte.ts';
 </script>
 
-{#if !session.signedIn}<CompatSettings />{/if}
+{#if session.signedIn}<AccountSettings />{:else}<CompatSettings />{/if}

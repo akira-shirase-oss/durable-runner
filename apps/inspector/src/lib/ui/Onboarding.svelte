@@ -28,6 +28,9 @@
 	} from '../saas.ts';
 	import { goto } from '$app/navigation';
 
+	/** true while the checklist is on screen (the overview keeps empty charts away meanwhile) */
+	let { open = $bindable(false) }: { open?: boolean } = $props();
+
 	const pid = account.pid ?? '';
 	const SLOW = 15_000;
 
@@ -58,6 +61,9 @@
 				: null,
 	);
 	const done = $derived(steps !== null && onboardingDone(steps));
+	$effect(() => {
+		open = steps !== null && !done;
+	});
 	const count = $derived(steps?.filter((s) => s.done).length ?? 0);
 	const hasSample = $derived(handlers?.some((h) => h.name === SAMPLE_HANDLER) ?? false);
 	const firstHandler = $derived(handlers?.[0]?.name ?? null);
