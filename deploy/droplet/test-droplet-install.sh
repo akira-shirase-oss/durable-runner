@@ -112,7 +112,7 @@ P1=$(free_port); P2=$(free_port)
 run() {
   local r=$1 st=$2 s=$3; shift 3
   mkdir -p "$st"
-  env ROOT="$r" FAKE_STATE="$st" DURABLE_PUBLIC_PORT="$P1" DURABLE_OPS_PORT="$P2" "$@" "$s"
+  env ROOT="$r" FAKE_STATE="$st" DURABLE_PUBLIC_PORT="$P1" DURABLE_OPS_PORT="$P2" DR_METADATA_URL="file://$work/no-metadata" "$@" "$s"
 }
 kitcopy() { # <dir>: a scratch copy of deploy/ (for the known-bad proofs)
   mkdir -p "$1"; cp -R "$kit/.." "$1/deploy"
@@ -210,6 +210,23 @@ run "$D" "$SD" "$kit/install.sh" >"$work/d.out" 2>&1 && bad "install overwrote a
 [[ ! -e "$D/etc/durable" ]] && ok "and wrote nothing" || bad "it wrote /etc/durable before refusing"
 
 # 6. The ports.
+echo "the droplet's reserved IP"
+M=$work/rip-m; SM=$work/state-rip-m; seed "$M"
+mkdir -p "$work/meta/reserved_ip/ipv4"
+printf true >"$work/meta/reserved_ip/ipv4/active"; printf 203.0.113.7 >"$work/meta/reserved_ip/ipv4/ip_address"
+if run "$M" "$SM" "$kit/install.sh" DR_METADATA_URL="file://$work/meta" >"$work/rip-m1.out" 2>&1 \
+  && run "$M" "$SM" "$kit/install.sh" DR_METADATA_URL="file://$work/meta" >"$work/rip-m2.out" 2>&1; then
+  [[ "$(grep -cxF 203.0.113.7 "$M/etc/durable/deny-cidrs")" == 1 ]] && ok "an active reserved IP is denied, once across two runs" \
+    || bad "deny-cidrs after two runs: $(cat "$M/etc/durable/deny-cidrs")"
+else
+  bad "install with a reserved IP failed: $(tail -3 "$work"/rip-m*.out)"
+fi
+grep -qxF 203.0.113.7 "$A/etc/durable/deny-cidrs" && bad "an address was denied without the metadata service" || ok "without the metadata service deny-cidrs keeps its comment only"
+printf false >"$work/meta/reserved_ip/ipv4/active"
+N=$work/rip-n; SN=$work/state-rip-n; seed "$N"
+run "$N" "$SN" "$kit/install.sh" DR_METADATA_URL="file://$work/meta" >"$work/rip-n.out" 2>&1 \
+  && ! grep -qxF 203.0.113.7 "$N/etc/durable/deny-cidrs" && ok "an inactive reserved IP isn't added" || bad "inactive reserved IP: $(cat "$N/etc/durable/deny-cidrs")"
+
 echo "the ports"
 python3 -c 'import socket, sys, time
 s = socket.socket(); s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)

@@ -75,7 +75,7 @@ if [[ -n "${DURABLE_INVITE_ONLY+set}" ]]; then
 fi
 
 # The hosted flags go only to a server that has them: clap refuses an unknown flag, and main's
-# server can predate S3's (--public-origin is on the S3 branch; --ops-listen isn't written yet).
+# server can predate S3's (--public-origin and --ops-listen arrived with S3).
 # The binary's own --help says, as the lab guard reads it.
 bin=${DURABLE_SERVER_BIN:-/usr/local/bin/durable-server}
 help=$("$bin" --help 2>&1 || true)
@@ -94,18 +94,36 @@ if [[ -n "$origin" ]]; then
 elif [[ -n "${DATABASE_URL:-}" ]] && has_flag --public-origin; then
   refuse "an account store needs DURABLE_PUBLIC_ORIGIN: mailed links are built from it"
 fi
+# The ops listener: the env ops keys answer only there (loopback, reached by an SSH tunnel). With an
+# account store the server refuses to boot without it, so it is required here too.
+if [[ -n "${DATABASE_URL:-}" && -z "${DURABLE_OPS_LISTEN:-}" ]]; then
+  refuse "an account store needs DURABLE_OPS_LISTEN (e.g. 127.0.0.1:58301): the ops keys must not answer on the public listener"
+fi
 if [[ -n "${DURABLE_OPS_LISTEN:-}" ]]; then
   [[ "$DURABLE_OPS_LISTEN" =~ ^(127\.0\.0\.1|\[::1\]):[0-9]{1,5}$ ]] \
     || refuse "DURABLE_OPS_LISTEN='$DURABLE_OPS_LISTEN' must be a loopback address:port (the ops keys answer there)"
   [[ "$DURABLE_OPS_LISTEN" != "${DURABLE_LISTEN:-127.0.0.1:58300}" ]] || refuse "DURABLE_OPS_LISTEN can't be the public listener's address"
   if has_flag --ops-listen; then
     extra="$extra --ops-listen $DURABLE_OPS_LISTEN"
+  elif [[ -n "${DATABASE_URL:-}" ]]; then
+    refuse "this server has no --ops-listen, and with an account store the ops keys would answer on the public listener: deploy a build that has it"
   else
     echo "durable-saas-run: WARNING DURABLE_OPS_LISTEN is set but this server has no --ops-listen: not passed, so the ops keys still answer on the public listener" >&2
   fi
 fi
+# Per-workspace capacity (a stopgap until plan limits): one tenant's share of live runs and of
+# the retained-run index, so a single free account can't fill the host.
+for pair in "DURABLE_MAX_LIVE_RUNS_PER_WS --max-live-runs-per-ws" "DURABLE_MAX_INDEX_BYTES_PER_WS --max-index-bytes-per-ws"; do
+  var=${pair%% *}; flag=${pair#* }
+  val=${!var:-}
+  [[ -n "$val" ]] || continue
+  [[ "$val" =~ ^[1-9][0-9]{0,15}$ ]] || refuse "$var='$val' must be a whole number above 0"
+  has_flag "$flag" || refuse "$var is set but this server has no $flag"
+  extra="$extra $flag $val"
+done
 case " ${DURABLE_EXTRA_ARGS:-} " in
-  *" --public-origin"*|*" --ops-listen"*) refuse "DURABLE_EXTRA_ARGS repeats a flag this wrapper sets (--public-origin / --ops-listen): use DURABLE_PUBLIC_ORIGIN / DURABLE_OPS_LISTEN" ;;
+  *" --public-origin"*|*" --ops-listen"*|*" --max-live-runs-per-ws"*|*" --max-index-bytes-per-ws"*)
+    refuse "DURABLE_EXTRA_ARGS repeats a flag this wrapper sets: use DURABLE_PUBLIC_ORIGIN / DURABLE_OPS_LISTEN / DURABLE_MAX_LIVE_RUNS_PER_WS / DURABLE_MAX_INDEX_BYTES_PER_WS" ;;
 esac
 # durable-run word-splits DURABLE_EXTRA_ARGS; every value added here was checked above to hold no
 # space or glob character.
