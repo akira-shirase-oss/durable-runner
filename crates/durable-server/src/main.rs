@@ -9434,12 +9434,19 @@ mod tests {
                 .await
                 .unwrap_or_else(|e| panic!("{e}"));
             let mut reply = Vec::new();
-            tokio::time::timeout(Duration::from_secs(5), probe.read_to_end(&mut reply))
-                .await
-                .unwrap_or_else(|_| panic!("{src}: the lane conn got no answer — it was dropped"))
-                // DECISIVE(overload-lane)
-                .unwrap_or_else(|e| panic!("{src}: the lane conn was reset, not answered: {e}"));
-            let text = String::from_utf8_lossy(&reply);
+            let read =
+                tokio::time::timeout(Duration::from_secs(5), probe.read_to_end(&mut reply)).await;
+            // An unanswered conn shows up three ways, all the same failure:
+            // a reset (the close found our request bytes queued — usual on
+            // macOS), a bare EOF (closed before they arrived — usual on
+            // Linux), or a hang. Each lands on the one assertion the lane
+            // guards: the conn READ a 503.
+            let text = match read {
+                Ok(Ok(_)) => String::from_utf8_lossy(&reply).into_owned(),
+                Ok(Err(e)) => format!("<reset, no answer: {e}>"),
+                Err(_) => "<no answer within 5 s>".to_string(),
+            };
+            // DECISIVE(overload-lane)
             assert!(
                 text.starts_with("HTTP/1.1 503"),
                 "{src}: expected the lane's 503, got: {text}"
