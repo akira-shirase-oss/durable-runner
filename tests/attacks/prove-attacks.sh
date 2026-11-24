@@ -85,25 +85,25 @@ mutations=(
   "registry-noop-skip|crates/durable-server/src/main.rs|unit:durable-server|tests::a_noop_put_does_no_store_epoch_or_disk_work|if app\.registry~~>if false && app.registry"
   "registry-rate|crates/durable-server/src/main.rs|unit:durable-server|tests::registry_mutations_are_rate_limited_per_workspace|app\.registry\.admit\(ws, Instant::now\(\)\)~~>Ok::<(), Duration>(())"
   "deny-cidr-mapped|crates/durable-server/src/ssrf.rs|unit:durable-server|ssrf::tests::an_ipv4_mapped_deny_cidr_names_its_ipv4_range|v6\.to_ipv4_mapped\(\)~~>None::<Ipv4Addr>"
-  "session-forge|crates/durable-server/src/main.rs|unit:durable-server|tests::s30_session_forge_dies_before_the_store|!bool::from\(subtle::ConstantTimeEq::ct_eq~~>bool::from(subtle::ConstantTimeEq::ct_eq",
-  "csrf|crates/durable-server/src/main.rs|unit:durable-server|tests::s30_signup_login_session_round_trip|csrf_token\(seed\)~~>csrf_token(&[0; 32])",
-  "csrf-open-post|crates/durable-server/src/main.rs|unit:durable-server|tests::s30_csrf_open_post|site != \"same-origin\" && site != \"none\"~~>false",
-  "cookie-attrs|crates/durable-server/src/main.rs|unit:durable-server|tests::s30_cookie_attributes|session_set_cookie\(&token\)~~>String::from(\"x\")",
-  "token-replay|crates/durable-accounts/src/memory.rs|unit:durable-server|tests::s31_verify_token_replay_410|!t\.consumed~~>true",
-  "token-kind-confusion|crates/durable-accounts/src/memory.rs|unit:durable-server|tests::s31_reset_token_cannot_verify|t\.kind == \"verify\"~~>true",
-  "prereg-takeover|crates/durable-accounts/src/memory.rs|unit:durable-server|tests::s31_verify_revokes_prereg_session|inner\.sessions\.values_mut\(\)~~>inner.sessions.values_mut().take(0)",
-  "addr-spec-injection|crates/durable-accounts/src/memory.rs|unit:durable-server|tests::s31_addr_spec_refused|!crate::mail::valid_addr_spec\(&mail\.send_to\)~~>false",
-  "mail-budget|crates/durable-accounts/src/memory.rs|unit:durable-server|tests::s31_outbox_hourly_cap|in_window >= crate::mail::MAX_HOURLY_PER_ADDR~~>in_window >= i64::MAX",
-  "enumeration|crates/durable-server/src/main.rs|unit:durable-server|tests::s31_forgot_resend_envelopes_match|let _ = issued;~~>if !issued { return Ok(no_store(StatusCode::OK.into_response())); }",
-  "invite-required|crates/durable-server/src/main.rs|unit:durable-server|tests::s31_invite_only_gate|!ok~~>false",
-  "verify-sets-cookie|crates/durable-server/src/main.rs|unit:durable-server|tests::s31_verify_round_trip|TokenCookie::Never~~>TokenCookie::UnlessForeignSession",
-  "lockout-shape|crates/durable-server/src/main.rs|unit:durable-server|tests::s31_lockout_cools_off|app\.lockouts\.fail\(&email, prefix, now\)~~>false",
-  "mail-global|crates/durable-server/src/main.rs|unit:durable-server|tests::s31_mail_global_budget_stops_drain|!app\.mail_budget\.open\(unix_ms\(\)\)~~>false",
-  "session-fixation|crates/durable-server/src/main.rs|unit:durable-server|tests::s32_login_never_adopts_a_planted_cookie|mint_session_token\(&app\.session_key\)~~>session_cookie(&parts).unwrap_or_default()",
-  "cooloff|crates/durable-server/src/main.rs|unit:durable-server|tests::s31_lockout_cools_off|app\.lockouts\.check\(&email, prefix, now\)~~>None::<u64>",
-  "idle-timeout|crates/durable-server/src/main.rs|unit:durable-server|tests::s32_idle_slides_then_times_out|grant\.expires_at_ms <= now \|\| idle <= now~~>false",
-  "session-idor|crates/durable-accounts/src/memory.rs|unit:durable-server|tests::s32_revoke_one_session|s\.account == account~~>true",
-  "reset-token-replay|crates/durable-accounts/src/memory.rs|unit:durable-server|tests::s32_reset_kills_cached_sessions_and_replay_dies|!t\.consumed~~>true",
+  "session-forge|crates/durable-server/src/main.rs|unit:durable-server|tests::s30_session_forge_dies_before_the_store|!bool::from\(subtle::ConstantTimeEq::ct_eq~~>bool::from(subtle::ConstantTimeEq::ct_eq"
+  "csrf|crates/durable-server/src/main.rs|unit:durable-server|tests::s30_signup_login_session_round_trip|csrf_token\(seed\)~~>csrf_token(&[0; 32])"
+  "csrf-open-post|crates/durable-server/src/main.rs|unit:durable-server|tests::s30_csrf_open_post|site != \"same-origin\" && site != \"none\"~~>false"
+  "cookie-attrs|crates/durable-server/src/main.rs|unit:durable-server|tests::s30_cookie_attributes|session_set_cookie\(&token\)~~>String::from(\"x\")"
+  "token-replay|crates/durable-accounts/src/memory.rs|unit:durable-server|tests::s31_verify_token_replay_410|!t\.consumed~~>true"
+  "token-kind-confusion|crates/durable-accounts/src/memory.rs|unit:durable-server|tests::s31_reset_token_cannot_verify|t\.kind == \"verify\"~~>true"
+  "prereg-takeover|crates/durable-accounts/src/memory.rs|unit:durable-server|tests::s31_verify_revokes_prereg_session|inner\.sessions\.values_mut\(\)~~>inner.sessions.values_mut().take(0)"
+  "addr-spec-injection|crates/durable-accounts/src/memory.rs|unit:durable-server|tests::s31_addr_spec_refused|!crate::mail::valid_addr_spec\(&mail\.send_to\)~~>false"
+  "mail-budget|crates/durable-accounts/src/memory.rs|unit:durable-server|tests::s31_outbox_hourly_cap|in_window >= crate::mail::MAX_HOURLY_PER_ADDR~~>in_window >= i64::MAX"
+  "enumeration|crates/durable-server/src/main.rs|unit:durable-server|tests::s31_forgot_resend_envelopes_match|let _ = issued;~~>if !issued { return Ok(no_store(StatusCode::OK.into_response())); }"
+  "invite-required|crates/durable-server/src/main.rs|unit:durable-server|tests::s31_invite_only_gate|!ok~~>false"
+  "verify-sets-cookie|crates/durable-server/src/main.rs|unit:durable-server|tests::s31_verify_round_trip|TokenCookie::Never~~>TokenCookie::UnlessForeignSession"
+  "lockout-shape|crates/durable-server/src/main.rs|unit:durable-server|tests::s31_lockout_cools_off|app\.lockouts\.fail\(&email, prefix, now\)~~>false"
+  "mail-global|crates/durable-server/src/main.rs|unit:durable-server|tests::s31_mail_global_budget_stops_drain|!app\.mail_budget\.open\(unix_ms\(\)\)~~>false"
+  "session-fixation|crates/durable-server/src/main.rs|unit:durable-server|tests::s32_login_never_adopts_a_planted_cookie|mint_session_token\(&app\.session_key\)~~>session_cookie(&parts).unwrap_or_default()"
+  "cooloff|crates/durable-server/src/main.rs|unit:durable-server|tests::s31_lockout_cools_off|app\.lockouts\.check\(&email, prefix, now\)~~>None::<u64>"
+  "idle-timeout|crates/durable-server/src/main.rs|unit:durable-server|tests::s32_idle_slides_then_times_out|grant\.expires_at_ms <= now \|\| idle <= now~~>false"
+  "session-idor|crates/durable-accounts/src/memory.rs|unit:durable-server|tests::s32_revoke_one_session|s\.account == account~~>true"
+  "reset-token-replay|crates/durable-accounts/src/memory.rs|unit:durable-server|tests::s32_reset_kills_cached_sessions_and_replay_dies|!t\.consumed~~>true"
 )
 
 # Every marker in the source has exactly one mutation, and every mutation
