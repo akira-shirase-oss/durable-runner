@@ -31,7 +31,6 @@
 			await getHealth(signal);
 			return getReady(signal);
 		},
-		{ live: false },
 	);
 	poll(status);
 
@@ -45,11 +44,18 @@
 	<title>{title} · Inspector · Durable Runner</title>
 </svelte:head>
 
+<!-- a hash link would be read as a route, so the skip link moves focus itself -->
+<button class="skip" onclick={() => document.getElementById('main')?.focus()}>Skip to content</button>
 <div class="shell">
 	<Sidebar {section} />
 	<div class="content">
-		<TopBar {title} monitoring={nav.monitoring && page.route.id !== null} health={status.data} healthStatus={status.status} />
-		<main id="main">
+		<TopBar
+			{title}
+			monitoring={nav.monitoring && page.route.id !== null && session.metricsSupported !== false}
+			health={status.data}
+			healthStatus={status.status}
+		/>
+		<main id="main" tabindex="-1">
 			{@render children()}
 		</main>
 	</div>
@@ -66,6 +72,31 @@
 		min-width: 0;
 		padding: 0 28px 48px 12px;
 	}
+	.skip {
+		position: fixed;
+		top: 8px;
+		left: 8px;
+		z-index: 50;
+		padding: 8px 12px;
+		border: 0;
+		border-radius: 10px;
+		background: var(--c-card);
+		box-shadow: 0 0 0 1px var(--c-bar-edge);
+		color: var(--c-ink);
+		font: inherit;
+		font-size: 14px;
+	}
+	.skip:not(:focus-visible) {
+		width: 1px;
+		height: 1px;
+		padding: 0;
+		overflow: hidden;
+		clip-path: inset(50%);
+		white-space: nowrap;
+	}
+	main:focus {
+		outline: none;
+	}
 	main {
 		min-width: 0;
 		max-width: 1360px;
@@ -74,6 +105,7 @@
 	@media (max-width: 899px) {
 		.shell {
 			grid-template-columns: minmax(0, 1fr);
+			grid-template-rows: auto minmax(0, 1fr);
 		}
 		.content {
 			padding: 0 16px 40px;

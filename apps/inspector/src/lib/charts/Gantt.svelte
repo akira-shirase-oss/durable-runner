@@ -12,7 +12,16 @@
 		steps,
 		stepName = () => null,
 		empty = 'No step has been dispatched yet',
-	}: { attempts: Attempt[]; now: number; steps: number; stepName?: (i: number) => string | null; empty?: string } = $props();
+		hole = null,
+	}: {
+		attempts: Attempt[];
+		now: number;
+		steps: number;
+		stepName?: (i: number) => string | null;
+		empty?: string;
+		/** a stretch whose events the server did not keep (the per-run cap): shaded, never drawn as an attempt */
+		hole?: [number, number] | null;
+	} = $props();
 
 	let width = $state(0);
 	let active = $state<number | null>(null);
@@ -32,6 +41,12 @@
 	const span = $derived(domain ? domain[1] - domain[0] : 0);
 	const ticks = $derived(domain ? offsetTicks(span, Math.max(2, Math.floor(pw / 80))) : []);
 	const laid = $derived(domain ? attempts.map((a) => barLayout(a, domain, pw, now)) : []);
+	const holeX = $derived.by(() => {
+		if (!hole || !domain || span <= 0) return null;
+		const x0 = Math.max(0, ((hole[0] - domain[0]) / span) * pw);
+		const x1 = Math.min(pw, ((hole[1] - domain[0]) / span) * pw);
+		return x1 - x0 >= 2 ? { x: x0, w: x1 - x0 } : null;
+	});
 
 	const OUTCOME: Record<string, { color: string; label: string }> = {
 		ok: { color: 'var(--c-chart-ok)', label: 'checkpointed' },
@@ -142,6 +157,12 @@
 						<text class="xlab" {x} y={height - 7} text-anchor={t === 0 ? 'start' : 'middle'}>{t === 0 ? '0' : `+${fmtMsTick(t)}`}</text>
 					{/each}
 					<line class="base" x1={LABEL} x2={LABEL + pw} y1={MT + rows * ROW} y2={MT + rows * ROW} />
+					{#if holeX}
+						<rect class="hole" x={LABEL + holeX.x} y={MT} width={holeX.w} height={rows * ROW} />
+						{#if holeX.w > 64}
+							<text class="hole-lab" x={LABEL + holeX.x + holeX.w / 2} y={MT + 11} text-anchor="middle">not kept</text>
+						{/if}
+					{/if}
 
 					{#each attempts as a, i (i)}
 						{@const b = laid[i]!}
@@ -239,6 +260,16 @@
 	.bar.on rect {
 		stroke: var(--c-ink);
 		stroke-width: 1.5;
+	}
+	.hole {
+		fill: var(--c-hover-band);
+		stroke: var(--c-line-strong);
+		stroke-dasharray: 3 3;
+	}
+	.hole-lab {
+		fill: var(--c-body);
+		font-size: 11px;
+		font-style: italic;
 	}
 	.probe {
 		stroke: var(--c-chart-lost);

@@ -43,6 +43,10 @@
 		if ((f ?? 0) > 0 || h.replies_lost > 0) return { tone: 'warn', text: 'Degraded' };
 		return { tone: 'ok', text: 'Healthy' };
 	}
+	$effect(() => {
+		if (res.status === 'ok') session.metricsSupported = true;
+		else if (res.status === 'unsupported') session.metricsSupported = false;
+	});
 </script>
 
 <div class="page" bind:clientWidth={width}>

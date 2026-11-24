@@ -43,9 +43,12 @@ test('the overview model: rates over the window, success without cancellations, 
 	assert.equal(o.liveRuns, 100); // the newest SAMPLED value
 	assert.equal(o.activeRuns, 6);
 	assert.equal(o.inFlight, 2);
-	// the counters cover 0 … now (20 s), not the whole 60 s window: 50 in 20 s is 150/min, not 50/min
-	assert.equal(o.completedPerMin, 150);
-	assert.equal(o.acceptedPerMin, 180);
+	// the counters cover 0 … now (20 s), but a rate is never extrapolated from under a minute: 50/min, not 150
+	assert.equal(o.completedPerMin, 50);
+	assert.equal(o.acceptedPerMin, 60);
+	// with an hour behind it, the same counts over 30 minutes covered read per minute of coverage
+	const long = overviewModel({ ...m, now: 1_800_000, window_ms: 3_600_000 }, 120);
+	assert.equal(long.completedPerMin, 50 / 30);
 	assert.equal(o.success, 50 / 51);
 	assert.equal(o.finished, 55);
 	assert.deepEqual([o.p50, o.p95, o.max], [120, 480, 900]);

@@ -64,8 +64,9 @@ export function overviewModel(m: Metrics, maxBins: number): OverviewModel {
 		liveRuns: last('live_runs'),
 		activeRuns: last('active_runs'),
 		inFlight: last('in_flight'),
-		completedPerMin: perMinute(t.completed, coveredMs(m)),
-		acceptedPerMin: perMinute(t.accepted, coveredMs(m)),
+		// never extrapolated from less than a minute: a server up for 7 s does not "complete 130 per minute"
+		completedPerMin: perMinute(t.completed, Math.max(60_000, coveredMs(m))),
+		acceptedPerMin: perMinute(t.accepted, Math.max(60_000, coveredMs(m))),
 		success: successRate(t.completed, t.failed),
 		finished: t.completed + t.failed + t.cancelled,
 		p50: t.step_ms?.p50 ?? null,

@@ -35,7 +35,7 @@
 {:else if status === 'unsupported'}
 	<p class="banner warn">
 		<Icon name="server" size={16} />
-		<span class="msg"><strong>This server does not serve <code>{route}</code>.</strong> It answered 404: an older durable-server, from before the observability API. {what} appears once the server is upgraded; everything else here works as before.</span>
+		<span class="msg"><strong>This server does not serve <code>{route}</code>.</strong> It answered 404: an older durable-server, from before the observability API. Upgrade the server to see {what.charAt(0).toLowerCase() + what.slice(1)} here; everything else works as before.</span>
 	</p>
 {:else if status === 'error' && error && stale !== null}
 	<p class="banner warn">

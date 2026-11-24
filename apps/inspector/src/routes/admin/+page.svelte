@@ -79,13 +79,13 @@
 	</div>
 	{#if d}
 		<dl class="tiles">
-			<KpiTile label="Journal generation" value={fmtInt(d.generation)} sub="bumped by each compaction" />
+			<KpiTile label="Journal generation" value={fmtInt(d.generation)} sub="+1 per compaction" />
 			<KpiTile label="Records written" value={fmtCompact(d.records_written)} sub="{fmtInt(d.records_written)} since start" />
 			<KpiTile label="Live runs" value={fmtCompact(d.live_runs)} sub="held in the index" />
 			<KpiTile label="Active runs" value={fmtCompact(d.active_runs)} sub="not yet terminal" />
 			<KpiTile label="Index" value={fmtBytes(d.index_bytes)} sub="{fmtInt(d.index_bytes)} bytes" />
-			<KpiTile label="Dedup keys" value={fmtCompact(d.dedup_keys)} sub="operation keys remembered" />
-			<KpiTile label="Disk reserve" value={d.space_ok ? 'OK' : 'Below reserve'} tone={d.space_ok ? 'ok' : 'bad'} sub={d.space_ok ? 'admission is open' : 'new runs are refused'}>
+			<KpiTile label="Dedup keys" value={fmtCompact(d.dedup_keys)} sub="op keys remembered" />
+			<KpiTile label="Disk reserve" value={d.space_ok ? 'OK' : 'Below reserve'} tone={d.space_ok ? 'ok' : 'bad'} sub={d.space_ok ? 'admission open' : 'new runs refused'}>
 				{#snippet icon()}<Icon name="hard-drive" size={18} />{/snippet}
 			</KpiTile>
 		</dl>
@@ -167,7 +167,7 @@
 <style>
 	.tiles {
 		display: grid;
-		grid-template-columns: repeat(auto-fill, minmax(165px, 1fr));
+		grid-template-columns: repeat(auto-fill, minmax(146px, 1fr));
 		gap: 12px;
 		margin: 0;
 	}

@@ -101,6 +101,7 @@
 		text-underline-offset: 3px;
 	}
 	.key {
+		min-width: 14ch;
 		color: var(--c-ink-soft);
 		font-family: var(--font-mono);
 		font-size: 13.5px;
@@ -156,7 +157,7 @@
 		}
 		.runlist td.key {
 			grid-area: 1 / 2;
-			min-width: 0;
+			min-width: 0 !important;
 			overflow: hidden;
 			text-overflow: ellipsis;
 			white-space: nowrap !important;

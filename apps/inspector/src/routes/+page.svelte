@@ -71,6 +71,10 @@
 		[...(m?.handlers ?? [])].sort((a, b) => b.failed / Math.max(1, b.calls) - a.failed / Math.max(1, a.calls) || b.calls - a.calls).slice(0, 8),
 	);
 	const unsupported = $derived(metricsRes.status === 'unsupported');
+	$effect(() => {
+		if (metricsRes.status === 'ok') session.metricsSupported = true;
+		else if (metricsRes.status === 'unsupported') session.metricsSupported = false;
+	});
 </script>
 
 <div class="page">
@@ -81,6 +85,16 @@
 
 	{#if unsupported}
 		<LegacyOverview />
+	{:else if metricsRes.status === 'needs-key' && !m}
+		<section class="card start" aria-labelledby="start-title">
+			<span class="start-icon" aria-hidden="true"><Icon name="key" size={22} /></span>
+			<h2 id="start-title">Add a key to see the dashboard</h2>
+			<p class="hint">
+				The read key shows the overview, runs, timelines and handlers; the API key also submits, cancels and
+				administers. Both stay in this tab only.
+			</p>
+			<a class="btn brand sm" href="#/settings"><Icon name="settings" />Open Settings</a>
+		</section>
 	{:else}
 		<dl class="kpis" aria-label="Key figures, {win}">
 			<KpiTile
@@ -254,9 +268,9 @@
 								<th scope="col">Handler</th>
 								<th scope="col" class="num">Calls</th>
 								<th scope="col" class="num">Failure</th>
-								<th scope="col" class="num">Lost replies</th>
+								<th scope="col" class="num lost-col">Lost replies</th>
 								<th scope="col" class="num">p95 (approx.)</th>
-								<th scope="col">Last failure, since start</th>
+								<th scope="col" class="last-col">Last failure, since start</th>
 							</tr>
 						</thead>
 						<tbody>
@@ -265,9 +279,9 @@
 									<th scope="row" class="mono-cell"><a class="hlink" href="#/handlers">{h.name}</a></th>
 									<td class="num">{fmtInt(h.calls)}</td>
 									<td class="num" class:bad={h.calls > 0 && h.failed / h.calls >= 0.01}>{h.calls ? fmtPct(h.failed / h.calls) : '—'}</td>
-									<td class="num">{fmtInt(h.replies_lost)}</td>
+									<td class="num lost-col">{fmtInt(h.replies_lost)}</td>
 									<td class="num">{fmtApproxMs(h.step_ms.p95)}</td>
-									<td class="muted">{h.last_failure_at ? fmtAgo(live.now - h.last_failure_at) : 'none'}</td>
+									<td class="muted last-col">{h.last_failure_at ? fmtAgo(live.now - h.last_failure_at) : 'none'}</td>
 								</tr>
 							{/each}
 						</tbody>
@@ -279,6 +293,34 @@
 </div>
 
 <style>
+	.start {
+		display: flex;
+		flex-direction: column;
+		align-items: flex-start;
+		gap: 10px;
+		padding: 26px 26px 28px;
+	}
+	.start h2 {
+		font-size: 19px;
+	}
+	.start .hint {
+		max-width: 62ch;
+		margin: 0;
+		line-height: 1.55;
+	}
+	.start a {
+		margin-top: 6px;
+		text-decoration: none;
+	}
+	.start-icon {
+		display: grid;
+		place-items: center;
+		width: 46px;
+		height: 46px;
+		border-radius: 14px;
+		background: var(--c-brand-tint);
+		color: var(--c-brand-deep);
+	}
 	.kpis {
 		display: grid;
 		grid-template-columns: repeat(6, minmax(0, 1fr));
@@ -302,6 +344,12 @@
 		max-height: 380px;
 		padding-top: 6px;
 		overflow-y: auto;
+	}
+	@media (max-width: 600px) {
+		.lost-col,
+		.last-col {
+			display: none;
+		}
 	}
 	.hlink {
 		color: var(--c-ink);

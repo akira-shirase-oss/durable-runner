@@ -33,7 +33,7 @@
 	<Notice status={diag.status} error={diag.error} what="Diagnostics" route="GET /admin/diagnostics" needsApi />
 {/if}
 
-<div class="grid two lower">
+<div class="grid two lower legacy">
 	<section class="card" aria-labelledby="legacy-states">
 		<div class="card-head">
 			<div>
@@ -79,6 +79,14 @@
 	}
 	.lower {
 		align-items: start;
+	}
+	.legacy {
+		grid-template-columns: minmax(0, 1fr) minmax(0, 2fr);
+	}
+	@media (max-width: 1100px) {
+		.legacy {
+			grid-template-columns: minmax(0, 1fr);
+		}
 	}
 	.card-head .btn {
 		text-decoration: none;

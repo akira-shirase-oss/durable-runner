@@ -54,6 +54,7 @@
 	const stepName = (i: number): string | null => specData?.steps[i]?.name ?? null;
 	const gap = $derived(tl ? gapIndex(tl.complete, tl.reason, events.length) : -1);
 	const attempts = $derived(buildAttempts(events, gap));
+	const hole = $derived<[number, number] | null>(gap > 0 && gap < events.length ? [events[gap - 1]!.at, events[gap]!.at] : null);
 	const rows = $derived(timelineRows(events, stepName, gap));
 	// a long timeline shows its first and last rows; the middle opens on request
 	const FOLD = 36;
@@ -218,6 +219,7 @@
 							now={live.now}
 							steps={run?.steps ?? 0}
 							{stepName}
+							{hole}
 							empty={tl.complete ? 'No step has been dispatched yet' : 'The server kept no attempts for this run'}
 						/>
 					{:else}

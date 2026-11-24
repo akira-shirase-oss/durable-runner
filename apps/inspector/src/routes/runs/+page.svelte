@@ -316,6 +316,9 @@
 			flex-basis: 100%;
 			max-width: none;
 		}
+		.order {
+			margin-left: 0;
+		}
 		.filters,
 		.scope,
 		.pager {

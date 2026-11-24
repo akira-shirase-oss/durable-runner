@@ -11,6 +11,8 @@ class Session {
 	/** Bumped on every key change: polled resources that were refused for want of a key try again. */
 	keysVersion = $state(0);
 	window = $state<Window>('1h');
+	/** Whether this server serves GET /metrics (null until a page asked): the time window is hidden without it. */
+	metricsSupported = $state<boolean | null>(null);
 	/** A success notice for the page ("run 10 cancelled"); pages show it in a banner. */
 	notice = $state<string | null>(null);
 
