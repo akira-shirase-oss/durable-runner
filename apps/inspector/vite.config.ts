@@ -13,11 +13,12 @@ export default defineConfig({
 					filename.split(/[/\\]/).includes('node_modules') ? undefined : true,
 			},
 			// A static single-page app served by durable-server under /inspector/.
-			// Routes live in the hash (#/runs/10): one index.html serves them all,
-			// so durable-server's CSP hashes the one bootstrap script it finds there
-			// (inspector_csp). The fallback page cannot use relative asset paths
-			// (it is served at any depth), so the base is the mount.
-			adapter: adapter({ pages: out, assets: out, fallback: 'index.html' }),
+			// Routes live in the hash (#/runs/10), so the one index.html SvelteKit
+			// writes serves them all (durable-server also answers any other path
+			// under /inspector with it), and durable-server's CSP hashes the
+			// attribute-less scripts it finds there (inspector_csp). Assets load
+			// from the mount, whatever the path.
+			adapter: adapter({ pages: out, assets: out }),
 			paths: { base: '/inspector' },
 			router: { type: 'hash' },
 		}),
