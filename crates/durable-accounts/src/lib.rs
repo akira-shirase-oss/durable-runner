@@ -316,7 +316,19 @@ pub enum AccountError {
     /// (S2 review #6: the route's pre-check is TOCTOU by nature).
     #[error("handler registry is full ({MAX_HANDLERS_PER_WS} per workspace)")]
     RegistryFull,
+    /// A stopgap cap refused the write atomically in the same
+    /// transaction/lock as the insert (S2-2): the `limit` name is the
+    /// API's `plan_limit` envelope field.
+    #[error("limit reached: {0}")]
+    PlanLimit(&'static str),
 }
+
+/// Pre-deploy S2-2 stopgap caps — S3-4's `plans` rows replace them
+/// with plan-shaped numbers; until then these are the same edges the
+/// Free row will carry.
+pub const STOPGAP_WS_PER_ACCOUNT: u64 = 3;
+pub const STOPGAP_KEYS_PER_WS: u64 = 10;
+pub const STOPGAP_INVITES_PER_WS_DAY: u64 = 20;
 
 impl From<sqlx::Error> for AccountError {
     fn from(err: sqlx::Error) -> Self {

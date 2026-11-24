@@ -5179,6 +5179,9 @@ struct ApiError {
     code: &'static str,
     message: String,
     retry_after: Option<u64>,
+    /// Extra top-level body fields (the plan_limit envelope's `limit`
+    /// name) — merged into the JSON object.
+    extra: Option<serde_json::Value>,
 }
 
 impl ApiError {
@@ -5188,13 +5191,22 @@ impl ApiError {
             code,
             message: message.into(),
             retry_after: None,
+            extra: None,
         }
     }
 }
 
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
-        let body = Json(serde_json::json!({ "error": self.message, "code": self.code }));
+        let mut body = serde_json::json!({ "error": self.message, "code": self.code });
+        if let Some(extra) = self.extra {
+            if let (Some(obj), Some(fields)) = (body.as_object_mut(), extra.as_object()) {
+                for (k, v) in fields {
+                    obj.insert(k.clone(), v.clone());
+                }
+            }
+        }
+        let body = Json(body);
         let mut res = (self.status, body).into_response();
         if self.status == StatusCode::TOO_MANY_REQUESTS {
             // A refusal the server chooses carries Retry-After (S2 N4).
@@ -5357,6 +5369,17 @@ async fn submit(
         steps: req.spec.steps,
         input,
     };
+    // A run may park at most 30 days out — a far-future not_before is a
+    // stuck slot the caller cannot observe (S2-2).
+    if let Some(nb) = req.not_before {
+        if nb > (unix_ms() + 30 * 86_400_000).max(0) as u64 {
+            return Err(ApiError::new(
+                StatusCode::BAD_REQUEST,
+                "not_before_too_far",
+                "not_before may be at most 30 days ahead",
+            ));
+        }
+    }
     let key = OperationKey(req.op_key);
     let submitted = match app
         .engine
@@ -5827,6 +5850,17 @@ fn store_err(e: durable_accounts::AccountError) -> ApiError {
             "registry_full",
             "the workspace's handler registry is at its bound",
         ),
+        // S2-2 stopgap: the store refused the write atomically — the
+        // 429 names the limit so the dashboard renders the edge.
+        E::PlanLimit(limit) => {
+            let mut e = ApiError::new(
+                StatusCode::TOO_MANY_REQUESTS,
+                "plan_limit",
+                format!("the {limit} limit is reached"),
+            );
+            e.extra = Some(serde_json::json!({ "limit": limit }));
+            e
+        }
         E::Store(m) => {
             eprintln!("durable-server: account store error: {m}");
             ApiError::new(
@@ -8673,7 +8707,7 @@ mod tests {
         let h = harness(false);
         for i in 0..60 {
             let mut b = submit_body(&format!("f-{i}"));
-            b["not_before"] = json!(9_999_999_999_999u64); // one event each
+            b["not_before"] = json!((unix_ms() as u64 + 2_500_000_000)); // one event each
             let (status, _) = call(&h.router, "POST", "/jobs", Some(KEY), Some(b)).await;
             assert_eq!(status, StatusCode::OK);
         }
@@ -8892,7 +8926,7 @@ mod tests {
     async fn submits_count_as_deduplicated_or_refused() {
         let h = harness(false);
         let mut later = submit_body("same");
-        later["not_before"] = json!(9_999_999_999_999u64);
+        later["not_before"] = json!((unix_ms() as u64 + 2_500_000_000));
         for _ in 0..3 {
             let (status, v) =
                 call(&h.router, "POST", "/jobs", Some(KEY), Some(later.clone())).await;
@@ -9441,7 +9475,7 @@ mod tests {
     async fn the_read_key_reads_and_nothing_else() {
         let h = harness(true);
         let mut later = submit_body("k");
-        later["not_before"] = json!(9_999_999_999_999u64); // stays queued
+        later["not_before"] = json!((unix_ms() as u64 + 2_500_000_000)); // stays queued
         let (status, v) = call(&h.router, "POST", "/jobs", Some(KEY), Some(later)).await;
         assert_eq!(status, StatusCode::OK);
         let id = v["run_id"].as_str().unwrap_or_default().to_string();
@@ -9475,7 +9509,7 @@ mod tests {
     async fn the_api_key_reads_back_a_runs_submitted_spec() {
         let h = harness(true);
         let mut body = submit_body("spec-1");
-        body["not_before"] = json!(9_999_999_999_999u64); // stays queued
+        body["not_before"] = json!((unix_ms() as u64 + 2_500_000_000)); // stays queued
         let (status, v) = call(&h.router, "POST", "/jobs", Some(KEY), Some(body.clone())).await;
         assert_eq!(status, StatusCode::OK, "{v}");
         let id = v["run_id"].as_str().unwrap_or_else(|| panic!("{v}"));
@@ -10609,7 +10643,7 @@ mod tests {
     async fn admits(r: &Router, key: &str, handler: &str) -> StatusCode {
         let mut b = submit_body(&format!("admit-{handler}"));
         b["spec"]["steps"][0]["handler"] = json!(handler);
-        b["not_before"] = json!(9_999_999_999_999u64);
+        b["not_before"] = json!((unix_ms() as u64 + 2_500_000_000));
         call(r, "POST", "/jobs", Some(key), Some(b)).await.0
     }
 
@@ -19487,6 +19521,143 @@ mod tests {
             assert!(!valid_ws_name(bad), "{bad:?}");
         }
         assert!(valid_ws_name("Team Ω (west)"));
+    }
+
+    /// S2-2 stopgaps, each with its named envelope: ≤3 owned
+    /// workspaces (deleted ones still count), ≤10 live keys, ≤20
+    /// invites/ws/day, and not_before within 30 days.
+    #[tokio::test]
+    async fn s2d_stopgap_limits_have_named_envelopes() {
+        let store = Arc::new(Memory::new());
+        let h = harness_store(false, None, Some(store.clone()));
+        signup_and_verify(&h.router, &store, "o@o.co", "a-long-enough-passphrase").await;
+        let (oc, ocsrf) = login_only(&h.router, "o@o.co", "a-long-enough-passphrase").await;
+        // Three workspaces land; the fourth is refused by the store.
+        let mut pid = String::new();
+        for n in ["a", "b", "c"] {
+            pid = make_ws(&h.router, &oc, n).await;
+        }
+        let (st, _, v) = raw(
+            &h.router,
+            "POST",
+            "/workspaces",
+            &session_headers(&oc, &ocsrf),
+            Some(json!({"name": "d"})),
+        )
+        .await;
+        assert_eq!(st, StatusCode::TOO_MANY_REQUESTS, "{v}");
+        assert_eq!(v["code"], "plan_limit");
+        assert_eq!(v["limit"], "workspaces_per_account");
+        // A soft-deleted ws still counts: delete `a`, the fourth is
+        // still refused.
+        let ws_a = store
+            .workspace_by_public_id(pid.parse().unwrap_or_else(|_| panic!("pid")))
+            .await
+            .unwrap_or_else(|e| panic!("{e}"))
+            .unwrap_or_else(|| panic!("ws"));
+        let _ = ws_a; // `pid` is c's — delete it and retry
+        let (st, _, dv) = raw(
+            &h.router,
+            "DELETE",
+            &format!("/workspaces/{pid}"),
+            &session_headers(&oc, &ocsrf),
+            Some(json!({"confirm": "delete c"})),
+        )
+        .await;
+        assert_eq!(st, StatusCode::NO_CONTENT, "{dv}");
+        let (st, _, v) = raw(
+            &h.router,
+            "POST",
+            "/workspaces",
+            &session_headers(&oc, &ocsrf),
+            Some(json!({"name": "d"})),
+        )
+        .await;
+        assert_eq!(st, StatusCode::TOO_MANY_REQUESTS, "deleted ws counts: {v}");
+        // Keys: 10 live, the 11th refused — a second account's ws, since
+        // the first is at its own cap.
+        signup_and_verify(&h.router, &store, "k@k.co", "a-long-enough-passphrase").await;
+        let (kc, kcsrf) = login_only(&h.router, "k@k.co", "a-long-enough-passphrase").await;
+        let pid_b = make_ws(&h.router, &kc, "keys").await;
+        let (oc, ocsrf) = (kc, kcsrf);
+        for i in 0..9 {
+            make_key(&h.router, &oc, &ocsrf, &pid_b, "write").await;
+            let _ = i;
+        }
+        let (st, _, v) = raw(
+            &h.router,
+            "POST",
+            &format!("/workspaces/{pid_b}/keys"),
+            &session_headers(&oc, &ocsrf),
+            Some(json!({"name": "tenth", "permission": "write"})),
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK, "{v}");
+        let key = v["key"].as_str().unwrap_or_default().to_string();
+        let (st, _, v) = raw(
+            &h.router,
+            "POST",
+            &format!("/workspaces/{pid_b}/keys"),
+            &session_headers(&oc, &ocsrf),
+            Some(json!({"name": "eleventh", "permission": "read"})),
+        )
+        .await;
+        assert_eq!(st, StatusCode::TOO_MANY_REQUESTS, "{v}");
+        assert_eq!(v["limit"], "api_keys");
+        // Invites: 20 in the day, the 21st refused. The pending-dup
+        // rule means 20 distinct addresses.
+        for i in 0..19 {
+            let (st, _, v) = raw(
+                &h.router,
+                "POST",
+                &format!("/workspaces/{pid_b}/members"),
+                &session_headers(&oc, &ocsrf),
+                Some(json!({"email": format!("i{i}@i.co"), "role": "viewer"})),
+            )
+            .await;
+            assert_eq!(st, StatusCode::OK, "invite {i}: {v}");
+        }
+        let (st, _, v) = raw(
+            &h.router,
+            "POST",
+            &format!("/workspaces/{pid_b}/members"),
+            &session_headers(&oc, &ocsrf),
+            Some(json!({"email": "i19@i.co", "role": "viewer"})),
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK, "{v}");
+        let (st, _, v) = raw(
+            &h.router,
+            "POST",
+            &format!("/workspaces/{pid_b}/members"),
+            &session_headers(&oc, &ocsrf),
+            Some(json!({"email": "i20@i.co", "role": "viewer"})),
+        )
+        .await;
+        assert_eq!(st, StatusCode::TOO_MANY_REQUESTS, "{v}");
+        assert_eq!(v["limit"], "invites_per_day");
+        // not_before: >30d refuses with its own code; ≤30d submits.
+        let key = key.as_str();
+        let (st, v) = call(
+            &h.router,
+            "PUT",
+            "/handlers/builtin:echo",
+            Some(&key),
+            Some(json!({"url": "builtin:echo"})),
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK, "{v}");
+        let mut far = submit_body("far");
+        far["not_before"] = json!((unix_ms() as u64) + 31 * 86_400_000);
+        far["spec"]["steps"] = json!([{ "name": "a", "handler": "builtin:echo" }]);
+        let (st, v) = call(&h.router, "POST", "/jobs", Some(&key), Some(far)).await;
+        assert_eq!(st, StatusCode::BAD_REQUEST, "{v}");
+        assert_eq!(v["code"], "not_before_too_far");
+        let mut ok = submit_body("ok");
+        ok["not_before"] = json!((unix_ms() as u64) + 86_400_000);
+        ok["spec"]["steps"] = json!([{ "name": "a", "handler": "builtin:echo" }]);
+        let (st, v) = call(&h.router, "POST", "/jobs", Some(&key), Some(ok)).await;
+        assert_eq!(st, StatusCode::OK, "{v}");
     }
 
     /// The dashboard's shape contract: GET /workspaces and

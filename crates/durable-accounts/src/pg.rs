@@ -265,6 +265,29 @@ impl AccountStore for Pg {
         prefix: &str,
         created_by: Option<u64>,
     ) -> Result<ApiKeyInfo, AccountError> {
+        // The cap lives in the transaction with the insert, behind a
+        // per-workspace advisory lock — two racing mints cannot both
+        // count 9 (S2-2). Live keys only; revoked rows don't count.
+        let mut tx = bounded(self.pool.begin()).await?;
+        bounded(
+            sqlx::query("SELECT pg_advisory_xact_lock($1)")
+                .bind(to_i64(workspace, "workspace")?)
+                .execute(&mut *tx),
+        )
+        .await?;
+        let live: i64 = bounded(
+            sqlx::query(
+                "SELECT COUNT(*) FROM api_keys \
+                 WHERE workspace_id = $1 AND revoked_at IS NULL",
+            )
+            .bind(to_i64(workspace, "workspace")?)
+            .fetch_one(&mut *tx),
+        )
+        .await?
+        .try_get(0)?;
+        if live as u64 >= crate::STOPGAP_KEYS_PER_WS {
+            return Err(AccountError::PlanLimit("api_keys"));
+        }
         let row = bounded(
             sqlx::query(
                 "INSERT INTO api_keys \
@@ -279,9 +302,10 @@ impl AccountStore for Pg {
             .bind(prefix)
             .bind(permission.as_str())
             .bind(created_by.map(|a| to_i64(a, "account")).transpose()?)
-            .fetch_one(&self.pool),
+            .fetch_one(&mut *tx),
         )
         .await?;
+        bounded(tx.commit()).await?;
         Ok(ApiKeyInfo {
             id: to_u64(row.try_get("id")?, "api key")?,
             public_id: row.try_get("public_id")?,
@@ -978,7 +1002,26 @@ impl AccountStore for Pg {
     ) -> Result<Workspace, AccountError> {
         // One transaction: the workspace row and its owner member row
         // land or neither does — an ownerless workspace cannot exist.
+        // The advisory lock + the count are in that same transaction:
+        // two racing creates cannot both pass the stopgap cap (S2-2);
+        // soft-deleted rows count until the purge removes them.
         let mut tx = bounded(self.pool.begin()).await?;
+        bounded(
+            sqlx::query("SELECT pg_advisory_xact_lock($1)")
+                .bind(to_i64(account, "account")?)
+                .execute(&mut *tx),
+        )
+        .await?;
+        let owned: i64 = bounded(
+            sqlx::query("SELECT COUNT(*) FROM workspaces WHERE created_by = $1")
+                .bind(to_i64(account, "account")?)
+                .fetch_one(&mut *tx),
+        )
+        .await?
+        .try_get(0)?;
+        if owned as u64 >= crate::STOPGAP_WS_PER_ACCOUNT {
+            return Err(AccountError::PlanLimit("workspaces_per_account"));
+        }
         let public_id = uuid::Uuid::now_v7();
         let mut secret = [0u8; 32];
         getrandom::fill(&mut secret)
@@ -1194,6 +1237,29 @@ impl AccountStore for Pg {
         token_hash: &[u8; 32],
         expires_at_ms: i64,
     ) -> Result<Option<crate::WorkspaceInvite>, AccountError> {
+        // The daily cap and the dup check are one transaction behind a
+        // per-workspace advisory lock — a burst cannot race past the
+        // count (S2-2).
+        let mut tx = bounded(self.pool.begin()).await?;
+        bounded(
+            sqlx::query("SELECT pg_advisory_xact_lock($1)")
+                .bind(to_i64(workspace, "workspace")?)
+                .execute(&mut *tx),
+        )
+        .await?;
+        let today: i64 = bounded(
+            sqlx::query(
+                "SELECT COUNT(*) FROM invites \
+                 WHERE workspace_id = $1 AND created_at > now() - interval '1 day'",
+            )
+            .bind(to_i64(workspace, "workspace")?)
+            .fetch_one(&mut *tx),
+        )
+        .await?
+        .try_get(0)?;
+        if today as u64 >= crate::STOPGAP_INVITES_PER_WS_DAY {
+            return Err(AccountError::PlanLimit("invites_per_day"));
+        }
         let public_id = uuid::Uuid::now_v7();
         // `invites_pending` makes the live-dup refusal atomic: ON
         // CONFLICT (workspace_id, email) WHERE pending DO NOTHING.
@@ -1212,12 +1278,13 @@ impl AccountStore for Pg {
             .bind(to_i64(invited_by, "account")?)
             .bind(token_hash.as_slice())
             .bind(ts(expires_at_ms))
-            .execute(&self.pool),
+            .execute(&mut *tx),
         )
         .await?;
         if done.rows_affected() == 0 {
             return Ok(None);
         }
+        bounded(tx.commit()).await?;
         Ok(Some(crate::WorkspaceInvite {
             public_id,
             email: email.to_string(),
@@ -1648,9 +1715,7 @@ impl AccountStore for Pg {
         if !dead.is_empty() {
             bounded(
                 sqlx::query(
-                    "UPDATE email_outbox SET status = 'failed', \
-                         text = '', html = '', subject = '' \
-                     WHERE id = ANY($1) AND status = 'sending'",
+                    "UPDATE email_outbox SET status = 'failed',                          text = '', html = '', subject = ''                      WHERE id = ANY($1) AND status = 'sending'",
                 )
                 .bind(&dead)
                 .execute(&self.pool),
@@ -2699,6 +2764,7 @@ mod tests {
             })
             .await
             .unwrap_or_else(|e| panic!("enqueue: {e}"));
+        // The claim returns the good row; the batch does not error.
         let claimed = store
             .outbox_claim(unix_ms(), 8, 60_000)
             .await
@@ -2713,6 +2779,7 @@ mod tests {
                 .all(|m| { matches!(m.mail.kind, "verify" | "reset" | "invite" | "notice") }),
             "no bad-kind row crosses the boundary"
         );
+        // The poisoned row is 'failed' — it can never claim again.
         let bad: (String,) =
             sqlx::query_as("SELECT status FROM email_outbox WHERE idempotency_key = $1")
                 .bind(format!("{unique}-bad"))

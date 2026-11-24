@@ -132,6 +132,7 @@ struct InviteRow {
     invited_by: u64,
     token_hash: [u8; 32],
     expires_at_ms: i64,
+    created_at_ms: i64,
     accepted: bool,
     revoked: bool,
 }
@@ -223,6 +224,7 @@ impl Memory {
                 invited_by: 0,
                 token_hash,
                 expires_at_ms,
+                created_at_ms: now_ms(),
                 accepted: false,
                 revoked: false,
             },
@@ -353,6 +355,14 @@ impl AccountStore for Memory {
             return Err(AccountError::Store(format!(
                 "workspace {workspace} does not exist"
             )));
+        }
+        let live = inner
+            .keys
+            .values()
+            .filter(|k| k.workspace == workspace && !k.revoked)
+            .count() as u64;
+        if live >= crate::STOPGAP_KEYS_PER_WS {
+            return Err(AccountError::PlanLimit("api_keys"));
         }
         let id = self.next_key.fetch_add(1, Ordering::Relaxed);
         let public_id = uuid::Uuid::now_v7();
@@ -868,6 +878,19 @@ impl AccountStore for Memory {
     ) -> Result<Workspace, AccountError> {
         // One atomic write: the row and its owner member row land or
         // neither does — an ownerless workspace can never exist.
+        // The stopgap cap counts every owned row — a soft-deleted ws
+        // keeps its seat until the purge (S2-2).
+        {
+            let inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+            let owned = inner
+                .members
+                .iter()
+                .filter(|((_, acc), m)| *acc == account && m.role == crate::Role::Owner)
+                .count() as u64;
+            if owned >= crate::STOPGAP_WS_PER_ACCOUNT {
+                return Err(AccountError::PlanLimit("workspaces_per_account"));
+            }
+        }
         let workspace = self.create_workspace(name).await?;
         let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         inner.members.insert(
@@ -1016,6 +1039,15 @@ impl AccountStore for Memory {
         if dup {
             return Ok(None);
         }
+        let day_ago = now_ms() - 86_400_000;
+        let today = inner
+            .invites
+            .values()
+            .filter(|i| i.workspace == workspace && i.created_at_ms > day_ago)
+            .count() as u64;
+        if today >= crate::STOPGAP_INVITES_PER_WS_DAY {
+            return Err(AccountError::PlanLimit("invites_per_day"));
+        }
         let invite = crate::WorkspaceInvite {
             public_id: uuid::Uuid::now_v7(),
             email: email.to_string(),
@@ -1033,6 +1065,7 @@ impl AccountStore for Memory {
                 invited_by,
                 token_hash: *token_hash,
                 expires_at_ms,
+                created_at_ms: now_ms(),
                 accepted: false,
                 revoked: false,
             },
