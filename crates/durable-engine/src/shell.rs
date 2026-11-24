@@ -47,11 +47,68 @@ pub struct Call {
     pub attempt: u32,
 }
 
+/// What a D-070 test call reports: the verdict plus bounded detail.
+/// `status` is `ok|failed|lost|refused|in_process`; `excerpt` carries
+/// ≤1 KiB of the reply (or the in-process detail).
+#[derive(Debug, Clone)]
+pub struct TestReply {
+    pub status: &'static str,
+    pub http_status: Option<u16>,
+    pub latency_ms: u64,
+    pub excerpt: Vec<u8>,
+}
+
+impl TestReply {
+    /// Non-HTTP handlers have nothing the probe can exercise.
+    pub fn in_process() -> Self {
+        TestReply {
+            status: "in_process",
+            http_status: None,
+            latency_ms: 0,
+            excerpt: b"registered in-process (builtin or --handler); the probe only exercises HTTP handlers".to_vec(),
+        }
+    }
+
+    /// An in-process handler's outcome, mapped like dispatch's.
+    pub fn from_outcome(outcome: Outcome, latency_ms: u64) -> Self {
+        match outcome {
+            Outcome::Checkpoint(bytes) => {
+                let excerpt = bytes[..bytes.len().min(1024)].to_vec();
+                TestReply {
+                    status: "ok",
+                    http_status: None,
+                    latency_ms,
+                    excerpt,
+                }
+            }
+            Outcome::Failed => TestReply {
+                status: "failed",
+                http_status: None,
+                latency_ms,
+                excerpt: Vec::new(),
+            },
+            Outcome::Lost => TestReply {
+                status: "lost",
+                http_status: None,
+                latency_ms,
+                excerpt: Vec::new(),
+            },
+        }
+    }
+}
+
 /// An allowlisted step handler. Only registered names may execute — the
 /// registry, not the job spec, is the trust boundary.
 #[async_trait::async_trait]
 pub trait StepHandler: Send + Sync {
     async fn execute(&self, step: &StepSpec, input: &[u8], idem_key: &str) -> Outcome;
+    /// The D-070 probe: ONE call, the dispatched path's request shape,
+    /// never journaled. HTTP handlers override with the real request;
+    /// builtin/in-process handlers answer `in_process` (or override to
+    /// run `execute` directly). Default is honest `in_process`.
+    async fn test_call(&self, _step: &StepSpec, _input: &[u8], _idem_key: &str) -> TestReply {
+        TestReply::in_process()
+    }
     /// Reconciliation probe: did the call under `idem_key` land remotely?
     /// Default `false` — honest "unknown is not found"; handlers that can
     /// really check override this.
@@ -201,6 +258,12 @@ enum Cmd {
         ws: u64,
         handlers: Vec<(String, Arc<dyn StepHandler>)>,
         reply: oneshot::Sender<Result<(), EngineError>>,
+    },
+    /// One armed handler by name — the D-070 probe's lookup.
+    GetHandler {
+        ws: u64,
+        name: String,
+        reply: oneshot::Sender<Option<Arc<dyn StepHandler>>>,
     },
 }
 
@@ -494,6 +557,23 @@ impl Engine {
             ws,
             name: name.to_string(),
         })
+    }
+
+    /// The armed handler for `(ws, name)` — the D-070 probe's lookup.
+    /// `None` for an unknown name or a stopped engine.
+    pub async fn handler(&self, ws: u64, name: &str) -> Option<Arc<dyn StepHandler>> {
+        let (reply, rx) = oneshot::channel();
+        if self
+            .send(Cmd::GetHandler {
+                ws,
+                name: name.to_string(),
+                reply,
+            })
+            .is_err()
+        {
+            return None;
+        }
+        answer(rx, self.reply_timeout).await.ok().flatten()
     }
 
     /// Replace a workspace's whole handler set — the store reconciler's
@@ -1235,6 +1315,9 @@ fn refuse(cmd: Cmd) {
             let _ = reply.send(Err(EngineError::Stopped));
         }
         Cmd::DeleteHandler { .. } => {}
+        Cmd::GetHandler { reply, .. } => {
+            let _ = reply.send(None);
+        }
     }
 }
 
@@ -1532,6 +1615,9 @@ async fn actor(
                 Some(Cmd::SetWorkspaceHandlers { ws, handlers, reply }) => {
                     pipe.answer(core.last_index(), reply, registry.set_ws(ws, handlers));
                     exec!().unpark(&core, ws);
+                }
+                Some(Cmd::GetHandler { ws, name, reply }) => {
+                    pipe.answer_read(core.last_index(), reply, registry.get(ws, &name));
                 }
                 None => {
                     pipe.shutdown().await;

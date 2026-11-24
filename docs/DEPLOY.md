@@ -507,7 +507,7 @@ curl -sS --max-time 5 --resolve <your-host>:443:<droplet-ip> \
 
 `install.sh` copies `apps/inspector/build/` to
 `/usr/local/share/durable/inspector` and the env points `--ui-dir` at it.
-Open `https://<your-host>/inspector/`, paste the read key for
+Open `https://<your-host>/app/`, paste the read key for
 listing and the API key for submit/admin — both live in sessionStorage
 only, Forget keys clears them.
 

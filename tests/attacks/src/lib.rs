@@ -113,6 +113,9 @@ pub async fn spawn(extra: &[&str]) -> AttackServer {
             // A ws-0 PUT /handlers/step store row shadows it where a test
             // needs its own target.
             .args(["--handler", "step=http://8.8.8.8/unused"])
+            // Accounts are configured (memory backend) so the server
+            // demands the public origin it checks /auth POSTs against.
+            .args(["--public-origin", "http://127.0.0.1"])
             .args(extra)
             .env("DURABLE_API_KEY", OPS_KEY)
             .env("DURABLE_READ_KEY", READ_KEY)

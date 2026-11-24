@@ -106,6 +106,9 @@ perf/check-clean-imports.sh
 step "perf: the heavy-slot proof (+ known-bad proof)"
 perf/test-heavy-held.sh
 
+step "migrations frozen (checksum manifest + known-bad proof)"
+scripts/check-migrations.sh
+
 step "deploy format guard (D-056)"
 deploy/test-format-guard.sh
 

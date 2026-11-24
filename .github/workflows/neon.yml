@@ -1,6 +1,9 @@
 # The real-Neon job for the S2 account store: the `pg_` tests in
 # crates/durable-accounts run against the scratch Neon database named by
-# the NEON_TEST_DATABASE_URL secret (sslmode=verify-full). When the
+# the NEON_TEST_DATABASE_URL secret (sslmode=verify-full). The pg tests
+# are #[ignore]d so a plain `cargo test` counts them as skipped; this job
+# runs them with --include-ignored and, when the secret is present, sets
+# DURABLE_REQUIRE_PG=1 so a missing URL fails rather than skips. When the
 # secret is absent the job still runs the memory-store suite and prints
 # a visible notice — a skipped integration is announced, never a silent
 # pass.
@@ -24,6 +27,7 @@ jobs:
     timeout-minutes: 15
     env:
       DURABLE_TEST_DATABASE_URL: ${{ secrets.NEON_TEST_DATABASE_URL }}
+      DURABLE_REQUIRE_PG: ${{ secrets.NEON_TEST_DATABASE_URL != '' && '1' || '' }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -44,7 +48,7 @@ jobs:
               the pg_* integration tests self-skip. Set the secret to a scratch Neon \
               database (sslmode=verify-full) to run them for real."
           fi
-          cargo test -p durable-accounts
+          cargo test -p durable-accounts --locked -- --include-ignored
 
       - name: Fail loudly if the secret exists but the pg tests still skipped
         if: env.DURABLE_TEST_DATABASE_URL != ''

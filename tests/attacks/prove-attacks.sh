@@ -44,9 +44,9 @@ export CARGO_TARGET_DIR="$here/target/prove"
 # marked line; the pattern may itself contain | and =>, so it goes last
 # and the in-field delimiter is ~~>)
 mutations=(
-  "auth|crates/durable-server/src/main.rs|auth_bypass|a_garbage_bearer_is_refused_and_nothing_is_recorded|app\.keyring\.verify\(key\)\.await~~>Verified::Granted(Auth { ws: 0, permission: Permission::Admin })"
-  "tenant-scope|crates/durable-server/src/main.rs|cross_tenant|a_second_workspace_cannot_read_anothers_run|Some\(run\) if run\.ws == auth\.ws => Ok\(run\)~~>Some(run) => Ok(run)"
-  "ops-scope|crates/durable-server/src/main.rs|cross_tenant|a_tenant_admin_cannot_reach_ops_routes|auth\.ws != 0 \|\| auth\.permission != Permission::Admin~~>false"
+  "auth|crates/durable-server/src/main.rs|auth_bypass|a_garbage_bearer_is_refused_and_nothing_is_recorded|app\.keyring\.verify\(key\)\.await~~>Verified::Granted(Principal::OpsKey)"
+  "tenant-scope|crates/durable-server/src/main.rs|cross_tenant|a_second_workspace_cannot_read_anothers_run|Some\(run\) if run\.ws == auth\.ws\(\) => Ok\(run\)~~>Some(run) => Ok(run)"
+  "ops-scope|crates/durable-server/src/main.rs|cross_tenant|a_tenant_admin_cannot_reach_ops_routes|!matches!\(auth, Principal::OpsKey\)~~>false"
   "rate-limit|crates/durable-server/src/main.rs|rate_limit|the_bucket_refuses_after_its_tokens|limits\.rate_per_addr > 0\.0~~>false"
   "cf-header|crates/durable-server/src/addr_limits.rs|header_spoof|spoofed_client_header_does_not_evade_the_bucket|trusted\.trusts\(peer\)~~>peer == peer"
   "ssrf-register|crates/durable-server/src/main.rs|ssrf|local_handler_urls_are_refused_at_registration|ssrf::check_url\(&parsed, policy\)~~>Ok::<(), &str>(())"
@@ -59,9 +59,9 @@ mutations=(
   "liveness-flood|crates/durable-server/src/main.rs|unit:durable-server|tests::health_survives_a_pinned_connection_pool|ready_pool\\.max\\(1\\)~~>ready_pool.min(0)"
   "slot-camp|crates/durable-server/src/main.rs|unit:durable-server|tests::a_fresh_head_gets_a_one_second_grace_then_dies_under_pressure|served_n == 0~~>false"
   "overload-lane|crates/durable-server/src/main.rs|unit:durable-server|tests::the_overload_lane_answers_conns_from_four_buckets|lane_answer\([^)]*\)~~>{ let _ = (lane_guard, lane_permit); drop(stream); }"
-  "obs-metrics-scope|crates/durable-server/src/main.rs|unit:durable-server|tests::metrics_answer_only_the_callers_workspace|auth\.ws == 0~~>true"
-  "obs-run-scope|crates/durable-server/src/main.rs|unit:durable-server|tests::run_events_answer_only_the_callers_workspace|Some\(run\) if run\.ws == auth\.ws => run,~~>Some(run) => run,"
-  "obs-feed-scope|crates/durable-server/src/main.rs|unit:durable-server|tests::the_feed_answers_only_the_callers_workspace|app\.obs\.feed\(auth\.ws, limit,~~>app.obs.feed(0, limit,"
+  "obs-metrics-scope|crates/durable-server/src/main.rs|unit:durable-server|tests::metrics_answer_only_the_callers_workspace|auth\.ws\(\) == 0~~>true"
+  "obs-run-scope|crates/durable-server/src/main.rs|unit:durable-server|tests::run_events_answer_only_the_callers_workspace|Some\(run\) if run\.ws == auth\.ws\(\) => run,~~>Some(run) => run,"
+  "obs-feed-scope|crates/durable-server/src/main.rs|unit:durable-server|tests::the_feed_answers_only_the_callers_workspace|app\.obs\.feed\(auth\.ws\(\), limit,~~>app.obs.feed(0, limit,"
   "obs-record-scope|crates/durable-engine/src/observe.rs|unit:durable-engine|observe::tests::a_workspace_view_holds_only_its_own_records|self\.ws\(o\.ws, o\.at\)~~>self.ws(0, o.at)"
   "parked-untrack|crates/durable-engine/src/shell.rs|unit:durable-engine|shell::tests::a_cancel_through_the_actor_drops_the_runs_scheduler_entries|exec!\(\)\.untrack\(w, run\);~~>let _ = w;"
   "ssrf-own-address|crates/durable-server/src/ssrf.rs|unit:durable-server|ssrf::tests::the_hosts_own_addresses_are_refused_by_both_layers|self\.host\.iter\(\)\.any\(\|&own\| same_address\(ip, own\)\)~~>false"
@@ -77,8 +77,8 @@ mutations=(
   "startup-recheck|crates/durable-server/src/main.rs|unit:durable-server|tests::the_startup_snapshot_never_arms_a_planted_local_row|let ok = reqwest::Url::parse\(&entry\.url\)~~>let ok = true || reqwest::Url::parse(&entry.url)"
   "numeric-id-ws0|crates/durable-server/src/main.rs|cross_tenant|a_tenant_cannot_address_its_own_run_by_its_internal_number|if ws == 0 && ~~>if true && "
   "keys-scope|crates/durable-engine/src/shell.rs|unit:durable-engine|shell::tests::keys_never_answer_another_workspaces_run|\.filter\(\|r\| r\.ws == ws\)~~>"
-  "list-scope|crates/durable-server/src/main.rs|unit:durable-server|tests::workspaces_are_isolated_end_to_end|\.list_in\(auth\.ws,~~>.list_in(0,"
-  "diag-scope|crates/durable-server/src/main.rs|unit:durable-server|tests::a_tenant_admin_key_never_reaches_the_ops_routes|diag_ws\(auth\.ws\)~~>diag_ws(0)"
+  "list-scope|crates/durable-server/src/main.rs|unit:durable-server|tests::workspaces_are_isolated_end_to_end|\.list_in\(auth\.ws\(\),~~>.list_in(0,"
+  "diag-scope|crates/durable-server/src/main.rs|unit:durable-server|tests::a_tenant_admin_key_never_reaches_the_ops_routes|diag_ws\(auth\.ws\(\)\)~~>diag_ws(0)"
   "v6-agg-first|crates/durable-server/src/addr_limits.rs|unit:durable-server|addr_limits::tests::a_slash48_spray_leaves_room_for_new_clients|self\.wait\(LimitKey::V6Aggregate\(p\), now\)~~>Duration::ZERO"
   "v6-per-agg-cap|crates/durable-server/src/addr_limits.rs|unit:durable-server|addr_limits::tests::a_slash48_holds_at_most_its_cap_of_slash64_entries|if at_cap\(self\) \{~~>if false {"
   "v6-agg-idle-reclaim|crates/durable-server/src/addr_limits.rs|unit:durable-server|addr_limits::tests::a_slash48_cap_frees_once_its_slash64s_go_idle|self\.reclaim_agg\(p, now\);~~>let _ = (p, now);"
@@ -87,12 +87,31 @@ mutations=(
   "registry-batch|crates/durable-server/src/main.rs|unit:durable-server|tests::the_registry_writer_saves_once_per_batch|batch\.len\(\) < REGISTRY_BATCH~~>batch.len() < 1"
   "registry-noop-skip|crates/durable-server/src/main.rs|unit:durable-server|tests::a_noop_put_does_no_store_epoch_or_disk_work|if app\.registry~~>if false && app.registry"
   "registry-set-after-save|crates/durable-server/src/main.rs|unit:durable-server|tests::a_put_whose_save_failed_is_retried_not_skipped|if saved\.is_ok\(\) \{~~>if true {"
-  "registry-view-invalidate|crates/durable-server/src/main.rs|unit:durable-server|tests::a_failed_put_never_leaves_the_old_url_claiming_armed|app\.registry\.remove\(auth\.ws, name\);~~>let _ = name;"
-  "registry-delete-forgets|crates/durable-server/src/main.rs|unit:durable-server|tests::a_delete_whose_save_failed_lets_the_same_put_rearm|app\.registry\.remove\(auth\.ws, &name\);~~>let _ = &name;"
+  "registry-view-invalidate|crates/durable-server/src/main.rs|unit:durable-server|tests::a_failed_put_never_leaves_the_old_url_claiming_armed|app\.registry\.remove\(auth\.ws\(\), name\);~~>let _ = name;"
+  "registry-delete-forgets|crates/durable-server/src/main.rs|unit:durable-server|tests::a_delete_whose_save_failed_lets_the_same_put_rearm|app\.registry\.remove\(auth\.ws\(\), &name\);~~>let _ = &name;"
   "rotate-set-after-save|crates/durable-server/src/main.rs|unit:durable-server|tests::a_rotate_whose_save_failed_lets_a_put_save_the_new_secret|if saved\.is_ok\(\) \{~~>if true {"
   "reconcile-forgets|crates/durable-server/src/main.rs|unit:durable-server|tests::a_reconcile_pass_that_did_not_land_forgets_its_views|for ws in &touched \{~~>for ws in &touched[..0] {"
   "registry-rate|crates/durable-server/src/main.rs|unit:durable-server|tests::registry_mutations_are_rate_limited_per_workspace|app\.registry\.admit\(ws, Instant::now\(\)\)~~>Ok::<(), Duration>(())"
   "deny-cidr-mapped|crates/durable-server/src/ssrf.rs|unit:durable-server|ssrf::tests::an_ipv4_mapped_deny_cidr_names_its_ipv4_range|v6\.to_ipv4_mapped\(\)~~>None::<Ipv4Addr>"
+  "session-forge|crates/durable-server/src/main.rs|unit:durable-server|tests::s30_session_forge_dies_before_the_store|!bool::from\(subtle::ConstantTimeEq::ct_eq~~>bool::from(subtle::ConstantTimeEq::ct_eq"
+  "csrf|crates/durable-server/src/main.rs|unit:durable-server|tests::s30_signup_login_session_round_trip|csrf_token\(seed\)~~>csrf_token(&[0; 32])"
+  "csrf-open-post|crates/durable-server/src/main.rs|unit:durable-server|tests::s30_csrf_open_post|site != \"same-origin\" && site != \"none\"~~>false"
+  "cookie-attrs|crates/durable-server/src/main.rs|unit:durable-server|tests::s30_cookie_attributes|session_set_cookie\(&token\)~~>String::from(\"x\")"
+  "token-replay|crates/durable-accounts/src/memory.rs|unit:durable-server|tests::s31_verify_token_replay_410|!t\.consumed~~>true"
+  "token-kind-confusion|crates/durable-accounts/src/memory.rs|unit:durable-server|tests::s31_reset_token_cannot_verify|t\.kind == \"verify\"~~>true"
+  "prereg-takeover|crates/durable-accounts/src/memory.rs|unit:durable-server|tests::s31_verify_revokes_prereg_session|inner\.sessions\.values_mut\(\)~~>inner.sessions.values_mut().take(0)"
+  "addr-spec-injection|crates/durable-accounts/src/memory.rs|unit:durable-server|tests::s31_addr_spec_refused|!crate::mail::valid_addr_spec\(&mail\.send_to\)~~>false"
+  "mail-budget|crates/durable-accounts/src/memory.rs|unit:durable-server|tests::s31_outbox_hourly_cap|in_window >= crate::mail::MAX_HOURLY_PER_ADDR~~>in_window >= i64::MAX"
+  "enumeration|crates/durable-server/src/main.rs|unit:durable-server|tests::s31_forgot_resend_envelopes_match|let _ = issued;~~>if !issued { return Ok(no_store(StatusCode::OK.into_response())); }"
+  "invite-required|crates/durable-server/src/main.rs|unit:durable-server|tests::s31_invite_only_gate|!ok~~>false"
+  "verify-sets-cookie|crates/durable-server/src/main.rs|unit:durable-server|tests::s31_verify_round_trip|TokenCookie::Never~~>TokenCookie::UnlessForeignSession"
+  "lockout-shape|crates/durable-server/src/main.rs|unit:durable-server|tests::s31_lockout_cools_off|app\.lockouts\.fail\(&email, prefix, now\)~~>false"
+  "mail-global|crates/durable-server/src/main.rs|unit:durable-server|tests::s31_mail_global_budget_stops_drain|!app\.mail_budget\.open\(unix_ms\(\)\)~~>false"
+  "session-fixation|crates/durable-server/src/main.rs|unit:durable-server|tests::s32_login_never_adopts_a_planted_cookie|mint_session_token\(&app\.session_key\)~~>session_cookie(&parts).unwrap_or_default()"
+  "cooloff|crates/durable-server/src/main.rs|unit:durable-server|tests::s31_lockout_cools_off|app\.lockouts\.check\(&email, prefix, now\)~~>None::<u64>"
+  "idle-timeout|crates/durable-server/src/main.rs|unit:durable-server|tests::s32_idle_slides_then_times_out|grant\.expires_at_ms <= now \|\| idle <= now~~>false"
+  "session-idor|crates/durable-accounts/src/memory.rs|unit:durable-server|tests::s32_revoke_one_session|s\.account == account~~>true"
+  "reset-token-replay|crates/durable-accounts/src/memory.rs|unit:durable-server|tests::s32_reset_kills_cached_sessions_and_replay_dies|!t\.consumed~~>true"
 )
 
 # Every marker in the source has exactly one mutation, and every mutation
@@ -151,6 +170,43 @@ if [ "$discover" -eq 0 ]; then
     exit 1
   fi
 fi
+
+# Pre-flight, before ANY build: apply every row's substitution to the real
+# source and require it to change the marked line. A stale pattern or a
+# marker one line off its guard is a NO-OP that otherwise costs a whole
+# scratch rebuild per row to discover (CI run 45481961653). Same targeting
+# rule as mutate(): an inline marker mutates its own line, a standalone
+# `// ATTACK(<name>)` comment mutates the line below it.
+cat > "$work/selfcheck.py" <<'PY'
+import re, sys
+bad = []
+for row in sys.stdin:
+    row = row.rstrip("\n")
+    if not row:
+        continue
+    name, file, _target, _test, subst = row.split("|", 4)
+    pattern, replacement = subst.split("~~>", 1)
+    lines = open(file).read().split("\n")
+    tag = f"ATTACK({name})"
+    hits = [i for i, l in enumerate(lines) if tag in l]
+    changed = any(
+        re.sub(pattern, replacement, lines[t], count=1) != lines[t]
+        for i in hits
+        for t in [i if lines[i].split("//")[0].strip() else i + 1]
+    )
+    if not hits:
+        bad.append(f"{name}: no ATTACK marker found")
+    elif not changed:
+        bad.append(f"{name}: mutation changes nothing on its target line(s)")
+if bad:
+    for b in bad:
+        print(f"prove-attacks self-check: {b}", file=sys.stderr)
+    sys.exit(1)
+PY
+printf '%s\n' "${mutations[@]}" | python3 -I "$work/selfcheck.py" || {
+  echo "prove-attacks: a mutation row is a no-op — fix the pattern or the marker" >&2
+  exit 1
+}
 
 # The suite's own tests compile once — only the attacked binary changes.
 ( cd "$here" && cargo build -p durable-attacks --tests --locked ) >&2

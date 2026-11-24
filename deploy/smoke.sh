@@ -99,9 +99,9 @@ if [[ "${1:-}" != --local-only ]]; then
   dom=${dom:-durable.404human.dev}
   code=$(curl -sS -o /dev/null -w '%{http_code} %{ssl_verify_result}' --max-time 10 "https://$dom/health" || echo "000 x")
   [[ "$code" == "200 0" ]] && ok "$dom/health 200 over valid TLS" || bad "$dom/health: $code"
-  headers=$(curl -sSI --max-time 10 "https://$dom/inspector/" || true)
+  headers=$(curl -sSI --max-time 10 "https://$dom/app/" || true)
   grep -qi '^server: cloudflare' <<<"$headers" && ok "served via Cloudflare" || bad "no server: cloudflare header"
-  grep -qi '^content-security-policy:' <<<"$headers" && ok "inspector has a CSP" || bad "no CSP on /inspector/"
+  grep -qi '^content-security-policy:' <<<"$headers" && ok "inspector has a CSP" || bad "no CSP on /app/"
   unauth=$(curl -sS -o /dev/null -w '%{http_code}' --max-time 10 -X POST "https://$dom/jobs" -d '{}' || echo 000)
   [[ "$unauth" == 401 ]] && ok "POST /jobs without a key is 401" || bad "POST /jobs without a key: $unauth"
 fi

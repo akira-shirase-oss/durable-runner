@@ -31,7 +31,7 @@ healthy() {
   fail "server on port $1 never became healthy"
 }
 
-# The API key: every route but /health, /ready and the inspector's files
+# The API key: every route but /health, /ready and the dashboard's files
 # needs it. The server and the CLI both read DURABLE_API_KEY from the
 # environment (never from argv). A fresh random key per pilot run; in
 # production, keep it in your secret store and export it into the server's
@@ -60,7 +60,7 @@ SERVE=("$SRV" --journal "$WORK/journal" --listen "127.0.0.1:$SRV_PORT"
   --backup-root "$WORK/backups" --handler "step=http://127.0.0.1:$HND_PORT/step"
   --allow-local-handlers)
 
-step "start the pilot handler + the server (UI mounted at /inspector)"
+step "start the pilot handler + the server (UI mounted at /app)"
 python3 examples/pilot/handler.py "$HND_PORT" &
 "${SERVE[@]}" --ui-dir "$ROOT/apps/inspector/build" >"$WORK/server.log" 2>&1 &
 SRV_PID=$!
@@ -82,7 +82,7 @@ AGAIN=$($CLI submit --op-key pilot/onboarding-email --step prepare=step --step d
 step "wait for done"
 S=""
 for _ in $(seq 1 120); do
-  S=$($CLI inspect --run "$ID")
+  S=$($CLI inspect --run="$ID")
   echo "$S" | grep -q '"done"' && break
   sleep 0.25
 done
@@ -90,11 +90,11 @@ echo "inspect -> $S"
 echo "$S" | grep -q '"done"' || fail "run $ID never reached done"
 FINISHED=$(echo "$S" | grep -o '"finished_at":[0-9]*')
 
-step "list + inspector page (reads need the key)"
+step "list + dashboard page (reads need the key)"
 curl -s -H "Authorization: Bearer $DURABLE_API_KEY" "http://127.0.0.1:$SRV_PORT/jobs"; echo
 CODE=$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:$SRV_PORT/jobs")
 [ "$CODE" = 401 ] || fail "an unauthenticated read answered $CODE, not 401"
-echo "inspector -> http://127.0.0.1:$SRV_PORT/inspector/ ($(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:$SRV_PORT/inspector/"))"
+echo "dashboard -> http://127.0.0.1:$SRV_PORT/app/ ($(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:$SRV_PORT/app/"))"
 
 step "kill -9 the server mid-life, restart against the same journal"
 kill -9 "$SRV_PID"
@@ -102,7 +102,7 @@ wait "$SRV_PID" 2>/dev/null || true
 "${SERVE[@]}" >>"$WORK/server.log" 2>&1 &
 SRV_PID=$!
 healthy "$SRV_PORT"
-S=$($CLI inspect --run "$ID")
+S=$($CLI inspect --run="$ID")
 echo "after replay -> $S"
 echo "$S" | grep -q '"done"' || fail "run $ID is not done after kill -9 and replay"
 
@@ -122,7 +122,7 @@ wait "$SRV_PID" 2>/dev/null || true
 RSRV_PID=$!
 healthy "$RSRV_PORT"
 RCLI="$BIN/durable-cli --server http://127.0.0.1:$RSRV_PORT"
-R=$($RCLI inspect --run "$ID")
+R=$($RCLI inspect --run="$ID")
 echo "restored inspect -> $R"
 echo "$R" | grep -q '"done"' || fail "the restored run is not done"
 echo "$R" | grep -q "$FINISHED" || fail "the restored run's finished_at changed ($FINISHED)"

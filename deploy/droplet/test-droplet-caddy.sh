@@ -172,7 +172,7 @@ headers=$(req "$HOST" /health -D - -o /dev/null | tr -d '\r')
 grep -qix 'strict-transport-security: max-age=31536000' <<<"$headers" && ok "HSTS for this host only" || bad "HSTS: $(grep -i strict <<<"$headers")"
 [[ "$(grep -ci '^x-content-type-options: nosniff$' <<<"$headers")" == 1 ]] && ok "exactly one nosniff" || bad "nosniff count: $(grep -ci '^x-content-type-options' <<<"$headers")"
 loc=$(req "$HOST" / -o /dev/null -w '%{http_code} %{redirect_url}')
-[[ "$loc" == "302 https://$HOST/inspector/" ]] && ok "/ redirects 302 to /inspector/" || bad "/ answered '$loc'"
+[[ "$loc" == "302 https://$HOST/app/" ]] && ok "/ redirects 302 to /app/" || bad "/ answered '$loc'"
 trusted '203.0.113.0/24'
 reload || bad "reload with other trusted ranges"
 got=$(req "$HOST" /health -H 'Cf-Connecting-Ip: 198.51.100.4')

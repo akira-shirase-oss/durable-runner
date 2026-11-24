@@ -123,6 +123,13 @@ impl PubId {
         }
     }
 
+    /// Derive a domain-separated HMAC key for the session-token tag
+    /// (review #8): one secret file on disk, distinct keys per use.
+    pub fn derive_key(&self, domain: &[u8]) -> hmac::Key {
+        let tag = hmac::sign(&self.key, domain);
+        hmac::Key::new(hmac::HMAC_SHA256, tag.as_ref())
+    }
+
     /// The public form of an internal id: base64url(no pad) of the
     /// permuted u64 — 11 chars, url-safe, fixed width.
     pub fn encode(&self, id: RunId) -> String {
