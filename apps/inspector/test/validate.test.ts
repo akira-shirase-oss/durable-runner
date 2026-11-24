@@ -52,3 +52,13 @@ test('inputs: JSON text to base64 and back', () => {
 	assert.equal(b64ToText(Buffer.from([0xff, 0xfe]).toString('base64')), null);
 	assert.equal(b64ToText(null), null);
 });
+
+test('workflow steps: at least one, named uniquely, each with a handler', async () => {
+	const { stepsError } = await import('../src/lib/validate.ts');
+	assert.equal(stepsError([{ name: 'echo', handler: 'builtin:echo' }]), null);
+	assert.equal(stepsError([])?.field, 'list');
+	assert.deepEqual(stepsError([{ name: 'a', handler: 'x' }, { name: '', handler: 'x' }]), { index: 1, field: 'name', message: 'Enter a step name' });
+	assert.equal(stepsError([{ name: 'a', handler: 'x' }, { name: 'a', handler: 'y' }])?.message, 'Two steps have this name');
+	assert.equal(stepsError([{ name: 'a', handler: ' ' }])?.field, 'handler');
+	assert.equal(stepsError(Array.from({ length: 65 }, (_, i) => ({ name: `s${i}`, handler: 'x' })))?.field, 'list');
+});

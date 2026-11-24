@@ -93,3 +93,19 @@ export function b64ToText(b64: string | null | undefined): string | null {
 		return null;
 	}
 }
+
+/** A workflow's steps: at least one, at most 64, each with a name (1–128, unique) and a handler. Returns the
+ *  first problem as `{index, field, message}` (index -1: the list itself), or null. */
+export function stepsError(steps: { name: string; handler: string }[]): { index: number; field: 'name' | 'handler' | 'list'; message: string } | null {
+	if (steps.length === 0) return { index: -1, field: 'list', message: 'Add at least one step' };
+	if (steps.length > 64) return { index: -1, field: 'list', message: 'A workflow has at most 64 steps' };
+	const seen = new Set<string>();
+	for (const [i, s] of steps.entries()) {
+		const n = nameError(s.name, 'step name');
+		if (n) return { index: i, field: 'name', message: n };
+		if (seen.has(s.name.trim())) return { index: i, field: 'name', message: 'Two steps have this name' };
+		seen.add(s.name.trim());
+		if (s.handler.trim() === '') return { index: i, field: 'handler', message: 'Pick the handler this step calls' };
+	}
+	return null;
+}
