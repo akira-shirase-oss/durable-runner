@@ -1,0 +1,547 @@
+/*
+ * The dashboard's shared pieces, global so every page and component reads the same: cards, section headings,
+ * state chips, banners, the segmented control, data tables, key/value lists, tiles, bars and badges. Colours come
+ * from tokens.css only. Motion: colour/opacity/transform, 150 ms at most, nothing infinite, no backdrop-filter.
+ */
+
+/* --- page scaffolding ------------------------------------------------------------------------------------ */
+.page {
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+  min-width: 0;
+}
+.grid {
+  display: grid;
+  gap: 16px;
+  min-width: 0;
+}
+.grid.two {
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+}
+.grid.three {
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+}
+.grid > * {
+  min-width: 0;
+}
+@media (max-width: 1180px) {
+  .grid.three {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+}
+@media (max-width: 900px) {
+  .grid.two,
+  .grid.three {
+    grid-template-columns: minmax(0, 1fr);
+  }
+}
+
+.sr {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  overflow: hidden;
+  clip-path: inset(50%);
+  white-space: nowrap;
+}
+
+/* --- cards ------------------------------------------------------------------------------------------------- */
+.card {
+  min-width: 0;
+  border-radius: 18px;
+  background: var(--c-card);
+  box-shadow:
+    0 0 0 1px var(--c-bar-edge),
+    0 1px 2px var(--c-tile-shadow);
+}
+.card-head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px 16px;
+  padding: 16px 18px 0;
+}
+.card-head.ruled {
+  padding-bottom: 14px;
+  border-bottom: 1px solid var(--c-line);
+}
+.card-body {
+  padding: 14px 18px 18px;
+}
+.card h2,
+.section-title {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin: 0;
+  font-size: 15.5px;
+  font-weight: 560;
+  letter-spacing: -0.01em;
+  line-height: 1.3;
+}
+.card h2 svg,
+.section-title svg {
+  color: var(--c-ink-soft);
+}
+.card h3 {
+  margin: 0 0 10px;
+  font-size: 14px;
+  font-weight: 600;
+  letter-spacing: -0.005em;
+}
+.sub {
+  margin: 2px 0 0;
+  color: var(--c-body);
+  font-size: 13px;
+  line-height: 1.4;
+}
+.hint {
+  color: var(--c-body);
+  font-size: 14px;
+}
+.empty {
+  margin: 0;
+  padding: 36px 20px;
+  color: var(--c-body);
+  font-size: 14px;
+  text-align: center;
+}
+.tag {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  height: 24px;
+  padding: 0 9px;
+  border-radius: 8px;
+  background: var(--c-app);
+  box-shadow: inset 0 0 0 1px var(--c-line);
+  color: var(--c-ink-soft);
+  font-size: 12.5px;
+  font-weight: 520;
+  white-space: nowrap;
+}
+.section-head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px 16px;
+  padding: 4px 2px 0;
+}
+.section-title {
+  font-size: 17px;
+}
+
+/* --- banners --------------------------------------------------------------------------------------------- */
+.banner {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  margin: 0;
+  padding: 11px 14px;
+  border-radius: 14px;
+  font-size: 14px;
+  font-weight: 480;
+  line-height: 1.45;
+}
+.banner > svg {
+  flex: none;
+  margin-top: 1.5px;
+}
+.banner .msg {
+  flex: 1;
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+.banner .msg strong {
+  font-weight: 600;
+}
+.banner .act {
+  flex: none;
+  margin: -5px -6px -5px 0;
+}
+.banner.error {
+  background: var(--c-danger-bg);
+  color: var(--c-danger);
+}
+.banner.notice {
+  background: var(--c-state-done-bg);
+  color: var(--c-state-done-ink);
+}
+.banner.warn {
+  background: var(--c-state-retry-bg);
+  color: var(--c-state-retry-ink);
+}
+.banner.notice .btn,
+.banner.warn .btn,
+.banner.error .btn {
+  color: inherit;
+}
+.banner.hint {
+  background: var(--c-card);
+  box-shadow: inset 0 0 0 1px var(--c-line);
+  color: var(--c-body);
+}
+.banner.hint > svg {
+  color: var(--c-brand-deep);
+}
+.banner a {
+  color: inherit;
+  font-weight: 560;
+  text-underline-offset: 3px;
+}
+
+/* --- state chips: the kind picks the colour; an unknown kind looks queued ----------------------------------- */
+.chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  height: 24px;
+  padding: 0 9px;
+  border-radius: 8px;
+  background: var(--c-state-queued-bg);
+  color: var(--c-state-queued-ink);
+  font-family: var(--font-sans);
+  font-size: 12.5px;
+  font-weight: 560;
+  white-space: nowrap;
+  vertical-align: middle;
+}
+.chip .dot {
+  flex: none;
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--c-state-queued);
+}
+.chip[data-state="running"] {
+  background: var(--c-state-run-bg);
+  color: var(--c-state-run-ink);
+}
+.chip[data-state="running"] .dot {
+  background: var(--c-state-run);
+}
+.chip[data-state="retry_waiting"] {
+  background: var(--c-state-retry-bg);
+  color: var(--c-state-retry-ink);
+}
+.chip[data-state="retry_waiting"] .dot {
+  background: var(--c-state-retry);
+}
+.chip[data-state="reconciling"] {
+  background: var(--c-state-probe-bg);
+  color: var(--c-state-probe-ink);
+}
+.chip[data-state="reconciling"] .dot {
+  background: var(--c-state-probe);
+}
+.chip[data-state="done"] {
+  background: var(--c-state-done-bg);
+  color: var(--c-state-done-ink);
+}
+.chip[data-state="done"] .dot {
+  background: var(--c-state-done);
+}
+.chip[data-state="failed"] {
+  background: var(--c-danger-bg);
+  color: var(--c-danger);
+}
+.chip[data-state="failed"] .dot {
+  background: var(--c-danger);
+}
+.chip[data-state="cancelled"] {
+  background: transparent;
+  box-shadow: inset 0 0 0 1px var(--c-line-strong);
+  color: var(--c-state-cancelled);
+}
+.chip[data-state="cancelled"] .dot {
+  background: transparent;
+  box-shadow: inset 0 0 0 1.5px var(--c-state-cancelled);
+}
+.state-detail {
+  color: var(--c-body);
+  font-family: var(--font-mono);
+  font-size: 12.5px;
+  white-space: nowrap;
+}
+
+/* --- the segmented control (order, time window, theme) ----------------------------------------------------- */
+.seg {
+  display: inline-flex;
+  flex: none;
+  gap: 2px;
+  padding: 3px;
+  border-radius: 12px;
+  background: var(--c-app);
+  box-shadow: inset 0 0 0 1px var(--c-line);
+}
+.seg button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  height: 30px;
+  padding: 0 11px;
+  border: 0;
+  border-radius: 9px;
+  background: transparent;
+  color: var(--c-body);
+  font: inherit;
+  font-size: 13.5px;
+  font-weight: 520;
+  white-space: nowrap;
+  cursor: pointer;
+  transition:
+    background-color 150ms ease-out,
+    color 150ms ease-out;
+}
+.seg button:hover {
+  color: var(--c-ink);
+}
+.seg button[aria-pressed="true"],
+.seg button[aria-checked="true"] {
+  background: var(--c-tile);
+  color: var(--c-ink);
+  box-shadow:
+    0 0 0 1px var(--c-bar-edge),
+    0 1px 3px var(--c-tile-shadow);
+}
+.seg button svg {
+  width: 15px;
+  height: 15px;
+}
+
+/* --- data tables ----------------------------------------------------------------------------------------- */
+.table-wrap {
+  min-width: 0;
+  overflow-x: auto;
+}
+table.data {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 14px;
+}
+table.data th,
+table.data td {
+  padding: 10px 12px;
+  border-top: 1px solid var(--c-line);
+  text-align: left;
+  white-space: nowrap;
+  vertical-align: middle;
+}
+table.data th {
+  padding-top: 8px;
+  padding-bottom: 8px;
+  background: var(--c-panel);
+  color: var(--c-body);
+  font-size: 12.5px;
+  font-weight: 520;
+}
+table.data th:first-child,
+table.data td:first-child {
+  padding-left: 18px;
+}
+table.data th:last-child,
+table.data td:last-child {
+  padding-right: 18px;
+}
+table.data tbody th {
+  background: transparent;
+  color: var(--c-ink);
+  font-size: 14px;
+  font-weight: 500;
+}
+table.data .num {
+  font-variant-numeric: tabular-nums;
+  text-align: right;
+}
+table.data tbody tr {
+  transition: background-color 150ms ease-out;
+}
+table.data tbody tr:hover {
+  background: var(--c-row-hover);
+}
+.mono-cell {
+  color: var(--c-ink-soft);
+  font-family: var(--font-mono);
+  font-size: 13px;
+}
+.muted {
+  color: var(--c-body);
+}
+.bad {
+  color: var(--c-danger);
+}
+
+/* --- key/value lists --------------------------------------------------------------------------------------- */
+.kv {
+  display: flex;
+  flex-direction: column;
+  margin: 0;
+}
+.kv > div {
+  display: grid;
+  grid-template-columns: 8rem minmax(0, 1fr);
+  gap: 12px;
+  align-items: baseline;
+  padding: 9px 0;
+  border-top: 1px solid var(--c-line);
+}
+.kv > div:first-child {
+  border-top: 0;
+}
+.kv dt {
+  color: var(--c-body);
+  font-size: 13.5px;
+}
+.kv dd {
+  min-width: 0;
+  margin: 0;
+  font-size: 14px;
+  overflow-wrap: anywhere;
+}
+
+/* --- bars (state and error counts) ------------------------------------------------------------------------ */
+.bars {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  margin: 0;
+}
+.bars > div {
+  display: grid;
+  grid-template-columns: minmax(6.5rem, 9.5rem) minmax(0, 1fr) auto;
+  gap: 12px;
+  align-items: center;
+  min-height: 30px;
+}
+.bars dt {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+  overflow: hidden;
+  color: var(--c-ink-soft);
+  font-size: 13px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.bars dd {
+  min-width: 0;
+  margin: 0;
+}
+.track {
+  height: 8px;
+  overflow: hidden;
+  border-radius: 4px;
+  background: var(--c-line);
+}
+.track i {
+  display: block;
+  height: 100%;
+  border-radius: 4px;
+  background: var(--c-state-queued);
+}
+.track i[data-state="running"] {
+  background: var(--c-state-run);
+}
+.track i[data-state="retry_waiting"] {
+  background: var(--c-state-retry);
+}
+.track i[data-state="reconciling"] {
+  background: var(--c-state-probe);
+}
+.track i[data-state="done"] {
+  background: var(--c-state-done);
+}
+.track i[data-state="failed"],
+.track i[data-state="error"] {
+  background: var(--c-danger);
+}
+.track i[data-state="cancelled"] {
+  background: var(--c-line-strong);
+}
+.count {
+  min-width: 3.5rem;
+  color: var(--c-ink-soft);
+  font-size: 13px;
+  font-variant-numeric: tabular-nums;
+  text-align: right;
+}
+
+/* --- badges --------------------------------------------------------------------------------------------- */
+.badge {
+  display: inline-flex;
+  align-items: center;
+  height: 20px;
+  padding: 0 8px;
+  border-radius: 999px;
+  background: var(--c-state-queued-bg);
+  color: var(--c-state-queued-ink);
+  font-size: 12px;
+  font-style: normal;
+  font-weight: 540;
+  white-space: nowrap;
+}
+.badge.set,
+.badge.ok {
+  background: var(--c-state-done-bg);
+  color: var(--c-state-done-ink);
+}
+.badge.bad {
+  background: var(--c-danger-bg);
+  color: var(--c-danger);
+}
+.badge.warn {
+  background: var(--c-state-retry-bg);
+  color: var(--c-state-retry-ink);
+}
+
+/* --- fields ---------------------------------------------------------------------------------------------- */
+.field {
+  display: flex;
+  flex-direction: column;
+  gap: 7px;
+  min-width: 0;
+}
+.field-label {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  color: var(--c-ink-soft);
+  font-size: 13.5px;
+  font-weight: 520;
+}
+.field-label svg {
+  color: var(--c-body);
+}
+.field-hint {
+  margin: 0;
+  color: var(--c-body);
+  font-size: 12.5px;
+  line-height: 1.45;
+}
+
+/* --- a confirm step for an operation that changes the journal -------------------------------------------- */
+.confirm {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  width: 100%;
+  padding: 12px 14px 14px;
+  border-radius: 14px;
+  background: var(--c-brand-tint);
+}
+.confirm p {
+  margin: 0;
+  color: var(--c-ink);
+  font-size: 14px;
+  font-weight: 520;
+}
+.confirm-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
