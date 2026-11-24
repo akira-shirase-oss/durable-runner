@@ -1,0 +1,51 @@
+# Durable Runner, shared droplet (deploy/droplet)
+# Durable Runner's site on the shared droplet. caddy-merge.sh renders it (the host from
+# DURABLE_PUBLIC_ORIGIN, the redirect from DURABLE_DASHBOARD_PATH, both in /etc/durable/durable.env)
+# and installs it as /etc/caddy/sites/durable-runner.caddy, which the root Caddyfile imports.
+#
+# A site block ONLY, no global options: the root Caddyfile (Colophon's installer writes it) owns
+# them, and they already hold what this site needs:
+#   admin on a unix socket; auto_https off; servers { import /etc/caddy/cloudflare-trusted.caddy
+#   (Cloudflare's ranges); client_ip_headers Cf-Connecting-Ip; protocols h1 h2 }.
+# So {client_ip} below is Cf-Connecting-Ip from a Cloudflare peer and the TCP peer from anyone
+# else. caddy-merge.sh refuses to install this file into a root that doesn't trust Cloudflare's
+# ranges that way. test-droplet-caddy.sh runs the merged result in Caddy.
+durablerunnerapp.404human.dev:443 {
+	# Cloudflare's Origin Certificate for THIS host (the one at /etc/caddy/origin.pem covers
+	# Colophon's host only), and Authenticated Origin Pulls with the trust Colophon's
+	# origin-pull-ca.sh writes: it is the same zone, so the same client certificate.
+	tls /etc/caddy/durable-origin.pem /etc/caddy/durable-origin.key {
+		client_auth {
+			mode require_and_verify
+			import /etc/caddy/origin-pull-trust.caddy
+		}
+	}
+	# HSTS for this host only: no includeSubDomains (other 404human.dev hosts are on Cloudflare
+	# Pages) and no preload.
+	header Strict-Transport-Security "max-age=31536000"
+	# nosniff on every response; deferred (>) so it replaces the server's own instead of doubling it.
+	header >X-Content-Type-Options nosniff
+	# The bare root opens the dashboard. A path matcher of "/" alone is exact; 302, so browsers
+	# don't keep it when the dashboard moves to /app/.
+	redir / /inspector/ 302
+	encode zstd gzip
+	reverse_proxy 127.0.0.1:58300 {
+		# durable-server trusts only this loopback hop for the header (deploy/durable-run.sh) and
+		# keys its per-address limits by it: overwrite whatever the request carried with the client
+		# Caddy resolved, so no visitor picks its own rate bucket and visitors aren't all keyed as
+		# 127.0.0.1 (white-hat finding B).
+		header_up CF-Connecting-IP {client_ip}
+		# A deploy is a restart plus a replay: while the unit is down the dial fails, and Caddy
+		# holds the request and retries the upstream for up to 15 s. Nothing reached the old
+		# process, so even a submit is safe to retry.
+		lb_try_duration 15s
+		lb_try_interval 250ms
+		# The server closes a connection idle for its header timeout (--header-timeout-ms,
+		# 10 s by default; hyper's header timer also ends idle keep-alives). Caddy would keep idle
+		# upstream connections 2 minutes and reuse one the server just closed: a 502 it can't
+		# retry. Keep them a shorter while than the server does.
+		transport http {
+			keepalive 5s
+		}
+	}
+}
