@@ -1481,7 +1481,18 @@ async fn actor(
                     // (in grace). Drop both now — a cancelled run's entry
                     // must not wait on its dead handler's return (S2
                     // re-review N2).
-                    let ws = core.run(run).map(|r| r.ws);
+                    // Only a waiting run can hold scheduler entries: a
+                    // cancel of a running or finished run touches none
+                    // (re-review #5).
+                    let ws = core
+                        .run(run)
+                        .filter(|r| {
+                            matches!(
+                                r.state,
+                                RunState::Queued { .. } | RunState::RetryWaiting { .. }
+                            )
+                        })
+                        .map(|r| r.ws);
                     let r = core.cancel(run, wall_ms()).map(|_| ());
                     if let Some(w) = ws {
                         // ATTACK(parked-untrack)
@@ -2079,15 +2090,27 @@ impl Exec<'_> {
     /// marker, its `dead_retry` tuple, and a parked entry (S2 re-review
     /// N2). Called when the run leaves waiting for a reason no queue
     /// pass will see: a cancel.
-    fn untrack(&mut self, ws: u64, run: RunId) {
-        self.dead_since.remove(&run);
-        self.dead_retry.retain(|Reverse((_, r, ..))| *r != run.0);
+    ///
+    /// Cheap for a run the scheduler never marked (re-review #5): the
+    /// heap is rebuilt only for a run with an in-grace marker (only such a
+    /// run has `dead_retry` tuples), and a parked list only loses the run
+    /// it holds. Returns whether there was anything to drop.
+    fn untrack(&mut self, ws: u64, run: RunId) -> bool {
+        let mut dropped = false;
+        if self.dead_since.remove(&run).is_some() {
+            self.dead_retry.retain(|Reverse((_, r, ..))| *r != run.0);
+            dropped = true;
+        }
         if let Some(v) = self.parked.get_mut(&ws) {
-            v.retain(|p| p.0 != run);
+            if let Some(i) = v.iter().position(|p| p.0 == run) {
+                v.remove(i);
+                dropped = true;
+            }
             if v.is_empty() {
                 self.parked.remove(&ws);
             }
         }
+        dropped
     }
 
     /// A registry change on `ws` may bring a parked run's handler back:
@@ -4271,6 +4294,35 @@ mod tests {
                 "grace {grace_ms}: the cancelled run's scheduler entries survived"
             );
         }
+    }
+
+    /// Re-review #5: untracking a run the scheduler never marked drops
+    /// nothing and rebuilds nothing — other runs' heap tuples and parked
+    /// entries stay exactly as they were.
+    #[tokio::test(flavor = "current_thread")]
+    async fn untracking_an_unmarked_run_touches_nothing() {
+        let mut sched = Sched::new(8);
+        for r in 0..1_000u64 {
+            sched
+                .dead_retry
+                .push(Reverse((wall_ms() + 1_000 + r, r + 10_000, 0, 1)));
+            sched.dead_since.insert(RunId(r + 10_000), wall_ms());
+        }
+        sched
+            .parked
+            .entry(0)
+            .or_default()
+            .push((RunId(77), StepIndex(0), 1, Arc::from("gone")));
+        let reg = Registry::default();
+        let mut ex = sched.exec(&reg, 64, 0, 8);
+        for r in 1_000..1_100u64 {
+            assert!(!ex.untrack(0, RunId(r)), "run {r} was never marked");
+        }
+        assert!(ex.untrack(0, RunId(77)), "a parked run is dropped");
+        assert!(ex.untrack(0, RunId(10_005)), "an in-grace run is dropped");
+        assert_eq!(sched.dead_retry.len(), 999);
+        assert_eq!(sched.dead_since.len(), 999);
+        assert!(sched.parked.is_empty());
     }
 
     /// Never answers; its probe reports the effect landed.

@@ -158,7 +158,10 @@ pub(crate) fn host_addresses() -> std::io::Result<Vec<IpAddr>> {
 }
 
 /// `--deny-cidr`: `ADDR/PREFIX`, or a bare address (one host). Host bits
-/// below the prefix are ignored.
+/// below the prefix are ignored. An IPv4-mapped range (`::ffff:a.b.c.d/N`,
+/// N >= 96) is stored as the IPv4 range it names, so it refuses the plain
+/// IPv4 form too; a shorter one is refused (re-review #7: it matched
+/// nothing).
 pub(crate) fn parse_cidr(s: &str) -> Result<(IpAddr, u8), String> {
     let (a, p) = match s.trim().split_once('/') {
         Some((a, p)) => (a, Some(p)),
@@ -174,6 +177,18 @@ pub(crate) fn parse_cidr(s: &str) -> Result<(IpAddr, u8), String> {
     };
     if len > bits {
         return Err(format!("prefix /{len} too long in {s:?}"));
+    }
+    if let IpAddr::V6(v6) = ip {
+        // ATTACK(deny-cidr-mapped)
+        if let Some(v4) = v6.to_ipv4_mapped() {
+            if len < 96 {
+                return Err(format!(
+                    "{s:?}: an IPv4-mapped range needs a /96 or longer prefix \
+                     (write the IPv4 range instead)"
+                ));
+            }
+            return Ok((IpAddr::V4(v4), len - 96));
+        }
     }
     Ok((ip, len))
 }
@@ -508,6 +523,28 @@ mod tests {
         let open = Policy::new(true, Vec::new(), deny);
         assert!(check_url(&url("http://127.0.0.1:9/h"), &open).is_ok());
         assert!(check_url(&url("http://127.0.0.7:9/h"), &open).is_err());
+    }
+
+    /// Re-review #7: an IPv4-mapped deny range refuses the IPv4 address it
+    /// names in every form; a mapped range shorter than /96 is refused.
+    #[test]
+    fn an_ipv4_mapped_deny_cidr_names_its_ipv4_range() {
+        let r = parse_cidr("::ffff:203.0.113.0/120").unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(r, (IpAddr::V4(Ipv4Addr::new(203, 0, 113, 0)), 24));
+        let one = parse_cidr("::ffff:198.51.100.7").unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(one, (IpAddr::V4(Ipv4Addr::new(198, 51, 100, 7)), 32));
+        let p = Policy::new(true, Vec::new(), vec![r, one]);
+        for u in [
+            "http://203.0.113.5/h",
+            "http://[::ffff:203.0.113.5]/h",
+            "http://198.51.100.7/h",
+        ] {
+            assert!(
+                check_url(&Url::parse(u).unwrap_or_else(|e| panic!("{e}")), &p).is_err(),
+                "{u}"
+            );
+        }
+        assert!(parse_cidr("::ffff:0:0/80").is_err(), "shorter than /96");
     }
 
     #[test]
