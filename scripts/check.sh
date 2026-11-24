@@ -103,6 +103,9 @@ fi
 step "perf: clean-imports gate (+ known-bad proof)"
 perf/check-clean-imports.sh
 
+step "perf: the heavy-slot proof (+ known-bad proof)"
+perf/test-heavy-held.sh
+
 step "deploy format guard (D-056)"
 deploy/test-format-guard.sh
 

@@ -1564,6 +1564,7 @@ async fn actor(
                 Some(Read::Keys { ws, runs, reply }) => {
                     let keys = runs
                         .iter()
+                        // ATTACK(keys-scope)
                         .map(|r| core.run(*r).filter(|r| r.ws == ws).map(|r| r.key.clone()))
                         .collect();
                     pipe.answer_read(core.last_index(), reply, keys);
@@ -4323,6 +4324,40 @@ mod tests {
         assert_eq!(sched.dead_retry.len(), 999);
         assert_eq!(sched.dead_since.len(), 999);
         assert!(sched.parked.is_empty());
+    }
+
+    /// Re-review #10: the feed's key lookup answers only the asking
+    /// workspace's runs — another workspace's run is `None`, like a run
+    /// that left the index.
+    #[tokio::test(flavor = "current_thread")]
+    async fn keys_never_answer_another_workspaces_run() {
+        let d = tempfile::tempdir().unwrap_or_else(|e| panic!("{e}"));
+        let eng = spawn(
+            d.path(),
+            Registry::default(),
+            ShellConfig {
+                tick_ms: 5,
+                ..Default::default()
+            },
+        )
+        .unwrap_or_else(|e| panic!("{e}"));
+        eng.put_handler(1, "echo", Arc::new(Echo))
+            .await
+            .unwrap_or_else(|e| panic!("{e}"));
+        let run = eng
+            .submit_at_scoped(1, OperationKey("ws1-key".into()), spec1("echo"), FAR)
+            .await
+            .unwrap_or_else(|e| panic!("{e}"));
+        let mine = eng
+            .keys(1, vec![run])
+            .await
+            .unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(mine, vec![Some(OperationKey("ws1-key".into()))], "control");
+        let theirs = eng
+            .keys(2, vec![run])
+            .await
+            .unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(theirs, vec![None], "workspace 2 learned workspace 1's key");
     }
 
     /// Never answers; its probe reports the effect landed.

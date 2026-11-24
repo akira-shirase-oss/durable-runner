@@ -2195,6 +2195,7 @@ fn decode_id(app: &App, ws: u64, s: &str) -> Result<u64, ApiError> {
     // internal numbers. A short digit string never decodes as an opaque
     // id (wrong byte count), so every realistic legacy id reaches here;
     // every other workspace's ids stay opaque-only.
+    // ATTACK(numeric-id-ws0)
     if ws == 0 && !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit()) {
         return s.parse::<u64>().map_err(|_| not_found());
     }
@@ -2308,6 +2309,7 @@ async fn list(
     };
     let page = app
         .engine
+        // ATTACK(list-scope)
         .list_in(auth.ws, order, q.limit.unwrap_or(100))
         .await?;
     let items: Vec<serde_json::Value> = page
@@ -2393,6 +2395,7 @@ async fn workspace_diagnostics(
     Authorized(auth): Authorized,
     State(app): State<App>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
+    // ATTACK(diag-scope)
     let d = app.engine.diag_ws(auth.ws).await?;
     Ok(Json(serde_json::to_value(d).unwrap_or_default()))
 }

@@ -127,15 +127,13 @@ const HEAVY_LOCK = process.env.DR_HEAVY_LOCK ??
     const fd9 = fs.fstatSync(9);
     const lock = fs.statSync(HEAVY_LOCK);
     // The fd is the proof, and the proof is the LOCK — an fd open on a
-    // world-writable file anyone can open proves nothing on its own.
-    // flock(9, LOCK_EX|LOCK_NB) on the inherited description succeeds
-    // only because this description already holds it (relock on the
-    // same description never contends); a merely-open fd to a contended
-    // lock fails (S2 re-review N5).
+    // world-writable file anyone can open proves nothing on its own, and
+    // flock(9) alone TAKES an unheld lock (re-review #12). heavy-held.sh
+    // proves the lock is held and that fd 9 is the holding description.
     if (fd9.ino === lock.ino && fd9.dev === lock.dev) {
-      const r = spawnSync('python3',
-        ['-c', 'import fcntl; fcntl.flock(9, fcntl.LOCK_EX | fcntl.LOCK_NB)'],
-        { stdio: ['ignore','ignore','inherit','ignore','ignore','ignore','ignore','ignore','ignore', 9] });
+      const r = spawnSync(path.join(ROOT, 'perf', 'heavy-held.sh'), [],
+        { stdio: ['ignore','ignore','inherit','ignore','ignore','ignore','ignore','ignore','ignore', 9],
+          env: { ...process.env, DR_HEAVY_LOCK: HEAVY_LOCK } });
       held = r.status === 0;
     }
   } catch { held = false; }
