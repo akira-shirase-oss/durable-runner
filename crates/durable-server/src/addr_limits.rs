@@ -119,7 +119,8 @@ pub fn client_addr(
     // ATTACK(cf-header)
     if trusted.trusts(peer) {
         if let Some(ip) = cf_connecting_ip.and_then(|v| v.trim().parse::<IpAddr>().ok()) {
-            return ip;
+            // A mapped `::ffff:a.b.c.d` names an IPv4 client: key it as one.
+            return ip.to_canonical();
         }
     }
     peer

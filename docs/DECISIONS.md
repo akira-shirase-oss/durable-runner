@@ -1177,3 +1177,48 @@ Proved by `metrics_answer_only_the_callers_workspace`,
 `a_tenants_handler_stats_are_capped_lru` (observer), each scoping line
 marked `ATTACK(obs-*)` with a mutation row in `prove-attacks.sh` that
 removes it and requires its test to go red.
+
+## D-061: the host is never a handler; the proxy hop owns the client address
+
+*(two findings of an independent white-hat review of S2 + main)*
+
+**A — the host's own addresses join the SSRF deny set.** The S2-5 guard
+refused the IANA non-global blocks but not the droplet's own public
+addresses, and Linux delivers a connection to a local address over `lo`:
+a handler URL naming the droplet's public IP (or a name resolving to it)
+reached anything listening on 0.0.0.0/[::] — sshd, exporters,
+Docker-published ports, the other products on the shared droplet. Now
+one `ssrf::Policy` value is shared by registration, the call-time
+literal check and the resolver; at boot it holds every interface address
+(getifaddrs through the `if-addrs` crate: the workspace forbids `unsafe`),
+both families, and the operator's `--deny-cidr` ranges. Listing the
+interfaces fails closed: the server does not start. `--allow-local-handlers`
+still opens the local blocks and the host's addresses (fixtures dial
+127.0.0.1); `--deny-cidr` ranges are refused even then. A reserved IP is
+not on any interface, so it is listed by the operator
+(`/etc/durable/deny-cidrs`); interface addresses are read once, at boot.
+The guard decides by address; the deploy guide adds a kernel egress
+firewall for the server's user as the second layer.
+
+**B — the server trusts the loopback hop; Caddy writes the header.**
+Behind Caddy every TCP peer is 127.0.0.1, while the server believed
+`CF-Connecting-IP` only from Cloudflare's ranges — so every visitor
+shared one bucket and `--max-conns-per-addr`-style limits became global.
+The deploy wrapper now trusts 127.0.0.1/32 and ::1/128 for a loopback
+listener, and Caddy (which alone sees Cloudflare's peers) resolves the
+client from `CF-Connecting-IP` and overwrites the header with it. Not a
+server default: a loopback-trusting default would let any local client
+choose its bucket (the attack suite's spoof proof runs on loopback), and
+the trust belongs where the proxy is configured. The server also
+canonicalizes peers (`::ffff:a.b.c.d` → `a.b.c.d`), or a dual-stack
+listener would neither trust the IPv4 hop nor key IPv4 clients apart
+(all of them sharing one /64).
+
+Proved by `the_hosts_own_addresses_are_refused_by_both_layers`,
+`deny_cidr_ranges_are_refused_even_with_allow_local`,
+`boot_refuses_every_interface_address`, `a_denied_or_own_address_gets_no_packet`
+(a real listener sees no connection; an open-policy control does),
+`visitors_behind_the_loopback_proxy_hop_get_their_own_buckets` and
+`deploy/test-proxy-hop.sh` (with known-bad copies); `ATTACK(ssrf-own-address)`,
+`ATTACK(ssrf-deny-cidr)` and `ATTACK(peer-canonical)` have mutation rows.
+

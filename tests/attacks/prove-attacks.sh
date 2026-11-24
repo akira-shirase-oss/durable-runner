@@ -39,8 +39,8 @@ mutations=(
   "ops-scope|crates/durable-server/src/main.rs|cross_tenant|a_tenant_admin_cannot_reach_ops_routes|auth\.ws != 0 \|\| auth\.permission != Permission::Admin~~>false"
   "rate-limit|crates/durable-server/src/main.rs|rate_limit|the_bucket_refuses_after_its_tokens|limits\.rate_per_addr > 0\.0~~>false"
   "cf-header|crates/durable-server/src/addr_limits.rs|header_spoof|spoofed_client_header_does_not_evade_the_bucket|trusted\.trusts\(peer\)~~>peer == peer"
-  "ssrf-register|crates/durable-server/src/main.rs|ssrf|local_handler_urls_are_refused_at_registration|, allow_local\)~~>, true)"
-  "ssrf-resolve|crates/durable-server/src/ssrf.rs|ssrf|a_domain_that_resolves_local_never_gets_a_packet|addrs\.into_iter\(\)\.any\(is_local\)~~>false"
+  "ssrf-register|crates/durable-server/src/main.rs|ssrf|local_handler_urls_are_refused_at_registration|ssrf::check_url\(&parsed, policy\)~~>Ok::<(), &str>(())"
+  "ssrf-resolve|crates/durable-server/src/ssrf.rs|ssrf|a_domain_that_resolves_local_never_gets_a_packet|addrs\.into_iter\(\)\.any\(\|ip\| policy\.refusal\(ip\)\.is_some\(\)\)~~>false"
   "body-limit|crates/durable-server/src/main.rs|bodies|an_oversized_body_is_refused_413|DefaultBodyLimit::max\(MAX_REQUEST_BYTES\)~~>DefaultBodyLimit::disable()"
   "body-deadline|crates/durable-server/src/main.rs|bodies|a_dribbled_body_is_cut_at_its_deadline|limits\.body_deadline~~>Duration::from_secs(3600)"
   "head-timeout|crates/durable-server/src/main.rs|bodies|a_partial_head_is_cut|limits\.header_timeout~~>Duration::from_secs(3600)"
@@ -54,6 +54,9 @@ mutations=(
   "obs-feed-scope|crates/durable-server/src/main.rs|unit:durable-server|the_feed_answers_only_the_callers_workspace|app\.obs\.feed\(auth\.ws, limit\)~~>app.obs.feed(0, limit)"
   "obs-record-scope|crates/durable-engine/src/observe.rs|unit:durable-engine|a_workspace_view_holds_only_its_own_records|self\.ws\(o\.ws, o\.at\)~~>self.ws(0, o.at)"
   "parked-untrack|crates/durable-engine/src/shell.rs|unit:durable-engine|a_cancel_through_the_actor_drops_the_runs_scheduler_entries|exec!\(\)\.untrack\(w, run\);~~>let _ = w;"
+  "ssrf-own-address|crates/durable-server/src/ssrf.rs|unit:durable-server|the_hosts_own_addresses_are_refused_by_both_layers|self\.host\.iter\(\)\.any\(\|&own\| same_address\(ip, own\)\)~~>false"
+  "ssrf-deny-cidr|crates/durable-server/src/ssrf.rs|unit:durable-server|a_denied_or_own_address_gets_no_packet|self\.deny\.iter\(\)\.any\(\|&block\| in_block\(ip, block\)\)~~>false"
+  "peer-canonical|crates/durable-server/src/main.rs|unit:durable-server|visitors_behind_the_loopback_proxy_hop_get_their_own_buckets|peer\.ip\(\)\.to_canonical\(\)~~>peer.ip()"
   "obs-call-scope|crates/durable-engine/src/observe.rs|unit:durable-server|metrics_answer_only_the_callers_workspace|obs\.ws\(ws, wall_ms\(\)\)~~>obs.ws(0, wall_ms())"
 )
 

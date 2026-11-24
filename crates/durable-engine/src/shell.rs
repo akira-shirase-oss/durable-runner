@@ -4228,13 +4228,29 @@ mod tests {
                 },
             )
             .unwrap_or_else(|e| panic!("{e}"));
-            // Admitted while the handler exists, due once it is gone.
+            // Admitted while the handler exists, due once it is gone. The
+            // delete is fire-and-forget; the put after it answers only
+            // once the actor has processed both (one command channel, in
+            // order), and the run must still be queued then — else the
+            // machine was too slow for the margin and the test says so.
             let run = eng
-                .submit_at(OperationKey("ghost".into()), spec1("gone"), wall_ms() + 50)
+                .submit_at(
+                    OperationKey("ghost".into()),
+                    spec1("gone"),
+                    wall_ms() + 1_500,
+                )
                 .await
                 .unwrap_or_else(|e| panic!("{e}"));
             eng.delete_handler(0, "gone")
                 .unwrap_or_else(|e| panic!("{e}"));
+            eng.put_handler(0, "sync", Arc::new(Echo))
+                .await
+                .unwrap_or_else(|e| panic!("{e}"));
+            let queued = eng.inspect(run).await.unwrap_or_else(|e| panic!("{e}"));
+            assert!(
+                matches!(queued.map(|r| r.state), Some(RunState::Queued { .. })),
+                "the run became due before its handler was deleted"
+            );
             let deadline = std::time::Instant::now() + Duration::from_secs(10);
             loop {
                 let c = eng.sched_counts().await.unwrap_or_else(|e| panic!("{e}"));

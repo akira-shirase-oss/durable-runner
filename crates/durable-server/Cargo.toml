@@ -17,6 +17,9 @@ durable-accounts = { path = "../durable-accounts" }
 durable-domain = { path = "../durable-domain" }
 durable-engine = { path = "../durable-engine" }
 durable-journal = { path = "../durable-journal" }
+# getifaddrs behind a safe API (this workspace forbids `unsafe`): the SSRF
+# guard refuses this host's own interface addresses (white-hat finding A).
+if-addrs = "0.15"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 ring = "0.17"
 serde = { version = "1", features = ["derive"] }

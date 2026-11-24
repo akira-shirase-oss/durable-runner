@@ -191,7 +191,22 @@ target/release/durable-server \
   inside the client's DNS resolver (a DNS answer that flips local after
   registration still sends zero packets; `--allow-local-handlers` opts
   out for development and fixtures — every loopback example here needs
-  it).
+  it). **This host's own addresses are refused too** (D-061): at startup
+  the server lists every interface address, both families — the
+  droplet's public IPv4/IPv6 included — and refuses them with the local
+  blocks, because Linux delivers a connection to the host's own public
+  address over `lo`, reaching anything listening on 0.0.0.0/[::] (sshd,
+  exporters, Docker-published ports, other products on a shared
+  droplet). The server refuses to start if the interfaces cannot be
+  listed. An address that reaches this host without being on one of its
+  interfaces — a DigitalOcean reserved IP, a load balancer's address —
+  goes in `--deny-cidr ADDR[/PREFIX]` (repeatable; on the droplet, one
+  per line in `/etc/durable/deny-cidrs`), refused even with
+  `--allow-local-handlers`. Interface addresses are read once at
+  startup: restart after attaching a new one. The startup log says how
+  many host addresses and deny ranges the guard holds. Pair it with the
+  egress firewall in `docs/DEPLOY.md`: the guard decides by address, the
+  firewall by destination at the kernel.
 - The journal directory is created on first run: `LOCK`, `manifest.json`,
   `gen-00000N/{journal.log,snapshot.bin}`, owner-only (directories 0700,
   files 0600; backups and restores too, D-038). Run the server as the

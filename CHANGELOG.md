@@ -167,6 +167,23 @@ contract + reference verifier ship in `docs/HANDLERS.md`.
   and exact body to the workspace's secret — a tampered body, stale
   timestamp, wrong-secret signature or a signature already seen fails
   the handler's own check (each rejection class regression-tested).
+- **Handler calls can no longer reach this host through its own
+  address** (D-061). The SSRF guard now also refuses every address on
+  the host's interfaces — the droplet's public IPv4 and IPv6 included,
+  which Linux delivers over loopback to anything listening on all
+  addresses — at registration, at call time and inside the resolver.
+  `--deny-cidr ADDR[/PREFIX]` (repeatable; `/etc/durable/deny-cidrs` on
+  the droplet) adds ranges such as a reserved IP, refused even with
+  `--allow-local-handlers`. The server refuses to start if it cannot
+  list its interfaces. The deploy guide adds an nftables egress firewall
+  for the server's user as a second layer.
+- **Visitors behind Caddy are no longer all one rate bucket** (D-061).
+  The server sees only Caddy's loopback connections; `durable-run` now
+  trusts that hop for `CF-Connecting-IP`, and the Caddyfile overwrites
+  the header with the client Caddy resolved from Cloudflare, so the
+  per-address limits key each visitor (IPv6 by /64) and nobody can pick
+  their own bucket. A dual-stack listener's `::ffff:a.b.c.d` peers are
+  treated as the IPv4 clients they are. `smoke.sh` checks both halves.
 
 ### Load evidence
 

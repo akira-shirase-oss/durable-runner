@@ -60,6 +60,14 @@ struct Args {
     /// resolves to one is refused before a packet leaves (S2-5).
     #[arg(long)]
     allow_local_handlers: bool,
+    /// Address range (repeatable, `ADDR/PREFIX` or one address) a handler
+    /// call never dials, on top of the local blocks and this host's own
+    /// interface addresses (which are refused automatically). List the
+    /// droplet's reserved/floating IP and any other address that reaches
+    /// this host without being on one of its interfaces. Refused even
+    /// with --allow-local-handlers.
+    #[arg(long = "deny-cidr", value_parser = ssrf::parse_cidr)]
+    deny_cidrs: Vec<(std::net::IpAddr, u8)>,
     /// Attempt timeout per step call, ms (bounded by domain limits).
     #[arg(long, default_value_t = 20_000)]
     step_timeout_ms: u64,
@@ -232,7 +240,7 @@ fn parse_v6_prefix(s: &str) -> std::result::Result<u8, String> {
 /// input and idempotency key go only to the registered URL), it ignores
 /// the proxy environment variables (nothing outside the allowlist can
 /// route calls), and it gives up connecting after 5 s.
-fn handler_client(allow_local: bool) -> Result<reqwest::Client> {
+fn handler_client(policy: &ssrf::Policy) -> Result<reqwest::Client> {
     reqwest::Client::builder()
         .redirect(reqwest::redirect::Policy::none())
         .no_proxy()
@@ -241,7 +249,7 @@ fn handler_client(allow_local: bool) -> Result<reqwest::Client> {
         // told it exists — the check is the resolution, so a DNS answer
         // that flips local between registration and dispatch sends zero
         // packets. No TOCTOU by construction.
-        .dns_resolver(ssrf::resolver(allow_local))
+        .dns_resolver(ssrf::resolver(policy))
         .connect_timeout(Duration::from_secs(5))
         .build()
         .context("build the handler HTTP client")
@@ -266,9 +274,9 @@ struct HttpHandler {
     /// here, at the last point before the wire. `None` = unparseable,
     /// refused like any local target.
     policy_url: Option<reqwest::Url>,
-    /// The `--allow-local-handlers` opt-out the check shares with
-    /// registration and the resolver.
-    allow_local: bool,
+    /// The SSRF policy the check shares with registration and the
+    /// resolver (local blocks, this host's own addresses, --deny-cidr).
+    policy: ssrf::Policy,
     /// `x-durable-run-id` carries the opaque public id, never the
     /// global sequence — a raw one would tell the tenant how much work
     /// every other workspace submitted between two of its calls.
@@ -281,7 +289,7 @@ impl HttpHandler {
     /// nothing sent — mirroring `ssrf::refused`'s classification.
     fn policy_ok(&self) -> bool {
         match &self.policy_url {
-            Some(u) => ssrf::check_url(u, self.allow_local).is_ok(),
+            Some(u) => ssrf::check_url(u, &self.policy).is_ok(),
             None => false,
         }
     }
@@ -544,9 +552,9 @@ struct HandlerFactory {
     client: reqwest::Client,
     timeout: Duration,
     max_output: usize,
-    /// `--allow-local-handlers` — dev/test opt-out shared by the
-    /// registration check and the client's resolver.
-    allow_local: bool,
+    /// The SSRF policy shared by the registration check, every built
+    /// handler's call-time check and the client's resolver.
+    policy: ssrf::Policy,
     /// The run-id encoder every built handler signs its headers with.
     pubid: pubid::PubId,
 }
@@ -566,7 +574,7 @@ impl HandlerFactory {
             max_output: self.max_output,
             secret,
             policy_url: reqwest::Url::parse(url).ok(),
-            allow_local: self.allow_local,
+            policy: self.policy.clone(),
             pubid: self.pubid.clone(),
         })
     }
@@ -575,7 +583,7 @@ impl HandlerFactory {
 /// The admission rule for a registered URL: http(s) with a host, and a
 /// literal local target refused unless `--allow-local-handlers` (S2-5's
 /// registration layer — domains are judged at dial by the resolver).
-fn valid_handler_url(url: &str, allow_local: bool) -> Result<String, ApiError> {
+fn valid_handler_url(url: &str, policy: &ssrf::Policy) -> Result<String, ApiError> {
     // Bounded like everything else (S2 review #6): an unbounded URL is
     // an unbounded registry row, snapshot line, and dial string.
     if url.len() > 2048 {
@@ -600,7 +608,7 @@ fn valid_handler_url(url: &str, allow_local: bool) -> Result<String, ApiError> {
         ));
     }
     // ATTACK(ssrf-register)
-    ssrf::check_url(&parsed, allow_local).map_err(|why| {
+    ssrf::check_url(&parsed, policy).map_err(|why| {
         ApiError::new(
             StatusCode::UNPROCESSABLE_ENTITY,
             "local_target_forbidden",
@@ -889,7 +897,7 @@ async fn registry_sync(
             // never reaches the registry (call-time policy still
             // refuses it; dropping it here refuses it *honestly*).
             let ok = reqwest::Url::parse(&r.url)
-                .map(|u| ssrf::check_url(&u, factory.allow_local).is_ok())
+                .map(|u| ssrf::check_url(&u, &factory.policy).is_ok())
                 .unwrap_or(false);
             if !ok {
                 refused += 1;
@@ -1243,6 +1251,17 @@ struct App {
     obs: Arc<Observer>,
 }
 
+/// Tests' SSRF policy: open for fixtures, else the IANA blocks only (a
+/// test that needs this host's addresses builds `Policy::boot` itself).
+#[cfg(test)]
+fn test_policy(allow_local: bool) -> ssrf::Policy {
+    if allow_local {
+        ssrf::Policy::open()
+    } else {
+        ssrf::Policy::strict()
+    }
+}
+
 /// Test constructor: the registry plumbing (`handlers.json`, factory,
 /// flags) points inside the test's journal dir like the real wiring.
 #[cfg(test)]
@@ -1267,10 +1286,10 @@ fn test_app(
         open_reads,
         backup_root,
         handler_factory: Arc::new(HandlerFactory {
-            client: handler_client(allow_local).unwrap_or_else(|e| panic!("{e}")),
+            client: handler_client(&test_policy(allow_local)).unwrap_or_else(|e| panic!("{e}")),
             timeout: Duration::from_secs(2),
             max_output: 1024 * 1024,
-            allow_local,
+            policy: test_policy(allow_local),
             pubid: pubid.clone(),
         }),
         flag_handlers: Arc::new(Vec::new()),
@@ -2469,7 +2488,7 @@ async fn put_handler(
             "handler name must be 1-128 chars with no control characters",
         ));
     }
-    let url = valid_handler_url(body.url.trim(), app.handler_factory.allow_local)?;
+    let url = valid_handler_url(body.url.trim(), &app.handler_factory.policy)?;
     // Finding 4: the bound check, the store write, the engine update and
     // the snapshot send are one critical section per workspace — a
     // reconcile's list+apply cannot interleave between them.
@@ -3001,20 +3020,26 @@ async fn main() -> Result<()> {
         ..Default::default()
     };
     let mut registry = Registry::default();
-    let client = handler_client(args.allow_local_handlers)?;
+    // The SSRF policy (S2-5 + white-hat A): this host's own interface
+    // addresses join the refused set — a handler URL naming the droplet's
+    // public address would otherwise be delivered over lo to anything
+    // listening on 0.0.0.0. Listing them fails closed: no start.
+    let policy = ssrf::Policy::boot(args.allow_local_handlers, args.deny_cidrs.clone())
+        .context("list this host's interface addresses for the SSRF guard")?;
+    let client = handler_client(&policy)?;
     let pubid =
         pubid::PubId::load_or_generate(&args.journal).with_context(|| "load public-id key")?;
     let factory = Arc::new(HandlerFactory {
         client,
         timeout: Duration::from_millis(args.step_timeout_ms),
         max_output: cfg.limits.max_output_bytes,
-        allow_local: args.allow_local_handlers,
+        policy: policy.clone(),
         pubid: pubid.clone(),
     });
     // A `--handler` flag URL obeys the same registration rule as the
     // route: literal-local refused unless --allow-local-handlers.
     for (_, url) in &args.handlers {
-        valid_handler_url(url, args.allow_local_handlers)
+        valid_handler_url(url, &policy)
             .map_err(|e| anyhow::anyhow!("--handler {url}: {}", e.message))?;
     }
     let mut flag_handlers: Vec<(String, Arc<dyn StepHandler>)> = Vec::new();
@@ -3052,7 +3077,7 @@ async fn main() -> Result<()> {
             // under --allow-local-handlers or edited offline — a literal
             // local target never enters the registry.
             let ok = reqwest::Url::parse(&entry.url)
-                .map(|u| ssrf::check_url(&u, args.allow_local_handlers).is_ok())
+                .map(|u| ssrf::check_url(&u, &policy).is_ok())
                 .unwrap_or(false);
             if !ok {
                 eprintln!(
@@ -3118,6 +3143,11 @@ async fn main() -> Result<()> {
              target local/private addresses"
         );
     }
+    let (own, denied) = policy.sizes();
+    eprintln!(
+        "durable-server: SSRF guard refuses this host's {own} interface addresses \
+         and {denied} --deny-cidr range(s) besides the local blocks"
+    );
     eprintln!("durable-server listening on {}", args.listen);
     let (stop_http, http_stopped) = tokio::sync::oneshot::channel::<()>();
     let health_serve = match &args.health_listen {
@@ -3573,6 +3603,12 @@ async fn serve_http(
             },
             _ = &mut stop => break,
         };
+        // A dual-stack listener reports an IPv4 client as `::ffff:a.b.c.d`:
+        // judged as IPv6, the loopback proxy hop (127.0.0.1/32) would not
+        // be trusted and every IPv4 client would share one /64 bucket
+        // (white-hat finding B). Every limit below sees the canonical form.
+        // ATTACK(peer-canonical)
+        let peer = std::net::SocketAddr::new(peer.ip().to_canonical(), peer.port());
         if let Slot::Lane(lane_permit) = slot {
             // The work pool is dry and this conn is waiting — real
             // demand may reclaim one idle served slot (N3).
@@ -5017,6 +5053,77 @@ mod tests {
         assert_eq!(runs(OBS_READ_A).await, sorted(a_ids));
         assert_eq!(runs(OBS_KEY_B).await, sorted(b_ids));
         assert_eq!(runs(KEY).await, sorted(ws0), "env keys: workspace 0's only");
+    }
+
+    /// White-hat finding B: behind Caddy every TCP peer is the loopback
+    /// hop, so the deploy trusts 127.0.0.1/32 and ::1/128 as the proxy
+    /// (deploy/durable-run.sh) and Caddy overwrites `CF-Connecting-IP`
+    /// with the client it resolved. Then each visitor gets its own bucket
+    /// (IPv6 by /64), a header from an untrusted peer is ignored, and a
+    /// dual-stack listener — which sees `::ffff:127.0.0.1` — still trusts
+    /// the hop. One token per 1000 s makes every refusal deterministic.
+    #[tokio::test]
+    async fn visitors_behind_the_loopback_proxy_hop_get_their_own_buckets() {
+        let hop = |nets: &[&str]| HttpLimits {
+            rate_per_addr: 0.001,
+            trusted_proxies: TrustedProxies(
+                nets.iter()
+                    .map(|n| IpNet::parse(n).unwrap_or_else(|e| panic!("{e}")))
+                    .collect(),
+            ),
+            ..HttpLimits::default()
+        };
+        let client = reqwest::Client::new();
+        let get = |base: String, visitor: &'static str| {
+            let c = client.clone();
+            async move {
+                c.get(format!("{base}/health"))
+                    .header("cf-connecting-ip", visitor)
+                    .send()
+                    .await
+                    .unwrap_or_else(|e| panic!("{e}"))
+                    .status()
+                    .as_u16()
+            }
+        };
+        // The deploy's trust: the loopback hop, both families.
+        let (addr, _stop, _h) = serving(hop(&["127.0.0.1/32", "::1/128"])).await;
+        let base = format!("http://{addr}");
+        for (visitor, want) in [
+            ("198.51.100.1", 200),
+            ("198.51.100.1", 429), // its own bucket is spent…
+            ("198.51.100.2", 200), // …another visitor's is not
+            ("2001:db8:1:1::1", 200),
+            ("2001:db8:1:1::2", 429), // the same /64: one bucket
+            // (another /64 in the same /48 is charged to the /48's
+            // aggregate too — the F3 bound — so the next visitor is a
+            // different /48)
+            ("2001:db8:2::1", 200),
+            ("::ffff:198.51.100.3", 200),
+            ("198.51.100.3", 429), // a mapped form is the same IPv4 client
+        ] {
+            assert_eq!(get(base.clone(), visitor).await, want, "{visitor}");
+        }
+        // A peer outside the trusted hop: its header is ignored, so every
+        // "visitor" it claims shares the peer's one bucket.
+        let (addr, _stop2, _h2) = serving(hop(&["::1/128"])).await;
+        let base = format!("http://{addr}");
+        assert_eq!(get(base.clone(), "198.51.100.10").await, 200);
+        assert_eq!(
+            get(base.clone(), "198.51.100.11").await,
+            429,
+            "spoofed header believed"
+        );
+        // Dual-stack: the IPv4 hop arrives as ::ffff:127.0.0.1 and must
+        // still be the trusted 127.0.0.1.
+        let (addr, _stop3, _h3) = serving_on(hop(&["127.0.0.1/32"]), "[::]:0").await;
+        let base = format!("http://127.0.0.1:{}", addr.port());
+        assert_eq!(get(base.clone(), "198.51.100.20").await, 200);
+        assert_eq!(
+            get(base.clone(), "198.51.100.21").await,
+            200,
+            "a dual-stack listener must canonicalize the mapped peer"
+        );
     }
 
     /// A submit refused 429 by the per-address limit counts as refused; a
@@ -6777,13 +6884,13 @@ mod tests {
         // The strict client — no --allow-local-handlers.
         let url = format!("http://localhost:{port}/step");
         let h = HttpHandler {
-            client: handler_client(false).unwrap_or_else(|e| panic!("{e}")),
+            client: handler_client(&ssrf::Policy::strict()).unwrap_or_else(|e| panic!("{e}")),
             policy_url: reqwest::Url::parse(&url).ok(),
             url,
             timeout: Duration::from_secs(2),
             max_output: 1024,
             secret: None,
-            allow_local: false,
+            policy: ssrf::Policy::strict(),
             pubid: pubid::PubId::ephemeral(),
         };
         let spec = StepSpec {
@@ -6806,13 +6913,13 @@ mod tests {
         // dials — the flag is what fixtures run under.
         let url = format!("http://localhost:{port}/step");
         let open = HttpHandler {
-            client: handler_client(true).unwrap_or_else(|e| panic!("{e}")),
+            client: handler_client(&ssrf::Policy::open()).unwrap_or_else(|e| panic!("{e}")),
             policy_url: reqwest::Url::parse(&url).ok(),
             url,
             timeout: Duration::from_secs(2),
             max_output: 1024,
             secret: None,
-            allow_local: true,
+            policy: ssrf::Policy::open(),
             pubid: pubid::PubId::ephemeral(),
         };
         let call = tokio::spawn(async move { open.execute(&spec, b"hi", "k").await });
@@ -6838,13 +6945,13 @@ mod tests {
         // it: strict policy, literal loopback URL.
         let url = format!("http://{addr}/step");
         let h = HttpHandler {
-            client: handler_client(false).unwrap_or_else(|e| panic!("{e}")),
+            client: handler_client(&ssrf::Policy::strict()).unwrap_or_else(|e| panic!("{e}")),
             policy_url: reqwest::Url::parse(&url).ok(),
             url,
             timeout: Duration::from_secs(2),
             max_output: 1024,
             secret: None,
-            allow_local: false,
+            policy: ssrf::Policy::strict(),
             pubid: pubid::PubId::ephemeral(),
         };
         let spec = StepSpec {
@@ -6865,6 +6972,110 @@ mod tests {
             escaped.is_err(),
             "a packet reached a literal local target — the call-time check failed"
         );
+    }
+
+    /// White-hat finding A, end to end: a handler URL naming a
+    /// `--deny-cidr` address (as a literal, and as a name resolving to it)
+    /// or this host's own interface address fails its attempt and probe,
+    /// refuses at registration, and the listener there never sees a
+    /// connection. The same listener answers an open policy — the control
+    /// that makes "no connection" mean the guard, not a dead listener.
+    #[tokio::test]
+    async fn a_denied_or_own_address_gets_no_packet() {
+        use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+        let spec = StepSpec {
+            name: "s".into(),
+            handler: "h".into(),
+        };
+        let factory = |policy: &ssrf::Policy| HandlerFactory {
+            client: handler_client(policy).unwrap_or_else(|e| panic!("{e}")),
+            timeout: Duration::from_secs(2),
+            max_output: 1024,
+            policy: policy.clone(),
+            pubid: pubid::PubId::ephemeral(),
+        };
+        let quiet = |l: tokio::net::TcpListener| async move {
+            tokio::time::timeout(Duration::from_millis(400), l.accept())
+                .await
+                .is_err()
+        };
+        // 1. --deny-cidr, under --allow-local-handlers: the deny still holds.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .unwrap_or_else(|e| panic!("{e}"));
+        let addr = listener.local_addr().unwrap_or_else(|e| panic!("{e}"));
+        let deny = ssrf::Policy::new(
+            true,
+            Vec::new(),
+            vec![
+                (IpAddr::V4(Ipv4Addr::LOCALHOST), 32),
+                (IpAddr::V6(Ipv6Addr::LOCALHOST), 128),
+            ],
+        );
+        let literal = format!("http://{addr}/step");
+        for url in [
+            literal.clone(),
+            format!("http://localhost:{}/step", addr.port()),
+        ] {
+            let h = factory(&deny).make(&url);
+            let outcome = h.execute(&spec, b"hi", "k").await;
+            assert!(matches!(outcome, Outcome::Failed), "{url}: {outcome:?}");
+            assert!(!h.ask(None, "k").await, "{url}: the probe is refused too");
+        }
+        assert!(valid_handler_url(&literal, &deny).is_err());
+        assert!(
+            quiet(listener).await,
+            "a packet reached a --deny-cidr address"
+        );
+        // The control: the open policy reaches a listener there.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .unwrap_or_else(|e| panic!("{e}"));
+        let addr = listener.local_addr().unwrap_or_else(|e| panic!("{e}"));
+        let call = factory(&ssrf::Policy::open()).make(&format!("http://{addr}/step"));
+        let reach = tokio::spawn(async move { call.execute(&spec_of("s"), b"hi", "k").await });
+        let got = tokio::time::timeout(Duration::from_secs(5), listener.accept()).await;
+        assert!(
+            matches!(got, Ok(Ok(_))),
+            "control: the open policy must connect"
+        );
+        reach.abort();
+
+        // 2. This host's own interface address, with the shipped policy.
+        let own = ssrf::host_addresses()
+            .unwrap_or_else(|e| panic!("{e}"))
+            .into_iter()
+            .find(|ip| ip.is_ipv4() && !ip.is_loopback());
+        let Some(own) = own else {
+            eprintln!(
+                "NOTICE: no non-loopback IPv4 interface address here; the own-address \
+                 path is proved by ssrf::tests::the_hosts_own_addresses_are_refused_by_both_layers"
+            );
+            return;
+        };
+        let listener = tokio::net::TcpListener::bind((own, 0))
+            .await
+            .unwrap_or_else(|e| panic!("{e}"));
+        let addr = listener.local_addr().unwrap_or_else(|e| panic!("{e}"));
+        let shipped = ssrf::Policy::boot(false, Vec::new()).unwrap_or_else(|e| panic!("{e}"));
+        let url = format!("http://{addr}/step");
+        let h = factory(&shipped).make(&url);
+        assert!(matches!(
+            h.execute(&spec, b"hi", "k").await,
+            Outcome::Failed
+        ));
+        assert!(valid_handler_url(&url, &shipped).is_err());
+        assert!(
+            quiet(listener).await,
+            "a packet reached this host's own address {own}"
+        );
+    }
+
+    fn spec_of(name: &str) -> StepSpec {
+        StepSpec {
+            name: name.into(),
+            handler: "h".into(),
+        }
     }
 
     /// S2-5 at registration: without `--allow-local-handlers` a literal
@@ -7403,13 +7614,13 @@ mod tests {
 
     fn http_handler(url: String) -> HttpHandler {
         HttpHandler {
-            client: handler_client(true).unwrap_or_else(|e| panic!("{e}")),
+            client: handler_client(&ssrf::Policy::open()).unwrap_or_else(|e| panic!("{e}")),
             policy_url: reqwest::Url::parse(&url).ok(),
             url,
             secret: None,
             timeout: Duration::from_secs(10),
             max_output: 1024,
-            allow_local: true,
+            policy: ssrf::Policy::open(),
             pubid: pubid::PubId::ephemeral(),
         }
     }
@@ -7565,13 +7776,13 @@ mod tests {
         reg.register(
             "step",
             Arc::new(HttpHandler {
-                client: handler_client(true).unwrap_or_else(|e| panic!("{e}")),
+                client: handler_client(&ssrf::Policy::open()).unwrap_or_else(|e| panic!("{e}")),
                 policy_url: reqwest::Url::parse(&format!("http://{addr}/step")).ok(),
                 url: format!("http://{addr}/step"),
                 timeout: Duration::from_millis(300),
                 max_output: 1024,
                 secret: None,
-                allow_local: true,
+                policy: ssrf::Policy::open(),
                 pubid: pid.clone(),
             }),
         );

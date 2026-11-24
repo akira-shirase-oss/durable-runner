@@ -15,8 +15,18 @@
 //!    packets. One local address in the answer refuses the whole
 //!    resolution — round-robin means "usually public" is not a defense.
 //!
-//! `--allow-local-handlers` opts out of both layers for development and
-//! fixtures; it is a visible command-line flag, never ambient state.
+//! Both layers refuse the same set, carried by [`Policy`]: the IANA
+//! non-global blocks (`is_local`), **this host's own interface addresses**
+//! (white-hat finding A: on Linux a connection to the droplet's own public
+//! address is delivered over `lo`, so a handler URL naming it reaches
+//! whatever listens on 0.0.0.0 — sshd, exporters, Docker-published ports,
+//! the other products on a shared droplet), and the operator's
+//! `--deny-cidr` ranges (a reserved/floating IP is not on any interface,
+//! so it must be listed).
+//!
+//! `--allow-local-handlers` opts out of the local blocks and the host's
+//! addresses for development and fixtures; it is a visible command-line
+//! flag, never ambient state. `--deny-cidr` ranges are refused even then.
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::Arc;
@@ -54,72 +64,191 @@ pub(crate) fn refused(e: &reqwest::Error) -> bool {
     }
 }
 
-/// reqwest's resolver with the policy inside: names resolve through the
-/// OS, then every returned address must be public (unless `allow_local`).
-/// reqwest receives only the validated set — the check is the resolution
-/// itself, so there is no validate-then-re-resolve gap.
-#[derive(Debug, Clone, Copy)]
-pub(crate) struct PolicyResolver {
+/// What a handler call may dial — one value shared by the registration
+/// check, the call-time literal check and the resolver, so the three can
+/// never disagree. Cheap to clone (the sets are shared).
+#[derive(Debug, Clone)]
+pub(crate) struct Policy {
+    /// `--allow-local-handlers`: the local blocks and this host's own
+    /// addresses are allowed (fixtures, development).
     allow_local: bool,
+    /// This host's own interface addresses, both families, collected at
+    /// boot (`Policy::boot`).
+    host: Arc<[IpAddr]>,
+    /// `--deny-cidr` ranges: refused always, `--allow-local-handlers` or not.
+    deny: Arc<[(IpAddr, u8)]>,
+}
+
+impl Policy {
+    pub(crate) fn new(allow_local: bool, host: Vec<IpAddr>, deny: Vec<(IpAddr, u8)>) -> Self {
+        Self {
+            allow_local,
+            host: host.into(),
+            deny: deny.into(),
+        }
+    }
+
+    /// The shipped policy: every address on this host's interfaces (the
+    /// public ones included) is refused with the local blocks. Fails —
+    /// and the server refuses to start — when the interfaces cannot be
+    /// listed: a guard that silently misses the host's own addresses is
+    /// the hole this closes.
+    pub(crate) fn boot(allow_local: bool, deny: Vec<(IpAddr, u8)>) -> std::io::Result<Self> {
+        Ok(Self::new(allow_local, host_addresses()?, deny))
+    }
+
+    /// The flag set: `--allow-local-handlers`, no host list, no extra
+    /// ranges (tests and fixtures).
+    #[cfg(test)]
+    pub(crate) fn open() -> Self {
+        Self::new(true, Vec::new(), Vec::new())
+    }
+
+    /// Strict, with no host list (tests that need only the IANA blocks).
+    #[cfg(test)]
+    pub(crate) fn strict() -> Self {
+        Self::new(false, Vec::new(), Vec::new())
+    }
+
+    /// How many host addresses and deny ranges this policy carries (the
+    /// startup log line).
+    pub(crate) fn sizes(&self) -> (usize, usize) {
+        (self.host.len(), self.deny.len())
+    }
+
+    /// Why `ip` may not be dialed, or `None` when it may.
+    pub(crate) fn refusal(&self, ip: IpAddr) -> Option<&'static str> {
+        // ATTACK(ssrf-deny-cidr)
+        if self.deny.iter().any(|&block| in_block(ip, block)) {
+            return Some("handler URL targets a range this server denies (--deny-cidr)");
+        }
+        if self.allow_local {
+            return None;
+        }
+        if is_local(ip) {
+            return Some("handler URL targets a local address");
+        }
+        // ATTACK(ssrf-own-address)
+        if self.host.iter().any(|&own| same_address(ip, own)) {
+            return Some("handler URL targets this server's own address");
+        }
+        None
+    }
+}
+
+/// Every address on this host's interfaces, both families (getifaddrs).
+pub(crate) fn host_addresses() -> std::io::Result<Vec<IpAddr>> {
+    let mut v: Vec<IpAddr> = if_addrs::get_if_addrs()?
+        .into_iter()
+        .map(|i| i.ip())
+        .collect();
+    v.sort_unstable();
+    v.dedup();
+    Ok(v)
+}
+
+/// `--deny-cidr`: `ADDR/PREFIX`, or a bare address (one host). Host bits
+/// below the prefix are ignored.
+pub(crate) fn parse_cidr(s: &str) -> Result<(IpAddr, u8), String> {
+    let (a, p) = match s.trim().split_once('/') {
+        Some((a, p)) => (a, Some(p)),
+        None => (s.trim(), None),
+    };
+    let ip: IpAddr = a.parse().map_err(|_| format!("bad address in {s:?}"))?;
+    let bits = if ip.is_ipv4() { 32 } else { 128 };
+    let len = match p {
+        None => bits,
+        Some(p) => p
+            .parse::<u8>()
+            .map_err(|_| format!("bad prefix in {s:?}"))?,
+    };
+    if len > bits {
+        return Err(format!("prefix /{len} too long in {s:?}"));
+    }
+    Ok((ip, len))
+}
+
+/// `ip` is in `block`, judging an IPv6 form that embeds an IPv4 address
+/// (mapped, NAT64, 6to4) by that address against a v4 block.
+fn in_block(ip: IpAddr, (net, len): (IpAddr, u8)) -> bool {
+    match (ip, net) {
+        (IpAddr::V4(ip), IpAddr::V4(net)) => in_v4(ip, (net, len)),
+        (IpAddr::V6(ip), IpAddr::V6(net)) => in_v6(ip, (net, len)),
+        (IpAddr::V6(ip), IpAddr::V4(net)) => {
+            embedded_v4(ip).is_some_and(|v4| in_v4(v4, (net, len)))
+        }
+        (IpAddr::V4(_), IpAddr::V6(_)) => false,
+    }
+}
+
+/// `ip` names the host address `own`, directly or through an IPv6 form
+/// that embeds it.
+fn same_address(ip: IpAddr, own: IpAddr) -> bool {
+    let bits = if own.is_ipv4() { 32 } else { 128 };
+    in_block(ip, (own, bits))
+}
+
+/// reqwest's resolver with the policy inside: names resolve through the
+/// OS, then every returned address must pass the [`Policy`]. reqwest
+/// receives only the validated set — the check is the resolution itself,
+/// so there is no validate-then-re-resolve gap.
+#[derive(Debug, Clone)]
+pub(crate) struct PolicyResolver {
+    policy: Policy,
 }
 
 impl Resolve for PolicyResolver {
     fn resolve(&self, name: Name) -> Resolving {
-        let allow = self.allow_local;
+        let policy = self.policy.clone();
         Box::pin(async move {
             let host = name.as_str().to_owned();
             let addrs: Vec<SocketAddr> =
                 tokio::net::lookup_host((host.as_str(), 0)).await?.collect();
-            validate_addrs(addrs.iter().map(SocketAddr::ip), allow)?;
+            validate_addrs(addrs.iter().map(SocketAddr::ip), &policy)?;
             Ok(Box::new(addrs.into_iter()) as Addrs)
         })
     }
 }
 
-/// Every resolved address must be public (unless `allow_local`): a single
-/// local address fails the whole resolution.
+/// Every resolved address must pass the policy: a single refused address
+/// fails the whole resolution.
 fn validate_addrs(
     addrs: impl IntoIterator<Item = IpAddr>,
-    allow_local: bool,
+    policy: &Policy,
 ) -> Result<(), ResolvedLocal> {
-    if allow_local {
-        return Ok(());
-    }
     // ATTACK(ssrf-resolve)
-    if addrs.into_iter().any(is_local) {
+    if addrs.into_iter().any(|ip| policy.refusal(ip).is_some()) {
         return Err(ResolvedLocal);
     }
     Ok(())
 }
 
 /// The handler client's resolver — the enforcement layer.
-pub(crate) fn resolver(allow_local: bool) -> Arc<PolicyResolver> {
-    Arc::new(PolicyResolver { allow_local })
+pub(crate) fn resolver(policy: &Policy) -> Arc<PolicyResolver> {
+    Arc::new(PolicyResolver {
+        policy: policy.clone(),
+    })
 }
 
-/// The registration-time check: scheme and a literal-local host fail
-/// fast. A *domain* cannot be judged here — it resolves at call time,
-/// inside `PolicyResolver`. `allow_local` is the `--allow-local-handlers`
-/// opt-out shared with the resolver.
-pub(crate) fn check_url(url: &Url, allow_local: bool) -> Result<(), &'static str> {
+/// The registration-time check (and the call-time literal check): scheme,
+/// and a literal host the policy refuses, fail fast. A *domain* cannot be
+/// judged here — it resolves at call time, inside `PolicyResolver`.
+pub(crate) fn check_url(url: &Url, policy: &Policy) -> Result<(), &'static str> {
     if !matches!(url.scheme(), "http" | "https") {
         return Err("handler URL must be http:// or https://");
     }
     let Some(host) = url.host() else {
         return Err("handler URL needs a host");
     };
-    if allow_local {
-        return Ok(());
-    }
     let ip = match host {
         Host::Ipv4(v4) => IpAddr::V4(v4),
         Host::Ipv6(v6) => IpAddr::V6(v6),
         Host::Domain(_) => return Ok(()),
     };
-    if is_local(ip) {
-        return Err("handler URL targets a local address");
+    match policy.refusal(ip) {
+        Some(why) => Err(why),
+        None => Ok(()),
     }
-    Ok(())
 }
 
 /// IPv4 blocks a handler call never dials: every entry of the IANA IPv4
@@ -264,7 +393,12 @@ mod tests {
 
     #[test]
     fn check_url_refuses_literal_local_and_bad_schemes() {
-        let strict = |u: &str| check_url(&Url::parse(u).unwrap_or_else(|e| panic!("{e}")), false);
+        let strict = |u: &str| {
+            check_url(
+                &Url::parse(u).unwrap_or_else(|e| panic!("{e}")),
+                &Policy::strict(),
+            )
+        };
         assert!(strict("http://127.0.0.1:9/h").is_err());
         assert!(strict("http://[::1]:9/h").is_err());
         assert!(strict("http://[::ffff:127.0.0.1]:9/h").is_err());
@@ -289,9 +423,126 @@ mod tests {
         // The flag opens everything — fixtures dial loopback.
         assert!(check_url(
             &Url::parse("http://127.0.0.1:9/h").unwrap_or_else(|e| panic!("{e}")),
-            true
+            &Policy::open()
         )
         .is_ok());
+    }
+
+    /// White-hat finding A: this host's own addresses — public ones
+    /// included — are refused by the literal check AND the resolver path,
+    /// in every IPv6 form that embeds them. The addresses here stand in
+    /// for a droplet's public ones (a test machine has none): without the
+    /// host list each is a public address that dials.
+    #[test]
+    fn the_hosts_own_addresses_are_refused_by_both_layers() {
+        let own_v4: IpAddr = "8.8.4.4".parse().unwrap_or_else(|e| panic!("{e}"));
+        let own_v6: IpAddr = "2606:4700::6810:84e5"
+            .parse()
+            .unwrap_or_else(|e| panic!("{e}"));
+        let ours = Policy::new(false, vec![own_v4, own_v6], Vec::new());
+        let url = |u: &str| Url::parse(u).unwrap_or_else(|e| panic!("{e}"));
+        for u in [
+            "http://8.8.4.4/h",
+            "https://8.8.4.4:8443/h",
+            "http://[2606:4700::6810:84e5]/h",
+            "http://[::ffff:8.8.4.4]/h", // mapped: judged by the v4 inside
+            "http://134743044/h",        // 8.8.4.4 as one decimal number
+        ] {
+            assert_eq!(
+                check_url(&url(u), &ours),
+                Err("handler URL targets this server's own address"),
+                "{u}"
+            );
+            assert!(
+                check_url(&url(u), &Policy::strict()).is_ok(),
+                "{u} is public: only the host list refuses it"
+            );
+        }
+        // The resolver path: an answer naming one of ours fails whole.
+        let mixed = [IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1)), own_v4];
+        assert!(validate_addrs(mixed, &ours).is_err());
+        assert!(validate_addrs([own_v6], &ours).is_err());
+        assert!(validate_addrs(mixed, &Policy::strict()).is_ok());
+        // Another public address still dials.
+        assert!(check_url(&url("http://8.8.8.8/h"), &ours).is_ok());
+        // --allow-local-handlers opens the host's addresses with the rest.
+        let open = Policy::new(true, vec![own_v4], Vec::new());
+        assert!(check_url(&url("http://8.8.4.4/h"), &open).is_ok());
+    }
+
+    /// `--deny-cidr` ranges are refused by both layers — even under
+    /// `--allow-local-handlers`, and through the embedding IPv6 forms.
+    #[test]
+    fn deny_cidr_ranges_are_refused_even_with_allow_local() {
+        let deny = vec![
+            parse_cidr("203.0.113.0/24").unwrap_or_else(|e| panic!("{e}")),
+            parse_cidr("2001:db8:5::/48").unwrap_or_else(|e| panic!("{e}")),
+            parse_cidr("127.0.0.7").unwrap_or_else(|e| panic!("{e}")),
+        ];
+        let url = |u: &str| Url::parse(u).unwrap_or_else(|e| panic!("{e}"));
+        for allow_local in [false, true] {
+            let p = Policy::new(allow_local, Vec::new(), deny.clone());
+            for u in [
+                "http://203.0.113.9/h",
+                "http://[::ffff:203.0.113.9]/h",
+                "http://[2001:db8:5:ffff::1]/h",
+            ] {
+                assert!(
+                    check_url(&url(u), &p).is_err(),
+                    "{u} allow_local={allow_local}"
+                );
+            }
+            assert!(validate_addrs([IpAddr::V4(Ipv4Addr::new(203, 0, 113, 200))], &p).is_err());
+        }
+        // Under the flag the rest of loopback still dials; the listed host does not.
+        let open = Policy::new(true, Vec::new(), deny);
+        assert!(check_url(&url("http://127.0.0.1:9/h"), &open).is_ok());
+        assert!(check_url(&url("http://127.0.0.7:9/h"), &open).is_err());
+    }
+
+    #[test]
+    fn deny_cidrs_parse_strictly() {
+        let v4 = |s: &str| {
+            (
+                IpAddr::V4(s.parse().unwrap_or_else(|e| panic!("{e}"))),
+                32u8,
+            )
+        };
+        assert_eq!(parse_cidr("203.0.113.7"), Ok(v4("203.0.113.7")));
+        assert_eq!(parse_cidr(" 203.0.113.7/32 "), Ok(v4("203.0.113.7")));
+        assert_eq!(
+            parse_cidr("2001:db8::/32").map(|(_, l)| l),
+            Ok(32),
+            "a v6 range"
+        );
+        for bad in [
+            "",
+            "203.0.113.7/33",
+            "2001:db8::/129",
+            "x/8",
+            "1.2.3.4/",
+            "1.2.3.4/-1",
+            "localhost",
+        ] {
+            assert!(parse_cidr(bad).is_err(), "{bad:?}");
+        }
+    }
+
+    /// The shipped policy really collects this host's addresses: every
+    /// address getifaddrs reports — loopback, the LAN address, any public
+    /// one — is refused by `Policy::boot`.
+    #[test]
+    fn boot_refuses_every_interface_address() {
+        let own = host_addresses().unwrap_or_else(|e| panic!("getifaddrs: {e}"));
+        assert!(own.contains(&IpAddr::V4(Ipv4Addr::LOCALHOST)), "{own:?}");
+        let p = Policy::boot(false, Vec::new()).unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(p.sizes(), (own.len(), 0));
+        for ip in own {
+            assert!(
+                p.refusal(ip).is_some(),
+                "{ip} is this host's: it must be refused"
+            );
+        }
     }
 
     /// The measured overhead the guard adds: one OS lookup + the CIDR
@@ -302,7 +553,7 @@ mod tests {
     /// stays a per-connection cost, not per-call latency.
     #[tokio::test]
     async fn resolver_overhead_is_per_connection_and_microscale() {
-        let r = resolver(false);
+        let r = resolver(&Policy::strict());
         let name = || -> Name { "localhost".parse().unwrap_or_else(|e| panic!("{e}")) };
         // Warm the OS cache, then measure a real resolve+validate pass.
         let _ = r.resolve(name()).await;
