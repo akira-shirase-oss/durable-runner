@@ -7,6 +7,11 @@
 		type RunItem, type Spec, type Diag,
 	} from '../lib/api';
 	import { idChWidth } from '../lib/idch';
+	import { stateView, share } from '../lib/state';
+	import Icon from '../lib/Icon.svelte';
+	import AppIcon from '../lib/AppIcon.svelte';
+	import '../lib/styles/tokens.css';
+	import '../lib/styles/base.css';
 
 	type Tab = 'runs' | 'submit' | 'admin';
 	type Order = 'asc' | 'desc';
@@ -222,352 +227,1252 @@
 	});
 </script>
 
-<main>
-	<header>
-		<h1>durable</h1>
+<header class="top">
+	<div class="bar">
+		<h1 class="brand">
+			<AppIcon size={32} />
+			<span class="name">Durable Runner</span>
+			<span class="sub">Inspector</span>
+		</h1>
 		<span class="pill" class:ok={alive === true && readyNow?.ready} class:bad={alive === false || readyNow?.ready === false}>
+			<i class="dot" aria-hidden="true"></i>
 			{#if alive === null}…
-			{:else if alive === false}server unreachable
-			{:else if readyNow === null}up
-			{:else if readyNow.ready}ready
-			{:else}not ready: {readyNow.code ?? 'starting'}{/if}
+			{:else if alive === false}Server unreachable
+			{:else if readyNow === null}Up
+			{:else if readyNow.ready}Ready
+			{:else}Not ready: {readyNow.code ?? 'starting'}{/if}
 		</span>
-		<nav class="tabs">
-			<button class:active={tab === 'runs'} onclick={() => (tab = 'runs')}>runs</button>
-			<button class:active={tab === 'submit'} onclick={() => (tab = 'submit')}>submit</button>
-			<button class:active={tab === 'admin'} onclick={() => { tab = 'admin'; refreshDiag(); }}>admin</button>
+		<span class="break" aria-hidden="true"></span>
+		<nav class="tabs" aria-label="Inspector sections">
+			<button class:active={tab === 'runs'} aria-current={tab === 'runs' ? 'page' : undefined} onclick={() => (tab = 'runs')}>
+				<Icon name="activity" size={15} />Runs
+			</button>
+			<button class:active={tab === 'submit'} aria-current={tab === 'submit' ? 'page' : undefined} onclick={() => (tab = 'submit')}>
+				<Icon name="file-plus" size={15} />Submit
+			</button>
+			<button class:active={tab === 'admin'} aria-current={tab === 'admin' ? 'page' : undefined} onclick={() => { tab = 'admin'; refreshDiag(); }}>
+				<Icon name="gauge" size={15} />Admin
+			</button>
 		</nav>
-		<button class="tool" title="switch theme" onclick={() => applyTheme(theme === 'dark' ? 'light' : 'dark')}>
-			{theme === 'dark' ? 'light' : 'dark'}
-		</button>
-		<button class="tool danger" onclick={forget}>Forget keys</button>
-	</header>
+		<div class="tools">
+			<button class="btn ghost icon" title={theme === 'dark' ? 'Switch to light' : 'Switch to dark'} aria-label="Dark theme" aria-pressed={theme === 'dark'}
+				onclick={() => applyTheme(theme === 'dark' ? 'light' : 'dark')}>
+				<Icon name={theme === 'dark' ? 'sun' : 'moon'} size={17} />
+			</button>
+			<button class="btn danger forget" onclick={forget}><Icon name="log-out" size={15} />Forget keys</button>
+		</div>
+	</div>
+</header>
 
-	<section class="keys">
-		<label>
-			read key <em class="badge" class:set={!!readKey}>{keyBadge('read')}</em>
-			<input type="password" autocomplete="off" placeholder="lists and run detail"
+<main>
+	<section class="card keys" aria-label="Keys">
+		<label class="field">
+			<span class="field-label"><Icon name="key" size={14} />Read key <em class="badge" class:set={!!readKey}>{keyBadge('read')}</em></span>
+			<input type="password" autocomplete="off" placeholder="Lists and run detail"
 				bind:value={readKey}
 				onchange={() => { saveKey('read', readKey); refresh(); }} />
 		</label>
-		<label>
-			API key <em class="badge" class:set={!!apiKey}>{keyBadge('api')}</em>
-			<input type="password" autocomplete="off" placeholder="submit, cancel, spec, admin"
+		<label class="field">
+			<span class="field-label"><Icon name="key" size={14} />API key <em class="badge" class:set={!!apiKey}>{keyBadge('api')}</em></span>
+			<input type="password" autocomplete="off" placeholder="Submit, cancel, spec, admin"
 				bind:value={apiKey}
 				onchange={() => saveKey('api', apiKey)} />
 		</label>
 	</section>
 
-	{#if error}<p class="error">{error}</p>{/if}
-	{#if notice}<p class="notice">{notice} <button class="tool" onclick={() => (notice = null)}>dismiss</button></p>{/if}
+	{#if error}<p class="banner error"><Icon name="alert" size={16} /><span class="msg">{error}</span></p>{/if}
+	{#if notice}<p class="banner notice"><Icon name="check" size={16} /><span class="msg">{notice}</span> <button class="btn ghost sm" onclick={() => (notice = null)}>Dismiss</button></p>{/if}
 
 	{#if tab === 'runs'}
-		{#if !readKey && !apiKey}<p class="hint">reads need a key — enter the read key (or the API key) above</p>{/if}
-		<div class="bar">
-			<span class="hint">order</span>
-			<button class="tool" class:active={order === 'desc'} onclick={() => setOrder('desc')}>newest first</button>
-			<button class="tool" class:active={order === 'asc'} onclick={() => setOrder('asc')}>oldest first</button>
-		</div>
-		{#if runs.length === 0 && !error}
-			<p class="empty">no runs yet</p>
-		{/if}
-		{#if runs.length > 0}
-			<table class="runlist" style:--id-ch="{idCh}ch">
-				<thead><tr><th>id</th><th>key</th><th>state</th><th>steps</th><th>finished</th><th></th></tr></thead>
-				<tbody>
-					{#each runs as r (r.id)}
-						<tr class:selected={detail?.id === r.id}>
-							<td class="id"><button class="link" onclick={() => openDetail(r.id)}>{r.id}</button></td>
-							<td class="key">{r.key}</td>
-							<td class="state" data-state={r.state.split(':')[0]}>{r.state}</td>
-							<td>{r.steps}</td>
-							<td>{r.finished_at ? new Date(r.finished_at).toLocaleTimeString() : '—'}</td>
-							<td>{#if cancellable(r.state)}<button class="danger" onclick={() => cancel(r.id)}>cancel</button>{/if}</td>
-							<td class="meta">
-								{r.state} · {r.steps} {r.steps === 1 ? 'step' : 'steps'} ·
-								{r.finished_at ? new Date(r.finished_at).toLocaleTimeString() : '—'}
-							</td>
-						</tr>
-					{/each}
-				</tbody>
-			</table>
-			<nav class="pager">
-				<button class="tool" onclick={pageBack} disabled={trail.length === 0}>&larr; back</button>
-				<span class="empty">page {trail.length + 1}, {order === 'desc' ? 'newest' : 'oldest'} first</span>
-				<button class="tool" onclick={pageForward} disabled={nextCursor === null}>forward &rarr;</button>
-			</nav>
-		{/if}
-		{#if detailErr}<p class="error">{detailErr}</p>{/if}
-		{#if detail}
-			<section class="panel">
-				<h2>run {detail.id} <button class="tool" onclick={() => { detail = null; detailSpec = null; }}>close</button></h2>
-				<dl>
-					<dt>key</dt><dd class="key">{detail.key}</dd>
-					<dt>state</dt><dd class="state" data-state={detail.state.split(':')[0]}>{detail.state}</dd>
-					<dt>steps</dt><dd>{detail.steps}</dd>
-					<dt>finished</dt><dd>{detail.finished_at ? new Date(detail.finished_at).toLocaleString() : '—'}</dd>
-				</dl>
-				{#if cancellable(detail.state)}<button class="danger" onclick={() => cancel(detail!.id)}>cancel this run</button>{/if}
-				{#if !detailSpec}
-					<button class="tool" disabled={!apiKey} title={apiKey ? '' : 'the spec may carry customer input (D-051) — the API key reveals it'} onclick={revealSpec}>
-						reveal spec{apiKey ? '' : ' — needs the API key'}
-					</button>
-				{:else}
-					<dl>
-						<dt>version</dt><dd>{detailSpec.version}</dd>
-						<dt>steps</dt>
-						<dd>{#each detailSpec.steps as s}<span class="chip">{s.name} → {s.handler}</span> {/each}</dd>
-						<dt>input</dt><dd class="key">{detailSpec.input_b64 || '—'}</dd>
-					</dl>
+		{#if !readKey && !apiKey}<p class="banner hint"><Icon name="key" size={16} /><span class="msg">Reads need a key — enter the read key (or the API key) above</span></p>{/if}
+		<div class="runs-layout" class:split={!!(detail || detailErr)}>
+			<section class="card runs" aria-labelledby="runs-title">
+				<div class="card-head">
+					<h2 id="runs-title">Runs</h2>
+					<div class="order">
+						<span class="hint" id="order-label">Order</span>
+						<div class="seg" role="group" aria-labelledby="order-label">
+							<button class:active={order === 'desc'} aria-pressed={order === 'desc'} onclick={() => setOrder('desc')}>Newest first</button>
+							<button class:active={order === 'asc'} aria-pressed={order === 'asc'} onclick={() => setOrder('asc')}>Oldest first</button>
+						</div>
+					</div>
+				</div>
+				{#if runs.length === 0 && !error}
+					<p class="empty">No runs yet</p>
+				{/if}
+				{#if runs.length > 0}
+					<table class="runlist" style:--id-ch="{idCh}ch">
+						<thead><tr><th>ID</th><th>Key</th><th>State</th><th>Steps</th><th>Finished</th><th><span class="sr">Action</span></th></tr></thead>
+						<tbody>
+							{#each runs as r (r.id)}
+								{@const sv = stateView(r.state)}
+								<tr class:selected={detail?.id === r.id}>
+									<td class="id"><button class="link" onclick={() => openDetail(r.id)}>{r.id}</button></td>
+									<td class="key">{r.key}</td>
+									<td class="state" data-state={sv.kind}>
+										<span class="chip" data-state={sv.kind}><i class="dot" aria-hidden="true"></i>{sv.label}</span>
+										{#if sv.detail}<span class="detail">{sv.detail}</span>{/if}
+									</td>
+									<td class="num">{r.steps}</td>
+									<td class="time">{r.finished_at ? new Date(r.finished_at).toLocaleTimeString() : '—'}</td>
+									<td class="act">{#if cancellable(r.state)}<button class="btn danger sm" onclick={() => cancel(r.id)}>Cancel</button>{/if}</td>
+									<td class="meta">
+										<span class="chip" data-state={sv.kind}><i class="dot" aria-hidden="true"></i>{sv.label}</span>
+										{#if sv.detail}{`${sv.detail} · `}{/if}{r.steps} {r.steps === 1 ? 'step' : 'steps'} ·
+										{r.finished_at ? new Date(r.finished_at).toLocaleTimeString() : '—'}
+									</td>
+								</tr>
+							{/each}
+						</tbody>
+					</table>
+					<nav class="pager" aria-label="Pages">
+						<button class="btn sm" onclick={pageBack} disabled={trail.length === 0}><Icon name="chevron-left" />Back</button>
+						<span class="hint">Page {trail.length + 1}, {order === 'desc' ? 'newest' : 'oldest'} first</span>
+						<button class="btn sm" onclick={pageForward} disabled={nextCursor === null}>Forward<Icon name="chevron-right" /></button>
+					</nav>
 				{/if}
 			</section>
-		{/if}
+			{#if detailErr || detail}
+				<div class="side">
+					{#if detailErr}<p class="banner error"><Icon name="alert" size={16} /><span class="msg">{detailErr}</span></p>{/if}
+					{#if detail}
+						{@const dv = stateView(detail.state)}
+						<section class="card panel run" aria-labelledby="detail-title">
+							<div class="card-head">
+								<h2 id="detail-title">Run <span class="mono">{detail.id}</span></h2>
+								<button class="btn ghost sm" onclick={() => { detail = null; detailSpec = null; }}><Icon name="x" />Close</button>
+							</div>
+							<dl class="kv">
+								<div><dt>Key</dt><dd class="key">{detail.key}</dd></div>
+								<div>
+									<dt>State</dt>
+									<dd class="state" data-state={dv.kind}>
+										<span class="chip" data-state={dv.kind}><i class="dot" aria-hidden="true"></i>{dv.label}</span>
+										{#if dv.detail}<span class="detail">{dv.detail}</span>{/if}
+									</dd>
+								</div>
+								<div><dt>Steps</dt><dd>{detail.steps}</dd></div>
+								<div><dt>Finished</dt><dd>{detail.finished_at ? new Date(detail.finished_at).toLocaleString() : '—'}</dd></div>
+							</dl>
+							<div class="actions">
+								{#if cancellable(detail.state)}<button class="btn danger" onclick={() => cancel(detail!.id)}><Icon name="x" />Cancel this run</button>{/if}
+								{#if !detailSpec}
+									<button class="btn" disabled={!apiKey} title={apiKey ? '' : 'the spec may carry customer input (D-051) — the API key reveals it'} onclick={revealSpec}>
+										<Icon name="eye" />Reveal spec{apiKey ? '' : ' — needs the API key'}
+									</button>
+								{/if}
+							</div>
+							{#if detailSpec}
+								<h3>Spec</h3>
+								<dl class="kv">
+									<div><dt>Version</dt><dd>{detailSpec.version}</dd></div>
+									<div>
+										<dt>Steps</dt>
+										<dd>
+											<ol class="step-list">
+												{#each detailSpec.steps as s, i}
+													<li><span class="n">{i + 1}</span><span class="mono">{s.name}</span><span class="arrow">→</span><span class="mono handler">{s.handler}</span></li>
+												{/each}
+											</ol>
+										</dd>
+									</div>
+									<div><dt>Input</dt><dd class="key">{detailSpec.input_b64 || '—'}</dd></div>
+								</dl>
+							{/if}
+						</section>
+					{/if}
+				</div>
+			{/if}
+		</div>
 	{:else if tab === 'submit'}
-		{#if !apiKey}<p class="hint">submitting needs the API key — enter it above</p>{/if}
-		<form class="panel" onsubmit={(e) => { e.preventDefault(); submit(); }}>
-			<label>operation key (idempotency)
-				<input required maxlength="256" bind:value={opKey} placeholder="deploy-2026-11-18" /></label>
+		{#if !apiKey}<p class="banner hint"><Icon name="key" size={16} /><span class="msg">Submitting needs the API key — enter it above</span></p>{/if}
+		<form class="card panel submit" onsubmit={(e) => { e.preventDefault(); submit(); }}>
+			<div class="card-head">
+				<h2>Submit a job</h2>
+				<span class="tag">spec v1</span>
+			</div>
+			<label class="field">
+				<span class="field-label">Operation key (idempotency)</span>
+				<input class="mono" required maxlength="256" bind:value={opKey} placeholder="deploy-2026-11-18" />
+			</label>
 			<fieldset>
-				<legend>steps</legend>
-				{#each steps as s, i}
-					<div class="step-row">
-						<input required placeholder="name" bind:value={s.name} />
-						<input required placeholder="handler" bind:value={s.handler} />
-						<button type="button" class="tool" disabled={steps.length === 1}
-							onclick={() => (steps = steps.filter((_, j) => j !== i))}>remove</button>
-					</div>
-				{/each}
-				<button type="button" class="tool" onclick={() => (steps = [...steps, { name: '', handler: '' }])}>+ step</button>
+				<legend class="field-label">Steps</legend>
+				<div class="step-rows">
+					{#each steps as s, i}
+						<div class="step-row">
+							<span class="n" aria-hidden="true">{i + 1}</span>
+							<input class="mono" required placeholder="name" aria-label="Step {i + 1} name" bind:value={s.name} />
+							<span class="arrow" aria-hidden="true">→</span>
+							<input class="mono" required placeholder="handler" aria-label="Step {i + 1} handler" bind:value={s.handler} />
+							<button type="button" class="btn ghost icon remove" title="Remove step {i + 1}" disabled={steps.length === 1}
+								onclick={() => (steps = steps.filter((_, j) => j !== i))}><Icon name="trash" /><span class="sr">Remove step {i + 1}</span></button>
+						</div>
+					{/each}
+				</div>
+				<button type="button" class="btn sm add" onclick={() => (steps = [...steps, { name: '', handler: '' }])}><Icon name="plus" />Add step</button>
 			</fieldset>
-			<label>input (sent base64-encoded)
-				<textarea rows="3" bind:value={inputText} placeholder="job input bytes"></textarea></label>
-			<label>not before (optional)
-				<input type="datetime-local" bind:value={notBefore} /></label>
-			<div>
-				<button type="submit" disabled={!apiKey || !opKey || steps.some((s) => !s.name || !s.handler)}>submit</button>
-				{#if lastRun}<span class="notice-inline">last accepted: run {lastRun}</span>{/if}
+			<label class="field">
+				<span class="field-label">Input (sent base64-encoded)</span>
+				<textarea class="mono" rows="3" bind:value={inputText} placeholder="job input bytes"></textarea>
+			</label>
+			<label class="field narrow">
+				<span class="field-label">Not before (optional)</span>
+				<input type="datetime-local" bind:value={notBefore} />
+			</label>
+			<div class="form-actions">
+				<button type="submit" class="btn brand" disabled={!apiKey || !opKey || steps.some((s) => !s.name || !s.handler)}><Icon name="arrow-up-right" />Submit</button>
+				{#if lastRun}<span class="notice-inline"><Icon name="check" size={15} />Last accepted: run {lastRun}</span>{/if}
 			</div>
 		</form>
 	{:else}
-		{#if !apiKey}<p class="hint">admin operations need the API key — enter it above</p>{/if}
-		<section class="panel">
-			<h2>diagnostics <button class="tool" onclick={refreshDiag} disabled={!apiKey}>refresh</button></h2>
+		{#if !apiKey}<p class="banner hint"><Icon name="key" size={16} /><span class="msg">Admin operations need the API key — enter it above</span></p>{/if}
+		<section class="panel diag" aria-labelledby="diag-title">
+			<div class="section-head">
+				<h2 id="diag-title">Diagnostics</h2>
+				<button class="btn sm" onclick={refreshDiag} disabled={!apiKey}><Icon name="rotate" />Refresh</button>
+			</div>
 			{#if diag}
-				<dl>
-					<dt>journal generation</dt><dd>{diag.generation}</dd>
-					<dt>records written</dt><dd>{diag.records_written.toLocaleString()}</dd>
-					<dt>live runs</dt><dd>{diag.live_runs.toLocaleString()}</dd>
-					<dt>active runs</dt><dd>{diag.active_runs.toLocaleString()}</dd>
-					<dt>index bytes</dt><dd>{diag.index_bytes.toLocaleString()}</dd>
-					<dt>dedup keys</dt><dd>{diag.dedup_keys.toLocaleString()}</dd>
-					<dt>disk reserve</dt><dd class={diag.space_ok ? 'state-ok' : 'state-bad'}>{diag.space_ok ? 'ok' : 'below reserve'}</dd>
+				<dl class="tiles">
+					<div class="tile"><dt>Journal generation</dt><dd>{diag.generation}</dd></div>
+					<div class="tile"><dt>Records written</dt><dd>{diag.records_written.toLocaleString()}</dd></div>
+					<div class="tile"><dt>Live runs</dt><dd>{diag.live_runs.toLocaleString()}</dd></div>
+					<div class="tile"><dt>Active runs</dt><dd>{diag.active_runs.toLocaleString()}</dd></div>
+					<div class="tile"><dt>Index bytes</dt><dd>{diag.index_bytes.toLocaleString()}</dd></div>
+					<div class="tile"><dt>Dedup keys</dt><dd>{diag.dedup_keys.toLocaleString()}</dd></div>
+					<div class="tile"><dt>Disk reserve</dt><dd class={diag.space_ok ? 'state-ok' : 'state-bad'}><Icon name="hard-drive" size={16} />{diag.space_ok ? 'ok' : 'below reserve'}</dd></div>
 				</dl>
-				{#if Object.keys(diag.states).length}
-					<h3>states</h3>
-					<dl>{#each Object.entries(diag.states) as [s, n]}<dt>{s}</dt><dd>{n.toLocaleString()}</dd>{/each}</dl>
+				{#if Object.keys(diag.states).length || Object.keys(diag.errors).length}
+					<div class="counts">
+						{#if Object.keys(diag.states).length}
+							{@const top = Math.max(...Object.values(diag.states))}
+							<div class="card">
+								<h3>States</h3>
+								<dl class="bars">
+									{#each Object.entries(diag.states) as [s, n]}
+										<div><dt class="mono">{s}</dt><dd><span class="track"><i data-state={s} style:width="{share(n, top)}%"></i></span><span class="count">{n.toLocaleString()}</span></dd></div>
+									{/each}
+								</dl>
+							</div>
+						{/if}
+						{#if Object.keys(diag.errors).length}
+							{@const top = Math.max(...Object.values(diag.errors))}
+							<div class="card">
+								<h3>Errors (counted, never dropped)</h3>
+								<dl class="bars errors">
+									{#each Object.entries(diag.errors) as [s, n]}
+										<div><dt class="mono">{s}</dt><dd><span class="track"><i style:width="{share(n, top)}%"></i></span><span class="count">{n.toLocaleString()}</span></dd></div>
+									{/each}
+								</dl>
+							</div>
+						{/if}
+					</div>
 				{/if}
-				{#if Object.keys(diag.errors).length}
-					<h3>errors (counted, never dropped)</h3>
-					<dl>{#each Object.entries(diag.errors) as [s, n]}<dt>{s}</dt><dd>{n.toLocaleString()}</dd>{/each}</dl>
+			{:else}
+				<p class="card empty">No diagnostics yet — refresh above</p>
+			{/if}
+		</section>
+		<div class="admin-actions">
+			<section class="card panel" aria-labelledby="compact-title">
+				<h2 id="compact-title"><Icon name="layers" size={17} />Compact the journal</h2>
+				<p class="hint">Expires finished runs past retention, snapshots the index, swaps the manifest — all or nothing</p>
+				{#if confirming === 'compact'}
+					<div class="confirm">
+						<p>Run compaction now?</p>
+						<div class="confirm-row">
+							<button class="btn brand sm" onclick={doCompact}>Yes, compact</button>
+							<button class="btn" onclick={() => (confirming = null)}>No</button>
+						</div>
+					</div>
+				{:else}
+					<button class="btn" disabled={!apiKey} onclick={() => (confirming = 'compact')}><Icon name="layers" />Compact</button>
 				{/if}
-			{:else}
-				<p class="empty">no diagnostics yet — refresh above</p>
-			{/if}
-		</section>
-		<section class="panel">
-			<h2>compact the journal</h2>
-			<p class="hint">expires finished runs past retention, snapshots the index, swaps the manifest — all or nothing</p>
-			{#if confirming === 'compact'}
-				<span class="confirm">run compaction now? <button class="danger" onclick={doCompact}>yes, compact</button> <button class="tool" onclick={() => (confirming = null)}>no</button></span>
-			{:else}
-				<button disabled={!apiKey} onclick={() => (confirming = 'compact')}>compact</button>
-			{/if}
-		</section>
-		<section class="panel">
-			<h2>back up the journal</h2>
-			<p class="hint">copies the journal into a named directory under the server's --backup-root (needs the flag set)</p>
-			<label>backup name <input maxlength="64" pattern="[A-Za-z0-9_.\-]+" bind:value={backupName} /></label>
-			{#if confirming === 'backup'}
-				<span class="confirm">write backup '{backupName}'? <button class="danger" onclick={doBackup}>yes, back up</button> <button class="tool" onclick={() => (confirming = null)}>no</button></span>
-			{:else}
-				<button disabled={!apiKey || !backupName} onclick={() => (confirming = 'backup')}>backup</button>
-			{/if}
-		</section>
+			</section>
+			<section class="card panel" aria-labelledby="backup-title">
+				<h2 id="backup-title"><Icon name="backup" size={17} />Back up the journal</h2>
+				<p class="hint">Copies the journal into a named directory under the server's --backup-root (needs the flag set)</p>
+				<label class="field">
+					<span class="field-label">Backup name</span>
+					<input class="mono" maxlength="64" pattern="[A-Za-z0-9_.\-]+" bind:value={backupName} />
+				</label>
+				{#if confirming === 'backup'}
+					<div class="confirm">
+						<p>Write backup '<span class="mono">{backupName}</span>'?</p>
+						<div class="confirm-row">
+							<button class="btn brand sm" onclick={doBackup}>Yes, back up</button>
+							<button class="btn" onclick={() => (confirming = null)}>No</button>
+						</div>
+					</div>
+				{:else}
+					<button class="btn" disabled={!apiKey || !backupName} onclick={() => (confirming = 'backup')}><Icon name="backup" />Backup</button>
+				{/if}
+			</section>
+		</div>
 	{/if}
 </main>
 
 <style>
-	/* Semantic tokens only — a later shared skin re-themes these names. */
-	:root {
-		--bg: #0d1117;
-		--bg-raised: #161b22;
-		--fg: #c9d1d9;
-		--fg-muted: #8b949e;
-		--border: #30363d;
-		--border-soft: #21262d;
-		--accent: #79c0ff;
-		--ok: #3fb950;
-		--warn: #d29922;
-		--danger: #f85149;
-		--queued: #a371f7;
-		--chip-bg: #21262d;
+	/* ---- layout ------------------------------------------------------------------------------------ */
+	.top,
+	main {
+		width: 100%;
+		max-width: 1232px;
+		margin: 0 auto;
+		padding: 0 16px;
 	}
-	:root[data-theme='light'] {
-		--bg: #ffffff;
-		--bg-raised: #f6f8fa;
-		--fg: #1f2328;
-		--fg-muted: #59636e;
-		--border: #d1d9e0;
-		--border-soft: #e8ebee;
-		--accent: #0969da;
-		--ok: #1a7f37;
-		--warn: #9a6700;
-		--danger: #d1242f;
-		--queued: #8250df;
-		--chip-bg: #eaeef2;
-	}
-	:global(body) {
-		margin: 0;
-		background: var(--bg);
-		color: var(--fg);
-		font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
-		font-size: 14px;
+	.top {
+		position: sticky;
+		top: 12px;
+		z-index: 10;
+		margin-top: 12px;
 	}
 	main {
-		max-width: 960px;
-		margin: 1.5rem auto;
-		padding: 0 1rem;
+		display: flex;
+		flex-direction: column;
+		gap: 16px;
+		padding-top: 20px;
+		padding-bottom: 48px;
 	}
-	header {
+
+	/* ---- the floating bar --------------------------------------------------------------------------- */
+	.bar {
+		display: flex;
+		flex-wrap: wrap;
+		align-items: center;
+		gap: 10px 12px;
+		min-height: 60px;
+		padding: 10px 10px 10px 16px;
+		border-radius: 20px;
+		background: var(--c-card);
+		box-shadow:
+			0 0 0 1px var(--c-bar-edge),
+			0 10px 30px -14px var(--c-shadow);
+	}
+	.brand {
 		display: flex;
 		align-items: center;
-		gap: 0.75rem;
-		border-bottom: 1px solid var(--border);
-		padding-bottom: 0.6rem;
-		flex-wrap: wrap;
-	}
-	h1 { font-size: 1.1rem; font-weight: 600; margin: 0; }
-	.pill {
-		font-size: 0.8rem;
-		border: 1px solid var(--border);
-		border-radius: 999px;
-		padding: 0.1rem 0.6rem;
-		color: var(--fg-muted);
-	}
-	.pill.ok { color: var(--ok); border-color: var(--ok); }
-	.pill.bad { color: var(--danger); border-color: var(--danger); }
-	.tabs { display: flex; gap: 0.25rem; flex: 1; }
-	button {
-		background: var(--chip-bg);
-		color: var(--fg);
-		border: 1px solid var(--border);
-		border-radius: 4px;
-		padding: 0.15rem 0.6rem;
-		font: inherit;
-		cursor: pointer;
-	}
-	button:hover:not(:disabled) { border-color: var(--fg-muted); }
-	button:disabled { opacity: 0.4; cursor: default; }
-	button.active { border-color: var(--accent); color: var(--accent); }
-	button.danger { color: var(--danger); }
-	button.danger:hover:not(:disabled) { border-color: var(--danger); }
-	button.link {
-		background: none; border: none; padding: 0;
-		color: var(--accent); cursor: pointer;
-	}
-	.keys {
-		display: flex;
-		gap: 1rem;
-		flex-wrap: wrap;
-		margin: 0.75rem 0;
-	}
-	.keys label {
-		display: flex;
-		gap: 0.5rem;
-		align-items: center;
-		color: var(--fg-muted);
-		flex: 1;
-		min-width: 16rem;
-	}
-	.badge {
-		font-style: normal;
-		font-size: 0.75rem;
-		color: var(--fg-muted);
-	}
-	.badge.set { color: var(--ok); }
-	input, textarea {
-		background: var(--bg-raised);
-		color: var(--fg);
-		border: 1px solid var(--border);
-		border-radius: 4px;
-		padding: 0.25rem 0.5rem;
-		font: inherit;
-		flex: 1;
-	}
-	.bar { display: flex; gap: 0.4rem; align-items: center; margin-bottom: 0.5rem; }
-	table { width: 100%; border-collapse: collapse; }
-	th, td {
-		text-align: left;
-		padding: 0.4rem 0.6rem;
-		border-bottom: 1px solid var(--border-soft);
+		gap: 9px;
+		margin: 0;
+		font-size: 19px;
+		font-weight: 560;
+		line-height: 1;
+		letter-spacing: -0.018em;
 		white-space: nowrap;
 	}
-	th { color: var(--fg-muted); font-weight: 500; }
-	tr.selected td { background: var(--bg-raised); }
-	.key { color: var(--accent); word-break: break-all; white-space: normal; }
-	.state[data-state='done'], .state-ok { color: var(--ok); }
-	.state[data-state='failed'], .state-bad { color: var(--danger); }
-	.state[data-state='cancelled'] { color: var(--fg-muted); }
-	.state[data-state='running'], .state[data-state='reconciling'] { color: var(--warn); }
-	.state[data-state='queued'], .state[data-state='retry_waiting'] { color: var(--queued); }
-	.error { color: var(--danger); }
-	.notice { color: var(--ok); }
-	.hint, .empty { color: var(--fg-muted); }
-	.pager { display: flex; justify-content: space-between; align-items: center; margin-top: 1rem; }
-	.panel {
-		background: var(--bg-raised);
-		border: 1px solid var(--border-soft);
-		border-radius: 6px;
-		padding: 0.9rem 1rem;
-		margin-top: 1rem;
+	.brand .sub {
+		padding-left: 2px;
+		color: var(--c-body);
+		font-weight: 440;
+		letter-spacing: -0.01em;
 	}
-	h2 { font-size: 1rem; font-weight: 600; margin: 0 0 0.6rem; display: flex; gap: 0.6rem; align-items: center; }
-	h3 { font-size: 0.9rem; color: var(--fg-muted); margin: 0.8rem 0 0.3rem; }
-	dl { display: grid; grid-template-columns: 11rem 1fr; gap: 0.2rem 1rem; margin: 0 0 0.6rem; }
-	dt { color: var(--fg-muted); }
-	dd { margin: 0; }
-	.chip {
-		display: inline-block;
-		background: var(--chip-bg);
-		border: 1px solid var(--border-soft);
+	.break {
+		display: none;
+	}
+	.tabs {
+		display: inline-flex;
+		gap: 2px;
+		margin-left: auto;
+		padding: 4px;
+		border-radius: 13px;
+		background: var(--c-app);
+		box-shadow: inset 0 0 0 1px var(--c-line);
+	}
+	.tabs button,
+	.seg button {
+		display: inline-flex;
+		align-items: center;
+		justify-content: center;
+		gap: 7px;
+		height: 34px;
+		padding: 0 14px;
+		border: 0;
+		border-radius: 9px;
+		background: transparent;
+		color: var(--c-body);
+		font: inherit;
+		font-size: 14px;
+		font-weight: 520;
+		letter-spacing: -0.005em;
+		white-space: nowrap;
+		cursor: pointer;
+		transition:
+			background-color 150ms ease-out,
+			color 150ms ease-out;
+	}
+	.tabs button:hover,
+	.seg button:hover {
+		color: var(--c-ink);
+	}
+	.tabs button.active,
+	.seg button.active {
+		background: var(--c-tile);
+		color: var(--c-ink);
+		box-shadow:
+			0 0 0 1px var(--c-bar-edge),
+			0 1px 3px var(--c-tile-shadow);
+	}
+	.tabs button.active :global(svg) {
+		color: var(--c-brand-deep);
+	}
+	.tools {
+		display: flex;
+		align-items: center;
+		gap: 6px;
+	}
+	.forget {
+		height: 40px;
+		border-radius: 12px;
+	}
+
+	/* status: ready / up / unreachable */
+	.pill {
+		display: inline-flex;
+		align-items: center;
+		gap: 7px;
+		height: 28px;
+		padding: 0 11px;
 		border-radius: 999px;
-		padding: 0.05rem 0.55rem;
-		margin-right: 0.3rem;
+		background: var(--c-state-queued-bg);
+		color: var(--c-state-queued-ink);
+		font-size: 13px;
+		font-weight: 520;
+		white-space: nowrap;
 	}
-	.step-row { display: flex; gap: 0.5rem; margin-bottom: 0.4rem; }
-	fieldset { border: 1px solid var(--border-soft); border-radius: 6px; margin: 0 0 0.8rem; }
-	legend { color: var(--fg-muted); }
-	form label { display: block; margin-bottom: 0.8rem; color: var(--fg-muted); }
-	form label input, form label textarea { display: block; margin-top: 0.3rem; width: 100%; box-sizing: border-box; }
-	.confirm { display: block; margin-top: 0.5rem; color: var(--warn); }
-	.notice-inline { color: var(--ok); margin-left: 0.6rem; }
-	td.meta { display: none; }
+	.pill .dot {
+		width: 7px;
+		height: 7px;
+		border-radius: 50%;
+		background: var(--c-state-queued);
+	}
+	.pill.ok {
+		background: var(--c-state-done-bg);
+		color: var(--c-state-done-ink);
+	}
+	.pill.ok .dot {
+		background: var(--c-state-done);
+	}
+	.pill.bad {
+		background: var(--c-danger-bg);
+		color: var(--c-danger);
+	}
+	.pill.bad .dot {
+		background: var(--c-danger);
+	}
+
+	/* ---- cards, headings, banners ------------------------------------------------------------------ */
+	.card {
+		border-radius: 18px;
+		background: var(--c-card);
+		box-shadow:
+			0 0 0 1px var(--c-bar-edge),
+			0 1px 2px var(--c-tile-shadow);
+	}
+	.card-head,
+	.section-head {
+		display: flex;
+		flex-wrap: wrap;
+		align-items: center;
+		justify-content: space-between;
+		gap: 10px 16px;
+	}
+	h2 {
+		display: flex;
+		align-items: center;
+		gap: 8px;
+		margin: 0;
+		font-size: 19px;
+		font-weight: 540;
+		letter-spacing: -0.015em;
+	}
+	h2 :global(svg) {
+		color: var(--c-ink-soft);
+	}
+	h3 {
+		margin: 0 0 10px;
+		font-size: 14px;
+		font-weight: 600;
+		letter-spacing: -0.005em;
+	}
+	.hint {
+		color: var(--c-body);
+		font-size: 14px;
+	}
+	.empty {
+		margin: 0;
+		padding: 40px 20px;
+		color: var(--c-body);
+		text-align: center;
+	}
+	.tag {
+		padding: 4px 10px;
+		border-radius: 10px;
+		background: var(--c-app);
+		box-shadow: inset 0 0 0 1px var(--c-line);
+		color: var(--c-ink-soft);
+		font-size: 12.5px;
+		font-weight: 520;
+	}
+	.sr {
+		position: absolute;
+		width: 1px;
+		height: 1px;
+		overflow: hidden;
+		clip-path: inset(50%);
+		white-space: nowrap;
+	}
+
+	.banner {
+		display: flex;
+		align-items: center;
+		gap: 10px;
+		margin: 0;
+		padding: 11px 14px;
+		border-radius: 14px;
+		font-size: 14.5px;
+		font-weight: 480;
+	}
+	.banner :global(svg) {
+		flex: none;
+	}
+	.banner .msg {
+		flex: 1;
+		min-width: 0;
+		overflow-wrap: anywhere;
+	}
+	.banner .msg::first-letter {
+		text-transform: uppercase;
+	}
+	.banner.error {
+		background: var(--c-danger-bg);
+		color: var(--c-danger);
+	}
+	.banner.notice {
+		padding-top: 6px;
+		padding-bottom: 6px;
+		background: var(--c-state-done-bg);
+		color: var(--c-state-done-ink);
+	}
+	.banner.notice .btn {
+		color: inherit;
+	}
+	.banner.hint {
+		background: var(--c-card);
+		box-shadow: inset 0 0 0 1px var(--c-line);
+		color: var(--c-body);
+	}
+	.banner.hint :global(svg) {
+		color: var(--c-brand-deep);
+	}
+
+	/* ---- keys -------------------------------------------------------------------------------------- */
+	.keys {
+		display: grid;
+		grid-template-columns: 1fr 1fr;
+		gap: 12px 16px;
+		padding: 14px 16px 16px;
+	}
+	.field {
+		display: flex;
+		flex-direction: column;
+		gap: 7px;
+		min-width: 0;
+	}
+	.field-label {
+		display: flex;
+		align-items: center;
+		gap: 7px;
+		padding: 0;
+		color: var(--c-ink-soft);
+		font-size: 13.5px;
+		font-weight: 520;
+	}
+	.field-label :global(svg) {
+		color: var(--c-body);
+	}
+	.badge {
+		margin-left: 2px;
+		padding: 2px 8px;
+		border-radius: 999px;
+		background: var(--c-state-queued-bg);
+		color: var(--c-state-queued-ink);
+		font-size: 12px;
+		font-style: normal;
+		font-weight: 520;
+	}
+	.badge.set {
+		background: var(--c-state-done-bg);
+		color: var(--c-state-done-ink);
+	}
+
+	/* ---- runs -------------------------------------------------------------------------------------- */
+	.runs-layout {
+		display: flex;
+		flex-direction: column;
+		gap: 16px;
+	}
+	.runs {
+		min-width: 0;
+		overflow-x: auto;
+	}
+	.runs .card-head {
+		padding: 16px 18px 14px;
+	}
+	.order {
+		display: flex;
+		align-items: center;
+		gap: 10px;
+	}
+	.seg {
+		display: inline-flex;
+		gap: 2px;
+		padding: 3px;
+		border-radius: 12px;
+		background: var(--c-app);
+		box-shadow: inset 0 0 0 1px var(--c-line);
+	}
+	.seg button {
+		height: 30px;
+		padding: 0 12px;
+		font-size: 13.5px;
+	}
+
+	table {
+		width: 100%;
+		border-collapse: collapse;
+		font-size: 14px;
+	}
+	th,
+	td {
+		padding: 11px 12px;
+		border-top: 1px solid var(--c-line);
+		text-align: left;
+		white-space: nowrap;
+		vertical-align: middle;
+	}
+	th {
+		padding-top: 9px;
+		padding-bottom: 9px;
+		background: var(--c-panel);
+		color: var(--c-body);
+		font-size: 12.5px;
+		font-weight: 520;
+	}
+	th:first-child,
+	td:first-child {
+		padding-left: 18px;
+	}
+	th:nth-child(6),
+	td.act {
+		padding-right: 18px;
+		text-align: right;
+	}
+	tbody tr {
+		transition: background-color 150ms ease-out;
+	}
+	tbody tr:hover {
+		background: var(--c-row-hover);
+	}
+	tbody tr.selected {
+		background: var(--c-row-selected);
+	}
+	td.id {
+		width: 1%;
+		font-family: var(--font-mono);
+		font-size: 14px;
+		font-weight: 600;
+	}
+	td.id .link {
+		font-variant-numeric: tabular-nums;
+	}
+	.key {
+		color: var(--c-ink-soft);
+		font-family: var(--font-mono);
+		font-size: 13.5px;
+		white-space: normal;
+		overflow-wrap: anywhere;
+	}
+	td.state {
+		white-space: normal;
+		line-height: 1.9;
+	}
+	td.num,
+	td.time {
+		color: var(--c-ink-soft);
+		font-variant-numeric: tabular-nums;
+	}
+	td.act {
+		width: 1%;
+		padding-top: 7px;
+		padding-bottom: 7px;
+	}
+	td.meta {
+		display: none;
+	}
+
+	/* state chips: the kind picks the colour (queued, running, retry_waiting, reconciling, done, failed,
+	   cancelled); an unknown kind looks queued */
+	.chip {
+		display: inline-flex;
+		align-items: center;
+		gap: 6px;
+		height: 24px;
+		padding: 0 9px;
+		border-radius: 8px;
+		background: var(--c-state-queued-bg);
+		color: var(--c-state-queued-ink);
+		font-family: var(--font-sans);
+		font-size: 12.5px;
+		font-weight: 560;
+		white-space: nowrap;
+		vertical-align: middle;
+	}
+	.chip .dot {
+		width: 6px;
+		height: 6px;
+		border-radius: 50%;
+		background: var(--c-state-queued);
+	}
+	.chip[data-state='running'] {
+		background: var(--c-state-run-bg);
+		color: var(--c-state-run-ink);
+	}
+	.chip[data-state='running'] .dot {
+		background: var(--c-state-run);
+	}
+	.chip[data-state='retry_waiting'] {
+		background: var(--c-state-retry-bg);
+		color: var(--c-state-retry-ink);
+	}
+	.chip[data-state='retry_waiting'] .dot {
+		background: var(--c-state-retry);
+	}
+	.chip[data-state='reconciling'] {
+		background: var(--c-state-probe-bg);
+		color: var(--c-state-probe-ink);
+	}
+	.chip[data-state='reconciling'] .dot {
+		background: var(--c-state-probe);
+	}
+	.chip[data-state='done'] {
+		background: var(--c-state-done-bg);
+		color: var(--c-state-done-ink);
+	}
+	.chip[data-state='done'] .dot {
+		background: var(--c-state-done);
+	}
+	.chip[data-state='failed'] {
+		background: var(--c-danger-bg);
+		color: var(--c-danger);
+	}
+	.chip[data-state='failed'] .dot {
+		background: var(--c-danger);
+	}
+	.chip[data-state='cancelled'] {
+		background: transparent;
+		box-shadow: inset 0 0 0 1px var(--c-line-strong);
+		color: var(--c-state-cancelled);
+	}
+	.chip[data-state='cancelled'] .dot {
+		background: transparent;
+		box-shadow: inset 0 0 0 1.5px var(--c-state-cancelled);
+	}
+	.detail {
+		display: inline-block;
+		margin-left: 8px;
+		color: var(--c-body);
+		font-family: var(--font-mono);
+		font-size: 12.5px;
+		line-height: 1.4;
+		white-space: nowrap;
+	}
+
+	.pager {
+		display: flex;
+		align-items: center;
+		justify-content: space-between;
+		gap: 12px;
+		padding: 12px 18px;
+		border-top: 1px solid var(--c-line);
+	}
+	.pager .hint {
+		font-size: 13.5px;
+	}
+
+	/* the run in focus */
+	.side {
+		display: flex;
+		flex-direction: column;
+		gap: 12px;
+		min-width: 0;
+	}
+	.panel.run {
+		padding: 16px 18px 18px;
+	}
+	.kv {
+		display: flex;
+		flex-direction: column;
+		margin: 14px 0 0;
+	}
+	.kv > div {
+		display: grid;
+		grid-template-columns: 7.5rem minmax(0, 1fr);
+		gap: 12px;
+		align-items: baseline;
+		padding: 10px 0;
+		border-top: 1px solid var(--c-line);
+	}
+	.kv dt {
+		color: var(--c-body);
+		font-size: 13.5px;
+	}
+	.kv dd {
+		min-width: 0;
+		margin: 0;
+		font-size: 14px;
+	}
+	.kv dd.state {
+		display: flex;
+		flex-wrap: wrap;
+		align-items: center;
+		gap: 6px 8px;
+	}
+	.kv dd.state .detail {
+		margin-left: 0;
+	}
+	.actions {
+		display: flex;
+		flex-wrap: wrap;
+		gap: 8px;
+		padding-top: 14px;
+		border-top: 1px solid var(--c-line);
+	}
+	.panel.run h3 {
+		margin: 18px 0 0;
+	}
+	.step-list {
+		margin: 0;
+		padding: 0;
+		overflow: hidden;
+		border-radius: 10px;
+		box-shadow: inset 0 0 0 1px var(--c-line-strong);
+		list-style: none;
+	}
+	.step-list li {
+		display: flex;
+		align-items: center;
+		gap: 8px;
+		min-height: 34px;
+		padding: 6px 11px;
+		overflow-wrap: anywhere;
+	}
+	.step-list li + li {
+		border-top: 1px solid var(--c-line);
+	}
+	.n {
+		display: inline-grid;
+		flex: none;
+		place-items: center;
+		width: 20px;
+		height: 20px;
+		border-radius: 6px;
+		background: var(--c-state-run-bg);
+		color: var(--c-state-run-ink);
+		font-size: 11.5px;
+		font-weight: 600;
+	}
+	.arrow {
+		flex: none;
+		color: var(--c-body);
+	}
+	.handler {
+		color: var(--c-body);
+	}
+
+	/* ---- submit ------------------------------------------------------------------------------------ */
+	.submit {
+		display: flex;
+		flex-direction: column;
+		gap: 18px;
+		width: 100%;
+		max-width: 760px;
+		padding: 18px 20px 20px;
+	}
+	fieldset {
+		display: flex;
+		flex-direction: column;
+		align-items: flex-start;
+		gap: 10px;
+		min-width: 0;
+		margin: 0;
+		padding: 0;
+		border: 0;
+	}
+	legend {
+		margin-bottom: 7px;
+	}
+	.step-rows {
+		display: flex;
+		flex-direction: column;
+		gap: 8px;
+		width: 100%;
+	}
+	.step-row {
+		display: grid;
+		grid-template-columns: 20px minmax(0, 1fr) auto minmax(0, 1fr) 40px;
+		gap: 10px;
+		align-items: center;
+	}
+	.remove {
+		color: var(--c-body);
+	}
+	.field.narrow {
+		max-width: 300px;
+	}
+	.form-actions {
+		display: flex;
+		flex-wrap: wrap;
+		align-items: center;
+		gap: 10px 16px;
+		padding-top: 4px;
+	}
+	.notice-inline {
+		display: inline-flex;
+		align-items: center;
+		gap: 7px;
+		color: var(--c-state-done-ink);
+		font-size: 14px;
+		font-weight: 520;
+	}
+
+	/* ---- admin ------------------------------------------------------------------------------------- */
+	.diag {
+		display: flex;
+		flex-direction: column;
+		gap: 12px;
+	}
+	.section-head {
+		padding: 2px 2px 0;
+	}
+	.tiles {
+		display: grid;
+		grid-template-columns: repeat(auto-fill, minmax(150px, 1fr));
+		gap: 10px;
+		margin: 0;
+	}
+	.tile {
+		padding: 13px 15px 14px;
+		border-radius: 16px;
+		background: var(--c-card);
+		box-shadow:
+			0 0 0 1px var(--c-bar-edge),
+			0 1px 2px var(--c-tile-shadow);
+	}
+	.tile dt {
+		color: var(--c-body);
+		font-size: 13px;
+	}
+	.tile dd {
+		display: flex;
+		align-items: center;
+		gap: 6px;
+		margin: 4px 0 0;
+		font-size: 22px;
+		font-weight: 520;
+		letter-spacing: -0.015em;
+		font-variant-numeric: tabular-nums;
+	}
+	.tile dd.state-ok {
+		color: var(--c-state-done-ink);
+	}
+	.tile dd.state-bad {
+		color: var(--c-danger);
+	}
+	.counts {
+		display: grid;
+		grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
+		align-items: start;
+		gap: 12px;
+	}
+	.counts .card {
+		padding: 16px 18px;
+	}
+	.bars {
+		display: flex;
+		flex-direction: column;
+		gap: 4px;
+		margin: 0;
+	}
+	.bars > div {
+		display: grid;
+		grid-template-columns: minmax(7rem, 11rem) minmax(0, 1fr);
+		gap: 12px;
+		align-items: center;
+		min-height: 28px;
+	}
+	.bars dt {
+		overflow: hidden;
+		color: var(--c-ink-soft);
+		font-size: 13px;
+		text-overflow: ellipsis;
+		white-space: nowrap;
+	}
+	.bars dd {
+		display: grid;
+		grid-template-columns: minmax(0, 1fr) auto;
+		gap: 12px;
+		align-items: center;
+		margin: 0;
+	}
+	.track {
+		height: 6px;
+		overflow: hidden;
+		border-radius: 3px;
+		background: var(--c-line);
+	}
+	.track i {
+		display: block;
+		height: 100%;
+		border-radius: 3px;
+		background: var(--c-state-queued);
+	}
+	.track i[data-state='running'] {
+		background: var(--c-state-run);
+	}
+	.track i[data-state='retry_waiting'] {
+		background: var(--c-state-retry);
+	}
+	.track i[data-state='reconciling'] {
+		background: var(--c-state-probe);
+	}
+	.track i[data-state='done'] {
+		background: var(--c-state-done);
+	}
+	.track i[data-state='failed'],
+	.errors .track i {
+		background: var(--c-danger);
+	}
+	.track i[data-state='cancelled'] {
+		background: var(--c-line-strong);
+	}
+	.count {
+		min-width: 3.5rem;
+		color: var(--c-ink-soft);
+		font-size: 13px;
+		font-variant-numeric: tabular-nums;
+		text-align: right;
+	}
+	.diag > .empty {
+		padding: 32px 20px;
+	}
+
+	.admin-actions {
+		display: grid;
+		grid-template-columns: repeat(auto-fit, minmax(320px, 1fr));
+		gap: 16px;
+		align-items: start;
+	}
+	.admin-actions .panel {
+		display: flex;
+		flex-direction: column;
+		align-items: flex-start;
+		gap: 12px;
+		padding: 18px 20px 20px;
+	}
+	.admin-actions h2 {
+		font-size: 17px;
+	}
+	.admin-actions .hint {
+		margin: 0;
+		line-height: 1.5;
+	}
+	.admin-actions .field {
+		width: 100%;
+	}
+	.confirm {
+		display: flex;
+		flex-direction: column;
+		gap: 10px;
+		width: 100%;
+		padding: 12px 14px 14px;
+		border-radius: 14px;
+		background: var(--c-brand-tint);
+	}
+	.confirm p {
+		margin: 0;
+		color: var(--c-ink);
+		font-size: 14px;
+		font-weight: 520;
+	}
+	.confirm-row {
+		display: flex;
+		flex-wrap: wrap;
+		gap: 8px;
+	}
+
+	/* ---- wide: the run in focus sits beside the list ---------------------------------------------- */
+	@media (min-width: 1180px) {
+		.runs-layout:not(.split) td.state {
+			white-space: nowrap;
+		}
+		.runs-layout.split {
+			display: grid;
+			grid-template-columns: minmax(0, 1fr) 400px;
+			align-items: start;
+			gap: 16px;
+		}
+		.runs-layout.split .side {
+			position: sticky;
+			top: 92px;
+		}
+	}
+
+	/* ---- narrow ------------------------------------------------------------------------------------ */
+	/* the bar folds into two rows: name and status, then the tabs with the theme and keys buttons */
+	@media (max-width: 900px) {
+		.pill {
+			margin-left: auto;
+		}
+		.break {
+			display: block;
+			flex-basis: 100%;
+			height: 0;
+		}
+		.tabs {
+			flex: 1;
+			margin-left: 0;
+		}
+		.tabs button {
+			flex: 1;
+			padding: 0 8px;
+		}
+	}
+
+	@media (max-width: 760px) {
+		.top {
+			position: static;
+		}
+		.bar {
+			padding: 9px 9px 9px 12px;
+			border-radius: 17px;
+		}
+		.brand {
+			font-size: 17.5px;
+		}
+		.keys {
+			grid-template-columns: 1fr;
+		}
+	}
+
 	@media (max-width: 600px) {
-		dl { grid-template-columns: 8rem 1fr; }
-		/* Two explicit rows: id (fixed 4ch, so keys align) + key ellipsized
-		   only when truly too long + action; then "state · N steps ·
-		   finished" under the key. Nothing escapes the viewport. */
-		.runlist thead { display: none; }
-		.runlist, .runlist tbody { display: block; }
+		.top {
+			top: 8px;
+			margin-top: 8px;
+		}
+		main {
+			padding-top: 14px;
+			gap: 12px;
+		}
+		.tabs button :global(svg) {
+			display: none;
+		}
+		.brand {
+			gap: 8px;
+			font-size: 17px;
+		}
+		.brand .sub {
+			padding-left: 0;
+		}
+		.pill {
+			height: 26px;
+			padding: 0 9px;
+			font-size: 12.5px;
+		}
+		/* "Forget keys" stays a visible, labelled button (D-053); on a phone it drops its icon to fit */
+		.tools {
+			gap: 4px;
+		}
+		.tools .forget {
+			padding: 0 10px;
+			font-size: 13.5px;
+		}
+		.forget :global(svg) {
+			display: none;
+		}
+		.tabs button {
+			padding: 0 6px;
+			font-size: 13.5px;
+		}
+		.runs .card-head {
+			padding: 14px 14px 12px;
+		}
+		.kv > div {
+			grid-template-columns: 6rem minmax(0, 1fr);
+		}
+		.step-row {
+			grid-template-columns: 20px minmax(0, 1fr) 40px;
+			grid-template-areas: 'n name rm' '. handler rm';
+			row-gap: 6px;
+		}
+		.step-row .n {
+			grid-area: n;
+		}
+		.step-row input:first-of-type {
+			grid-area: name;
+		}
+		.step-row input:last-of-type {
+			grid-area: handler;
+		}
+		.step-row .arrow {
+			display: none;
+		}
+		.step-row .remove {
+			grid-area: rm;
+		}
+		.submit,
+		.admin-actions .panel {
+			padding: 16px;
+		}
+		.admin-actions {
+			grid-template-columns: 1fr;
+		}
+		.counts {
+			grid-template-columns: 1fr;
+		}
+		.bars > div {
+			grid-template-columns: 7.5rem minmax(0, 1fr);
+		}
+
+		/* The run list as two explicit rows: id (sized to the widest id on the page, so keys align) + key
+		   ellipsized only when truly too long + action; then "state · N steps · finished" under the key.
+		   Nothing escapes the viewport (capture.mjs asserts it). Ids and keys share the monospace font, so
+		   the id column's ch matches the id's own digits. */
+		.runlist thead {
+			display: none;
+		}
+		.runlist,
+		.runlist tbody {
+			display: block;
+		}
 		.runlist tr {
 			display: grid;
 			grid-template-columns: var(--id-ch, 4ch) minmax(0, 1fr) auto;
-			column-gap: 0.7rem;
-			padding: 0.45rem 0;
+			column-gap: 10px;
 			align-items: baseline;
+			padding: 10px 14px;
+			border-top: 1px solid var(--c-line);
+			font-family: var(--font-mono);
+			font-size: 14px;
 		}
-		.runlist td { display: block; padding: 0.15rem 0; }
-		.runlist td:nth-child(1) { grid-area: 1 / 1; overflow: hidden; }
+		.runlist td {
+			display: block;
+			width: auto;
+			padding: 0;
+			border: 0;
+			line-height: 1.45;
+		}
+		.runlist td:nth-child(1) {
+			grid-area: 1 / 1;
+			overflow: hidden;
+		}
 		.runlist td:nth-child(2) {
 			grid-area: 1 / 2;
 			min-width: 0;
@@ -576,16 +1481,36 @@
 			white-space: nowrap;
 			word-break: normal;
 		}
-		.runlist td:nth-child(6) { grid-area: 1 / 3; }
-		.runlist td:nth-child(3), .runlist td:nth-child(4), .runlist td:nth-child(5) { display: none; }
+		.runlist td:nth-child(6) {
+			grid-column: 3;
+			grid-row: 1 / 3;
+			align-self: center;
+		}
+		.runlist td:nth-child(3),
+		.runlist td:nth-child(4),
+		.runlist td:nth-child(5) {
+			display: none;
+		}
 		.runlist td.meta {
 			grid-area: 2 / 2;
 			display: block;
 			min-width: 0;
+			margin-top: 6px;
 			overflow: hidden;
+			color: var(--c-body);
+			font-family: var(--font-sans);
+			font-size: 13px;
 			text-overflow: ellipsis;
 			white-space: nowrap;
-			color: var(--fg-muted);
+		}
+		.runlist td.meta .chip {
+			height: 20px;
+			margin-right: 4px;
+			padding: 0 7px;
+			font-size: 12px;
+		}
+		.pager {
+			padding: 10px 14px;
 		}
 	}
 </style>
