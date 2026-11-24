@@ -27,11 +27,16 @@
 		busy = true;
 		error = null;
 		try {
+			// who this tab was before: a reset signs out every session of ITS account, never another one's
+			const before = account.mode === 'signed-in' ? (account.me?.email ?? '') : null;
 			await resetPassword(token, password);
 			password = '';
-			// a reset sets no cookie and signs out every session of that account: read what is true now, assume nothing
+			// read what is true now, assume nothing (a server may or may not sign this browser in)
 			await account.refresh().catch(() => {});
-			if (account.mode === 'signed-in') {
+			if (account.mode === 'signed-in' && before === null) {
+				// signed out before, signed in now: the server opened a fresh session for the reset account
+				void goto('#/overview', { replace: true });
+			} else if (account.mode === 'signed-in') {
 				// this tab holds another account's session, which a reset does not touch
 				done = true;
 				void goto('#/reset', { replace: true, shallow: true });

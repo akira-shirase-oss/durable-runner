@@ -43,9 +43,19 @@ async function ctxFor(width = 1440) {
 }
 
 let n = 0;
-async function step(page, label, fn, { shot = true, width = 1440, full = false } = {}) {
+const broken = new Set();
+/** One journey step: run, screenshot, check CSP/console/overflow, record. `needs`: chains that must be intact (a
+ *  failure breaks the step's own `chain` and every step needing it is recorded as skipped, not timed out). */
+async function step(page, label, fn, { shot = true, width = 1440, full = false, chain = 'a', needs = [chain] } = {}) {
 	n++;
 	const name = `${String(n).padStart(2, '0')}-${width}-${label.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '').slice(0, 48)}`;
+	const missing = needs.filter((c) => broken.has(c));
+	if (missing.length) {
+		rows.push({ step: n, label, width, result: 'skipped', shot: '', note: `needs ${missing.join(', ')}` });
+		console.log(`skip ${n} ${label}`);
+		broken.add(chain);
+		return false;
+	}
 	let result = 'pass';
 	let note = '';
 	try {
@@ -64,6 +74,7 @@ async function step(page, label, fn, { shot = true, width = 1440, full = false }
 		const sw = await page.evaluate(() => document.scrollingElement.scrollWidth).catch(() => 0);
 		if (sw > width) { result = 'FAIL'; failures.push(`${label}: horizontal overflow ${sw}`); }
 	}
+	if (result !== 'pass') broken.add(chain);
 	rows.push({ step: n, label, width, result, shot: shot && page ? `${name}.png` : '', note });
 	console.log(`${result === 'pass' ? 'ok  ' : 'FAIL'} ${n} ${label}${note ? ` — ${note}` : ''}`);
 	return result === 'pass';
@@ -72,7 +83,8 @@ async function step(page, label, fn, { shot = true, width = 1440, full = false }
 /** The newest mailed link of `kind` to `to`, from the log mailer's output (waits for the 5 s outbox tick). */
 async function mailedLink(to, kind, after = 0) {
 	for (let i = 0; i < 40; i++) {
-		const log = fs.readFileSync(LOG, 'utf8').slice(after);
+		// `after` is a byte offset (fs.statSync size): slice the bytes, then decode (the log holds multi-byte "—")
+		const log = fs.readFileSync(LOG).subarray(after).toString('utf8');
 		const blocks = log.split('durable-server: mail ').filter((b) => b.startsWith(`${kind} to ${to}\n`));
 		const last = blocks.at(-1);
 		const link = last?.match(/https?:\/\/\S+#\/[a-z-]+\?token=[A-Za-z0-9_-]+/)?.[0];
@@ -201,7 +213,7 @@ await step(A, 'Send a test call to builtin:echo', async () => {
 	await row.locator('form button[type=submit]').click();
 	await A.waitForSelector('.test-result', { timeout: 15_000 });
 	const r = (await A.locator('.test-result').textContent())?.replace(/\s+/g, ' ').trim();
-	if (!/\bok\b/.test(r ?? '')) throw new Error(`test call: ${r}`);
+	if (!/^ok builtin:echo answered 2xx/.test(r ?? '')) throw new Error(`test call: ${r}`);
 	return r;
 });
 await step(A, 'Submit the first job with curl as the onboarding card shows it', async () => {
@@ -265,7 +277,7 @@ const B = ctxB.page;
 await step(B, 'Open the invite signed out', async () => {
 	await B.goto(inviteLink.replace(/^https?:\/\/[^/]+/, BASE), { waitUntil: 'networkidle' });
 	await B.waitForSelector('h1:has-text("invited")', { timeout: 10_000 });
-});
+}, { chain: 'b', needs: ['a', 'b'] });
 since = logSize();
 await step(B, 'Create account B from the invite', async () => {
 	await B.getByRole('button', { name: 'Create an account' }).click();
@@ -274,18 +286,18 @@ await step(B, 'Create account B from the invite', async () => {
 	await B.fill('#password', PASS.b);
 	await B.click('button[type=submit]');
 	await B.waitForSelector('h1:has-text("Check your inbox")', { timeout: 10_000 });
-});
+}, { chain: 'b', needs: ['a', 'b'] });
 await step(B, 'Verify B and sign in: back on the invite', async () => {
 	await verifyFromMail(B, who('b'), PASS.b, since);
 	await signIn(B, who('b'), PASS.b);
 	await B.waitForSelector('h1:has-text("Join")', { timeout: 10_000 });
 	return await B.evaluate(() => location.hash.replace(/token=.*/, 'token=…'));
-});
+}, { chain: 'b', needs: ['a', 'b'] });
 await step(B, 'Accept the invite: B is in Journey A', async () => {
 	await B.getByRole('button', { name: /Accept and join/ }).click();
 	await B.waitForSelector('.ws-btn:has-text("Journey A")', { timeout: 10_000 });
 	return (await B.locator('.ws-btn').textContent())?.replace(/\s+/g, ' ').trim();
-}, { full: true });
+}, { chain: 'b', needs: ['a', 'b'], full: true });
 await step(B, 'B (member) sees A\'s run but cannot manage keys or the team', async () => {
 	await B.goto(`${APP}#/runs/${runId}`, { waitUntil: 'networkidle' });
 	await B.waitForSelector('.tl li', { timeout: 15_000 });
@@ -293,19 +305,19 @@ await step(B, 'B (member) sees A\'s run but cannot manage keys or the team', asy
 	await B.waitForSelector('.banner.hint:has-text("member")', { timeout: 10_000 });
 	if (await B.locator('#key-name').count()) throw new Error('a member sees the create-key form');
 	return 'keys read-only for a member';
-});
+}, { chain: 'b', needs: ['a', 'b'] });
 await step(B, 'B (member) on Team: no invite form, no role controls', async () => {
 	await B.goto(`${APP}#/team`, { waitUntil: 'networkidle' });
 	await B.waitForSelector('.rows li', { timeout: 10_000 });
 	if (await B.locator('#inv-email').count()) throw new Error('a member sees the invite form');
 	if (await B.locator('select.role-select').count()) throw new Error('a member sees role controls');
-});
+}, { chain: 'b', needs: ['a', 'b'] });
 await step(A, 'A makes B a viewer', async () => {
 	await A.goto(`${APP}#/team`, { waitUntil: 'networkidle' });
 	const row = A.locator('.rows li', { hasText: who('b') });
 	await row.locator('select').selectOption('viewer');
 	await A.waitForSelector('.banner.notice:has-text("viewer")', { timeout: 10_000 });
-});
+}, { chain: 'b', needs: ['a', 'b'] });
 await step(B, 'B (viewer): no cancel, no spec, no handler changes', async () => {
 	await B.goto(`${APP}#/handlers`, { waitUntil: 'networkidle' });
 	await B.reload({ waitUntil: 'networkidle' });
@@ -318,7 +330,7 @@ await step(B, 'B (viewer): no cancel, no spec, no handler changes', async () => 
 	const reveal = B.getByRole('button', { name: /Reveal spec/ }).first();
 	if (!(await reveal.isDisabled())) throw new Error('a viewer can reveal the spec');
 	return `viewer PUT /handlers → 403 ${r.body?.code}`;
-});
+}, { chain: 'b', needs: ['a', 'b'] });
 
 // C: isolation
 const ctxC = await ctxFor();
@@ -330,7 +342,7 @@ await step(C, 'Account C with its own workspace', async () => {
 	await signIn(C, who('c'), PASS.c);
 	await createWorkspace(C, 'Journey C');
 	await dismissReveal(C);
-});
+}, { chain: 'c', needs: ['c'] });
 await step(C, 'Isolation: C cannot open A\'s run by URL, nor list A\'s workspace', async () => {
 	await C.goto(`${APP}#/runs/${runId}`, { waitUntil: 'networkidle' });
 	await C.waitForSelector('.banner.error', { timeout: 15_000 });
@@ -346,7 +358,7 @@ await step(C, 'Isolation: C cannot open A\'s run by URL, nor list A\'s workspace
 	const own = await apiFromPage(C, 'GET', `/jobs/${runId}`, null, await C.evaluate(() => sessionStorage.getItem('durable-workspace')));
 	if (own.status === 200) throw new Error('A\'s run reads through C\'s own workspace');
 	return `page: “${text}”; API with A's workspace: run ${direct.status} ${direct.body?.code}, list ${list.status} ${list.body?.code}, workspace ${ws.status}; via C's workspace ${own.status}`;
-});
+}, { chain: 'c', needs: ['a', 'c'] });
 
 // forgot / reset for A, in a fresh browser
 const ctxR = await ctxFor();
@@ -357,16 +369,25 @@ await step(R, 'Forgot password for A', async () => {
 	await R.fill('#email', who('a'));
 	await R.click('button[type=submit]');
 	await R.waitForSelector('h1:has-text("Check your inbox")', { timeout: 10_000 });
-});
+}, { chain: 'r', needs: ['r'] });
 const NEW_A = 'a different long passphrase for ada';
 await step(R, 'Reset from the mailed link → sign-in with a note', async () => {
 	const link = await mailedLink(who('a'), 'reset', since);
 	await R.goto(link, { waitUntil: 'networkidle' });
 	await R.fill('#password', NEW_A);
 	await R.click('button[type=submit]');
-	await R.waitForSelector('.banner.notice:has-text("Password changed")', { timeout: 10_000 });
-	return await R.evaluate(() => location.hash);
-});
+	// the reset contract is moving to "no cookie" (then: sign-in with a note); a server that still signs the
+	// browser in lands on the overview instead — record which
+	await R.waitForSelector('.banner.notice:has-text("Password changed"), #ob-title, .ws-btn', { timeout: 10_000 });
+	const h = await R.evaluate(() => location.hash);
+	if (h.startsWith('#/overview')) {
+		await R.locator('.acct-btn').click();
+		await R.locator('#acct-menu button', { hasText: 'Sign out' }).click();
+		await R.waitForSelector('h1:has-text("Sign in")', { timeout: 10_000 });
+		return 'the server set a session cookie on reset (old contract): landed on the overview, signed out to continue';
+	}
+	return h;
+}, { chain: 'r', needs: ['r'] });
 await step(R, 'Sign in with the new password; the old one is refused', async () => {
 	await R.fill('#email', who('a'));
 	await R.fill('#password', PASS.a);
@@ -374,12 +395,12 @@ await step(R, 'Sign in with the new password; the old one is refused', async () 
 	await R.waitForSelector('.banner.error:has-text("invalid_credentials")', { timeout: 10_000 });
 	await signIn(R, who('a'), NEW_A);
 	await R.waitForSelector('.ws-btn:has-text("Journey A")', { timeout: 10_000 });
-});
+}, { chain: 'r', needs: ['r'] });
 await step(A, 'A\'s old tab after the reset: signed out', async () => {
 	await A.goto(`${APP}#/runs`, { waitUntil: 'networkidle' });
 	await A.waitForSelector('h1:has-text("Sign in")', { timeout: 15_000 });
 	return await A.locator('.banner.notice').first().textContent().catch(() => '');
-});
+}, { chain: 'r2', needs: ['a', 'r'] });
 await step(R, 'Sign out', async () => {
 	await R.locator('.acct-btn').click();
 	await R.locator('#acct-menu button', { hasText: 'Sign out' }).click();
@@ -387,26 +408,26 @@ await step(R, 'Sign out', async () => {
 	const s = await R.evaluate(async () => (await fetch('/auth/session')).status);
 	if (s !== 401) throw new Error(`after sign-out /auth/session answered ${s}`);
 	return '/auth/session → 401';
-});
+}, { chain: 'r', needs: ['r'] });
 for (const c of [ctxA, ctxB, ctxC, ctxR]) await c.ctx.close();
 
 // the core at 390
 const ctxD = await ctxFor(390);
 const D = ctxD.page;
 since = logSize();
-await step(D, 'Phone: sign up', async () => signUp(D, who('d'), PASS.d), { width: 390 });
-await step(D, 'Phone: verify from the mail', async () => verifyFromMail(D, who('d'), PASS.d, since), { width: 390 });
+await step(D, 'Phone: sign up', async () => signUp(D, who('d'), PASS.d), { chain: 'd', width: 390 });
+await step(D, 'Phone: verify from the mail', async () => verifyFromMail(D, who('d'), PASS.d, since), { chain: 'd', width: 390 });
 await step(D, 'Phone: sign in, first workspace, secret once', async () => {
 	await signIn(D, who('d'), PASS.d);
 	await createWorkspace(D, 'Journey D');
-}, { width: 390 });
-await step(D, 'Phone: overview checklist', async () => { await dismissReveal(D); await D.waitForSelector('#ob-title', { timeout: 10_000 }); }, { width: 390, full: true });
+}, { chain: 'd', width: 390 });
+await step(D, 'Phone: overview checklist', async () => { await dismissReveal(D); await D.waitForSelector('#ob-title', { timeout: 10_000 }); }, { chain: 'd', width: 390, full: true });
 await step(D, 'Phone: API key shown once', async () => {
 	await D.goto(`${APP}#/keys`, { waitUntil: 'networkidle' });
 	await D.fill('#key-name', 'phone-key');
 	await D.click('form button[type=submit]');
 	await D.waitForSelector('dialog[open] .copy-value', { timeout: 10_000 });
-}, { width: 390 });
+}, { chain: 'd', width: 390 });
 await step(D, 'Phone: sample handler and a test call', async () => {
 	await dismissReveal(D);
 	await D.goto(`${APP}#/handlers`, { waitUntil: 'networkidle' });
@@ -415,19 +436,19 @@ await step(D, 'Phone: sample handler and a test call', async () => {
 	await row.getByRole('button', { name: 'Test call' }).click();
 	await row.locator('form button[type=submit]').click();
 	await D.waitForSelector('.test-result', { timeout: 15_000 });
-}, { width: 390, full: true });
+}, { chain: 'd', width: 390, full: true });
 await step(D, 'Phone: send a test job from the overview', async () => {
 	await D.goto(`${APP}#/overview`, { waitUntil: 'networkidle' });
 	await D.getByRole('button', { name: /Send a test job/ }).click();
 	await D.waitForSelector('.tl li', { timeout: 15_000 });
 	return await D.evaluate(() => location.hash);
-}, { width: 390, full: true });
+}, { chain: 'd', width: 390, full: true });
 await step(D, 'Phone: menu and sign out', async () => {
 	await D.getByRole('button', { name: 'Menu', exact: true }).click();
 	await D.locator('.acct-btn').click();
 	await D.locator('#acct-menu button', { hasText: 'Sign out' }).click();
 	await D.waitForSelector('h1:has-text("Sign in")', { timeout: 10_000 });
-}, { width: 390 });
+}, { chain: 'd', width: 390 });
 await ctxD.ctx.close();
 await browser.close();
 
