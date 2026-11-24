@@ -60,7 +60,8 @@ git -C "$src" clean -q -ffdx
 
 channel=$(sed -n 's/^channel *= *"\([^"]*\)".*/\1/p' "$src/rust-toolchain.toml" | head -1)
 [[ "$channel" =~ ^[0-9]+\.[0-9]+(\.[0-9]+)?$ ]] || die "rust-toolchain.toml's channel '$channel' isn't a pinned version"
-if ! rustup toolchain list | grep -q "^$channel-"; then
+installed=$(rustup toolchain list 2>/dev/null || true)
+if ! grep -q "^$channel-" <<<"$installed"; then
   echo "installing Rust $channel (once per toolchain bump)"
   rustup toolchain install "$channel" --profile minimal --component clippy,rustfmt >/dev/null
 fi

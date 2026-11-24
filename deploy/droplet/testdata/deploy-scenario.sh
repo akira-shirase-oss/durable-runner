@@ -13,7 +13,9 @@
 #   5. a build that dies on start: upgrade.sh's restore_prev brings the previous one back;
 #   6. a build that is up but fails its smoke: rollback.sh brings the previous one back;
 #   7. a lab build: refused before anything stops;
-#   8. a stale build record: refused.
+#   8. a stale build record: refused;
+#   9. droplet-build.sh: a commit on main builds and is recorded; one off main, a lab build and a
+#      branch name are refused.
 # shellcheck disable=SC2015  # ok and bad only print (both return 0), so `t && ok || bad` is if-then-else here.
 set -euo pipefail
 fails=0
@@ -190,6 +192,45 @@ build v7 ok
 echo "0000000000000000000000000000000000000000 x y" >"$B/built"
 deploy v7 && bad "deployed without a matching build record" || { grep -q 'last build was of' /tmp/deploy-v7.out && ok "refused: the record names another commit" || bad "refused for another reason: $(tail -3 /tmp/deploy-v7.out)"; }
 [[ "$(live)" == v3 ]] && ok "v3 still live" || bad "live $(live)"
+
+echo "9. droplet-build.sh (a local repository as GitHub; a fake cargo and rustup)"
+printf '[toolchain]\nchannel = "1.99.1"\n' >"$src/rust-toolchain.toml"
+git -C "$src" add -A; git -C "$src" commit -qm toolchain
+git init -q --bare /srv/dr.git
+git -C "$src" push -q /srv/dr.git HEAD:refs/heads/main
+main_commit=$(git -C "$src" rev-parse HEAD)
+git -C "$src" commit -q --allow-empty -m "not on main"; git -C "$src" push -q /srv/dr.git HEAD:refs/heads/side
+side_commit=$(git -C "$src" rev-parse HEAD)
+mkdir -p /root/.cargo/bin /opt/stub/builds
+mkstub /opt/stub/builds/ok vB ok; mkstub /opt/stub/builds/lab vL lab
+cat >/root/.cargo/bin/cargo <<'EOF'
+#!/usr/bin/env bash
+echo "cargo $*" >>/run/fake-systemd/cargo-calls
+mkdir -p "$CARGO_TARGET_DIR/release"
+cp "/opt/stub/builds/${FAKE_BUILD_MODE:-ok}" "$CARGO_TARGET_DIR/release/durable-server"
+printf '#!/bin/sh\necho durable-cli\n' >"$CARGO_TARGET_DIR/release/durable-cli"; chmod 0755 "$CARGO_TARGET_DIR/release/durable-cli"
+echo "    Finished \`release\` profile [optimized] target(s)"
+EOF
+cat >/root/.cargo/bin/rustup <<'EOF'
+#!/usr/bin/env bash
+echo "rustup $*" >>/run/fake-systemd/cargo-calls
+[[ "$1 $2" == "toolchain list" ]] && echo "1.99.1-x86_64-unknown-linux-gnu (default)"
+exit 0
+EOF
+chmod +x /root/.cargo/bin/cargo /root/.cargo/bin/rustup
+b() { env DURABLE_BUILD_DIR=/opt/b2 DURABLE_REPO_URL=file:///srv/dr.git "$@" >/tmp/build.out 2>&1; }
+b /kit/deploy/droplet/direct/droplet-build.sh "$main_commit" && ok "builds a commit on main" || { cat /tmp/build.out; bad "the build of main failed"; }
+read -r rc rs _ </opt/b2/built 2>/dev/null || true
+[[ "$rc" == "$main_commit" && "$rs" == "$(sha256sum /opt/b2/target/release/durable-server | cut -d' ' -f1)" && "$(git -C /opt/b2/src rev-parse HEAD)" == "$main_commit" ]] \
+  && ok "records the commit and the binaries' sha256; the checkout is at the commit" || bad "build record: $(cat /opt/b2/built 2>/dev/null)"
+grep -q -- 'build --release --locked -p durable-server -p durable-cli' /run/fake-systemd/cargo-calls && ! grep -q -- '--features' /run/fake-systemd/cargo-calls \
+  && ok "cargo build --release --locked, both packages, no features" || bad "cargo was called as: $(cat /run/fake-systemd/cargo-calls)"
+b /kit/deploy/droplet/direct/droplet-build.sh "$main_commit" && ok "a second build of the same commit (incremental)" || bad "the second build failed"
+b /kit/deploy/droplet/direct/droplet-build.sh "$side_commit" && bad "built a commit that isn't on main" \
+  || { grep -q "isn't on GitHub's main" /tmp/build.out && [[ ! -e /opt/b2/built ]] && ok "refuses a commit that isn't on main, and drops the old record" || bad "side-branch refusal: $(cat /tmp/build.out)"; }
+b env FAKE_BUILD_MODE=lab /kit/deploy/droplet/direct/droplet-build.sh "$main_commit" && bad "recorded a lab build" \
+  || { grep -q 'LAB' /tmp/build.out && [[ ! -e /opt/b2/built ]] && ok "refuses to record a lab build" || bad "lab refusal: $(cat /tmp/build.out)"; }
+b /kit/deploy/droplet/direct/droplet-build.sh main && bad "took a branch name for a commit" || ok "takes only a full commit id"
 
 systemctl stop durable-server
 (( fails == 0 )) || { echo "deploy-scenario: $fails FAILED"; exit 1; }
