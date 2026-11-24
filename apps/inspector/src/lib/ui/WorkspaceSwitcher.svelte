@@ -49,7 +49,7 @@
 			<span class="mark" aria-hidden="true">{initial(current.name)}</span>
 			<span class="text"><span class="name">{current.name}</span><span class="meta">{ROLE_LABEL[current.role]} · {plan(current.plan)} plan</span></span>
 		{:else}
-			<span class="mark empty" aria-hidden="true"><Icon name="box" size={15} /></span>
+			<span class="mark blank" aria-hidden="true"><Icon name="box" size={15} /></span>
 			<span class="text"><span class="name">No workspace yet</span><span class="meta">Create one to start</span></span>
 		{/if}
 		<Icon name="chevrons-up-down" size={15} />
@@ -124,7 +124,7 @@
 		border-radius: 7px;
 		font-size: 12px;
 	}
-	.mark.empty {
+	.mark.blank {
 		background: var(--c-surface);
 		color: var(--c-body);
 	}

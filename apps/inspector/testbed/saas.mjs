@@ -148,11 +148,11 @@ const PAGES = [
   { name: 'overview-setup-fallback', hash: '#/overview', mock: { fresh: true, workspaces: 'one', onboardingRoute: false }, wait: '#ob-title' },
   { name: 'overview', hash: '#/overview', mock: {}, wait: '.chart svg .ylab' },
   { name: 'switcher', hash: '#/overview', mock: {}, wait: '.chart svg .ylab', full: false, act: async (p, w) => {
-    if (w === 390) await p.getByRole('button', { name: 'Menu' }).click();
+    if (w === 390) await p.getByRole('button', { name: 'Menu', exact: true }).click();
     await p.locator('.ws-btn').click(); await p.waitForSelector('.pop');
   } },
   { name: 'account-menu', hash: '#/overview', mock: {}, wait: '.chart svg .ylab', full: false, act: async (p, w) => {
-    if (w === 390) await p.getByRole('button', { name: 'Menu' }).click();
+    if (w === 390) await p.getByRole('button', { name: 'Menu', exact: true }).click();
     await p.locator('.acct-btn').click(); await p.waitForSelector('#acct-menu');
     await p.locator('#acct-menu').scrollIntoViewIfNeeded();
   } },
@@ -208,6 +208,8 @@ try {
     }
     console.log(`axe: ${scanned} page states scanned, ${total} violation group(s)`);
     process.exitCode = total ? 4 : 0;
+  } else if (FLAGS.has('--behaviour')) {
+    await behaviour();
   } else {
     for (const theme of quick ? ['light'] : ['light', 'dark']) for (const width of quick ? [1440] : [1440, 390]) {
       for (const pg of list) {
@@ -226,7 +228,7 @@ try {
         await ctx.close();
       }
     }
-    if (!quick && !ONLY) await behaviour();
+    if (!quick && !ONLY && !FLAGS.has('--behaviour')) await behaviour();
   }
 } finally {
   await browser.close();
@@ -302,9 +304,9 @@ async function behaviour() {
     console.log(`switch: ${after.length} /jobs request(s) after switching, all to Staging: ${ok}`);
     if (!ok) failures.push('after switching, /jobs did not follow the selected workspace');
     // sign out
-    if (await page.getByRole('button', { name: 'Menu' }).isVisible()) await page.getByRole('button', { name: 'Menu' }).click();
+    if (await page.getByRole('button', { name: 'Menu', exact: true }).isVisible()) await page.getByRole('button', { name: 'Menu', exact: true }).click();
     await page.locator('.acct-btn').click();
-    await page.getByRole('button', { name: 'Sign out' }).click();
+    await page.locator('#acct-menu button', { hasText: 'Sign out' }).click();
     await page.waitForSelector('h1:has-text("Sign in")');
     console.log(`sign out: ${await page.evaluate(() => location.hash)}`);
     await ctx.close();

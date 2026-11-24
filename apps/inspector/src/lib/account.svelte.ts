@@ -132,16 +132,23 @@ class Account {
 		this.notice = null;
 		// the login answer has no workspace list: the session bootstrap does
 		await this.refresh();
+		// accepted, yet no session: the browser dropped the cookie (__Host- cookies need HTTPS)
+		if (this.mode !== 'signed-in') {
+			throw new ApiError('signed in, but this browser did not keep the session cookie (it is Secure: the page must be served over HTTPS)', 0, 'cookie_refused');
+		}
 	}
 
+	/** Sign out on the server first: a cookie the server still honours must not look signed out here. A 401
+	 *  means it already ended, which is the same outcome. */
 	async signOut(): Promise<void> {
 		try {
 			await logout(this.cred);
-		} finally {
-			this.#clear();
-			this.notice = 'Signed out.';
-			this.mode = 'signed-out';
+		} catch (e) {
+			if (!(e instanceof ApiError && e.status === 401)) throw e;
 		}
+		this.#clear();
+		this.notice = 'Signed out.';
+		this.mode = 'signed-out';
 	}
 
 	/** After a password change or reset the server minted a fresh session: its new CSRF token. */

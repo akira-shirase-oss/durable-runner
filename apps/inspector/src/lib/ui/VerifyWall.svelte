@@ -47,7 +47,7 @@
 		{#if sent}<p class="banner notice" role="status"><Icon name="check" size={16} /><span class="msg">If the address still needs verifying, a fresh link is on its way. The newest link replaces the older ones.</span></p>{/if}
 		<div class="form-actions">
 			<button class="btn brand sm" disabled={busy || sent} onclick={resend}><Icon name="send" />{busy ? 'Sending…' : 'Resend the link'}</button>
-			<button class="btn sm" onclick={() => void account.signOut()}><Icon name="log-out" />Sign out</button>
+			<button class="btn sm" onclick={() => void account.signOut().catch(() => {})}><Icon name="log-out" />Sign out</button>
 		</div>
 	</section>
 {/if}

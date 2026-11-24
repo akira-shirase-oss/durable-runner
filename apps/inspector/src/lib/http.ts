@@ -59,7 +59,8 @@ export function parseEnvelope(body: unknown): Envelope {
 /** The dashboard's sentence for a refusal: what the code means for the person looking at the page. The server's
  *  own message is the fallback, so a code this build does not know still reads as the server wrote it. */
 const COPY: Record<string, string> = {
-	unauthenticated: 'Your session has ended. Sign in again.',
+	unauthenticated: 'The server answered as if you were signed out. If your session ended, sign in again.',
+	cookie_refused: 'Signed in, but this browser did not keep the session cookie. The dashboard must be opened over HTTPS.',
 	invalid_credentials: 'That email and password do not match an account.',
 	email_unverified: 'Verify your email address first: this needs a verified account.',
 	csrf_failed: 'The request was refused as cross-site. Reload the page and try again.',

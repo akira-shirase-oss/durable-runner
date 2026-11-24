@@ -75,7 +75,7 @@
 		{#if error}
 			<ErrorBanner {error} />
 			{#if error.code === 'invite_email_mismatch'}
-				<button class="btn sm" onclick={() => { account.rememberNext(here); void account.signOut(); }}><Icon name="log-out" />Sign out and use the invited address</button>
+				<button class="btn sm" onclick={() => { account.rememberNext(here); void account.signOut().catch(() => {}); }}><Icon name="log-out" />Sign out and use the invited address</button>
 			{/if}
 		{/if}
 		<div class="form-actions">

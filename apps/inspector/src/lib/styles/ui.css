@@ -683,7 +683,11 @@ select:focus-visible {
   border-top: 0;
 }
 .rows > li.dim {
-  opacity: 0.7;
+  /* dimmed by ground, not opacity: text keeps its contrast */
+  background: var(--c-panel);
+}
+.rows > li.dim .row-title {
+  color: var(--c-ink-soft);
 }
 .row-main {
   display: flex;

@@ -7,14 +7,18 @@
 
 	let open = $state(false);
 	let busy = $state(false);
+	let failed = $state<string | null>(null);
 	let root: HTMLDivElement | undefined = $state();
 	let button: HTMLButtonElement | undefined = $state();
 	const dark = $derived(theme.scheme === 'dark');
 
 	async function signOut() {
 		busy = true;
+		failed = null;
 		try {
 			await account.signOut();
+		} catch (e) {
+			failed = `Not signed out: ${e instanceof Error ? e.message : String(e)}. Try again.`;
 		} finally {
 			busy = false;
 		}
@@ -43,6 +47,7 @@
 			<a class="item" href="#/settings" onclick={() => (open = false)}><Icon name="user" size={16} />Account settings</a>
 			<button class="item" aria-pressed={dark} onclick={() => theme.toggle()}><Icon name={dark ? 'sun' : 'moon'} size={16} />Dark theme<span class="state">{dark ? 'On' : 'Off'}{theme.choice === 'system' ? ' · system' : ''}</span></button>
 			<button class="item" disabled={busy} onclick={signOut}><Icon name="log-out" size={16} />{busy ? 'Signing out…' : 'Sign out'}</button>
+			{#if failed}<p class="failed" role="alert">{failed}</p>{/if}
 		</div>
 	{/if}
 	<button class="acct-btn" bind:this={button} aria-expanded={open} aria-controls="acct-menu" onclick={() => (open = !open)}>
@@ -166,6 +171,12 @@
 		margin-left: auto;
 		color: var(--c-body);
 		font-size: 12.5px;
+	}
+	.failed {
+		margin: 4px 8px;
+		color: var(--c-danger);
+		font-size: 13px;
+		line-height: 1.4;
 	}
 	@keyframes pop-up {
 		from {
