@@ -982,4 +982,152 @@ mod tests {
             "the bound admits exactly MAX_HANDLERS_PER_WS, never more"
         );
     }
+
+    fn mail(kind: &'static str, to: &str) -> Mail {
+        Mail {
+            kind,
+            send_to: to.to_string(),
+            subject: format!("{kind} mail"),
+            text: "body".into(),
+            html: "<p>body</p>".into(),
+            idempotency_key: format!("{kind}:{to}"),
+        }
+    }
+
+    /// S3-0's new surface end to end on the real dialect: signup with the
+    /// pending hash on the verify token, a session grant joined to its
+    /// account, an unknown hash's verified negative, revoke, re-sign-up
+    /// superseding the token, ws-0 membership impossible, and the outbox
+    /// mark's idempotence — the same contract the Memory impl is
+    /// fuzz-checked against, proved where the SQL actually runs.
+    #[tokio::test]
+    async fn pg_signup_session_and_revoke_round_trip() {
+        let Some(store) = store().await else { return };
+        let email = format!("pg-s30-{}@example.com", std::process::id());
+        let verify = mail("verify", &email);
+        let notice = mail("notice", &email);
+        let out = store
+            .signup(
+                &email,
+                "$argon2id$v=19$m=19456,t=2,p=1$AAAAAAAAAAA$fakehashfakehashfakehashfakehashfakeh",
+                &hash(1),
+                1_800_000_000_000,
+                &verify,
+                &notice,
+            )
+            .await
+            .unwrap_or_else(|e| panic!("signup: {e}"));
+        let SignupOutcome::Created {
+            outbox: Some(mail_id),
+        } = out
+        else {
+            panic!("first signup must be Created with a queued mail: {out:?}")
+        };
+        let account = store
+            .account_by_email(&email)
+            .await
+            .unwrap_or_else(|e| panic!("by email: {e}"))
+            .unwrap_or_else(|| panic!("the account must exist"));
+        assert!(!account.email_verified);
+        store
+            .create_session(&crate::NewSession {
+                account: account.id,
+                token_hash: hash(7),
+                csrf_seed: hash(9),
+                expires_at_ms: 4_000_000_000_000,
+                idle_expires_at_ms: 4_000_000_000_000,
+                user_agent: Some("pg-test".into()),
+                ip: Some(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)),
+            })
+            .await
+            .unwrap_or_else(|e| panic!("create session: {e}"));
+        let grant = store
+            .session_grant(&hash(7))
+            .await
+            .unwrap_or_else(|e| panic!("grant: {e}"))
+            .unwrap_or_else(|| panic!("the live session must resolve"));
+        assert_eq!(grant.account.id, account.id);
+        assert_eq!(grant.csrf_seed, hash(9));
+        // A verified negative is Some(None)-shaped: unknown hash → None,
+        // never an error and never a different account.
+        assert!(store
+            .session_grant(&hash(8))
+            .await
+            .unwrap_or_else(|e| panic!("grant: {e}"))
+            .is_none());
+        // ws 0 cannot hold a member row (the CHECK), and ws ≠ 0 without a
+        // row answers None — both are the ops-plane invariant, not errors.
+        assert_eq!(
+            store
+                .member_role(account.id, 0)
+                .await
+                .unwrap_or_else(|e| panic!("role ws0: {e}")),
+            None
+        );
+        assert!(store
+            .revoke_session(&hash(7))
+            .await
+            .unwrap_or_else(|e| panic!("revoke: {e}")));
+        assert!(!store
+            .revoke_session(&hash(7))
+            .await
+            .unwrap_or_else(|e| panic!("revoke twice: {e}")));
+        assert!(store
+            .session_grant(&hash(7))
+            .await
+            .unwrap_or_else(|e| panic!("grant: {e}"))
+            .is_none());
+        // Re-sign-up of an unverified address supersedes the token and —
+        // review #2 — revokes every live session the sign-up could have
+        // minted for an attacker who registered someone else's address.
+        store
+            .create_session(&crate::NewSession {
+                account: account.id,
+                token_hash: hash(10),
+                csrf_seed: hash(9),
+                expires_at_ms: 4_000_000_000_000,
+                idle_expires_at_ms: 4_000_000_000_000,
+                user_agent: None,
+                ip: None,
+            })
+            .await
+            .unwrap_or_else(|e| panic!("create session 2: {e}"));
+        let out = store
+            .signup(
+                &email,
+                "$argon2id$v=19$m=19456,t=2,p=1$BBBBBBBBBBB$otherhashotherhashotherhashotherhash",
+                &hash(2),
+                1_800_000_000_000,
+                &verify,
+                &notice,
+            )
+            .await
+            .unwrap_or_else(|e| panic!("re-signup: {e}"));
+        assert!(
+            matches!(out, SignupOutcome::VerifyResent { .. }),
+            "unverified re-signup must resend: {out:?}"
+        );
+        assert!(
+            store
+                .session_grant(&hash(10))
+                .await
+                .unwrap_or_else(|e| panic!("grant: {e}"))
+                .is_none(),
+            "re-sign-up revoked the live session"
+        );
+        // The outbox row marks Sent once; a second mark is a no-op, never
+        // a state regression (the drain may race a manual send).
+        store
+            .outbox_mark(mail_id, MailOutcome::Sent)
+            .await
+            .unwrap_or_else(|e| panic!("mark: {e}"));
+        store
+            .outbox_mark(mail_id, MailOutcome::Sent)
+            .await
+            .unwrap_or_else(|e| panic!("mark twice: {e}"));
+        store
+            .revoke_sessions_for_account(account.id)
+            .await
+            .unwrap_or_else(|e| panic!("revoke all: {e}"));
+    }
 }
