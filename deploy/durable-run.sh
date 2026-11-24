@@ -55,6 +55,15 @@ if [[ -f "$etc/handlers" ]]; then
   done <"$etc/handlers"
 fi
 
+# Every start goes through here, so the lab guard runs here too (S3): the
+# env file can name any binary, a lab build in target/release included
+# (deploy/lab-build-guard.sh, installed as durable-lab-guard).
+bin="${DURABLE_SERVER_BIN:-/usr/local/bin/durable-server}"
+guard="$(dirname "$0")/durable-lab-guard"
+[[ -x "$guard" ]] || guard="$(dirname "$0")/lab-build-guard.sh"
+[[ -x "$guard" ]] || { echo "durable-run: no lab-build guard beside $0; refusing to start" >&2; exit 1; }
+"$guard" "$bin" || exit 1
+
 # Extra flags, e.g. DURABLE_EXTRA_ARGS="--max-live-runs 2000000".
 # shellcheck disable=SC2086
-exec "${DURABLE_SERVER_BIN:-/usr/local/bin/durable-server}" "${args[@]}" ${DURABLE_EXTRA_ARGS:-}
+exec "$bin" "${args[@]}" ${DURABLE_EXTRA_ARGS:-}

@@ -17,13 +17,22 @@ trap 'rm -rf "$work"' EXIT
 # A stub server that records its argv, one argument per line.
 cat >"$work/stub" <<'STUB'
 #!/usr/bin/env bash
+# durable-run's lab guard asks --help first: answer like a production build.
+if [[ "${1:-}" == --help ]]; then
+  printf 'Usage: durable-server [OPTIONS]\n      --journal <JOURNAL>\n'
+  exit 0
+fi
 printf '%s\n' "$@" >"$STUB_OUT"
 STUB
 chmod +x "$work/stub"
+# The known-bad copies below run from $work: give them the guard too, so
+# they fail on their removed rule, not on a missing guard.
+cp deploy/lab-build-guard.sh "$work/lab-build-guard.sh"
 mkdir -p "$work/etc"
 printf '203.0.113.7/32   # the reserved IP\n\n# a comment line\n2001:db8:7::/48\n' >"$work/etc/deny-cidrs"
 
 argv_of() { # script listen → the argv file
+  rm -f "$work/argv"
   STUB_OUT="$work/argv" DURABLE_ETC="$work/etc" DURABLE_SERVER_BIN="$work/stub" \
     DURABLE_LISTEN="$2" bash "$1"
   cat "$work/argv"
