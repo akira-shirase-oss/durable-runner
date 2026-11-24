@@ -132,6 +132,11 @@ pub struct ApiKeyInfo {
 pub struct HandlerRegistration {
     pub name: String,
     pub url: String,
+    /// D-070 health columns: when the last test call ran (unix ms), its
+    /// verdict (`ok|failed|refused|lost`) and its latency.
+    pub last_test_at_ms: Option<i64>,
+    pub last_test_status: Option<String>,
+    pub last_test_latency_ms: Option<i64>,
 }
 
 /// An account row. `id` is the internal join key — never external;
@@ -431,6 +436,17 @@ pub trait AccountStore: Send + Sync {
 
     /// Insert or replace a handler registration for a workspace.
     async fn put_handler(&self, workspace: u64, name: &str, url: &str) -> Result<(), AccountError>;
+
+    /// Stamp one D-070 test call onto the registration's health columns.
+    /// `false` when no registration by that name exists in the workspace.
+    async fn record_handler_test(
+        &self,
+        workspace: u64,
+        name: &str,
+        at_ms: i64,
+        status: &str,
+        latency_ms: i64,
+    ) -> Result<bool, AccountError>;
 
     /// Delete a handler registration. Returns whether one existed.
     async fn delete_handler(&self, workspace: u64, name: &str) -> Result<bool, AccountError>;

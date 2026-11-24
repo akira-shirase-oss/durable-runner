@@ -37,7 +37,7 @@ pub struct Memory {
 struct Inner {
     workspaces: HashMap<u64, Workspace>,
     keys: HashMap<u64, KeyRow>,
-    handlers: HashMap<(u64, String), String>,
+    handlers: HashMap<(u64, String), HandlerRow>,
     accounts: HashMap<u64, Account>,
     /// (workspace, account) -> role. ws 0 rows are never written — the
     /// ops plane is key-only.
@@ -46,6 +46,13 @@ struct Inner {
     email_tokens: HashMap<u64, EmailTokenRow>,
     invites: HashMap<u64, InviteRow>,
     outbox: HashMap<u64, OutboxRow>,
+}
+
+struct HandlerRow {
+    url: String,
+    last_test_at_ms: Option<i64>,
+    last_test_status: Option<String>,
+    last_test_latency_ms: Option<i64>,
 }
 
 struct KeyRow {
@@ -486,9 +493,12 @@ impl AccountStore for Memory {
             .handlers
             .iter()
             .filter(|((ws, _), _)| *ws == workspace)
-            .map(|((_, name), url)| HandlerRegistration {
+            .map(|((_, name), row)| HandlerRegistration {
                 name: name.clone(),
-                url: url.clone(),
+                url: row.url.clone(),
+                last_test_at_ms: row.last_test_at_ms,
+                last_test_status: row.last_test_status.clone(),
+                last_test_latency_ms: row.last_test_latency_ms,
             })
             .collect();
         handlers.sort_by(|a, b| a.name.cmp(&b.name));
@@ -508,8 +518,36 @@ impl AccountStore for Memory {
         if !inner.handlers.contains_key(&key) && count >= crate::MAX_HANDLERS_PER_WS {
             return Err(AccountError::RegistryFull);
         }
-        inner.handlers.insert(key, url.to_string());
+        inner
+            .handlers
+            .entry(key)
+            .and_modify(|row| row.url = url.to_string())
+            .or_insert(HandlerRow {
+                url: url.to_string(),
+                last_test_at_ms: None,
+                last_test_status: None,
+                last_test_latency_ms: None,
+            });
         Ok(())
+    }
+
+    async fn record_handler_test(
+        &self,
+        workspace: u64,
+        name: &str,
+        at_ms: i64,
+        status: &str,
+        latency_ms: i64,
+    ) -> Result<bool, AccountError> {
+        self.check_up()?;
+        let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(row) = inner.handlers.get_mut(&(workspace, name.to_string())) else {
+            return Ok(false);
+        };
+        row.last_test_at_ms = Some(at_ms);
+        row.last_test_status = Some(status.to_string());
+        row.last_test_latency_ms = Some(latency_ms);
+        Ok(true)
     }
 
     async fn delete_handler(&self, workspace: u64, name: &str) -> Result<bool, AccountError> {
@@ -1588,7 +1626,10 @@ mod tests {
             a_handlers,
             vec![HandlerRegistration {
                 name: "h".into(),
-                url: "https://a.example/h".into()
+                url: "https://a.example/h".into(),
+                last_test_at_ms: None,
+                last_test_status: None,
+                last_test_latency_ms: None,
             }]
         );
         assert!(store

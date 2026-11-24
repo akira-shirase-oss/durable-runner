@@ -27,7 +27,8 @@ use durable_accounts::{
 use durable_domain::{JobSpec, Millis, OperationKey, RunId, RunState, StepSpec};
 use durable_engine::observe::{self, Observer, Window};
 use durable_engine::shell::{
-    spawn, Call, Engine, Order, Outcome, Registry, ShellConfig, StepHandler, MAX_HANDLERS_PER_WS,
+    spawn, Call, Engine, Order, Outcome, Registry, ShellConfig, StepHandler, TestReply,
+    MAX_HANDLERS_PER_WS,
 };
 use durable_engine::EngineError;
 use serde::{Deserialize, Serialize};
@@ -483,6 +484,89 @@ impl HttpHandler {
         }
     }
 
+    /// The D-070 probe: ONE call, exactly the dispatched path's request
+    /// shape — same body, same signing, same policy recheck, same
+    /// timeout, same bounded read — with no `Call` context and a reply
+    /// detail instead of an `Outcome`. Never journaled.
+    async fn probe_call_once(&self, input: &[u8], idem_key: &str) -> TestReply {
+        let start = Instant::now();
+        let refused = || TestReply {
+            status: "refused",
+            http_status: None,
+            latency_ms: 0,
+            excerpt: Vec::new(),
+        };
+        if !self.policy_ok() {
+            return refused();
+        }
+        let body = serde_json::to_vec(&serde_json::json!({
+            "input": input,
+            "idem_key": idem_key,
+        }))
+        .unwrap_or_default();
+        let digest = hex(&sha256(&body));
+        let req = self
+            .client
+            .post(&self.url)
+            .header("x-idempotency-key", idem_key)
+            .header("content-type", "application/json")
+            .body(body)
+            .timeout(self.timeout);
+        let (authority, path) = self.authority_and_path();
+        let res = with_call(
+            req,
+            None,
+            self.secret.as_deref(),
+            idem_key,
+            &digest,
+            "POST",
+            &authority,
+            &path,
+            &self.pubid,
+        )
+        .send()
+        .await;
+        let latency = start.elapsed().as_millis() as u64;
+        match res {
+            Ok(r) => {
+                let http = r.status();
+                match read_bounded(r, 1024).await {
+                    Ok(excerpt) => TestReply {
+                        status: if http.is_success() { "ok" } else { "failed" },
+                        http_status: Some(http.as_u16()),
+                        latency_ms: latency,
+                        excerpt: excerpt.unwrap_or_default(),
+                    },
+                    Err(_) => TestReply {
+                        status: "failed",
+                        http_status: Some(http.as_u16()),
+                        latency_ms: latency,
+                        excerpt: Vec::new(),
+                    },
+                }
+            }
+            Err(e) if ssrf::refused(&e) => refused(),
+            Err(e) if e.is_timeout() => TestReply {
+                status: "lost",
+                http_status: None,
+                latency_ms: latency,
+                excerpt: Vec::new(),
+            },
+            Err(e) if e.is_connect() => TestReply {
+                status: "failed",
+                http_status: None,
+                latency_ms: latency,
+                excerpt: Vec::new(),
+            },
+            Err(_) => TestReply {
+                status: "lost",
+                http_status: None,
+                latency_ms: latency,
+                excerpt: Vec::new(),
+            },
+        }
+    }
+
     /// Probe asks the handler whether the call under `idem_key` landed.
     /// `GET {url}?idem_key=…` → 200 means found; anything else is unknown
     /// → reported as not-found honestly (default trait behaviour).
@@ -562,6 +646,13 @@ impl StepHandler for HttpHandler {
 
     async fn probe_call(&self, call: Call, _step: &StepSpec, idem_key: &str) -> bool {
         self.ask(Some(call), idem_key).await
+    }
+
+    /// The D-070 probe goes through the real signed request path — a
+    /// stored-url handler is exercised exactly as a dispatch would,
+    /// minus journaling.
+    async fn test_call(&self, _step: &StepSpec, input: &[u8], idem_key: &str) -> TestReply {
+        self.probe_call_once(input, idem_key).await
     }
 }
 
@@ -645,6 +736,40 @@ impl HandlerFactory {
             policy: policy.clone(),
             pubid: self.pubid.clone(),
         })
+    }
+}
+
+/// The onboarding sample handler (ruling 5'): the reserved name
+/// `builtin:echo` registers like any handler but executes in-process —
+/// no network hop, nothing to sign, and it can never be a reflector.
+/// Its "url" is the marker string itself.
+const BUILTIN_ECHO: &str = "builtin:echo";
+
+struct BuiltinEcho;
+#[async_trait::async_trait]
+impl StepHandler for BuiltinEcho {
+    async fn execute(&self, _step: &StepSpec, input: &[u8], _idem_key: &str) -> Outcome {
+        Outcome::Checkpoint(input.to_vec())
+    }
+    /// The D-070 probe runs in-process through the same outcome mapping.
+    async fn test_call(&self, step: &StepSpec, input: &[u8], idem_key: &str) -> TestReply {
+        let start = Instant::now();
+        let outcome = self.execute(step, input, idem_key).await;
+        TestReply::from_outcome(outcome, start.elapsed().as_millis() as u64)
+    }
+}
+
+/// What one stored registration arms: `builtin:echo` is in-process,
+/// every other URL builds through the signed, SSRF-guarded path.
+fn arm_url(
+    factory: &HandlerFactory,
+    url: &str,
+    secret: Option<Arc<[u8; 32]>>,
+) -> Arc<dyn StepHandler> {
+    if url == BUILTIN_ECHO {
+        Arc::new(BuiltinEcho)
+    } else {
+        factory.make_signed(url, secret)
     }
 }
 
@@ -1142,14 +1267,15 @@ async fn registry_sync(
             // never reaches the registry (call-time policy still
             // refuses it; dropping it here refuses it *honestly*).
             // ATTACK(reconcile-recheck)
-            let ok = reqwest::Url::parse(&r.url)
-                .map(|u| ssrf::check_url(&u, &factory.store_policy).is_ok())
-                .unwrap_or(false);
+            let ok = r.url == BUILTIN_ECHO
+                || reqwest::Url::parse(&r.url)
+                    .map(|u| ssrf::check_url(&u, &factory.store_policy).is_ok())
+                    .unwrap_or(false);
             if !ok {
                 refused += 1;
                 continue;
             }
-            set.push((r.name.clone(), factory.make_signed(&r.url, secret.clone())));
+            set.push((r.name.clone(), arm_url(factory, &r.url, secret.clone())));
             accepted.push(RegistryEntry {
                 ws: ws.id,
                 name: r.name.clone(),
@@ -1606,6 +1732,10 @@ struct App {
     sessions: std::sync::Arc<SessionCache>,
     /// The generation-checked member-role cache (D-066).
     members: std::sync::Arc<MemberCache>,
+    /// D-070 probe budgets: 30/hour per workspace (the Free plan's
+    /// bound; S3-4 makes it plan-read) + 10/minute per client address.
+    test_calls_ws: std::sync::Arc<Mutex<HashMap<u64, std::collections::VecDeque<Instant>>>>,
+    test_calls_addr: std::sync::Arc<Mutex<SlidingWindow>>,
     /// The bounded argon2 queue (review #9).
     argon: std::sync::Arc<ArgonQueue>,
     /// Per-address limits for the open auth surface.
@@ -1682,7 +1812,7 @@ async fn arm_snapshot(
             );
             continue;
         }
-        let h = factory.make_signed(&entry.url, secret);
+        let h = arm_url(factory, &entry.url, secret);
         match engine.put_handler(entry.ws, &entry.name, h).await {
             Ok(()) => armed.push((entry.ws, entry.name, entry.url)),
             Err(e) => eprintln!(
@@ -1763,6 +1893,11 @@ fn test_app(
         session_key: std::sync::Arc::new(pubid.derive_key(b"session-token-v1")),
         sessions: std::sync::Arc::new(SessionCache::new()),
         members: std::sync::Arc::new(MemberCache::new()),
+        test_calls_ws: std::sync::Arc::new(Mutex::new(HashMap::new())),
+        test_calls_addr: std::sync::Arc::new(Mutex::new(SlidingWindow::new(
+            10,
+            Duration::from_secs(60),
+        ))),
         argon: std::sync::Arc::new(ArgonQueue::new()),
         auth_limits: std::sync::Arc::new(AuthLimits::new()),
         lockouts: std::sync::Arc::new(LoginLockouts::new()),
@@ -2771,60 +2906,72 @@ impl FromRequestParts<App> for SessionAuth {
                 "API keys cannot reach the session surface",
             ));
         }
-        let token = session_cookie(parts).ok_or_else(|| {
-            ApiError::new(StatusCode::UNAUTHORIZED, "unauthenticated", "no session")
-        })?;
-        let Some(hash) = session_token_hash(&app.session_key, &token) else {
-            return Err(ApiError::new(
-                StatusCode::UNAUTHORIZED,
-                "unauthenticated",
-                "no session",
-            ));
-        };
-        let now = app.now_ms();
-        if let Some(grant) = app.sessions.get(&hash, now) {
-            app.sessions.touch(hash, now);
-            return Ok(SessionAuth(grant));
-        }
-        let fill_start = Instant::now();
-        let grant = match store.session_grant(&hash).await {
-            Ok(Some(g)) => g,
-            Ok(None) => {
-                return Err(ApiError::new(
-                    StatusCode::UNAUTHORIZED,
-                    "unauthenticated",
-                    "no session",
-                ))
-            }
-            Err(_) => return Err(accounts_unavailable()),
-        };
-        // The idle check takes the pending-touch floor too — a slide
-        // queued but not yet flushed still counts as use (D-071).
-        let idle = grant.idle_expires_at_ms.max(app.sessions.touch_idle(&hash));
-        // ATTACK(idle-timeout)
-        if grant.expires_at_ms <= now || idle <= now {
-            return Err(ApiError::new(
-                StatusCode::UNAUTHORIZED,
-                "unauthenticated",
-                "session expired",
-            ));
-        }
-        let grant = std::sync::Arc::new(grant);
-        // A revocation that landed inside the store await drops the
-        // fill — deny rather than serve stale (review #10).
-        if !app
-            .sessions
-            .put(hash, std::sync::Arc::clone(&grant), fill_start)
-        {
-            return Err(ApiError::new(
-                StatusCode::UNAUTHORIZED,
-                "unauthenticated",
-                "no session",
-            ));
-        }
-        app.sessions.touch(hash, now);
+        let grant = session_grant_for(app, parts, &store).await?;
         Ok(SessionAuth(grant))
     }
+}
+
+/// The session-cookie → grant resolution shared by `SessionAuth` and
+/// the dual-auth flat routes (D-066): tag-checked `drs_`, cache-then-
+/// store, idle+absolute expiry with the pending-touch floor, and the
+/// mid-await bump drop — identical answers either way in.
+async fn session_grant_for(
+    app: &App,
+    parts: &Parts,
+    store: &Arc<dyn AccountStore>,
+) -> Result<std::sync::Arc<durable_accounts::SessionGrant>, ApiError> {
+    let token = session_cookie(parts)
+        .ok_or_else(|| ApiError::new(StatusCode::UNAUTHORIZED, "unauthenticated", "no session"))?;
+    let Some(hash) = session_token_hash(&app.session_key, &token) else {
+        return Err(ApiError::new(
+            StatusCode::UNAUTHORIZED,
+            "unauthenticated",
+            "no session",
+        ));
+    };
+    let now = app.now_ms();
+    if let Some(grant) = app.sessions.get(&hash, now) {
+        app.sessions.touch(hash, now);
+        return Ok(grant);
+    }
+    let fill_start = Instant::now();
+    let grant = match store.session_grant(&hash).await {
+        Ok(Some(g)) => g,
+        Ok(None) => {
+            return Err(ApiError::new(
+                StatusCode::UNAUTHORIZED,
+                "unauthenticated",
+                "no session",
+            ))
+        }
+        Err(_) => return Err(accounts_unavailable()),
+    };
+    // The idle check takes the pending-touch floor too — a slide
+    // queued but not yet flushed still counts as use (D-071).
+    let idle = grant.idle_expires_at_ms.max(app.sessions.touch_idle(&hash));
+    // ATTACK(idle-timeout)
+    if grant.expires_at_ms <= now || idle <= now {
+        return Err(ApiError::new(
+            StatusCode::UNAUTHORIZED,
+            "unauthenticated",
+            "session expired",
+        ));
+    }
+    let grant = std::sync::Arc::new(grant);
+    // A revocation that landed inside the store await drops the
+    // fill — deny rather than serve stale (review #10).
+    if !app
+        .sessions
+        .put(hash, std::sync::Arc::clone(&grant), fill_start)
+    {
+        return Err(ApiError::new(
+            StatusCode::UNAUTHORIZED,
+            "unauthenticated",
+            "no session",
+        ));
+    }
+    app.sessions.touch(hash, now);
+    Ok(grant)
 }
 
 /// A session-authed mutation: SessionAuth plus the synchroniser CSRF
@@ -3822,6 +3969,175 @@ async fn member_access(
         ));
     }
     Ok((ws, role))
+}
+
+/// A session's workspace on a FLAT route (`/handlers*` — D-066): the
+/// `x-durable-workspace` header names it; absent or unparseable is 400
+/// `workspace_required`, deleted is 410, non-member 404, low role 403.
+async fn flat_member(
+    app: &App,
+    grant: &durable_accounts::SessionGrant,
+    parts: &Parts,
+    need: Role,
+) -> Result<(durable_accounts::Workspace, Role), ApiError> {
+    let raw = parts
+        .headers
+        .get("x-durable-workspace")
+        .and_then(|v| v.to_str().ok())
+        .ok_or_else(|| {
+            ApiError::new(
+                StatusCode::BAD_REQUEST,
+                "workspace_required",
+                "session callers name the workspace in x-durable-workspace",
+            )
+        })?;
+    let pid = raw.parse::<uuid::Uuid>().map_err(|_| {
+        ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "workspace_required",
+            "x-durable-workspace must be a workspace public id",
+        )
+    })?;
+    let store = accounts(app)?;
+    let Some(ws) = store.workspace_by_public_id(pid).await.map_err(store_err)? else {
+        return Err(ApiError::new(
+            StatusCode::NOT_FOUND,
+            "not_found",
+            "no such workspace",
+        ));
+    };
+    if ws.deleted_at_ms.is_some() {
+        return Err(ApiError::new(
+            StatusCode::GONE,
+            "workspace_closed",
+            "this workspace is deleted",
+        ));
+    }
+    let account = grant.account.id;
+    let role = match app.members.get(account, ws.id) {
+        Some(role) => role,
+        None => {
+            let fill_start = Instant::now();
+            let Some(role) = store.member_role(account, ws.id).await.map_err(store_err)? else {
+                return Err(ApiError::new(
+                    StatusCode::NOT_FOUND,
+                    "not_found",
+                    "no such workspace",
+                ));
+            };
+            app.members.put(account, ws.id, role, fill_start);
+            role
+        }
+    };
+    if role < need {
+        return Err(ApiError::new(
+            StatusCode::FORBIDDEN,
+            "forbidden",
+            "this role may not do that",
+        ));
+    }
+    Ok((ws, role))
+}
+
+/// The dual-auth resolution for flat tenant routes (D-066/D-073): a
+/// bearer takes the key path (workspace from the grant, `key_need` the
+/// permission the call requires); a session takes the member path
+/// (workspace from `x-durable-workspace`, `role_need` the role the call
+/// requires, `write` also binds the CSRF + Origin checks). Neither
+/// credential answers 401.
+async fn flat_access(
+    app: &App,
+    parts: &Parts,
+    key_need: Permission,
+    role_need: Role,
+    write: bool,
+) -> Result<u64, ApiError> {
+    if let Some(key) = bearer(parts) {
+        // ATTACK(auth)
+        return match app.keyring.verify(key).await {
+            Verified::Granted(Principal::OpsKey) => Ok(0),
+            Verified::Granted(Principal::OpsRead) if key_need == Permission::Read => Ok(0),
+            Verified::Granted(Principal::StoreKey { ws, permission })
+                if key_need == Permission::Read || permission == Permission::Write =>
+            {
+                Ok(ws)
+            }
+            Verified::Granted(_) => Err(ApiError::new(
+                StatusCode::FORBIDDEN,
+                "forbidden",
+                "this key may only read; this route needs write",
+            )),
+            Verified::Denied => Err(unauthorized()),
+            Verified::Unavailable => Err(accounts_unavailable()),
+        };
+    }
+    let Some(store) = app.keyring.store.clone() else {
+        return Err(ApiError::new(
+            StatusCode::NOT_FOUND,
+            "unauthenticated",
+            "no account store is configured",
+        ));
+    };
+    let grant = session_grant_for(app, parts, &store).await?;
+    if write {
+        let presented = parts
+            .headers
+            .get("x-durable-csrf")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or_default();
+        if !csrf_ok(&grant.csrf_seed, presented) {
+            return Err(csrf_failed());
+        }
+        check_request_origin(parts)?;
+    }
+    let (ws, _) = flat_member(app, &grant, parts, role_need).await?;
+    Ok(ws.id)
+}
+
+/// Tiny shim: the flat handlers below were written against
+/// `Authorized(auth)`'s `auth.ws()` accessor — resolved now by
+/// `flat_access`/`flat_admin_access` into the same shape.
+struct FlatWs(u64);
+impl FlatWs {
+    fn ws(&self) -> u64 {
+        self.0
+    }
+}
+
+/// `/handler-secret` (D-073): the ops key or a session admin/owner —
+/// a data-plane key is refused outright even when it can write.
+async fn flat_admin_access(app: &App, parts: &Parts) -> Result<u64, ApiError> {
+    if let Some(key) = bearer(parts) {
+        return match app.keyring.verify(key).await {
+            Verified::Granted(Principal::OpsKey) => Ok(0),
+            Verified::Granted(_) => Err(ApiError::new(
+                StatusCode::FORBIDDEN,
+                "forbidden",
+                "handler-secret needs a session admin; data-plane keys cannot mint it",
+            )),
+            Verified::Denied => Err(unauthorized()),
+            Verified::Unavailable => Err(accounts_unavailable()),
+        };
+    }
+    let Some(store) = app.keyring.store.clone() else {
+        return Err(ApiError::new(
+            StatusCode::NOT_FOUND,
+            "unauthenticated",
+            "no account store is configured",
+        ));
+    };
+    let grant = session_grant_for(app, parts, &store).await?;
+    let presented = parts
+        .headers
+        .get("x-durable-csrf")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or_default();
+    if !csrf_ok(&grant.csrf_seed, presented) {
+        return Err(csrf_failed());
+    }
+    check_request_origin(parts)?;
+    let (ws, _) = flat_member(app, &grant, parts, Role::Admin).await?;
+    Ok(ws.id)
 }
 
 /// `dri_` + hex(32 B random). The store keeps sha256 only — the token
@@ -5635,13 +5951,32 @@ async fn delete_workspace_key(
 /// admin permission required (Authorized). The store is authoritative;
 /// each write lands in the engine's dispatch registry and the snapshot.
 async fn list_handlers(
-    Authorized(auth): Authorized,
     State(app): State<App>,
+    parts: Parts,
 ) -> Result<Json<serde_json::Value>, ApiError> {
+    let ws = flat_access(&app, &parts, Permission::Read, Role::Viewer, false).await?;
     let store = accounts(&app)?;
-    let regs = store.list_handlers(auth.ws()).await.map_err(store_err)?;
+    let regs = store.list_handlers(ws).await.map_err(store_err)?;
+    // Health percentiles ride the ws-scoped observer ring (1 h window) —
+    // the test-call columns come from the store row.
+    let index = app
+        .engine
+        .metrics_index(observe::Scope::Ws(ws))
+        .await
+        .unwrap_or_else(|_| durable_engine::shell::MetricsIndex {
+            counts: observe::IndexCounts::default(),
+            handlers: Vec::new(),
+        });
+    let names: Vec<String> = regs.iter().map(|r| r.name.clone()).collect();
+    let m = app.obs.metrics(
+        observe::Scope::Ws(ws),
+        Window::H1,
+        observe::wall_ms(),
+        index.counts,
+        &names,
+    );
     let mut handlers: Vec<serde_json::Value> = Vec::new();
-    if auth.ws() == 0 {
+    if ws == 0 {
         // Flag handlers are ws 0's too; a store row shadows them on a
         // name conflict (store rows push after, the map keeps the last).
         for (name, _) in app.flag_handlers.iter() {
@@ -5650,7 +5985,18 @@ async fn list_handlers(
     }
     for r in regs {
         handlers.retain(|h| h["name"] != r.name);
-        handlers.push(serde_json::json!({ "name": r.name, "url": r.url }));
+        let mstats = m.handlers.iter().find(|x| x.name == r.name);
+        handlers.push(serde_json::json!({
+            "name": r.name,
+            "url": r.url,
+            "health": {
+                "last_test_at_ms": r.last_test_at_ms,
+                "last_test_status": r.last_test_status,
+                "last_test_latency_ms": r.last_test_latency_ms,
+                "p50_ms": mstats.and_then(|x| x.step_ms.p50),
+                "p95_ms": mstats.and_then(|x| x.step_ms.p95),
+            },
+        }));
     }
     Ok(Json(serde_json::json!({ "handlers": handlers })))
 }
@@ -5718,11 +6064,13 @@ async fn registry_file_replace_ws(
 }
 
 async fn put_handler(
-    Authorized(auth): Authorized,
     State(app): State<App>,
+    parts: Parts,
     P(name): P<String>,
     Json(body): Json<PutHandlerReq>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
+    let ws_id = flat_access(&app, &parts, Permission::Write, Role::Member, true).await?;
+    let auth = FlatWs(ws_id);
     let store = accounts(&app)?;
     let name = name.trim();
     if name.is_empty() || name.len() > 128 || name.chars().any(char::is_control) {
@@ -5733,7 +6081,19 @@ async fn put_handler(
         ));
     }
     // ATTACK(tenant-register-policy)
-    let url = valid_handler_url(body.url.trim(), &app.handler_factory.store_policy)?;
+    let url = if name == BUILTIN_ECHO {
+        let u = body.url.trim();
+        if !u.is_empty() && u != BUILTIN_ECHO {
+            return Err(ApiError::new(
+                StatusCode::BAD_REQUEST,
+                "bad_handler_url",
+                "builtin:echo registers with url \"builtin:echo\" or an empty url",
+            ));
+        }
+        BUILTIN_ECHO.to_string()
+    } else {
+        valid_handler_url(body.url.trim(), &app.handler_factory.store_policy)?
+    };
     registry_rate(&app, auth.ws())?;
     // Finding 4: the bound check, the store write, the engine update and
     // the snapshot send are one critical section per workspace — a
@@ -5798,7 +6158,7 @@ async fn put_handler(
         .put_handler(
             auth.ws(),
             name,
-            app.handler_factory.make_signed(&url, secret.clone()),
+            arm_url(&app.handler_factory, &url, secret.clone()),
         )
         .await?;
     let saved = registry_file_upsert(
@@ -5825,9 +6185,11 @@ async fn put_handler(
 /// rotate takes effect without waiting for the reconciler. The secret
 /// is returned exactly once — verification needs it on the handler side.
 async fn rotate_handler_secret(
-    Authorized(auth): Authorized,
     State(app): State<App>,
+    parts: Parts,
 ) -> Result<Json<serde_json::Value>, ApiError> {
+    let ws_id = flat_admin_access(&app, &parts).await?;
+    let auth = FlatWs(ws_id);
     let store = accounts(&app)?;
     registry_rate(&app, auth.ws())?;
     // Bump before the store write — same epoch ordering as PUT (S3).
@@ -5864,7 +6226,7 @@ async fn rotate_handler_secret(
     for r in &regs {
         set.push((
             r.name.clone(),
-            app.handler_factory.make_signed(&r.url, shared.clone()),
+            arm_url(&app.handler_factory, &r.url, shared.clone()),
         ));
         entries.push(RegistryEntry {
             ws: auth.ws(),
@@ -5888,10 +6250,12 @@ async fn rotate_handler_secret(
 }
 
 async fn delete_handler(
-    Authorized(auth): Authorized,
     State(app): State<App>,
+    parts: Parts,
     P(name): P<String>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
+    let ws_id = flat_access(&app, &parts, Permission::Write, Role::Member, true).await?;
+    let auth = FlatWs(ws_id);
     let store = accounts(&app)?;
     registry_rate(&app, auth.ws())?;
     // Bump before the store write — same epoch ordering as PUT (S3).
@@ -5920,6 +6284,129 @@ async fn delete_handler(
     app.registry.remove(auth.ws(), &name);
     registry_file_remove(&app, auth.ws(), &name).await?;
     Ok(Json(serde_json::json!({ "deleted": name })))
+}
+
+#[derive(Deserialize)]
+struct TestCallReq {
+    input_b64: String,
+}
+
+/// The D-070 probe, shared by the flat and member routes: ONE call
+/// through the armed handler's own test path — the signed, SSRF-guarded
+/// HTTP request for an HTTP handler, `execute` in-process for
+/// `builtin:echo`, an honest `in_process` for anything else. Never
+/// journaled, never a run. Budgets: 30/hour per workspace (Free's
+/// bound; S3-4 reads the plan) + 10/minute per client address; the
+/// second strike 429s.
+async fn test_call_run(
+    app: &App,
+    ws: u64,
+    name: &str,
+    addr: std::net::IpAddr,
+    body: &[u8],
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let req: TestCallReq = serde_json::from_slice(body).map_err(|_| {
+        ApiError::new(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "bad_json",
+            "malformed JSON",
+        )
+    })?;
+    let input = base64_decode(&req.input_b64)
+        .map_err(|e| ApiError::new(StatusCode::UNPROCESSABLE_ENTITY, "bad_input", e))?;
+    if input.len() > 8 * 1024 {
+        return Err(ApiError::new(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "input_too_large",
+            "test input exceeds 8 KiB",
+        ));
+    }
+    {
+        let mut per = app.test_calls_ws.lock().unwrap_or_else(|e| e.into_inner());
+        let now = Instant::now();
+        if let Some(q) = per.get_mut(&ws) {
+            while q
+                .front()
+                .is_some_and(|t| now.duration_since(*t) > Duration::from_secs(3600))
+            {
+                q.pop_front();
+            }
+        }
+        if per.get(&ws).is_some_and(|q| q.len() >= 30) {
+            return Err(ApiError::new(
+                StatusCode::TOO_MANY_REQUESTS,
+                "test_call_limited",
+                "test calls are bounded to 30 per workspace per hour",
+            ));
+        }
+        if per.len() >= 10_000 && !per.contains_key(&ws) {
+            return Err(ApiError::new(
+                StatusCode::TOO_MANY_REQUESTS,
+                "test_call_limited",
+                "the probe budget table is full; retry",
+            ));
+        }
+        per.entry(ws).or_default().push_back(now);
+    }
+    if let Err(wait) = app
+        .test_calls_addr
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .check(addr, Instant::now())
+    {
+        return Err(ApiError::new(
+            StatusCode::TOO_MANY_REQUESTS,
+            "test_call_limited",
+            format!(
+                "test calls are bounded to 10 per client per minute; retry in {}s",
+                wait.as_secs().max(1)
+            ),
+        ));
+    }
+    let Some(handler) = app.engine.handler(ws, name).await else {
+        return Err(ApiError::new(
+            StatusCode::NOT_FOUND,
+            "not_found",
+            "no such handler in this workspace",
+        ));
+    };
+    let step = StepSpec {
+        name: "test".to_string(),
+        handler: name.to_string(),
+    };
+    let idem = format!("probe/{ws}/{name}/{}", observe::wall_ms());
+    let reply = handler.test_call(&step, &input, &idem).await;
+    // The row's test columns update when the registry knows the name —
+    // flag-registered names have no store row to write.
+    if let Ok(store) = accounts(app) {
+        let _ = store
+            .record_handler_test(
+                ws,
+                name,
+                observe::wall_ms() as i64,
+                reply.status,
+                reply.latency_ms as i64,
+            )
+            .await;
+    }
+    Ok(Json(serde_json::json!({
+        "status": reply.status,
+        "http_status": reply.http_status,
+        "latency_ms": reply.latency_ms,
+        "reply_excerpt_b64": base64::engine::general_purpose::STANDARD.encode(&reply.excerpt),
+    })))
+}
+
+/// `POST /handlers/{name}/test` — flat: ops key, ws key, or a session
+/// member of the `x-durable-workspace` workspace.
+async fn test_call_flat(
+    State(app): State<App>,
+    axum::extract::Path(name): axum::extract::Path<String>,
+    parts: Parts,
+    body: axum::body::Bytes,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let ws = flat_access(&app, &parts, Permission::Write, Role::Member, true).await?;
+    test_call_run(&app, ws, &name, client(&parts), &body).await
 }
 
 async fn compact(
@@ -6094,6 +6581,7 @@ fn router(app: App, ui_dir: Option<&Path>) -> Router {
             "/handlers/{name}",
             axum::routing::put(put_handler).delete(delete_handler),
         )
+        .route("/handlers/{name}/test", post(test_call_flat))
         .merge(observability)
         // A submit is at most 64 KiB of input (base64: ~88 KiB) plus its
         // spec; nothing legitimate comes near this.
@@ -6465,6 +6953,11 @@ async fn main() -> Result<()> {
         session_key: std::sync::Arc::new(pubid.derive_key(b"session-token-v1")),
         sessions: std::sync::Arc::new(SessionCache::new()),
         members: std::sync::Arc::new(MemberCache::new()),
+        test_calls_ws: std::sync::Arc::new(Mutex::new(HashMap::new())),
+        test_calls_addr: std::sync::Arc::new(Mutex::new(SlidingWindow::new(
+            10,
+            Duration::from_secs(60),
+        ))),
         argon: std::sync::Arc::new(ArgonQueue::new()),
         auth_limits: std::sync::Arc::new(AuthLimits::new()),
         lockouts: std::sync::Arc::new(LoginLockouts::new()),
@@ -7650,6 +8143,21 @@ mod tests {
         free: Option<Arc<std::sync::atomic::AtomicU64>>,
         store: Option<Arc<dyn AccountStore>>,
     ) -> Harness {
+        harness_store_local(with_backup_root, free, store, true)
+    }
+
+    /// `harness_store` with the shipped strict SSRF policy — every other
+    /// test wants loopback fixture handlers, this one wants the guard.
+    fn harness_strict(store: Option<Arc<dyn AccountStore>>) -> Harness {
+        harness_store_local(false, None, store, false)
+    }
+
+    fn harness_store_local(
+        with_backup_root: bool,
+        free: Option<Arc<std::sync::atomic::AtomicU64>>,
+        store: Option<Arc<dyn AccountStore>>,
+        allow_local: bool,
+    ) -> Harness {
         let journal = tempfile::tempdir().unwrap_or_else(|e| panic!("{e}"));
         let backups = tempfile::tempdir().unwrap_or_else(|e| panic!("{e}"));
         let mut reg = Registry::default();
@@ -7682,7 +8190,7 @@ mod tests {
             false,
             backup_root,
             journal.path(),
-            true,
+            allow_local,
         );
         Harness {
             router: router(app.clone(), None),
@@ -9369,7 +9877,7 @@ mod tests {
             .unwrap_or_else(|| panic!("workspace {pid}"))
             .id;
         register_step(&store, ws_id, &h.app.engine).await;
-        assert!(issued.starts_with("dr_"));
+        assert!(issued.starts_with("drk_"));
 
         let (status, v) = call(
             &h.router,
@@ -9767,12 +10275,14 @@ mod tests {
             )
             .await
             .unwrap_or_else(|e| panic!("{e}"));
-        let h = harness_store(true, None, Some(store));
+        let h = harness_store(true, None, Some(store.clone()));
         let epoch = || {
             h.app
                 .registry_epoch
                 .load(std::sync::atomic::Ordering::Acquire)
         };
+        // D-073: rotate is session-admin only — seat one on ws `a`.
+        let (cookie, csrf, pid) = session_admin_on(&h.router, &store, &a, "adm@x.co").await;
         let e0 = epoch();
         for (method, uri, body) in [
             (
@@ -9781,11 +10291,19 @@ mod tests {
                 Some(json!({ "url": "http://127.0.0.1:9/x" })),
             ),
             ("DELETE", "/handlers/h", None),
-            ("POST", "/handler-secret", None),
         ] {
             let (status, v) = call(&h.router, method, uri, Some(key_a), body).await;
             assert_eq!(status, StatusCode::OK, "{method} {uri}: {v}");
         }
+        let (status, _, v) = raw(
+            &h.router,
+            "POST",
+            "/handler-secret",
+            &ws_headers(&cookie, &csrf, &pid),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{v}");
         assert_eq!(epoch() - e0, 3, "PUT + DELETE + rotate each bump once");
     }
 
@@ -10167,6 +10685,18 @@ mod tests {
         ) -> Result<(), AccountError> {
             self.inner.put_handler(workspace, name, url).await
         }
+        async fn record_handler_test(
+            &self,
+            workspace: u64,
+            name: &str,
+            at_ms: i64,
+            status: &str,
+            latency_ms: i64,
+        ) -> Result<bool, AccountError> {
+            self.inner
+                .record_handler_test(workspace, name, at_ms, status, latency_ms)
+                .await
+        }
         async fn delete_handler(&self, workspace: u64, name: &str) -> Result<bool, AccountError> {
             if workspace == self.ws {
                 self.deleting.trip().await;
@@ -10531,6 +11061,18 @@ mod tests {
         ) -> Result<(), AccountError> {
             self.bump();
             self.inner.put_handler(workspace, name, url).await
+        }
+        async fn record_handler_test(
+            &self,
+            workspace: u64,
+            name: &str,
+            at_ms: i64,
+            status: &str,
+            latency_ms: i64,
+        ) -> Result<bool, AccountError> {
+            self.inner
+                .record_handler_test(workspace, name, at_ms, status, latency_ms)
+                .await
         }
         async fn delete_handler(&self, workspace: u64, name: &str) -> Result<bool, AccountError> {
             self.bump();
@@ -10999,9 +11541,29 @@ mod tests {
                 .and_then(|e| e.secret)
         };
         let old = secret_in_file();
+        // D-073: rotate is session-admin only — seat one on ws A.
+        let a_ws = {
+            let inner = &_store.inner;
+            inner
+                .list_workspaces(100, None)
+                .await
+                .unwrap_or_else(|e| panic!("{e}"))
+                .into_iter()
+                .find(|w| w.name == "ra")
+                .unwrap_or_else(|| panic!("ws A"))
+        };
+        let (cookie, csrf, pid) =
+            session_admin_on(&h.router, &_store.inner, &a_ws, "adm@x.co").await;
         {
             let _block = SaveBlock::on(&h);
-            let (status, v) = call(&h.router, "POST", "/handler-secret", Some(key_a), None).await;
+            let (status, _, v) = raw(
+                &h.router,
+                "POST",
+                "/handler-secret",
+                &ws_headers(&cookie, &csrf, &pid),
+                None,
+            )
+            .await;
             assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{v}");
         }
         let (status, v) = put_h(&h, key_a, "http://127.0.0.1:9/a").await;
@@ -14721,8 +15283,17 @@ mod tests {
         .await;
         assert_eq!(status, StatusCode::OK, "{v}");
 
-        // Rotate: the new secret comes back once, and differs.
-        let (status, v) = call(&h.router, "POST", "/handler-secret", Some(key_a), None).await;
+        // Rotate (D-073: session admin on ws `a`): the new secret comes
+        // back once, and differs.
+        let (cookie, csrf, pid) = session_admin_on(&h.router, &store, &a, "adm@x.co").await;
+        let (status, _, v) = raw(
+            &h.router,
+            "POST",
+            "/handler-secret",
+            &ws_headers(&cookie, &csrf, &pid),
+            None,
+        )
+        .await;
         assert_eq!(status, StatusCode::OK, "{v}");
         let new_secret = unhex(v["secret"].as_str().unwrap_or(""))
             .unwrap_or_else(|| panic!("rotation must return the new secret once: {v}"));
@@ -17034,6 +17605,44 @@ mod tests {
 
     // ---- S3-3: workspaces, members, roles, invites -------------------
 
+    /// Sign up + verify + log in `email`, then seat it as an ADMIN member
+    /// of `ws` — a store-level invite + accept, the D-073 way a rotate
+    /// targets a store-made workspace.
+    async fn session_admin_on(
+        router: &Router,
+        store: &Memory,
+        ws: &durable_accounts::Workspace,
+        email: &str,
+    ) -> (String, String, String) {
+        signup_and_verify(router, store, email, "a-long-enough-passphrase").await;
+        let (cookie, csrf) = login_only(router, email, "a-long-enough-passphrase").await;
+        let acc = store
+            .account_by_email(email)
+            .await
+            .unwrap_or_else(|e| panic!("{e}"))
+            .unwrap_or_else(|| panic!("account"));
+        let token = mint_invite_token();
+        let now = observe::wall_ms() as i64;
+        let invite = store
+            .create_invite(
+                ws.id,
+                email,
+                Role::Admin,
+                acc.id,
+                &sha256(token.as_bytes()),
+                now + 60_000,
+            )
+            .await
+            .unwrap_or_else(|e| panic!("{e}"));
+        assert!(invite.is_some(), "the invite row must mint");
+        let seated = store
+            .accept_invite(&sha256(token.as_bytes()), acc.id, now)
+            .await
+            .unwrap_or_else(|e| panic!("{e}"));
+        assert!(seated.is_some(), "the accept must seat the admin row");
+        (cookie, csrf, ws.public_id.to_string())
+    }
+
     /// Create `name` as `cookie`'s workspace; returns its public_id.
     async fn make_ws(router: &Router, cookie: &str, name: &str) -> String {
         let (st, _, v) = raw(
@@ -17770,5 +18379,366 @@ mod tests {
             .await
             .unwrap_or_else(|e| panic!("{e}"));
         assert!(keys[0].last_used_at_ms.is_some(), "the flush landed");
+    }
+
+    // ---- S3-6: handlers management + the builtin:echo test call ------
+
+    /// A session caller on a flat route names its workspace in
+    /// `x-durable-workspace`.
+    fn ws_headers(cookie: &str, csrf: &str, pid: &str) -> [(&'static str, String); 3] {
+        [
+            ("cookie", cookie.to_string()),
+            ("x-durable-csrf", csrf.to_string()),
+            ("x-durable-workspace", pid.to_string()),
+        ]
+    }
+
+    /// The D-070 probe on the in-process builtin: a member registers
+    /// `builtin:echo` by name, the test call echoes the input in-process
+    /// (no network hop), and a ws write key can probe the same handler.
+    #[tokio::test]
+    async fn s36_testcall_echo() {
+        let store = Arc::new(Memory::new());
+        let h = harness_store(false, None, Some(store.clone()));
+        signup_and_verify(&h.router, &store, "o@o.co", "a-long-enough-passphrase").await;
+        let (cookie, csrf) = login_only(&h.router, "o@o.co", "a-long-enough-passphrase").await;
+        let pid = make_ws(&h.router, &cookie, "alpha").await;
+
+        let (st, _, v) = raw(
+            &h.router,
+            "PUT",
+            "/handlers/builtin:echo",
+            &ws_headers(&cookie, &csrf, &pid),
+            Some(json!({"url": "builtin:echo"})),
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK, "{v}");
+        // GET lists it without any secret material.
+        let (st, _, v) = raw(
+            &h.router,
+            "GET",
+            "/handlers",
+            &[
+                ("cookie", cookie.clone()),
+                ("x-durable-workspace", pid.clone()),
+            ],
+            None,
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK, "{v}");
+        assert_eq!(v["handlers"][0]["name"], "builtin:echo");
+        assert!(v["handlers"][0].get("handler_secret").is_none(), "{v}");
+
+        // Session probe: echoes the input, bounded excerpt, no run.
+        let input = base64::engine::general_purpose::STANDARD.encode(b"ping-body");
+        let (st, _, v) = raw(
+            &h.router,
+            "POST",
+            "/handlers/builtin:echo/test",
+            &ws_headers(&cookie, &csrf, &pid),
+            Some(json!({"input_b64": input})),
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK, "{v}");
+        assert_eq!(v["status"], "ok", "{v}");
+        assert!(v["latency_ms"].is_number(), "{v}");
+        let excerpt = base64::engine::general_purpose::STANDARD
+            .decode(v["reply_excerpt_b64"].as_str().unwrap_or_default())
+            .unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(excerpt, b"ping-body");
+        // A write key probes the same armed handler.
+        let (_, key) = make_key(&h.router, &cookie, &csrf, &pid, "write").await;
+        let (st, _, v) = raw(
+            &h.router,
+            "POST",
+            "/handlers/builtin:echo/test",
+            &[("authorization", format!("Bearer {key}"))],
+            Some(json!({"input_b64": input})),
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK, "{v}");
+        assert_eq!(v["status"], "ok", "{v}");
+        // The row's test columns updated: GET shows last_test_status ok.
+        let (st, _, v) = raw(
+            &h.router,
+            "GET",
+            "/handlers",
+            &[("authorization", format!("Bearer {key}"))],
+            None,
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK, "{v}");
+        assert_eq!(v["handlers"][0]["health"]["last_test_status"], "ok", "{v}");
+        assert!(
+            v["handlers"][0]["health"]["last_test_at_ms"].is_number(),
+            "{v}"
+        );
+    }
+
+    /// ssrf-testcall: a private target is refused at registration —
+    /// nothing is ever armed, so zero packets can reach it — and a test
+    /// call on an unarmed name answers 404.
+    #[tokio::test]
+    async fn s36_ssrf_testcall() {
+        let store = Arc::new(Memory::new());
+        let h = harness_strict(Some(store.clone()));
+        signup_and_verify(&h.router, &store, "o@o.co", "a-long-enough-passphrase").await;
+        let (cookie, csrf) = login_only(&h.router, "o@o.co", "a-long-enough-passphrase").await;
+        let pid = make_ws(&h.router, &cookie, "alpha").await;
+
+        for target in [
+            "http://127.0.0.1:9/h",
+            "http://169.254.169.254/latest",
+            "http://[::1]:9/h",
+            "http://10.0.0.1/h",
+        ] {
+            let (st, _, v) = raw(
+                &h.router,
+                "PUT",
+                "/handlers/probe",
+                &ws_headers(&cookie, &csrf, &pid),
+                Some(json!({"url": target})),
+            )
+            .await;
+            assert_eq!(st, StatusCode::UNPROCESSABLE_ENTITY, "{target}: {v}");
+            assert_eq!(v["code"], "local_target_forbidden", "{target}: {v}");
+        }
+        let (st, _, v) = raw(
+            &h.router,
+            "GET",
+            "/handlers",
+            &[
+                ("cookie", cookie.clone()),
+                ("x-durable-workspace", pid.clone()),
+            ],
+            None,
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK, "{v}");
+        assert_eq!(v["handlers"].as_array().map(|x| x.len()), Some(0), "{v}");
+        let (st, _, v) = raw(
+            &h.router,
+            "POST",
+            "/handlers/probe/test",
+            &ws_headers(&cookie, &csrf, &pid),
+            Some(json!({"input_b64": "aGk="})),
+        )
+        .await;
+        assert_eq!(st, StatusCode::NOT_FOUND, "{v}");
+    }
+
+    /// testcall-abuse: the per-client bound strikes before the
+    /// workspace's hourly one — the 11th call in a burst 429s with a
+    /// Retry-After-shaped refusal, and an already-registered handler is
+    /// unaffected.
+    #[tokio::test]
+    async fn s36_testcall_abuse() {
+        let store = Arc::new(Memory::new());
+        let h = harness_store(false, None, Some(store.clone()));
+        signup_and_verify(&h.router, &store, "o@o.co", "a-long-enough-passphrase").await;
+        let (cookie, csrf) = login_only(&h.router, "o@o.co", "a-long-enough-passphrase").await;
+        let pid = make_ws(&h.router, &cookie, "alpha").await;
+        let (_, key) = make_key(&h.router, &cookie, &csrf, &pid, "write").await;
+        let (st, _, v) = raw(
+            &h.router,
+            "PUT",
+            "/handlers/builtin:echo",
+            &[("authorization", format!("Bearer {key}"))],
+            Some(json!({"url": "builtin:echo"})),
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK, "{v}");
+        for i in 0..10 {
+            let (st, _, v) = raw(
+                &h.router,
+                "POST",
+                "/handlers/builtin:echo/test",
+                &[("authorization", format!("Bearer {key}"))],
+                Some(json!({"input_b64": "aGk="})),
+            )
+            .await;
+            assert_eq!(st, StatusCode::OK, "call {i}: {v}");
+        }
+        let (st, _, v) = raw(
+            &h.router,
+            "POST",
+            "/handlers/builtin:echo/test",
+            &[("authorization", format!("Bearer {key}"))],
+            Some(json!({"input_b64": "aGk="})),
+        )
+        .await;
+        assert_eq!(st, StatusCode::TOO_MANY_REQUESTS, "{v}");
+        assert_eq!(v["code"], "test_call_limited", "{v}");
+    }
+
+    /// secret-in-get: the workspace signing secret is shown exactly once
+    /// (create/rotate); no GET surface can be made to carry it.
+    #[tokio::test]
+    async fn s36_secret_in_get() {
+        let store = Arc::new(Memory::new());
+        let h = harness_store(false, None, Some(store.clone()));
+        signup_and_verify(&h.router, &store, "o@o.co", "a-long-enough-passphrase").await;
+        let (cookie, csrf) = login_only(&h.router, "o@o.co", "a-long-enough-passphrase").await;
+        let pid = make_ws(&h.router, &cookie, "alpha").await;
+        // Rotate once so the live secret is a value we hold.
+        let (st, _, v) = raw(
+            &h.router,
+            "POST",
+            "/handler-secret",
+            &ws_headers(&cookie, &csrf, &pid),
+            None,
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK, "{v}");
+        let secret = v["secret"].as_str().unwrap_or_default().to_string();
+        assert!(secret.len() >= 32, "{v}");
+        for uri in ["/handlers", "/workspaces", &format!("/workspaces/{pid}")] {
+            let (st, _, v) = raw(
+                &h.router,
+                "GET",
+                uri,
+                &[
+                    ("cookie", cookie.clone()),
+                    ("x-durable-workspace", pid.clone()),
+                ],
+                None,
+            )
+            .await;
+            assert_eq!(st, StatusCode::OK, "{uri}: {v}");
+            assert!(
+                !v.to_string().contains(&secret),
+                "{uri} carried the signing secret"
+            );
+        }
+    }
+
+    /// handler-secret-key: data-plane keys — even write — can never
+    /// rotate the signing secret; a session admin can.
+    #[tokio::test]
+    async fn s36_handler_secret_key() {
+        let store = Arc::new(Memory::new());
+        let h = harness_store(false, None, Some(store.clone()));
+        signup_and_verify(&h.router, &store, "o@o.co", "a-long-enough-passphrase").await;
+        let (cookie, csrf) = login_only(&h.router, "o@o.co", "a-long-enough-passphrase").await;
+        let pid = make_ws(&h.router, &cookie, "alpha").await;
+        let (_, key) = make_key(&h.router, &cookie, &csrf, &pid, "write").await;
+        let (st, _, v) = raw(
+            &h.router,
+            "POST",
+            "/handler-secret",
+            &[("authorization", format!("Bearer {key}"))],
+            None,
+        )
+        .await;
+        assert_eq!(st, StatusCode::FORBIDDEN, "{v}");
+        // A read key gets the same refusal, not a weaker one.
+        let (_, rkey) = make_key(&h.router, &cookie, &csrf, &pid, "read").await;
+        let (st, _, _) = raw(
+            &h.router,
+            "POST",
+            "/handler-secret",
+            &[("authorization", format!("Bearer {rkey}"))],
+            None,
+        )
+        .await;
+        assert_eq!(st, StatusCode::FORBIDDEN);
+    }
+
+    /// Member roles on the flat surface: a member PUTs and GETs; a
+    /// viewer can GET but not PUT/DELETE; a non-member session gets 404
+    /// (the pid never leaks).
+    #[tokio::test]
+    async fn s36_member_handlers() {
+        let store = Arc::new(Memory::new());
+        let h = harness_store(false, None, Some(store.clone()));
+        signup_and_verify(&h.router, &store, "o@o.co", "a-long-enough-passphrase").await;
+        let (cookie, csrf) = login_only(&h.router, "o@o.co", "a-long-enough-passphrase").await;
+        let pid = make_ws(&h.router, &cookie, "alpha").await;
+
+        signup_and_verify(&h.router, &store, "m@m.co", "a-long-enough-passphrase").await;
+        let (mc, mcsrf) = login_only(&h.router, "m@m.co", "a-long-enough-passphrase").await;
+        let (_, _, token) = make_invite(&h.router, &cookie, &csrf, &pid, "m@m.co", "member").await;
+        let (st, _, v) = raw(
+            &h.router,
+            "POST",
+            "/invites/accept",
+            &[("cookie", mc.clone()), ("x-durable-csrf", mcsrf.clone())],
+            Some(json!({"token": token})),
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK, "{v}");
+        let (st, _, v) = raw(
+            &h.router,
+            "PUT",
+            "/handlers/builtin:echo",
+            &ws_headers(&mc, &mcsrf, &pid),
+            Some(json!({"url": "builtin:echo"})),
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK, "{v}");
+
+        signup_and_verify(&h.router, &store, "v@v.co", "a-long-enough-passphrase").await;
+        let (vc, vcsrf) = login_only(&h.router, "v@v.co", "a-long-enough-passphrase").await;
+        let (_, _, vtok) = make_invite(&h.router, &cookie, &csrf, &pid, "v@v.co", "viewer").await;
+        let (st, _, _) = raw(
+            &h.router,
+            "POST",
+            "/invites/accept",
+            &[("cookie", vc.clone()), ("x-durable-csrf", vcsrf.clone())],
+            Some(json!({"token": vtok})),
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK);
+        let (st, _, v) = raw(
+            &h.router,
+            "GET",
+            "/handlers",
+            &[("cookie", vc.clone()), ("x-durable-workspace", pid.clone())],
+            None,
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK, "{v}");
+        let (st, _, v) = raw(
+            &h.router,
+            "PUT",
+            "/handlers/viewer-put",
+            &ws_headers(&vc, &vcsrf, &pid),
+            Some(json!({"url": "builtin:echo"})),
+        )
+        .await;
+        assert_eq!(st, StatusCode::FORBIDDEN, "{v}");
+        let (st, _, v) = raw(
+            &h.router,
+            "DELETE",
+            "/handlers/builtin:echo",
+            &ws_headers(&vc, &vcsrf, &pid),
+            None,
+        )
+        .await;
+        assert_eq!(st, StatusCode::FORBIDDEN, "{v}");
+
+        // A session with no membership in pid: every flat route 404s the
+        // workspace, never 403s the route.
+        signup_and_verify(&h.router, &store, "x@x.co", "a-long-enough-passphrase").await;
+        let (xc, xcsrf) = login_only(&h.router, "x@x.co", "a-long-enough-passphrase").await;
+        for (method, uri) in [
+            ("GET", "/handlers"),
+            ("PUT", "/handlers/x"),
+            ("DELETE", "/handlers/builtin:echo"),
+        ] {
+            let (st, _, v) = raw(
+                &h.router,
+                method,
+                uri,
+                &ws_headers(&xc, &xcsrf, &pid),
+                if method == "PUT" {
+                    Some(json!({"url": "builtin:echo"}))
+                } else {
+                    None
+                },
+            )
+            .await;
+            assert_eq!(st, StatusCode::NOT_FOUND, "{method} {uri}: {v}");
+        }
     }
 }

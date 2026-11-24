@@ -455,7 +455,8 @@ impl AccountStore for Pg {
     ) -> Result<Vec<HandlerRegistration>, AccountError> {
         let rows = bounded(
             sqlx::query(
-                "SELECT name, url FROM handler_registrations \
+                "SELECT name, url, last_test_at, last_test_status, last_test_latency_ms \
+                 FROM handler_registrations \
                  WHERE workspace_id = $1 ORDER BY name",
             )
             .bind(to_i64(workspace, "workspace")?)
@@ -467,6 +468,11 @@ impl AccountStore for Pg {
                 Ok(HandlerRegistration {
                     name: row.try_get("name")?,
                     url: row.try_get("url")?,
+                    last_test_at_ms: row
+                        .try_get::<Option<time::OffsetDateTime>, _>("last_test_at")?
+                        .map(ms),
+                    last_test_status: row.try_get("last_test_status")?,
+                    last_test_latency_ms: row.try_get("last_test_latency_ms")?,
                 })
             })
             .collect()
@@ -514,6 +520,32 @@ impl AccountStore for Pg {
         }
         bounded(tx.commit()).await?;
         Ok(())
+    }
+
+    async fn record_handler_test(
+        &self,
+        workspace: u64,
+        name: &str,
+        at_ms: i64,
+        status: &str,
+        latency_ms: i64,
+    ) -> Result<bool, AccountError> {
+        let n = bounded(
+            sqlx::query(
+                "UPDATE handler_registrations \
+                 SET last_test_at = $3, last_test_status = $4, last_test_latency_ms = $5 \
+                 WHERE workspace_id = $1 AND name = $2",
+            )
+            .bind(to_i64(workspace, "workspace")?)
+            .bind(name)
+            .bind(ts(at_ms))
+            .bind(status)
+            .bind(latency_ms)
+            .execute(&self.pool),
+        )
+        .await?
+        .rows_affected();
+        Ok(n > 0)
     }
 
     async fn delete_handler(&self, workspace: u64, name: &str) -> Result<bool, AccountError> {
@@ -1990,7 +2022,10 @@ mod tests {
                 .unwrap_or_else(|e| panic!("list: {e}")),
             vec![HandlerRegistration {
                 name: "h".into(),
-                url: "https://a.example/h2".into()
+                url: "https://a.example/h2".into(),
+                last_test_at_ms: None,
+                last_test_status: None,
+                last_test_latency_ms: None,
             }]
         );
         assert!(store

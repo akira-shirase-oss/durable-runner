@@ -152,6 +152,13 @@ CREATE UNIQUE INDEX api_keys_public_id ON api_keys (public_id);
 -- most one UPDATE per key per tick — no per-request writes.
 ALTER TABLE api_keys ADD COLUMN last_used_at TIMESTAMPTZ;
 
+-- D-070: handler health columns — the last test call's stamp, its
+-- verdict and its latency; percentiles come from the observer rings.
+ALTER TABLE handler_registrations
+    ADD COLUMN last_test_at TIMESTAMPTZ,
+    ADD COLUMN last_test_status TEXT,
+    ADD COLUMN last_test_latency_ms BIGINT;
+
 -- The mail outbox (D-068): every mail is a row written in the same
 -- transaction as the fact that needs it, so a lost send is a pending
 -- row, never a lost mail. The claim transition pending -> sending is
