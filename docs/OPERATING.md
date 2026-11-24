@@ -209,7 +209,8 @@ target/release/durable-server \
   (`cargo build --features lab`) has `--allow-local-tenant-handlers`, for
   the workspace load scenario's loopback fixtures; `scripts/check.sh`
   refuses a default build that enables it, and `install.sh`, `upgrade.sh`
-  and `smoke.sh` refuse a lab binary (`deploy/lab-build-guard.sh`, D-062). **This host's own addresses are refused too** (D-061): at startup
+  and `smoke.sh` refuse a lab binary, as do `rollback.sh` and every start
+  through `durable-run` (`deploy/lab-build-guard.sh`, D-062). **This host's own addresses are refused too** (D-061): at startup
   the server lists every interface address, both families — the
   droplet's public IPv4/IPv6 included — and refuses them with the local
   blocks, because Linux delivers a connection to the host's own public
