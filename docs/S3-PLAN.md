@@ -251,7 +251,10 @@ ALTER TABLE accounts ADD CONSTRAINT accounts_email_lc
 -- expiry, revocation, rotation linkage, CSRF token, bookkeeping.
 ALTER TABLE sessions
     ADD COLUMN public_id UUID NOT NULL DEFAULT gen_random_uuid(),
-    ADD COLUMN csrf_seed BYTEA NOT NULL DEFAULT '\x00',
+    -- No default (review #11): a NULL-able or defaulted seed would mint
+    -- the publicly computable CSRF token HMAC(zero, "csrf") for any row
+    -- that forgot to bind it.
+    ADD COLUMN csrf_seed BYTEA NOT NULL CHECK (octet_length(csrf_seed) = 32),
     ADD COLUMN last_seen_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     ADD COLUMN idle_expires_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     ADD COLUMN revoked_at TIMESTAMPTZ,
@@ -283,6 +286,11 @@ CREATE TABLE email_tokens (
     kind TEXT NOT NULL CHECK (kind IN ('verify','reset')),
     token_hash BYTEA NOT NULL UNIQUE,     -- sha256 of the mailed value
     sent_to TEXT NOT NULL,                -- the address the token went to
+    -- The sign-up's password hash, pending (review #2): verify installs
+    -- the password of the sign-up whose mail was actually opened, so a
+    -- later re-sign-up always wins and a pre-registration attacker's
+    -- credential never survives verification.
+    password_hash TEXT,
     created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     expires_at TIMESTAMPTZ NOT NULL,
     used_at TIMESTAMPTZ,
@@ -309,6 +317,23 @@ CREATE TABLE invites (
 );
 CREATE UNIQUE INDEX invites_pending ON invites (workspace_id, email)
     WHERE accepted_at IS NULL AND revoked_at IS NULL;
+
+-- Review #4c/#17: ws 0 is the ops plane, never a tenant. Membership and
+-- invites can only exist for tenant workspaces (id <> 0), so no session
+-- principal can ever resolve to the ops workspace through a member row.
+ALTER TABLE members
+    ADD CONSTRAINT members_ws_nonzero CHECK (workspace_id <> 0);
+ALTER TABLE invites
+    ADD CONSTRAINT invites_ws_nonzero CHECK (workspace_id <> 0);
+
+-- Review S3: api_keys.id (sequential) crossed GET …/keys; add the same
+-- public_id indirection every other entity has (exposed in S3-5).
+ALTER TABLE api_keys
+    ADD COLUMN public_id UUID,
+    ADD COLUMN created_by BIGINT REFERENCES accounts (id);
+UPDATE api_keys SET public_id = gen_random_uuid() WHERE public_id IS NULL;
+ALTER TABLE api_keys ALTER COLUMN public_id SET NOT NULL;
+CREATE UNIQUE INDEX api_keys_public_id ON api_keys (public_id);
 
 -- Transactional mail. Enqueued in the same transaction as the fact that
 -- needs it; the drain worker owns status transitions.
@@ -418,9 +443,20 @@ unbounded read on a hot path.
   the larger parameters buy margin the threat model doesn't need at
   friends-beta scale, and the parameter set is a config constant that
   can be raised once measured (recorded in the decision entry).
-- **Never on an async worker** — verify and hash are CPU-bound and hold
-  tens of MiB; `spawn_blocking` + a semaphore bounds both CPU and
-  memory, and a 6th concurrent auth request waits rather than balloons.
+- **Never on an async worker, and the queue is bounded** (review #9):
+  the semaphore permit is acquired on the async side *before*
+  `spawn_blocking` (blocking-pool threads never park on auth work);
+  at most ~32 waiters, each waiting ≤ 2 s — beyond either bound the
+  request is refused `503 busy` + `Retry-After`. One argon2 job per
+  client address at a time (a second concurrent request from the same
+  address → `503 busy`); rate-limit, body and shape checks all run
+  before the permit. (Reserve-1-permit for known-device cookies rides
+  with the S3-2 lockout mechanics.)
+- **Signup hashes on every branch** (review S3): the argon2 hash runs
+  before `store.signup` is called, so Created / VerifyResent / Taken
+  all cost the same work — the branch is not a timing oracle. Forgot/
+  resend do their store work *after* the identical 202 is composed
+  (same reason, S3-1).
 - Constant-work for unknown accounts: a login attempt for an email with
   no account verifies against a **dummy PHC string** (a fixed argon2id
   hash of a fixed input), so "email exists" is not a timing oracle.
@@ -453,8 +489,15 @@ unbounded read on a hot path.
 
 ### Sessions (D-060)
 
-- Token: 32 random bytes → cookie value `drs_<64 hex>`; store SHA-256.
-  The `drs_` prefix lets a misrouted bearer be denied cheaply.
+- Token: `drs_` + hex(16 B random ∥ 16 B tag) where
+  `tag = HMAC-SHA256(session_key, random)[..16]` — **self-authenticating**
+  (review #8): a forged value fails the tag before any store I/O, so a
+  random-token flood can never reach the Neon pool. The store keeps
+  SHA-256 of the whole token as today. `session_key` is derived
+  server-side from the journal's `public_id.key` via
+  `HMAC(key, "session-token-v1")` — one secret file, domain-separated.
+  New-format API keys get the same tagged shape (`drk_`, S3-5); legacy
+  `dr_` keys keep verifying through the store until rotated.
 - `sessions`: `idle_expires_at` = now+14 d, slid forward on use;
   `expires_at` = created+30 d (absolute, never slides); `revoked_at` for
   logout/revoke; `replaced_by` chains rotations.
@@ -464,12 +507,33 @@ unbounded read on a hot path.
   revoke the session's siblings and mint new (a stale session after a
   privilege change is the classic session-fixation-adjacent hole).
 - Revoke-all: `POST /me/sessions/revoke-all` revokes every session
-  except the current one; password reset/change revokes **all**
-  (including current — the reset response sets a fresh session after
-  `POST /auth/reset`).
+  except the current one; password reset/change **and email verify**
+  revoke **all** (including current — the reset response sets a fresh
+  session after `POST /auth/reset`; verify never sets a cookie at all,
+  so a mailed link can never sign the opener's browser in as the
+  account — review #17). Re-sign-up of an unverified address also
+  revokes its sessions (the pre-registration takeover's second leg).
 - `last_seen_at` flushes per D-067 (60 s flush; idle-expiry checks use
   the flushed value — a session may over-live by ≤ 60 s + flush lag,
   documented).
+- **Cache-fill generations (review #10).** Every cache filled after an
+  `await` records `(invalidation-key, fill-start)`: a bump logged for
+  the same key inside the await window means the fetched value
+  post-dates nothing — the fill is dropped and the answer denied
+  rather than served stale. Bumps: `revoke_session`/`revoke-all`
+  (session token / account), `revoke_key`/`rotate_handler_secret`/
+  `delete_workspace` (key hash / workspace), `remove_member`/`demote`
+  (membership). The bump log is a bounded in-memory vec (~60 s of
+  entries, matching the grant TTL) — overflow clears the cache, which
+  is a safe global invalidation. Hits check their key's latest bump
+  too: an entry older than its invalidation counts as a miss.
+- **Verify/reset revoke semantics:** `POST /auth/verify` consumes the
+  token in one transaction that installs the token's pending password
+  hash, sets `email_verified_at` and revokes every session of the
+  account — and sets **no cookie**. `POST /auth/reset` revokes all and
+  sets a fresh session **only when the request carries no session
+  cookie or the cookie is for the same account** (never signs a
+  different signed-in browser over).
 - Per-account session cap: 20 live sessions; the 21st sign-in evicts the
   oldest-idle (LRU), never refuses — a cap that refuses is a self-DoS.
 - Max absolute lifetime bounds "stolen laptop" exposure; idle bounds
@@ -484,9 +548,19 @@ unbounded read on a hot path.
 - Every cookie-authenticated non-GET must send `x-durable-csrf:
   <token>`; the server recomputes and compares constant-time.
   Missing/wrong → `403 csrf_failed`.
-- Additionally, if `Origin` is present it must equal the service origin;
-  if `Sec-Fetch-Site` is present it must be `same-origin`/`none`.
-- Bearer-key calls skip CSRF entirely.
+- Additionally, if `Origin` is present its authority must equal the
+  request `Host`; if `Sec-Fetch-Site` is present it must be
+  `same-origin`/`none` (`same-site` is refused — sibling subdomains are
+  not the origin).
+- **The same Origin/Sec-Fetch-Site check runs on every unauthenticated
+  `/auth` POST** (signup/login/forgot/reset/verify) — review #17: with
+  no session the synchroniser token cannot exist, so the origin check
+  is the CSRF layer there. JSON-only bodies (`J<T>` → 415 on
+  form-encoded) and no CORS layer are the other two invariants.
+- Bearer-key calls skip CSRF — but **when any `Authorization` header is
+  present the request resolves as bearer only** (review S3): no cookie
+  fallback, so a `drs_` bearer and a `dr_` cookie both just 401. The
+  CSRF exemption follows the resolved principal, not the header.
 
 ### Enumeration resistance
 
@@ -507,10 +581,10 @@ unbounded read on a hot path.
 |---|---|---|
 | `POST /auth/signup` | 5/hour, 20/day | per address (IP) |
 | `POST /auth/login` | 10/min | per address |
-| login failures | 10 / 10 min → 15-min cool-off + owner notice mail | per account |
+| login failures | 10 / 10 min → 15-min cool-off | per (email, client /24-or-/64), in-memory bounded counters — keyed by normalized email **whether or not the account exists** so 429-vs-401 is not an oracle (review #13); a known-device cookie bypasses the cool-off; a successful reset clears it; the owner notice mail rides the per-(address,kind) budget, at most once a day |
 | `POST /auth/forgot`, `/auth/resend-verification` | 5/hour | per address |
 | `POST /auth/verify`, `/auth/reset`, `/invites/accept` | 20/min | per address |
-| outbound mail | 3/hour | per email address (outbox) |
+| outbound mail | 3/hour per (address, kind) — newest replaces pending | per email address (outbox); plus a **global** daily budget with a circuit breaker (review #14) |
 | invites | 20/day | per workspace |
 | handler test calls | plan value (Free: 30/hour) | per workspace + 10/min/address |
 
@@ -523,13 +597,29 @@ in front of all of it.
 
 ## The authorization matrix
 
-Principal kinds: **ops key** (`DURABLE_API_KEY`, ws-0 admin),
-**write key** / **read key** (per-workspace store keys; `admin` stays
-the stored value, `write` is the API/UI word — boundary translation
-per ruling 3, no data migration), **session role**
-(owner/admin/member/viewer, resolved per `x-durable-workspace`).
+Principal kinds (review #4 — one enum, no collapsing):
+`Principal { OpsKey, OpsRead, StoreKey { ws, Write|Read },
+Member { account, ws, role } }`. The env keys (`DURABLE_API_KEY`,
+`DURABLE_READ_KEY`) are the ops plane: they grant `OpsKey`/`OpsRead`
+**only on the loopback `--ops-listen` listener** on a SaaS deployment
+(ruling 2'); with no `--ops-listen` flag (self-host/dev) they keep
+working on the main listener, exactly like v1.0.x/S2. Store keys carry
+`Write|Read` — the Rust enum is `Permission::{Write, Read}`; `admin`
+stays the stored string, `write` is the API/UI word (ruling 3).
+`ops_admin` matches `OpsKey` only — a store key on ws 0 can never reach
+`/admin/*`. A session resolves to `Member{…}` only through a member
+row; `CHECK (workspace_id <> 0)` means no session is ever ws-0.
 `—` = route unreachable for that principal; `404*` = foreign-workspace
 id answers 404, never 403 (no oracle).
+
+Membership resolution (review #1): `/workspaces/{pid}/*` routes resolve
+the member role from the **path** `pid` only (`PathMember`); if
+`x-durable-workspace` is also present and differs → `400
+workspace_mismatch`. Flat routes (`/jobs`, `/handlers`,
+`/diagnostics`, `/whoami`) take the workspace from
+`x-durable-workspace` for session principals — absent or unresolvable
+→ `400 workspace_required` (a session never defaults to ws 0). Bearer
+keys need no header: the workspace is in the key.
 
 | Route | Ops key | Write key | Read key | Owner | Admin | Member | Viewer |
 |---|---|---|---|---|---|---|---|
@@ -555,15 +645,14 @@ id answers 404, never 403 (no oracle).
 | `GET /workspaces/{pid}` | — | — | — | ✓ | ✓ | ✓ | ✓ |
 | `PATCH /workspaces/{pid}` (rename) | — | — | — | ✓ | ✓ | — | — |
 | `DELETE /workspaces/{pid}` | — | — | — | ✓ | — | — | — |
-| `GET/POST …/members`, `GET …/invites` | — | — | — | ✓ | ✓ | — | ✓ GET only |
+| `GET/POST …/members`, `GET …/invites` | — | — | — | ✓ | ✓ | ✓ GET only | ✓ GET only |
 | `POST/DELETE …/invites*` | — | — | — | ✓ | ✓ | — | — |
 | `PATCH/DELETE …/members/{account_pid}` | — | — | — | ✓ | ✓ (not owner) | — | — |
 | `GET/POST/DELETE/POST-rotate …/keys*` | — | — | — | ✓ | ✓ | — | ✓ GET only |
 | `POST …/workflows`, `POST …/workflows/{wid}/run`, `PATCH/DELETE …/workflows/{wid}` | — | — | — | ✓ | ✓ | ✓ | — |
 | `GET …/workflows*`, `GET …/workflows/{wid}/runs` | — | — | — | ✓ | ✓ | ✓ | ✓ |
 | `GET …/usage`, `GET …/onboarding` | — | — | — | ✓ | ✓ | ✓ | ✓ |
-| `POST /invites/accept`, `/invites/decline` | — | — | — | any authenticated session (accept requires session email == invite email) |
-| `GET|POST /echo` (new, sample) | open (address-rate-limited) |
+| `POST /invites/accept`, `/invites/decline` | — | — | — | any **verified** session (accept requires session email == invite email — review #2) |
 
 What an API key can never do: anything under `/auth`, `/me`,
 `/workspaces*` — sessions only. What a session can never do: `/admin/*`
@@ -659,9 +748,9 @@ Changes to the flat route's behaviour:
 | `GET /workspaces/{pid}/workflows/{wid}` | detail + all versions `[{version,spec,created_at}]` |
 | `PATCH /workspaces/{pid}/workflows/{wid}` | `{name?, spec?}` — a spec change appends version n+1 (immutable); `name` change only bumps `updated_at` |
 | `DELETE /workspaces/{pid}/workflows/{wid}` | archive (`archived_at`); list/get omit it |
-| `POST /workspaces/{pid}/workflows/{wid}/run` | `{input_b64?}` (override default) → `engine.submit_scoped(ws, "wfr_<uuidv7>", spec)` → `{run_id, version}`; `workflow_runs` row |
-| `GET /workspaces/{pid}/workflows/{wid}/runs` | page of `workflow_runs` joined to engine `inspect` (≤50/page) → `[{run_id,submitted_at,state,finished_at}]` |
-| `POST /echo` | `{any small JSON}` → echoes it; `GET /echo?idem_key=` → 404. Ruling 5: JSON only (`Content-Type: application/json` in and out, `X-Content-Type-Options: nosniff`, `Content-Security-Policy: default-src 'none'`), body ≤ 8 KiB, address-rate-limited (30/min), and it **requires the signed-call header shape** (`x-durable-timestamp` + `x-durable-signature` present) else `401 unsigned` — never an open reflector; it does not need the workspace secret. Dispatch reaches it through the public origin like any customer handler — no SSRF exception, no loopback shortcut |
+| `POST /workspaces/{pid}/workflows/{wid}/run` | `{input_b64?}` (override default; a client `Idempotency-Key` header derives the op key `wfr_<wid>_<uuid>` from it so SPA retries don't double effects — review S3) → `engine.submit_scoped(ws, op_key, spec)` → `{run_id, version}`; `workflow_runs` row |
+| `GET /workspaces/{pid}/workflows/{wid}/runs` | page of `workflow_runs` joined through `scoped_run` (never raw `engine.inspect` — review #3) (≤50/page) → `[{run_id,submitted_at,state,finished_at}]` |
+| `builtin:echo` | **No public `/echo` route** (ruling 5' replacing ruling 5): the onboarding sample is an in-process builtin handler — name `builtin:echo` registers like a normal handler, no network hop, echo of the call input bounded to the step input cap, per-workspace rate-limited like every test call, clearly labelled "sample handler" in the UI. It can never be a reflector, needs no signature headers, and shares no bucket across tenants (review #16 is moot). The exit journey uses it, then also registers a real fixture handler URL |
 
 Errors: `plan_limit` 429 carries `{limit,plan,used,cap}` + `Retry-After`
 for rate kinds; `unregistered_handler` 409; `workspace_closed` 410;
@@ -698,7 +787,25 @@ add *"retry in N s"* from `Retry-After`.
 The submit-rate bucket lives beside `addr_limits` — a per-workspace
 token bucket keyed on `auth.ws`, in memory, bounded (map cap = live
 workspaces, LRU beyond), so a tenant's burst hits its own bucket, never
-the shared per-address limiter's fairness.
+the shared per-address limiter's fairness. **Run now calls the same
+`admit(ws, spec)` as `POST /jobs`** (review #7): one admission path —
+the per-ws submit bucket and the `live_runs`/`retained_bytes`
+pre-checks — so a workflow run can never bypass plan limits.
+
+**Plan capacity bounds (review #7):** the Free row gains
+`retained_bytes` (~16 MiB proposal) enforced as the per-workspace index
+share at admission — so `workspaces_per_account` × share stays far
+below the global index bound and two free accounts cannot exhaust it.
+Soft-deleted workspaces count toward `workspaces_per_account` until the
+purge removes the row (no delete+recreate cycle to dodge the cap).
+
+**Neon growth bounds (review #15):** every table above has a bounded
+lifetime: workflow versions ≤ 50 per workflow (insert refuses past it)
+with spec ≤ 96 KiB and a per-workspace workflow-write rate; a purge
+job (nightly, in-process behind `store`-mode) deletes runs-index rows,
+revoked+expired sessions, used/expired `email_tokens`, closed invites,
+failed `email_outbox` rows and dropped mail bodies past token expiry —
+the store can never grow without bound under churn.
 
 ---
 
@@ -715,11 +822,12 @@ the shared per-address limiter's fairness.
   page) and short SDK snippets (TypeScript `fetch`, Python `requests`,
   and a signature-verification snippet matching `docs/HANDLERS.md`).
 - **Sample workflow:** a "try it" card on the Workflows empty state
-  creates a workflow `demo` whose one step calls handler `echo` →
-  `https://<public origin>/echo` — the runner's own bounded echo route,
-  reachable through public DNS so the SSRF guard passes it honestly —
-  then Run now lands the user on the finished timeline. Zero setup; the
-  journey is the product teaching itself.
+  creates a workflow `demo` whose one step calls `builtin:echo` — the
+  in-process sample handler (ruling 5'; no URL, no network hop, echoes
+  its input bounded to the step cap) — then Run now lands the user on
+  the finished timeline. Zero setup; the journey is the product
+  teaching itself. The card also offers "point it at a real endpoint"
+  with the register-handler curl.
 - Signed-in-but-unverified users see a verify-wall card (resend button →
   `/auth/resend-verification`); read pages work so they can look around
   — mutations refuse `email_unverified` with a banner.
@@ -864,7 +972,18 @@ pending old one.
 | Response-side u64 leak | `public_id`/pubid everywhere; S2's no-u64-leak scan extended to every new route's response |
 | DoS via oversized names/inputs | existing byte caps; new text fields bounded (names ≤128, emails ≤254, bodies by `MAX_REQUEST_BYTES`) |
 | Timing on token verify | sha256 of high-entropy token → unique-index lookup; digest compare constant-time; timing carries no usable signal |
-| Login CSRF (victim logged in as attacker) | noted residual: accepted for v1 — the harm is the victim seeing the attacker's empty workspaces; no job data crosses; revisited with 2FA work |
+| Login CSRF (victim logged in as attacker) | Origin/Sec-Fetch-Site + JSON-only bodies on unauthenticated `/auth` POSTs (review #17) — a cross-site form can no longer reach login at all |
+| Pre-registration takeover (attacker signs up a stranger's email before they do) | verify token carries the pending password hash — the verify link's sign-up wins; verify/re-sign-up revoke all sessions; verify sets no cookie; invite accept needs a verified email (review #2) |
+| Token forgery floods the store | self-authenticating `drs_`/`drk_` formats — tag failure dies before I/O (review #8) |
+| Argon2 queue exhaustion | bounded semaphore + bounded waiters + ≤2 s wait → 503 `busy` + Retry-After; one job per address (review #9) |
+| Stale cache resurrects revoked credential | generation-checked fill (review #10): invalidate-during-await drops the fill and denies |
+| Header/path workspace confusion | path-only membership on `/workspaces/{pid}/*`; mismatch → 400, not silent merge (review #1) |
+| Sequential ids crossing the API | `sessions.public_id`, `api_keys.public_id`, `invites.public_id` — u64 never crosses (review S3) |
+| Bearer+cookie ambiguity | `Authorization` present → bearer-only resolution (review S3) |
+| Open `/echo` reflector | none exists — `builtin:echo` is in-process, per-ws bounded (ruling 5') |
+| Env key replay over the public edge | ops keys honoured on `--ops-listen` loopback only (ruling 2') |
+| Mail as a spam/cost vector | fixed subjects, escaped bodies, strict addr-spec, per-(address,kind) + global budgets, outbox caps (review #14) |
+| Neon growth without bound | purge job + bounded lifetimes on every table (review #15) |
 
 **Explicitly out of scope for v1** (each leaves room, none blocks):
 2FA/TOTP (session model already supports "privilege change → rotate";
@@ -886,7 +1005,7 @@ mutated in `prove-attacks.sh` — new `// ATTACK(name)` markers) /
 
 | # | Slice | Outcome + invariant | Fails-first tests | Attack proofs | Load / drill |
 |---|---|---|---|---|---|
-| S3-0 | Session plumbing + sign-up + login | Migration `0002`; `AccountStore` methods for accounts/sessions; `SessionAuth` principal + session cache; argon2id verify/hash on `spawn_blocking` behind the semaphore; `POST /auth/signup` (account+token+outbox in one tx, `Memory` mailer), `POST /auth/login`, `POST /auth/logout`, `GET /auth/session`. *A full sign-up→login→session round-trip works end to end against the Memory store.* | sign-up → 202 + account row unverified; login → cookie + `{csrf}`; a request with the cookie resolves `{account}`; forged/expired/revoked token 401s; cookie attributes asserted (Secure/HttpOnly/SameSite=Lax/Path=/ /no Domain) | `session-forge` (unknown `drs_` value → 401, denied on shape before the store), `csrf` (mutation without/with wrong `x-durable-csrf` → 403), `cookie-attrs` | session verify at battery rate on the cached path; Neon-down drill: cached sessions proceed, uncached → `accounts_unavailable` |
+| S3-0 | Session plumbing + sign-up + login | Migration `0002`; `AccountStore` methods for accounts/sessions; `Principal` enum (review #4) + `SessionAuth` + generation-checked session cache (#10); self-authenticating `drs_` tokens (#8); argon2id on `spawn_blocking` behind the **bounded** semaphore (#9); Origin/Sec-Fetch-Site on unauthenticated `/auth` POSTs (#17); signup hashes on every branch; `POST /auth/signup` (+token+outbox one tx), `POST /auth/login`, `POST /auth/logout`, `GET /auth/session`. *A full sign-up→login→session round-trip works end to end against the Memory store.* | sign-up → 202 + account row unverified; login → cookie + `{csrf}`; a request with the cookie resolves `{account}`; forged/expired/revoked token 401s **before** store I/O (tag check); cookie attributes asserted (Secure/HttpOnly/SameSite=Lax/Path=/ /no Domain); `busy` 503 + Retry-After when the argon2 queue saturates; `Cache-Control: no-store` + `Vary: Cookie` asserted | `session-forge` (random `drs_` value → 401, denied on tag before the store — mutation removes the tag check), `csrf` (mutation without/with wrong `x-durable-csrf` → 403), `csrf-open-post` (Origin/Sec-Fetch-Site refusal on unauthenticated `/auth` POSTs), `cookie-attrs` | session verify at battery rate on the cached path; Neon-down drill: cached sessions proceed, uncached → `accounts_unavailable` |
 | S3-1 | Verify + reset + outbox worker + enumeration | `POST /auth/verify`, `/auth/resend-verification`, `/auth/forgot`, `/auth/reset`; `email_tokens`; outbox drain (bounded batch, backoff, `failed`); `Mailer` impls (`Memory`, `Log`, `Resend` wired at deploy); `DURABLE_INVITE_ONLY` | verify → verified; reused token → 410; reset-kind token refused at `/auth/verify`; forgot/reset round-trip; invite-only flag blocks sign-up without a token | `token-replay`, `token-kind-confusion`, `enumeration` (unknown vs known email → identical 202 + identical body; dummy-verify counter shows equal work), `invite-required` | outbox drain: 10k pending rows bounded-batch + backoff; mailer-down drill: retries then `failed`, never lost; Resend send deadline |
 | S3-2 | Session lifecycle + /me | rotation on sign-in/privilege change, idle+absolute expiry, revoke-one + revoke-all, sessions list, `/me/password`; per-account login cool-off | reset revokes all sessions; the 21st session LRU-evicts the oldest-idle; idle-expired token → 401; cool-off shape after 10 failures | `session-fixation` (a pre-set cookie value never becomes a session; login mints fresh), `reset-token-replay`, `cooloff` (429 shape, not silence), `idle-timeout` (clock-injected expiry check) | login throughput vs the argon2 semaphore (memory bounded under concurrency — measured) |
 | S3-3 | Workspaces + members + roles + invites | `POST /workspaces` (+ owner member row + `handler_secret` shown once), PATCH rename, DELETE soft (D-068), members via invites only, role changes, remove; the matrix enforced in `SessionAuth` for every member route | member of A on B's routes → 404; viewer mutation → 403; invite accept with mismatched session email → 403; deleted ws: keys dead immediately, admission 410, live runs cancelled | `idor-workspace`, `role-escalation` (viewer PATCH member; member DELETE ws; admin demotes owner), `invite-hijack`, `last-owner` (remove/demote owner → 409), `deleted-ws-key` (key of a deleted ws → 401 same request) | two-workspace membership churn vs cached lookups; delete drill: a live run is cancelled honestly, finished history untouched |
@@ -903,12 +1022,14 @@ sandbox per the browser rule):
 
 1. Sign up with a fresh address → verify (mail captured from the Log
    mailer / test outbox).
-2. Register handler `echo` → `https://<origin>/echo` → send test call →
-   `ok`.
+2. Register the `builtin:echo` sample handler → send test call → `ok`;
+   then register a real fixture handler URL (the suite's own listener)
+   → test call → `ok` (ruling 5': the journey exercises a real
+   dispatch, not only the builtin).
 3. Create an API key (scope write) → shown once.
-4. Create workflow `demo` (step → `echo`) → **Run now** → land on the
-   run's timeline → it finishes (steps, attempt, timestamps all
-   rendered).
+4. Create workflow `demo` (step → the fixture handler) → **Run now** →
+   land on the run's timeline → it finishes (steps, attempt, timestamps
+   all rendered).
 
 Plus negative journeys: wrong password, expired verify token, invite
 accept by the wrong account, CSRF-blocked mutation (the journey asserts
@@ -925,11 +1046,32 @@ the refusal, not just the happy path).
   308-redirects to `/app` preserving the path tail and query.
 - New env: `RESEND_API_KEY`, `MAIL_FROM` =
   `Durable Runner <durable-runner@404human.dev>` (ruling 7),
-  `--public-origin https://durablerunnerapp.404human.dev`,
+  `--public-origin https://durablerunnerapp.404human.dev` — **required
+  at boot whenever an account store is configured** (review #18; absent
+  it, the server refuses to start rather than mint Host-derived links),
   `DURABLE_INVITE_ONLY` (default off, env-at-boot only per ruling 9),
   `DURABLE_MAILER` (default resend when `RESEND_API_KEY` set; `log`
   allowed only with `--allow-local-handlers` or a dev flag — never
   silently in deploy).
+- **`--ops-listen 127.0.0.1:PORT`** (ruling 2'): on a SaaS deployment
+  the env ops keys are honoured only on this loopback listener, reached
+  by SSH tunnel; proxied requests bearing an env key get 401
+  (`unauthenticated`) on the public listener. With no account store
+  (self-host), env keys keep working on the public listener exactly as
+  v1.0.x. `/admin/*` lives only behind `OpsKey` either way.
+- Mail is hardened (review #14): subjects are fixed server-side strings
+  (only the workspace *name* is interpolated, length-capped), HTML
+  bodies escape user data (`workspace`, names), `send_to` is a strict
+  single addr-spec (no commas/display-name tricks — the parser, not a
+  regex, validates), invites per workspace/day and per (address,kind)
+  pending caps bound the outbox, and a global daily send budget trips a
+  circuit breaker (alert via the log) before a mail loop can bill us.
+- Response hygiene (review #18/S3): session-authed responses carry
+  `Cache-Control: no-store`; `Vary: Cookie` joins `Vary:
+  x-durable-workspace` on every authed route so a shared cache can
+  never serve one tenant's body to another. `GET /auth/session` returns
+  **404** (not 401) when no account store is configured — the
+  dashboard's compat key-paste mode keys off exactly that status.
 - Migrations 0002/0003 through `sqlx::migrate!` at startup as today;
   `scripts/deploy-readiness/neon-sweep.sh` must pass both on real Neon
   before the slices merge (no superuser constructs anywhere above).
@@ -969,3 +1111,60 @@ build:
    implementation (S3-1); the outbox row claim (`pending→sending`) is
    the dedupe either way.
 9. **Invite-only** — env-at-boot only for v1.
+
+### Amended rulings (2026-11-24, after the white-hat review)
+
+- **Ruling 5′ (replaces 5): no public `/echo`.** The onboarding sample
+  is the in-process builtin handler `builtin:echo` (no network hop,
+  input echo bounded to the step cap, per-workspace rate-limited like
+  every test call, labelled "sample" in the UI). The exit journey uses
+  it *and* registers a real fixture handler URL.
+- **Ruling 2′ (extends 2):** env ops keys are honoured only on the
+  loopback `--ops-listen` listener on a SaaS deployment (SSH tunnel);
+  a proxied request bearing an env key → `401`. The compat key-paste
+  mode is offered only when `GET /auth/session` answers 404.
+
+---
+
+## White-hat review 2026-11-24
+
+Independent review of this plan: 5 × S1, 13 × S2, plus S3 items. Every
+finding is accepted unless ruled otherwise; each maps to the slice that
+fixes it and the attack proof that must go red with its guard mutated.
+Findings **5** (SSRF to the host's own public addresses) and **6**
+(client address trusted behind Caddy) are fixed on the coordinator's
+S2-onto-main branch — **the rate-limit and test-call sections here
+depend on them**: every address-keyed bucket in this plan assumes
+`client_addr` is the *untrusted* socket address unless the peer is a
+configured trusted proxy, and every SSRF claim assumes the resolver
+also refuses the host's own public IPs. Nothing in S3 re-litigates
+those two; S3 slices inherit the coordinator's fix.
+
+| # | Finding (sev) | Fixed in | Mechanism | Attack proof (must go red mutated) |
+|---|---|---|---|---|
+| 1 | Workspace confusion: header vs path (S1) | S3-3 | path-only `PathMember` on `/workspaces/{pid}/*`; header mismatch → `400 workspace_mismatch` | `ws-header-path-mismatch` |
+| 2 | Pre-registration account takeover (S1) | S3-0/S3-1/S3-3 | pending `password_hash` on the verify token; verify & re-sign-up revoke all sessions; verify sets no cookie; invite accept requires verified email; unverified purge | `prereg-takeover`, `verify-sets-cookie` |
+| 3 | Engine calls resolved outside the workspace scope (S1) | S3-3/S3-7 | every engine read goes through `scoped_run(ws, pubid)` — never raw `inspect`/`diag` | `cross-ws-inspect` (S3-3), `idor-workflow` (S3-7) |
+| 4 | Session/key principal collapse + ws-0 store key reaches ops (S1) | S3-0/S3-3 | `Principal{OpsKey,OpsRead,StoreKey{ws,Write|Read},Member}`; `ops_admin` = OpsKey only; `CHECK(workspace_id<>0)` | `ops-storekey`, `member-ws0` |
+| 5 | SSRF to the host's own public addresses (S1) | **coordinator's S2-merge branch** | resolver refuses own public IPs | inherited (`ssrf-*` proofs) |
+| 6 | Client address trusted behind Caddy (S1) | **coordinator's S2-merge branch** | trusted-proxy list; else socket addr | inherited (`xff-spoof`) |
+| 7 | Plan capacity bounds absent (S2) | S3-4 | `retained_bytes` share; one `admit()` for `/jobs` + Run now; soft-deleted ws counted | `plan-capacity`, `runnow-bypass` |
+| 8 | Token forgery reaches the store (S2) | S3-0 (`drs_`), S3-5 (`drk_`) | self-authenticating tag checked before I/O | `session-forge`, `key-forge` |
+| 9 | Argon2 queue unbounded (S2) | S3-0 | permit before `spawn_blocking`; ≤32 waiters ≤2 s → 503 `busy` + Retry-After; 1/address | `argon2-flood` |
+| 10 | Cache fill races invalidation (S2) | S3-0 (session/keyring), S3-3 (membership) | generation bump on every invalidate; fill dropped if bumped mid-await; hit checks staleness | `stale-session-cache`, `stale-key-cache` |
+| 11 | `csrf_seed` default ⇒ computable token (S2) | S3-0 | `NOT NULL CHECK(octet_length=32)`, no default; minted at insert | `csrf-seed-zero` |
+| 12 | Session ids sequential in API (S2) | S3-0 | `sessions.public_id` exposed, u64 never crosses | covered by no-u64-leak scan |
+| 13 | Lockout leaks account existence (S2) | S3-2 | counters keyed by normalized email whether or not the account exists; per-(email, client-prefix) cool-off; known-device bypass | `lockout-oracle` |
+| 14 | Mail: template injection + spend amplification (S2) | S3-1 | fixed subjects, escaped bodies, strict single addr-spec, invite caps, global daily budget + breaker | `mail-budget`, `addr-spec-injection` |
+| 15 | Neon tables grow without bound (S2) | S3-4/S3-7 | purge job + bounded lifetimes/versions | `purge` drill (bounded-row assertion) |
+| 16 | `/echo` = open reflector (S2) | removed (ruling 5′) | `builtin:echo`, in-process, per-ws bucket | moot — no route exists |
+| 17 | CSRF gaps: unauthenticated posts + `same-site` + verify-sets-cookie (S2) | S3-0 | Origin/Sec-Fetch-Site on all unauth `/auth` POSTs; `same-site` refused; JSON-only bodies; verify never sets a cookie | `csrf-open-post`, `csrf-samesite`, `verify-sets-cookie` |
+| 18 | Deployment leaks ops surface (S2) | S3-3 (ops-listen flag), S3-9 (deploy) | `--ops-listen` loopback; `--public-origin` required with an account store; env key on public edge → 401 | `ops-key-public-edge` |
+
+S3 items folded in above: `api_keys.public_id` (S3-5 list/get by
+public_id), bearer-precedence when `Authorization` is present (S3-0),
+signup hashing on every branch + forgot/resend work after the 202
+(S3-0/S3-1), Run-now idempotency key derived from a client-supplied
+`Idempotency-Key` (S3-7), `Cache-Control: no-store`/`Vary: Cookie`
+(S3-0), `GET /auth/session` → 404 without a store (S3-0), and the
+`Vary` on every authed route (S3-8's header assertion).
