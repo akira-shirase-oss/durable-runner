@@ -51,7 +51,7 @@ async fn an_oversized_body_is_refused_413() {
     let mut body = submit_body("pad-1");
     body["pad"] = serde_json::json!("x".repeat(300 * 1024));
     let r = c
-        .post(format!("{}/jobs", s.base))
+        .post(format!("{}/jobs", s.ops_base))
         .bearer_auth(OPS_KEY)
         .json(&body)
         .send()
@@ -67,14 +67,14 @@ async fn an_oversized_body_is_refused_413() {
 #[tokio::test]
 async fn a_chunked_body_past_the_cap_is_refused_413() {
     let s = spawn(&[]).await;
-    let mut conn = TcpStream::connect(addr(&s.base))
+    let mut conn = TcpStream::connect(addr(&s.ops_base))
         .await
         .unwrap_or_else(|e| panic!("{e}"));
     conn.write_all(
         format!(
             "POST /jobs HTTP/1.1\r\nHost: {}\r\nAuthorization: Bearer {OPS_KEY}\r\n\
              Content-Type: application/json\r\nTransfer-Encoding: chunked\r\n\r\n",
-            addr(&s.base)
+            addr(&s.ops_base)
         )
         .as_bytes(),
     )
@@ -97,7 +97,7 @@ async fn a_chunked_body_past_the_cap_is_refused_413() {
 #[tokio::test]
 async fn a_lying_content_length_cannot_smuggle_the_body() {
     let s = spawn(&[]).await;
-    let mut conn = TcpStream::connect(addr(&s.base))
+    let mut conn = TcpStream::connect(addr(&s.ops_base))
         .await
         .unwrap_or_else(|e| panic!("{e}"));
     // Declares 8 bytes, then streams a full submit: the parsed prefix
@@ -108,7 +108,7 @@ async fn a_lying_content_length_cannot_smuggle_the_body() {
         format!(
             "POST /jobs HTTP/1.1\r\nHost: {}\r\nAuthorization: Bearer {OPS_KEY}\r\n\
              Content-Type: application/json\r\nContent-Length: 8\r\n\r\n",
-            addr(&s.base)
+            addr(&s.ops_base)
         )
         .as_bytes(),
     )
@@ -124,7 +124,7 @@ async fn a_lying_content_length_cannot_smuggle_the_body() {
     );
     // The smuggled remainder created nothing.
     let l = http()
-        .get(format!("{}/jobs", s.base))
+        .get(format!("{}/jobs", s.ops_base))
         .bearer_auth(OPS_KEY)
         .send()
         .await
@@ -141,14 +141,14 @@ async fn a_lying_content_length_cannot_smuggle_the_body() {
 #[tokio::test]
 async fn a_dribbled_body_is_cut_at_its_deadline() {
     let s = spawn(&["--body-deadline-ms", "700"]).await;
-    let mut conn = TcpStream::connect(addr(&s.base))
+    let mut conn = TcpStream::connect(addr(&s.ops_base))
         .await
         .unwrap_or_else(|e| panic!("{e}"));
     conn.write_all(
         format!(
             "POST /jobs HTTP/1.1\r\nHost: {}\r\nAuthorization: Bearer {OPS_KEY}\r\n\
              Content-Type: application/json\r\nContent-Length: 4096\r\n\r\n{{",
-            addr(&s.base)
+            addr(&s.ops_base)
         )
         .as_bytes(),
     )
@@ -171,7 +171,7 @@ async fn a_dribbled_body_is_cut_at_its_deadline() {
 #[tokio::test]
 async fn a_partial_head_is_cut() {
     let s = spawn(&["--header-timeout-ms", "700"]).await;
-    let mut conn = TcpStream::connect(addr(&s.base))
+    let mut conn = TcpStream::connect(addr(&s.ops_base))
         .await
         .unwrap_or_else(|e| panic!("{e}"));
     conn.write_all(b"POST /jobs HT")

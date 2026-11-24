@@ -17143,14 +17143,17 @@ mod tests {
         )
         .await;
         assert_eq!(st, StatusCode::OK, "{v}");
-        let fresh = heads
-            .get_all(header::SET_COOKIE)
-            .iter()
-            .filter_map(|v| v.to_str().ok())
-            .find(|s| s.starts_with("__Host-drs="))
-            .map(cookie_header)
-            .unwrap_or_else(|| panic!("reset mints a session: {heads:?}"));
-        // The pre-reset session is dead; the fresh one resolves.
+        // Reset mints NO cookie (S3 cheap, same as verify) — the
+        // mailbox owner signs in fresh.
+        assert!(
+            !heads
+                .get_all(header::SET_COOKIE)
+                .iter()
+                .filter_map(|v| v.to_str().ok())
+                .any(|s| s.starts_with("__Host-drs=")),
+            "reset signs no browser over: {heads:?}"
+        );
+        // The pre-reset session is dead.
         let (st, _, _) = raw(
             &h.router,
             "GET",
@@ -17160,16 +17163,6 @@ mod tests {
         )
         .await;
         assert_eq!(st, StatusCode::UNAUTHORIZED);
-        let (st, _, v) = raw(
-            &h.router,
-            "GET",
-            "/auth/session",
-            &[("cookie", fresh)],
-            None,
-        )
-        .await;
-        assert_eq!(st, StatusCode::OK, "{v}");
-        assert_eq!(v["account"]["email"], "f@f.co");
         // Old password dead, new password live, replay dead.
         let (st, _, _) = raw(
             &h.router,

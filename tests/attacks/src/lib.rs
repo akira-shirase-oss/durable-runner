@@ -67,7 +67,12 @@ fn free_port() -> u16 {
 /// A running server under attack. Killed (not drained) on drop — it is a
 /// fixture, not production.
 pub struct AttackServer {
+    /// The public `--listen` socket — env keys are refused here.
     pub base: String,
+    /// The loopback `--ops-listen` socket — env ops/read keys grant
+    /// here. S2-5: a store-configured server refuses to boot without
+    /// it, so every spawn carries one and grant-needing calls go here.
+    pub ops_base: String,
     _dir: tempfile::TempDir,
     child: Child,
 }
@@ -89,10 +94,14 @@ pub async fn spawn(extra: &[&str]) -> AttackServer {
     for _attempt in 0..3 {
         let dir = tempfile::tempdir().unwrap_or_else(|e| panic!("tempdir: {e}"));
         let port = free_port();
+        let ops_port = free_port();
         let mut cmd = Command::new(&bin);
         cmd.arg("--journal")
             .arg(dir.path().join("journal"))
-            .args(["--listen", &format!("127.0.0.1:{port}")]);
+            .args(["--listen", &format!("127.0.0.1:{port}")])
+            // S2-5: a configured account store refuses boot without a
+            // loopback ops listener; env keys grant only here.
+            .args(["--ops-listen", &format!("127.0.0.1:{ops_port}")]);
         // Harness defaults, yielded to any flag `extra` sets itself —
         // clap refuses a repeated scalar flag.
         for flag in ["--rate-limit-per-addr", "--max-conns-per-addr"] {
@@ -149,6 +158,7 @@ pub async fn spawn(extra: &[&str]) -> AttackServer {
         if up {
             return AttackServer {
                 base,
+                ops_base: format!("http://127.0.0.1:{ops_port}"),
                 _dir: dir,
                 child,
             };
@@ -173,11 +183,18 @@ pub fn http() -> reqwest::Client {
         .unwrap_or_else(|e| panic!("client: {e}"))
 }
 
-/// The smallest submit body that passes spec validation.
+/// The smallest submit body that passes spec validation. `not_before`
+/// parks the run ~29 days out — inside the server's 30-day admit cap
+/// (S2-2) and far beyond any test's lifetime.
 pub fn submit_body(op_key: &str) -> serde_json::Value {
+    let parked = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
+        + 29 * 86_400_000;
     serde_json::json!({
         "op_key": op_key,
-        "not_before": 9_999_999_999_999u64,
+        "not_before": parked,
         "spec": {
             "version": 1,
             "steps": [{ "name": "a", "handler": "step" }],

@@ -28,7 +28,7 @@ async fn a_garbage_bearer_is_refused_and_nothing_is_recorded() {
     assert_eq!(code, "unauthorized");
     // Nothing was recorded behind the refusal.
     let l = c
-        .get(format!("{}/jobs", s.base))
+        .get(format!("{}/jobs", s.ops_base))
         .bearer_auth(OPS_KEY)
         .send()
         .await
@@ -126,30 +126,30 @@ async fn the_read_key_cannot_mutate_or_administrate() {
     for (name, req) in [
         (
             "submit",
-            c.post(format!("{}/jobs", s.base))
+            c.post(format!("{}/jobs", s.ops_base))
                 .bearer_auth(READ_KEY)
                 .json(&submit_body("rk")),
         ),
         (
             "compact",
-            c.post(format!("{}/admin/compact", s.base))
+            c.post(format!("{}/admin/compact", s.ops_base))
                 .bearer_auth(READ_KEY)
                 .json(&serde_json::json!({})),
         ),
         (
             "put handler",
-            c.put(format!("{}/handlers/x", s.base))
+            c.put(format!("{}/handlers/x", s.ops_base))
                 .bearer_auth(READ_KEY)
                 .json(&serde_json::json!({ "url": "http://203.0.113.9/h" })),
         ),
         (
             "ops diagnostics",
-            c.get(format!("{}/admin/diagnostics", s.base))
+            c.get(format!("{}/admin/diagnostics", s.ops_base))
                 .bearer_auth(READ_KEY),
         ),
         (
             "workspace create",
-            c.post(format!("{}/admin/workspaces", s.base))
+            c.post(format!("{}/admin/workspaces", s.ops_base))
                 .bearer_auth(READ_KEY)
                 .json(&serde_json::json!({ "name": "x" })),
         ),
