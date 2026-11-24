@@ -14,21 +14,21 @@
 # 3. the dashboard is built here at the same commit (git archive, npm ci, build) and uploaded;
 # 4. droplet-deploy.sh installs through deploy/upgrade.sh and rolls back on any failed check;
 # 5. /health, /ready and the dashboard are checked through the public URL; the time is printed.
-# Settings: DURABLE_DASHBOARD_PATH (/inspector/), DURABLE_DASHBOARD_APP (apps/inspector),
+# Settings: DURABLE_DASHBOARD_PATH (/app/), DURABLE_DASHBOARD_APP (apps/inspector),
 # DURABLE_BUILD_TIMEOUT_SECS (1800: the first build on a droplet is cold), DURABLE_DEPLOY_TIMEOUT_SECS (600).
 set -euo pipefail
 REPO=$(cd "$(dirname "$0")/../../.." && pwd)
 die() { echo "deploy: error: $*" >&2; exit 1; }
 HOST=${DURABLE_DEPLOY_HOST:-}
 URL=${DURABLE_PUBLIC_URL:-}
-DASH=${DURABLE_DASHBOARD_PATH:-/inspector/}
+DASH=${DURABLE_DASHBOARD_PATH:-/app/}
 APP=${DURABLE_DASHBOARD_APP:-apps/inspector}
 BUILD_TIMEOUT=${DURABLE_BUILD_TIMEOUT_SECS:-1800}
 DEPLOY_TIMEOUT=${DURABLE_DEPLOY_TIMEOUT_SECS:-600}
 [[ "$HOST" =~ ^[A-Za-z0-9][A-Za-z0-9._@-]*$ ]] || die "set DURABLE_DEPLOY_HOST to the droplet's ssh alias"
 URL=${URL%/}
 [[ "$URL" =~ ^https://([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$ ]] || die "set DURABLE_PUBLIC_URL to https://<public host>"
-[[ "$DASH" =~ ^/([a-z0-9_-]+/)+$ ]] || die "DURABLE_DASHBOARD_PATH must look like /inspector/"
+[[ "$DASH" =~ ^/([a-z0-9_-]+/)+$ ]] || die "DURABLE_DASHBOARD_PATH must look like /app/"
 [[ "$APP" =~ ^apps/[a-z0-9_-]+$ ]] || die "DURABLE_DASHBOARD_APP must be apps/<name>"
 for v in BUILD_TIMEOUT DEPLOY_TIMEOUT; do [[ "${!v}" =~ ^[0-9]+$ ]] || die "$v must be a whole number of seconds"; done
 REMOTE=/root/durable-deploy

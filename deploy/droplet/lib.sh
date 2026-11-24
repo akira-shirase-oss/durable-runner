@@ -35,7 +35,7 @@ DR_MARK='# Durable Runner, shared droplet (deploy/droplet)'
 DR_PUBLIC_PORT=${DURABLE_PUBLIC_PORT:-58300}
 DR_OPS_PORT=${DURABLE_OPS_PORT:-58301}
 DR_SITE_HOST_SHIPPED=durablerunnerapp.404human.dev
-DR_DASHBOARD_SHIPPED=/inspector/
+DR_DASHBOARD_SHIPPED=/app/
 
 die() { echo "error: $*" >&2; exit 1; }
 say() { printf '   %s\n' "$*"; }
@@ -119,7 +119,7 @@ dashboard_path_valid() { [[ "$1" =~ ^/([a-z0-9_-]+/)+$ ]]; }
 render_site() {
   local file=$1 host=$2 dash=$3 addr redir count l
   host_valid "$host" || { echo "error: '$host' isn't a plain lowercase hostname" >&2; return 1; }
-  dashboard_path_valid "$dash" || { echo "error: the dashboard path '$dash' must look like /inspector/" >&2; return 1; }
+  dashboard_path_valid "$dash" || { echo "error: the dashboard path '$dash' must look like /app/" >&2; return 1; }
   addr="$DR_SITE_HOST_SHIPPED:443 {"
   redir=$'\t'"redir / $DR_DASHBOARD_SHIPPED 302"
   for l in "$addr" "$redir"; do
