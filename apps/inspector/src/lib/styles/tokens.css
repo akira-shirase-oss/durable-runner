@@ -1,0 +1,194 @@
+/*
+ * The inspector's palette: the only file with literal colours. The names and values mirror Durable Runner's
+ * landing (src/styles/tokens.css there) for every token the inspector uses; the inspector-only additions are
+ * grouped last. Light values live on :root; each has a dark twin in BOTH dark blocks below: the device's dark
+ * setting (unless Light was chosen) and an explicit Dark choice (the theme toggle sets data-theme).
+ */
+:root {
+  color-scheme: light;
+
+  /* page and type */
+  --c-page: #ffffff;
+  --c-ink: #1e1e1e;
+  --c-ink-soft: #474747;
+  --c-body: #5c5c5c;
+  --c-line: #ebebeb;
+  --c-line-strong: #dedede;
+  --c-surface: #f6f7f9;
+  --c-focus: #c9431a;
+
+  /* the brand: vermilion (the app icon's gradient and white mark; a deeper shade for brand-coloured text) */
+  --c-brand-1: #ff9a5c;
+  --c-brand-2: #f0501f;
+  --c-brand-glow: #ffd9c2;
+  --c-on-brand: #ffffff;
+  --c-brand-tint: #ffe6da;
+  --c-brand-deep: #c9431a;
+  --c-brand-edge: #ffffff40;
+  --c-brand-shade: #b8340f55;
+
+  /* cards, bars, hover */
+  --c-card: #ffffff;
+  --c-card-edge: #ffffff00;
+  --c-shadow: #0000002e;
+  --c-hover: #f5f5f5;
+  --c-bar-edge: #0000000f;
+  --c-panel: #fafafb;
+  --c-tile: #ffffff;
+  --c-tile-shadow: #0f172a1f;
+  --c-glass-edge: #ffffff4d;
+
+  /* the one brand button */
+  --c-cta: #d0461b;
+  --c-cta-hover: #c4411a;
+  --c-cta-hi: #ee5f2b;
+  --c-on-cta: #ffffff;
+
+  /* run states: the accent (dots, bars) and the chip ground */
+  --c-state-run: #2f6af5;
+  --c-state-run-bg: #e3edff;
+  --c-state-done: #14804a;
+  --c-state-done-bg: #dcf5e6;
+  --c-state-retry: #a16207;
+  --c-state-retry-bg: #fdf3c7;
+  --c-state-queued: #5b5f6b;
+  --c-state-queued-bg: #eceef2;
+  --c-state-probe: #6d4ad8;
+  --c-state-probe-bg: #ece6fd;
+  --c-alert: #f04438;
+
+  /* inspector only: the page behind the cards, row states, input edges (3:1 on a card) */
+  --c-app: #f6f7f9;
+  --c-row-hover: #fafafb;
+  --c-row-selected: #fff4ee;
+  --c-input-edge: #8d9299;
+
+  /* inspector only: chip text on its chip ground, AA (4.5:1) in both themes */
+  --c-state-run-ink: #2456d3;
+  --c-state-done-ink: #0f6b3d;
+  --c-state-retry-ink: #8a5306;
+  --c-state-queued-ink: #5b5f6b;
+  --c-state-probe-ink: #6d4ad8;
+  --c-state-cancelled: #5c5c5c;
+
+  /* inspector only: failures and destructive actions, quiet red */
+  --c-danger: #b42318;
+  --c-danger-bg: #fdecea;
+  --c-danger-edge: #f1c4be;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    color-scheme: dark;
+    --c-page: #0d0e10;
+    --c-ink: #f1f1f1;
+    --c-ink-soft: #c4c4c4;
+    --c-body: #a3a3a3;
+    --c-line: #24262a;
+    --c-line-strong: #31343a;
+    --c-surface: #16181c;
+    --c-focus: #ff8a5c;
+    --c-brand-1: #ff9a5c;
+    --c-brand-2: #f0501f;
+    --c-brand-glow: #ffd9c2;
+    --c-on-brand: #ffffff;
+    --c-brand-tint: #3a1f14;
+    --c-brand-deep: #ff8a5c;
+    --c-brand-edge: #ffffff40;
+    --c-brand-shade: #b8340f55;
+    --c-card: #16181b;
+    --c-card-edge: #ffffff12;
+    --c-shadow: #00000099;
+    --c-hover: #1f2226;
+    --c-bar-edge: #ffffff14;
+    --c-panel: #121417;
+    --c-tile: #1d2025;
+    --c-tile-shadow: #00000080;
+    --c-glass-edge: #ffffff38;
+    --c-cta: #d0461b;
+    --c-cta-hover: #c4411a;
+    --c-cta-hi: #ee5f2b;
+    --c-on-cta: #ffffff;
+    --c-state-run: #7fa8ff;
+    --c-state-run-bg: #1a2742;
+    --c-state-done: #4ccf8a;
+    --c-state-done-bg: #12301f;
+    --c-state-retry: #facc15;
+    --c-state-retry-bg: #33290c;
+    --c-state-queued: #b4b8c2;
+    --c-state-queued-bg: #262a31;
+    --c-state-probe: #b6a3f5;
+    --c-state-probe-bg: #2a2244;
+    --c-alert: #f97066;
+    --c-app: #0d0e10;
+    --c-row-hover: #1c1f23;
+    --c-row-selected: #24180f;
+    --c-input-edge: #666b74;
+    --c-state-run-ink: #7fa8ff;
+    --c-state-done-ink: #4ccf8a;
+    --c-state-retry-ink: #facc15;
+    --c-state-queued-ink: #b4b8c2;
+    --c-state-probe-ink: #b6a3f5;
+    --c-state-cancelled: #a3a3a3;
+    --c-danger: #f97066;
+    --c-danger-bg: #3a1715;
+    --c-danger-edge: #5c2620;
+  }
+}
+
+:root[data-theme="dark"] {
+  color-scheme: dark;
+  --c-page: #0d0e10;
+  --c-ink: #f1f1f1;
+  --c-ink-soft: #c4c4c4;
+  --c-body: #a3a3a3;
+  --c-line: #24262a;
+  --c-line-strong: #31343a;
+  --c-surface: #16181c;
+  --c-focus: #ff8a5c;
+  --c-brand-1: #ff9a5c;
+  --c-brand-2: #f0501f;
+  --c-brand-glow: #ffd9c2;
+  --c-on-brand: #ffffff;
+  --c-brand-tint: #3a1f14;
+  --c-brand-deep: #ff8a5c;
+  --c-brand-edge: #ffffff40;
+  --c-brand-shade: #b8340f55;
+  --c-card: #16181b;
+  --c-card-edge: #ffffff12;
+  --c-shadow: #00000099;
+  --c-hover: #1f2226;
+  --c-bar-edge: #ffffff14;
+  --c-panel: #121417;
+  --c-tile: #1d2025;
+  --c-tile-shadow: #00000080;
+  --c-glass-edge: #ffffff38;
+  --c-cta: #d0461b;
+  --c-cta-hover: #c4411a;
+  --c-cta-hi: #ee5f2b;
+  --c-on-cta: #ffffff;
+  --c-state-run: #7fa8ff;
+  --c-state-run-bg: #1a2742;
+  --c-state-done: #4ccf8a;
+  --c-state-done-bg: #12301f;
+  --c-state-retry: #facc15;
+  --c-state-retry-bg: #33290c;
+  --c-state-queued: #b4b8c2;
+  --c-state-queued-bg: #262a31;
+  --c-state-probe: #b6a3f5;
+  --c-state-probe-bg: #2a2244;
+  --c-alert: #f97066;
+  --c-app: #0d0e10;
+  --c-row-hover: #1c1f23;
+  --c-row-selected: #24180f;
+  --c-input-edge: #666b74;
+  --c-state-run-ink: #7fa8ff;
+  --c-state-done-ink: #4ccf8a;
+  --c-state-retry-ink: #facc15;
+  --c-state-queued-ink: #b4b8c2;
+  --c-state-probe-ink: #b6a3f5;
+  --c-state-cancelled: #a3a3a3;
+  --c-danger: #f97066;
+  --c-danger-bg: #3a1715;
+  --c-danger-edge: #5c2620;
+}

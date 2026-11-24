@@ -3,7 +3,23 @@
 	<head>
 		<meta charset="utf-8" />
 		<meta name="viewport" content="width=device-width, initial-scale=1" />
-		<title>durable inspector</title>
+		<title>Inspector · Durable Runner</title>
+		<link rel="icon" href="%sveltekit.assets%/favicon.svg" type="image/svg+xml" />
+		<link rel="preload" href="%sveltekit.assets%/fonts/google-sans-flex-latin.woff2" as="font" type="font/woff2" crossorigin />
+		<!--
+			The stored theme (dark unless Light was chosen, as the page itself decides on mount) is applied before
+			first paint, with the page ground, so a reload never flashes the other theme. durable-server's
+			inspector_csp() allows this script by its sha256 (it hashes every attribute-less script element in
+			index.html, so never write that tag's literal text in a comment here); styles may be inline under that
+			CSP. The colours are tokens.css's --c-app pair.
+		-->
+		<style>
+			html { background: #f6f7f9; color-scheme: light; }
+			html[data-theme='dark'] { background: #0d0e10; color-scheme: dark; }
+		</style>
+		<script>
+			try { document.documentElement.dataset.theme = localStorage.getItem('durable-theme') || 'dark'; } catch { document.documentElement.dataset.theme = 'dark'; }
+		</script>
 		%sveltekit.head%
 	</head>
 	<body data-sveltekit-preload-data="hover">
