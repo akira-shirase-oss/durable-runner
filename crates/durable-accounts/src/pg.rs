@@ -1179,8 +1179,11 @@ impl Pg {
 
 /// Postgres-backed tests run only when `DURABLE_TEST_DATABASE_URL` points
 /// at a scratch database (local Postgres in development, Neon in CI).
-/// Without it they report a visible skip so a missing secret never reads
-/// as a silent pass.
+/// Each is `#[ignore]`d so a plain `cargo test` counts them as skipped in
+/// the result line — an `ok` line can never again read as real-dialect
+/// evidence. The neon CI job runs them with `--include-ignored` and sets
+/// `DURABLE_REQUIRE_PG=1`, which turns a missing URL into a failure
+/// instead of a skip.
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1189,6 +1192,12 @@ mod tests {
     fn url() -> Option<String> {
         match std::env::var("DURABLE_TEST_DATABASE_URL") {
             Ok(url) if !url.is_empty() => Some(url),
+            _ if std::env::var("DURABLE_REQUIRE_PG").as_deref() == Ok("1") => {
+                panic!(
+                    "DURABLE_REQUIRE_PG=1 but DURABLE_TEST_DATABASE_URL is not set — \
+                     the pg tests were required to run for real"
+                );
+            }
             _ => {
                 eprintln!(
                     "DURABLE_TEST_DATABASE_URL not set — skipping Postgres-backed account tests"
@@ -1254,6 +1263,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "needs DURABLE_TEST_DATABASE_URL (CI: neon job runs --include-ignored)"]
     async fn pg_the_default_workspace_is_seeded() {
         let Some(store) = store().await else { return };
         let ws = store
@@ -1264,6 +1274,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "needs DURABLE_TEST_DATABASE_URL (CI: neon job runs --include-ignored)"]
     async fn pg_a_created_key_verifies_and_revokes() {
         let Some(store) = store().await else { return };
         let ws = store
@@ -1300,6 +1311,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "needs DURABLE_TEST_DATABASE_URL (CI: neon job runs --include-ignored)"]
     async fn pg_handlers_upsert_and_scope_per_workspace() {
         let Some(store) = store().await else { return };
         let a = store
@@ -1349,6 +1361,7 @@ mod tests {
     /// advisory-lock transaction makes count-and-insert one critical
     /// section: at the boundary exactly ONE concurrent put may land.
     #[tokio::test]
+    #[ignore = "needs DURABLE_TEST_DATABASE_URL (CI: neon job runs --include-ignored)"]
     async fn pg_a_put_burst_at_the_bound_admits_exactly_one() {
         let Some(store) = store().await else { return };
         let store = Arc::new(store);
@@ -1410,6 +1423,7 @@ mod tests {
     /// mark's idempotence — the same contract the Memory impl is
     /// fuzz-checked against, proved where the SQL actually runs.
     #[tokio::test]
+    #[ignore = "needs DURABLE_TEST_DATABASE_URL (CI: neon job runs --include-ignored)"]
     async fn pg_signup_session_and_revoke_round_trip() {
         let Some(store) = store().await else { return };
         let email = format!("pg-s30-{}@example.com", std::process::id());
@@ -1546,6 +1560,7 @@ mod tests {
     /// and kills siblings, and the outbox claim/mark/sweep cycle
     /// matches the Memory contract.
     #[tokio::test]
+    #[ignore = "needs DURABLE_TEST_DATABASE_URL (CI: neon job runs --include-ignored)"]
     async fn pg_verify_reset_outbox_round_trip() {
         let Some(store) = store().await else { return };
         let email = format!("pg-s31-{}@example.com", std::process::id());
