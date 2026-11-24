@@ -82,7 +82,7 @@ AGAIN=$($CLI submit --op-key pilot/onboarding-email --step prepare=step --step d
 step "wait for done"
 S=""
 for _ in $(seq 1 120); do
-  S=$($CLI inspect --run "$ID")
+  S=$($CLI inspect --run="$ID")
   echo "$S" | grep -q '"done"' && break
   sleep 0.25
 done
@@ -102,7 +102,7 @@ wait "$SRV_PID" 2>/dev/null || true
 "${SERVE[@]}" >>"$WORK/server.log" 2>&1 &
 SRV_PID=$!
 healthy "$SRV_PORT"
-S=$($CLI inspect --run "$ID")
+S=$($CLI inspect --run="$ID")
 echo "after replay -> $S"
 echo "$S" | grep -q '"done"' || fail "run $ID is not done after kill -9 and replay"
 
@@ -122,7 +122,7 @@ wait "$SRV_PID" 2>/dev/null || true
 RSRV_PID=$!
 healthy "$RSRV_PORT"
 RCLI="$BIN/durable-cli --server http://127.0.0.1:$RSRV_PORT"
-R=$($RCLI inspect --run "$ID")
+R=$($RCLI inspect --run="$ID")
 echo "restored inspect -> $R"
 echo "$R" | grep -q '"done"' || fail "the restored run is not done"
 echo "$R" | grep -q "$FINISHED" || fail "the restored run's finished_at changed ($FINISHED)"
