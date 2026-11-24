@@ -1,0 +1,69 @@
+# Durable Runner, shared droplet (deploy/droplet)
+# durable-server as the hosted service, on the droplet it shares with Colophon. install.sh puts
+# this at /etc/systemd/system/durable-server.service; direct/droplet-deploy.sh refreshes it from
+# the release it switches to. The self-hosted unit is deploy/durable-server.service.
+#
+# Secrets never sit in this file, the environment file or argv: each is a root-only file in
+# /etc/durable/credentials (put-secret.sh writes them), handed over by LoadCredential= and
+# exported by durable-saas-run.sh, because the server reads them from its environment
+# (DURABLE_API_KEY, DURABLE_READ_KEY, DATABASE_URL, RESEND_API_KEY). A missing one stops the
+# start here, before anything runs.
+[Unit]
+Description=Durable Runner (hosted, shared droplet)
+Wants=network-online.target
+After=network-online.target
+# A second writer on the same journal must never run; the lock is on the filesystem too.
+ConditionPathExists=/var/lib/durable
+
+[Service]
+Type=simple
+User=durable
+Group=durable
+EnvironmentFile=/etc/durable/durable.env
+LoadCredential=api_key:/etc/durable/credentials/api_key
+LoadCredential=read_key:/etc/durable/credentials/read_key
+LoadCredential=database_url:/etc/durable/credentials/database_url
+LoadCredential=resend_api_key:/etc/durable/credentials/resend_api_key
+# The release's own wrapper: /opt/durable/current is the release direct/droplet-deploy.sh
+# switched to, and its deploy/ is that commit's.
+ExecStart=/opt/durable/current/deploy/droplet/durable-saas-run.sh
+Restart=on-failure
+RestartSec=2
+# The drain (--drain-timeout-secs 30) plus margin; past it SIGKILL, which the journal survives.
+TimeoutStopSec=70
+LimitNOFILE=65536
+# The journal and its backups are the only writable paths.
+ReadWritePaths=/var/lib/durable
+UMask=0077
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+NoNewPrivileges=yes
+CapabilityBoundingSet=
+AmbientCapabilities=
+ProtectClock=yes
+ProtectHostname=yes
+ProtectKernelLogs=yes
+ProtectKernelModules=yes
+ProtectKernelTunables=yes
+ProtectControlGroups=yes
+# Other products' processes are invisible from here.
+ProtectProc=invisible
+# AF_NETLINK: the SSRF guard lists this host's own addresses with getifaddrs (if-addrs), which
+# asks the kernel over netlink; without it the guard can't see the droplet's public IPs.
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX AF_NETLINK
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=durable-server
+
+[Install]
+WantedBy=multi-user.target
