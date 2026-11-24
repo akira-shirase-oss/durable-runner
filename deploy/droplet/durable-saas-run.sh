@@ -4,9 +4,10 @@
 # The server reads its secrets from its environment, never argv (argv is visible to every local
 # user). systemd hands them over as files in $CREDENTIALS_DIRECTORY (LoadCredential=, from the
 # root-only /etc/durable/credentials); this wrapper exports each under the name the server reads,
-# checks the settings that would make a hosted deploy unsafe, adds the hosted flags, and execs the
-# release's own deploy/durable-run.sh, which builds the rest of argv (listen, journal, limits, the
-# loopback hop, deny-cidrs, handlers) and execs durable-server. It prints no secret.
+# checks the settings that would make a hosted deploy unsafe, adds the hosted flags, and execs
+# durable-run beside it (/usr/local/bin; deploy/durable-run.sh in a checkout), which builds the
+# rest of argv (listen, journal, limits, the loopback hop, deny-cidrs, handlers), runs the lab
+# guard on the binary and execs durable-server. It prints no secret.
 #
 #   credential       variable           required when
 #   api_key          DURABLE_API_KEY    always (the ops plane's write key, >= 32 characters)
@@ -96,4 +97,7 @@ esac
 # space or glob character.
 DURABLE_EXTRA_ARGS="$extra ${DURABLE_EXTRA_ARGS:-}"
 export DURABLE_EXTRA_ARGS
-exec "$here/../durable-run.sh"
+run=$here/durable-run
+[[ -x "$run" ]] || run=$here/../durable-run.sh
+[[ -x "$run" ]] || refuse "no durable-run beside $0"
+exec "$run"

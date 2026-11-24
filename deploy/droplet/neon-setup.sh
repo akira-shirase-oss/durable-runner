@@ -53,7 +53,7 @@ rootcert=${NEON_SSLROOTCERT:-system}
 if [[ "$rootcert" == system ]]; then
   # sslrootcert=system (the OS's public roots) is libpq 16+; older ones look for ~/.postgresql/root.crt.
   major=$(psql --version | grep -oE '[0-9]+' | head -1)
-  [[ "$major" =~ ^[0-9]+$ ]] && (( major >= 16 )) || die "psql $major can't verify against the system's roots (needs 16+); or set NEON_SSLROOTCERT to a CA bundle file"
+  if ! [[ "$major" =~ ^[0-9]+$ ]] || (( major < 16 )); then die "psql $major can't verify against the system's roots (needs 16+); or set NEON_SSLROOTCERT to a CA bundle file"; fi
 fi
 
 url=$(tr -d '\r\n' <"$owner_file")

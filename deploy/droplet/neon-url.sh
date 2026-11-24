@@ -1,4 +1,4 @@
-# shellcheck shell=bash
+# shellcheck shell=bash disable=SC2034  # a library: neon_url_split sets variables for its caller
 # Sourced by neon-setup.sh. Copied from Colophon's deploy/droplet/neon-url.sh (same Neon, same
 # reasons), with the URL split added so psql never sees a password on its command line.
 #

@@ -7,6 +7,13 @@
 # the client, and CF-Connecting-IP is attacker-controlled.
 # shellcheck disable=SC2015  # ok and bad only print, so `t && ok || bad` is if-then-else here.
 set -uo pipefail
+# The shared droplet (deploy/droplet: Colophon's root Caddyfile, no Cloudflare ranges in
+# trusted-proxies) has its own checks; its env file starts with that kit's marker. So upgrade.sh's
+# and rollback.sh's `smoke.sh --local-only` judge the host they actually run on.
+if [[ "$(head -n 1 /etc/durable/durable.env 2>/dev/null)" == "# Durable Runner, shared droplet (deploy/droplet)" ]]; then
+  [[ "${1:-}" == --local-only ]] && exec "$(dirname "$0")/droplet/smoke.sh" --release
+  exec "$(dirname "$0")/droplet/smoke.sh"
+fi
 failures=0
 ok()  { printf '  ok    %s\n' "$1"; }
 bad() { printf '  FAIL  %s\n' "$1"; failures=$((failures + 1)); }

@@ -4,10 +4,11 @@
 #   sudo deploy/droplet/install.sh          # from a checkout on the droplet (/opt/durable-build/src)
 #
 # It makes, if missing: the system user durable; /etc/durable (settings), /etc/durable/credentials
-# (0700, root), /var/lib/durable (the journal), /opt/durable/releases; the env file from
-# durable.env.template; the two ops keys (generated here, never shown); the unit
-# durable-server.service, enabled. It starts nothing: direct/deploy.sh installs the first release
-# and starts it, once the Neon URL and the Resend key are in place (put-secret.sh).
+# (0700, root), /var/lib/durable (the journal), /opt/durable/dashboards; the env file from
+# durable.env.template; the two ops keys (generated here, never shown); durable-run,
+# durable-lab-guard and durable-saas-run in /usr/local/bin; the unit durable-server.service,
+# enabled. It starts nothing: direct/deploy.sh installs the first build and starts it, once the
+# Neon URL and the Resend key are in place (put-secret.sh).
 #
 # Coexisting with Colophon: it never touches ufw, sshd, redis, Caddy (caddy-merge.sh is the one
 # Caddy step) or any file outside the paths above; an existing unit file or env file that isn't
@@ -34,7 +35,7 @@ say "ports $DR_PUBLIC_PORT and $DR_OPS_PORT: free or durable-server's own"
 
 # 2. Ours, or refused: files of these names that this kit didn't write.
 for f in "$DR_UNIT_FILE" "$DR_ENV"; do
-  if [[ -e "$f" ]] && ! head -n 1 "$f" | grep -qxF -- "$DR_MARK"; then
+  if [[ -e "$f" && "$(head -n 1 "$f")" != "$DR_MARK" ]]; then
     die "$f exists and isn't this kit's (its first line isn't '$DR_MARK'): a self-hosted install, or another product? Nothing was changed"
   fi
 done
@@ -52,7 +53,7 @@ ensure_dir "$DR_STATE" 0750 "$DR_USER:$DR_USER"
 ensure_dir "$DR_STATE/journal" 0750 "$DR_USER:$DR_USER"
 ensure_dir "$DR_STATE/backups" 0750 "$DR_USER:$DR_USER"
 ensure_dir "$DR_OPT" 0755
-ensure_dir "$DR_OPT/releases" 0755
+ensure_dir "$DR_DASHES" 0755
 ensure_dir "$DR_BUILD" 0755
 
 # 4. Settings: written once, never overwritten (edit it; this run keeps your changes).
@@ -99,7 +100,14 @@ done
 missing=()
 for k in database_url resend_api_key; do [[ -s "$DR_CREDS/$k" ]] || missing+=("$k"); done
 
-# 6. The unit: replaced only when this kit's copy differs, then one daemon-reload.
+# 6. The start-up scripts, beside one another in /usr/local/bin as the self-hosted install puts
+# them: the unit starts durable-saas-run, which execs durable-run, which runs durable-lab-guard on
+# the binary before every exec and refuses to start without it. Each deploy refreshes them from
+# the commit it installs (direct/droplet-deploy.sh). The binaries come with the first deploy.
+ensure_dir "$DR_BIN" 0755
+if install_scripts "$here/.."; then say "start-up scripts: installed in $DR_BIN"; else say "start-up scripts: current"; fi
+
+# 7. The unit: replaced only when this kit's copy differs, then one daemon-reload.
 if put_file "$here/durable-server.service" "$DR_UNIT_FILE" 0644; then
   systemctl daemon-reload
   say "unit: $DR_UNIT_FILE installed (daemon-reload)"

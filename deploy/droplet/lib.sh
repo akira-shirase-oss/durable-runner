@@ -1,4 +1,4 @@
-# shellcheck shell=bash
+# shellcheck shell=bash disable=SC2034  # a library: its settings are read by the scripts that source it
 # Sourced by the shared-droplet scripts (install.sh, caddy-merge.sh, smoke.sh, put-secret.sh,
 # direct/droplet-deploy.sh). The droplet is shared: Colophon already serves from it, so every
 # path below is Durable Runner's own, and nothing here writes outside them except the one import
@@ -14,6 +14,14 @@ DR_CREDS=$DR_ETC/credentials
 DR_ENV=$DR_ETC/durable.env
 DR_STATE=$ROOT/var/lib/durable
 DR_OPT=$ROOT/opt/durable
+# The binaries and the start-up scripts sit where the self-hosted install puts them, so
+# deploy/upgrade.sh (its staged copy, durable-server.prev, restore_prev) and deploy/rollback.sh
+# work here unchanged: /usr/local/bin/durable-server (+ .prev), durable-cli, durable-run,
+# durable-lab-guard, and this kit's durable-saas-run. Only the dashboard is versioned by release
+# directory: /opt/durable/dashboards/<release>, served through the /opt/durable/dashboard link.
+DR_BIN=$ROOT/usr/local/bin
+DR_DASHES=$DR_OPT/dashboards
+DR_DASH_LINK=$DR_OPT/dashboard
 DR_BUILD=${DURABLE_BUILD_DIR:-$ROOT/opt/durable-build}
 DR_UNIT_FILE=$ROOT/etc/systemd/system/durable-server.service
 DR_UNIT=durable-server
@@ -35,8 +43,10 @@ say() { printf '   %s\n' "$*"; }
 # Values from the environment or a file meet shell arithmetic only after this (AGENTS.md: a
 # subscript like x[$(cmd)] in (( )) runs cmd).
 is_uint() { [[ "${1:-}" =~ ^[0-9]+$ ]]; }
-is_uint "$DR_PUBLIC_PORT" && (( DR_PUBLIC_PORT > 0 && DR_PUBLIC_PORT < 65536 )) || die "DURABLE_PUBLIC_PORT '$DR_PUBLIC_PORT' isn't a port"
-is_uint "$DR_OPS_PORT" && (( DR_OPS_PORT > 0 && DR_OPS_PORT < 65536 )) || die "DURABLE_OPS_PORT '$DR_OPS_PORT' isn't a port"
+for _p in "$DR_PUBLIC_PORT" "$DR_OPS_PORT"; do
+  if ! is_uint "$_p" || (( _p == 0 || _p > 65535 )); then die "DURABLE_PUBLIC_PORT / DURABLE_OPS_PORT: '$_p' isn't a port"; fi
+done
+unset _p
 
 # mode_of <path>: the octal permission bits (GNU stat on the droplet, BSD stat in a Mac test).
 mode_of() { stat -c %a "$1" 2>/dev/null || stat -f %Lp "$1"; }
@@ -174,4 +184,15 @@ port_check() {
   done <<<"$listeners"
   [[ -z "$foreign" ]] || die "port $port ($what) is held by something that isn't durable-server:$foreign it was left running; free the port or change the band"
   return 0
+}
+
+# install_scripts <deploy-dir>: durable-run, durable-lab-guard and durable-saas-run from a deploy/
+# tree into /usr/local/bin. Returns 0 when it changed any, 1 when all three were current.
+install_scripts() {
+  local d=$1 changed=1 pair
+  for pair in durable-run.sh:durable-run lab-build-guard.sh:durable-lab-guard droplet/durable-saas-run.sh:durable-saas-run; do
+    [[ -s "$d/${pair%%:*}" ]] || die "$d/${pair%%:*} is missing"
+    if put_file "$d/${pair%%:*}" "$DR_BIN/${pair##*:}" 0755; then changed=0; fi
+  done
+  return "$changed"
 }

@@ -22,27 +22,29 @@ failures=0
 ok()  { printf '  ok    %s\n' "$1"; }
 bad() { printf '  FAIL  %s\n' "$1"; failures=$((failures + 1)); }
 LOCAL=http://127.0.0.1:$DR_PUBLIC_PORT
-bin=$(env_get DURABLE_SERVER_BIN "$DR_ENV"); bin=${bin:-/opt/durable/current/bin/durable-server}
-bin=$ROOT$bin
+bin=$DR_BIN/durable-server
 need_accounts=$(env_get DURABLE_REQUIRE_ACCOUNTS "$DR_ENV"); need_accounts=${need_accounts:-1}
 need_mail=$(env_get DURABLE_REQUIRE_MAIL "$DR_ENV"); need_mail=${need_mail:-1}
 origin=$(env_get DURABLE_PUBLIC_ORIGIN "$DR_ENV")
 host=$(origin_host "$origin" 2>/dev/null || true)
 
 echo "the release"
-"$here/../lab-build-guard.sh" "$bin" >/dev/null 2>&1 \
-  && ok "$bin is a production build" \
-  || bad "$bin is a LAB build or unreadable (--allow-local-tenant-handlers turns the tenant SSRF guard off)"
+# Judge the binary systemd is RUNNING (/proc/<MainPID>/exe), never a path from the environment,
+# as deploy/smoke.sh does. DURABLE_PROC_ROOT is for the tests only.
+proc_root=${DURABLE_PROC_ROOT:-$ROOT/proc}
 systemctl is-active --quiet "$DR_UNIT" && ok "$DR_UNIT active" || bad "$DR_UNIT not active"
 pid=$(unit_main_pid)
-proc=$ROOT/proc/$pid
+proc=$proc_root/$pid
 if (( pid > 0 )) && [[ -e "$proc/exe" ]]; then
+  "$here/../lab-build-guard.sh" "$proc/exe" >/dev/null 2>&1 \
+    && ok "the running durable-server is a production build" \
+    || bad "the running durable-server is a LAB build or unreadable (--allow-local-tenant-handlers turns the tenant SSRF guard off)"
   running=$(readlink -f "$proc/exe" 2>/dev/null || true)
   [[ -n "$running" && "$running" == "$(readlink -f "$bin")" ]] \
-    && ok "the running process is this release's binary" \
-    || bad "the running process is ${running:-unknown}, not $(readlink -f "$bin") (restart it)"
+    && ok "it runs $bin as installed" \
+    || bad "it runs ${running:-something unknown}, not the installed $bin (restart it)"
 else
-  bad "no running process to inspect (MainPID $pid)"
+  bad "no running durable-server to judge (MainPID $pid)"
 fi
 
 echo "the server, on loopback"

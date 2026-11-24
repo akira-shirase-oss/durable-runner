@@ -24,9 +24,9 @@ LoadCredential=api_key:/etc/durable/credentials/api_key
 LoadCredential=read_key:/etc/durable/credentials/read_key
 LoadCredential=database_url:/etc/durable/credentials/database_url
 LoadCredential=resend_api_key:/etc/durable/credentials/resend_api_key
-# The release's own wrapper: /opt/durable/current is the release direct/droplet-deploy.sh
-# switched to, and its deploy/ is that commit's.
-ExecStart=/opt/durable/current/deploy/droplet/durable-saas-run.sh
+# This kit's wrapper, beside durable-run and durable-lab-guard (install.sh, droplet-deploy.sh):
+# it exports the credentials and execs durable-run, which runs the lab guard, then the server.
+ExecStart=/usr/local/bin/durable-saas-run
 Restart=on-failure
 RestartSec=2
 # The drain (--drain-timeout-secs 30) plus margin; past it SIGKILL, which the journal survives.
