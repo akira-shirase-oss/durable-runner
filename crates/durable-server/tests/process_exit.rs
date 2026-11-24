@@ -83,9 +83,16 @@ async fn wait_ready(c: &reqwest::Client, base: &str) {
 
 /// Submit a delayed job; its run id if acknowledged.
 async fn submit(c: &reqwest::Client, base: &str, key: &str) -> Option<String> {
+    // ~29 days out — inside the 30-day admit cap (S2-2), parked for
+    // the test's lifetime.
+    let parked = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
+        + 29 * 86_400_000;
     let body = serde_json::json!({
         "op_key": key,
-        "not_before": 9_999_999_999_999u64,
+        "not_before": parked,
         "spec": { "version": 1, "steps": [{ "name": "a", "handler": "step" }], "input_b64": "aGk=" },
     });
     let r = c
