@@ -26,9 +26,11 @@ fi
 name="backup-$(date -u +%Y%m%dT%H%MZ)"
 key=$(tr -d '\n' </etc/durable/api-key)
 # The server copies the journal under --backup-root atomically.
-# DURABLE_LISTEN is 127.0.0.1:PORT on the droplet; curl it directly.
+# The ops key answers on the ops listener when one is set (--ops-listen: with an account store the
+# public listener 401s it), else on DURABLE_LISTEN; both are 127.0.0.1:PORT, so curl directly.
+ops=${DURABLE_OPS_LISTEN:-$DURABLE_LISTEN}
 code=$(curl -sS -o "$STAGE/backup.json" -w '%{http_code}' --max-time 600 \
-  -X POST "http://${DURABLE_LISTEN}/admin/backup" \
+  -X POST "http://${ops}/admin/backup" \
   -H "authorization: Bearer $key" -H 'content-type: application/json' \
   -d "{\"name\":\"$name\"}")
 [[ "$code" == 200 ]] || { echo "durable-backup: /admin/backup $code: $(cat "$STAGE/backup.json")" >&2; exit 1; }

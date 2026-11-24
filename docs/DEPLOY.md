@@ -180,9 +180,10 @@ Cloudflare. It FAILS while origin pulls still trust Cloudflare's shared
 certificate; that trust is set by Colophon's `origin-pull-ca.sh` for the whole
 zone, and should end as our own zone certificate only, never the shared one.
 
-**8. Optional hardening.** If the droplet has a reserved IP, add it to
-`/etc/durable/deny-cidrs`; addresses on the droplet's interfaces are refused
-already. The egress firewall in the self-host section below is keyed to the
+**8. Hardening.** `install.sh` asks DigitalOcean's metadata service for the
+droplet's reserved IP and, when one is active, adds it to
+`/etc/durable/deny-cidrs` (D-061); addresses on the droplet's interfaces are
+refused already. Rerun `install.sh` if a reserved IP is assigned later. The egress firewall in the self-host section below is keyed to the
 `durable` user, so it doesn't affect Colophon.
 
 ### The routine deploy (under 10 minutes)
@@ -240,18 +241,16 @@ the journal and Neon are untouched.
 All of these live in `/etc/durable/durable.env`. Restart after a change
 (`systemctl restart durable-server`), or let the next deploy pick it up.
 
-- `DURABLE_OPS_LISTEN=127.0.0.1:58301`: set this once the server has
-  `--ops-listen` (S3 ruling 2'). clap refuses unknown flags, so the wrapper
-  passes it only when this line is set and the binary's `--help` lists it. If
-  the setting is on but the binary lacks the flag, the wrapper logs a warning
-  instead. The ops keys are then answered there only, through
-  `ssh -L 58301:127.0.0.1:58301 $H`. `--public-origin` follows the same rule:
-  it is passed only to a server that has it (the S3 branch has it, main at
-  8b46ec3 doesn't).
-- `DURABLE_DASHBOARD_PATH=/app/`: set this once the server mounts the
-  dashboard at `/app` (with `/inspector` answering 308). Then rerun
-  `caddy-merge.sh` (for the root redirect) and pass
-  `DURABLE_DASHBOARD_PATH=/app/` to `deploy.sh` (for its public check).
+- `DURABLE_OPS_LISTEN=127.0.0.1:58301` is on in the template and required: with
+  an account store the server refuses to boot without `--ops-listen`, and the
+  wrapper refuses first. The env ops keys answer only there, through
+  `ssh -L 58301:127.0.0.1:58301 $H`; on the public listener they get 401.
+- `DURABLE_MAX_LIVE_RUNS_PER_WS=500` and `DURABLE_MAX_INDEX_BYTES_PER_WS=16777216`
+  (16 MiB) cap one workspace's share of live runs and of the retained-run
+  index until plan limits land (S3-4). Raise them here.
+- `DURABLE_DASHBOARD_PATH=/app/` is the default (the server mounts the
+  dashboard at `/app`; `/inspector` answers 308). If you move it, rerun
+  `caddy-merge.sh` and pass the same value to `deploy.sh`.
 - `DURABLE_INVITE_ONLY`: off by default; the line stays commented. The server
   only checks whether the variable exists, so `0` would mean on. The wrapper
   reads `0`/`false`/`off`/`no`/empty as off and drops the variable, and reads
@@ -281,9 +280,10 @@ both.
 
 ### Not yet on the shared host
 
-Journal backups to R2 are not wired up here. `durable-backup` assumes the
-self-host paths and the ops key on the public listener, so they wait for
-`--ops-listen`. Until then the journal lives only on the droplet's disk, plus
+Journal backups to R2 are not wired up here yet. `durable-backup` now posts to
+the ops listener when `DURABLE_OPS_LISTEN` is set, but its R2 credentials and
+age recipient follow the self-host layout and aren't installed by this kit.
+Until they are, the journal lives only on the droplet's disk, plus
 DigitalOcean's droplet backups if those are on.
 
 ### The kit's tests

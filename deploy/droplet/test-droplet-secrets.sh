@@ -34,6 +34,7 @@ cat >"$work/stub" <<'EOF'
 #!/usr/bin/env bash
 if [[ "${1:-}" == --help ]]; then
   echo "Usage: durable-server [OPTIONS]"; echo "      --journal <JOURNAL>"
+  echo "      --max-live-runs-per-ws <MAX_LIVE_RUNS_PER_WS>"; echo "      --max-index-bytes-per-ws <MAX_INDEX_BYTES_PER_WS>"
   [[ -n "${STUB_OLD:-}" ]] || { echo "      --public-origin <PUBLIC_ORIGIN>"; echo "      --ops-listen <OPS_LISTEN>"; }
   exit 0
 fi
@@ -50,7 +51,7 @@ runw() {
     DURABLE_SERVER_BIN="$work/stub" STUB_DIR="$work" DURABLE_LISTEN=127.0.0.1:58300 \
     DURABLE_PUBLIC_ORIGIN=https://durablerunnerapp.404human.dev \
     DURABLE_MAIL_FROM="Durable Runner <durable-runner@404human.dev>" \
-    DURABLE_REQUIRE_ACCOUNTS=1 DURABLE_REQUIRE_MAIL=1 "$@" "$kit/durable-saas-run.sh" >"$work/out" 2>&1
+    DURABLE_REQUIRE_ACCOUNTS=1 DURABLE_REQUIRE_MAIL=1 DURABLE_OPS_LISTEN=127.0.0.1:58301 "$@" "$kit/durable-saas-run.sh" >"$work/out" 2>&1
 }
 has_pair() { local prev="" line; while IFS= read -r line; do [[ "$prev" == "$1" && "$line" == "$2" ]] && return 0; prev=$line; done <"$work/argv"; return 1; }
 envval() { sed -n "s/^$1=//p" "$work/env"; }
@@ -62,16 +63,18 @@ if runw DURABLE_INVITE_ONLY=0; then ok "starts with every credential"; else bad 
 leak=0; for v in "$API" "$READ" "s3cretPassw0rd" "$RESEND"; do grep -qF -- "$v" "$work/argv" && leak=1; grep -qF -- "$v" "$work/out" && leak=1; done
 (( leak == 0 )) && ok "no secret in argv or in what it prints" || bad "a secret reached argv or the output"
 has_pair --public-origin https://durablerunnerapp.404human.dev && ok "--public-origin from DURABLE_PUBLIC_ORIGIN" || bad "no --public-origin: $(tr '\n' ' ' <"$work/argv")"
-grep -qx -- --ops-listen "$work/argv" && bad "--ops-listen passed although DURABLE_OPS_LISTEN is unset" || ok "no --ops-listen while the setting is off"
+has_pair --ops-listen 127.0.0.1:58301 && ok "--ops-listen from DURABLE_OPS_LISTEN (the hosted default)" || bad "no --ops-listen: $(tr '\n' ' ' <"$work/argv")"
 has_pair --trusted-proxy 127.0.0.1/32 && ok "durable-run still adds the loopback hop" || bad "no loopback hop"
 grep -q '^DURABLE_INVITE_ONLY=' "$work/env" && bad "DURABLE_INVITE_ONLY=0 reached the server (it would turn invite-only ON)" || ok "DURABLE_INVITE_ONLY=0 is dropped (off)"
 runw DURABLE_INVITE_ONLY=yes && [[ "$(envval DURABLE_INVITE_ONLY)" == 1 ]] && ok "DURABLE_INVITE_ONLY=yes reaches the server as 1" || bad "invite-only on didn't reach the server"
-runw DURABLE_OPS_LISTEN=127.0.0.1:58301 && has_pair --ops-listen 127.0.0.1:58301 && ok "--ops-listen when DURABLE_OPS_LISTEN is set" || bad "no --ops-listen with the setting on"
-runw STUB_OLD=1 DURABLE_OPS_LISTEN=127.0.0.1:58301 && ! grep -qx -- --public-origin "$work/argv" && ! grep -qx -- --ops-listen "$work/argv" \
-  && grep -q 'WARNING DURABLE_OPS_LISTEN' "$work/out" && ok "a server without the S3 flags gets neither (clap would refuse them), with a warning for --ops-listen" \
-  || bad "an older server: $(tr '\n' ' ' <"$work/argv"; cat "$work/out")"
+runw DURABLE_MAX_LIVE_RUNS_PER_WS=500 DURABLE_MAX_INDEX_BYTES_PER_WS=16777216 \
+  && has_pair --max-live-runs-per-ws 500 && has_pair --max-index-bytes-per-ws 16777216 \
+  && ok "the per-workspace capacity settings reach the server" || bad "per-workspace caps: $(tr '\n' ' ' <"$work/argv"; cat "$work/out")"
 rm -f "$creds/database_url" "$creds/resend_api_key"
 runw DURABLE_REQUIRE_ACCOUNTS=0 DURABLE_REQUIRE_MAIL=0 && ! grep -q '^DATABASE_URL=' "$work/env" && ok "a key-only server starts without the account store when told to" || bad "REQUIRE_*=0 didn't start without them: $(cat "$work/out")"
+runw STUB_OLD=1 DURABLE_REQUIRE_ACCOUNTS=0 DURABLE_REQUIRE_MAIL=0 && ! grep -qx -- --public-origin "$work/argv" && ! grep -qx -- --ops-listen "$work/argv" \
+  && grep -q 'WARNING DURABLE_OPS_LISTEN' "$work/out" && ok "a key-only older server gets neither S3 flag (clap would refuse them), with a warning for --ops-listen" \
+  || bad "an older key-only server: $(tr '\n' ' ' <"$work/argv" 2>/dev/null; cat "$work/out")"
 
 refused() { # <description> <setup command> [VAR=value...]
   local what=$1 setup=$2 rc=0; shift 2
@@ -91,6 +94,10 @@ refused "DURABLE_MAILER=log" ':' DURABLE_MAILER=log
 refused "an in-memory account store" ':' DURABLE_ACCOUNTS_BACKEND=memory
 refused "an unclear DURABLE_INVITE_ONLY" ':' DURABLE_INVITE_ONLY=maybe
 refused "a public ops listener" ':' DURABLE_OPS_LISTEN=0.0.0.0:58301
+refused "an account store without the ops listener" ':' DURABLE_OPS_LISTEN=
+refused "an account store on a server without --ops-listen" ':' STUB_OLD=1
+refused "a per-workspace cap that isn't a number" ':' DURABLE_MAX_LIVE_RUNS_PER_WS=lots
+refused "--max-live-runs-per-ws repeated in DURABLE_EXTRA_ARGS" ':' "DURABLE_EXTRA_ARGS=--max-live-runs-per-ws 9999999"
 refused "an origin with a path" ':' DURABLE_PUBLIC_ORIGIN=https://durablerunnerapp.404human.dev/x
 refused "an http origin" ':' DURABLE_PUBLIC_ORIGIN=http://durablerunnerapp.404human.dev
 refused "--public-origin repeated in DURABLE_EXTRA_ARGS" ':' "DURABLE_EXTRA_ARGS=--public-origin https://evil.example"
