@@ -1045,7 +1045,7 @@ the refusal, not just the happy path).
   site file per product on the shared droplet). One dashboard build at
   `/app` (signed-in SaaS mode + compat key-paste mode); `/inspector`
   308-redirects to `/app` preserving the path tail and query.
-- New env: `RESEND_API_KEY`, `MAIL_FROM` =
+- New env: `RESEND_API_KEY`, `DURABLE_MAIL_FROM` =
   `Durable Runner <durable-runner@404human.dev>` (ruling 7),
   `--public-origin https://durablerunnerapp.404human.dev` — **required
   at boot whenever an account store is configured** (review #18; absent
