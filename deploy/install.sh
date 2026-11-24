@@ -17,6 +17,7 @@ install -d -m 0755 /etc/durable /usr/local/share/durable
 install -m 0755 target/release/durable-server /usr/local/bin/
 install -m 0755 target/release/durable-cli /usr/local/bin/ 2>/dev/null || true
 install -m 0755 deploy/durable-run.sh /usr/local/bin/durable-run
+install -m 0755 deploy/lab-build-guard.sh /usr/local/bin/durable-lab-guard
 [[ -d apps/inspector/build ]] && rm -rf /usr/local/share/durable/inspector \
   && cp -r apps/inspector/build /usr/local/share/durable/inspector || true
 

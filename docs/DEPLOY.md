@@ -86,7 +86,10 @@ deploy/install.sh           # user, dirs, keys, units; enables + starts
 `install.sh` (and `upgrade.sh`) first refuse a lab build — a
 `cargo build --features lab` binary, which `examples/pilot/run-workspaces.sh`
 leaves in the same `target/release` — so rebuild with a plain
-`cargo build --release` if it says so (D-062).
+`cargo build --release` if it says so (D-062). `install.sh` also puts the
+guard beside `durable-run` (`/usr/local/bin/durable-lab-guard`), which
+runs it before every start; a droplet installed before D-062 gets it by
+re-running `install.sh` (idempotent).
 
 `install.sh` generated `DURABLE_API_KEY`/`DURABLE_READ_KEY` into
 `/etc/durable/durable.env` (0600). Write `/etc/durable/handlers` — one

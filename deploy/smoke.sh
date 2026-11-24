@@ -12,11 +12,18 @@ ok()  { printf '  ok    %s\n' "$1"; }
 bad() { printf '  FAIL  %s\n' "$1"; failures=$((failures + 1)); }
 
 echo "the binary"
-# A lab build turns the tenant SSRF guard off (S3 re-review 3).
-installed=${DURABLE_SERVER_BIN:-/usr/local/bin/durable-server}
-"$(dirname "$0")/lab-build-guard.sh" "$installed" 2>/dev/null \
-  && ok "$installed is a production build" \
-  || bad "$installed is a LAB build or unreadable — reinstall a plain cargo build --release"
+# A lab build turns the tenant SSRF guard off (S3 re-review 3). Judge the
+# binary systemd is RUNNING (/proc/<MainPID>/exe), never a path from the
+# environment. DURABLE_PROC_ROOT exists for deploy/test-lab-guard.sh only.
+proc=${DURABLE_PROC_ROOT:-/proc}
+pid=$(systemctl show -p MainPID --value durable-server 2>/dev/null || echo 0)
+if [[ "$pid" =~ ^[0-9]+$ ]] && (( pid > 0 )); then
+  "$(dirname "$0")/lab-build-guard.sh" "$proc/$pid/exe" 2>/dev/null \
+    && ok "the running durable-server is a production build" \
+    || bad "the running durable-server is a LAB build or unreadable — reinstall a plain cargo build --release"
+else
+  bad "no running durable-server to judge (MainPID $pid)"
+fi
 
 echo "services"
 for unit in durable-server caddy; do
@@ -54,10 +61,9 @@ if grep -q 'trusted_ca_cert_file /etc/caddy/aop-zone-ca.pem' /etc/caddy/Caddyfil
 else
   bad "Caddy does not require OUR zone AOP CA (/etc/caddy/aop-zone-ca.pem) — CREATE.md 3"
 fi
-pid=$(systemctl show -p MainPID --value durable-server 2>/dev/null || echo 0)
 argv=""
 if [[ "$pid" =~ ^[0-9]+$ ]] && (( pid > 0 )); then
-  argv=$(tr '\0' ' ' </proc/"$pid"/cmdline 2>/dev/null || true)
+  argv=$(tr '\0' ' ' <"$proc/$pid/cmdline" 2>/dev/null || true)
 fi
 if [[ "$argv" == *"--trusted-proxy 127.0.0.1/32"* ]]; then
   ok "durable-server trusts the loopback proxy hop"
