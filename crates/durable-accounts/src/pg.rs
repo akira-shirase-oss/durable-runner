@@ -130,6 +130,7 @@ fn key_info_from(row: &sqlx::postgres::PgRow) -> Result<ApiKeyInfo, AccountError
         // the store is the account's public_id (selected as
         // created_by_pid by the caller's LEFT JOIN).
         created_by: row.try_get::<Option<uuid::Uuid>, _>("created_by_pid")?,
+        created_at_ms: ms(row.try_get::<time::OffsetDateTime, _>("created_at")?),
     })
 }
 
@@ -269,7 +270,7 @@ impl AccountStore for Pg {
                 "INSERT INTO api_keys \
                  (workspace_id, name, key_hash, prefix, permission, created_by) \
                  VALUES ($1, $2, $3, $4, $5, $6) \
-                 RETURNING id, public_id, \
+                 RETURNING id, public_id, created_at, \
                      (SELECT public_id FROM accounts WHERE id = $6) AS created_by_pid",
             )
             .bind(to_i64(workspace, "workspace")?)
@@ -290,6 +291,7 @@ impl AccountStore for Pg {
             revoked: false,
             last_used_at_ms: None,
             created_by: row.try_get("created_by_pid")?,
+            created_at_ms: ms(row.try_get::<time::OffsetDateTime, _>("created_at")?),
         })
     }
 
@@ -327,7 +329,7 @@ impl AccountStore for Pg {
             sqlx::query(
                 "SELECT k.id, k.public_id, k.name, k.prefix, k.permission, \
                         (k.revoked_at IS NOT NULL) AS revoked, k.last_used_at, \
-                        a.public_id AS created_by_pid \
+                        k.created_at, a.public_id AS created_by_pid \
                  FROM api_keys k LEFT JOIN accounts a ON a.id = k.created_by \
                  WHERE k.workspace_id = $1 ORDER BY k.id",
             )
@@ -347,7 +349,7 @@ impl AccountStore for Pg {
             sqlx::query(
                 "SELECT k.id, k.public_id, k.name, k.prefix, k.permission, \
                         (k.revoked_at IS NOT NULL) AS revoked, k.last_used_at, \
-                        a.public_id AS created_by_pid \
+                        k.created_at, a.public_id AS created_by_pid \
                  FROM api_keys k LEFT JOIN accounts a ON a.id = k.created_by \
                  WHERE k.workspace_id = $1 AND k.public_id = $2 AND k.revoked_at IS NULL",
             )
@@ -399,7 +401,7 @@ impl AccountStore for Pg {
                 "INSERT INTO api_keys \
                  (workspace_id, name, key_hash, prefix, permission, created_by) \
                  VALUES ($1, $2, $3, $4, $5, $6) \
-                 RETURNING id, public_id, \
+                 RETURNING id, public_id, created_at, \
                      (SELECT public_id FROM accounts WHERE id = $6) AS created_by_pid",
             )
             .bind(to_i64(workspace, "workspace")?)
@@ -420,6 +422,7 @@ impl AccountStore for Pg {
             revoked: false,
             last_used_at_ms: None,
             created_by: row.try_get("created_by_pid")?,
+            created_at_ms: ms(row.try_get::<time::OffsetDateTime, _>("created_at")?),
         };
         bounded(tx.commit()).await?;
         Ok(Some((info, old_hash)))

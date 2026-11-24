@@ -3699,7 +3699,27 @@ async fn auth_reset(
     ))
 }
 
-async fn auth_session(SessionAuth(grant): SessionAuth) -> Result<Response, ApiError> {
+async fn auth_session(
+    SessionAuth(grant): SessionAuth,
+    State(app): State<App>,
+) -> Result<Response, ApiError> {
+    // The dashboard boots off this call — the account's workspaces in
+    // the same shape GET /workspaces returns them.
+    let rows = accounts(&app)?
+        .workspaces_for_account(grant.account.id)
+        .await
+        .map_err(store_err)?;
+    let workspaces: Vec<serde_json::Value> = rows
+        .iter()
+        .map(|(ws, role)| {
+            serde_json::json!({
+                "public_id": ws.public_id,
+                "name": ws.name,
+                "role": role.as_str(),
+                "plan": "free",
+            })
+        })
+        .collect();
     Ok(no_store(
         Json(serde_json::json!({
             "account": {
@@ -3708,7 +3728,7 @@ async fn auth_session(SessionAuth(grant): SessionAuth) -> Result<Response, ApiEr
                 "verified": grant.account.email_verified,
             },
             "csrf": csrf_token(&grant.csrf_seed),
-            "workspaces": [],
+            "workspaces": workspaces,
         }))
         .into_response(),
     ))
@@ -4263,6 +4283,8 @@ async fn ws_list_mine(
                 "public_id": ws.public_id,
                 "name": ws.name,
                 "role": role.as_str(),
+                // Every ws lives on 'free' until S3-4 lands plan rows.
+                "plan": "free",
             })
         })
         .collect();
@@ -4656,6 +4678,7 @@ fn key_json(k: &ApiKeyInfo) -> serde_json::Value {
         "revoked": k.revoked,
         "last_used_at_ms": k.last_used_at_ms,
         "created_by": k.created_by,
+        "created_at_ms": k.created_at_ms,
     })
 }
 
@@ -5929,6 +5952,7 @@ async fn list_workspace_keys(
                 "prefix": k.prefix,
                 "permission": k.permission.api_str(),
                 "revoked": k.revoked,
+                "created_at_ms": k.created_at_ms,
             })
         })
         .collect();
@@ -19370,6 +19394,41 @@ mod tests {
             invite_mail.mail.text.contains(&url),
             "mail body lacks the app link: {}",
             invite_mail.mail.text
+        );
+    }
+
+    /// The dashboard's shape contract: GET /workspaces and
+    /// GET /auth/session carry the same workspace objects with `plan`,
+    /// and key rows carry `created_at_ms`.
+    #[tokio::test]
+    async fn s3d_workspace_and_key_shapes() {
+        let store = Arc::new(Memory::new());
+        let h = harness_store(false, None, Some(store.clone()));
+        signup_and_verify(&h.router, &store, "o@o.co", "a-long-enough-passphrase").await;
+        let (oc, ocsrf) = login_only(&h.router, "o@o.co", "a-long-enough-passphrase").await;
+        let pid = make_ws(&h.router, &oc, "alpha").await;
+        make_key(&h.router, &oc, &ocsrf, &pid, "write").await;
+        for path in ["/workspaces".to_string(), "/auth/session".to_string()] {
+            let (st, _, v) = raw(&h.router, "GET", &path, &[("cookie", oc.clone())], None).await;
+            assert_eq!(st, StatusCode::OK, "{path}: {v}");
+            let ws = &v["workspaces"][0];
+            assert_eq!(ws["public_id"].as_str().unwrap_or_default(), pid, "{path}");
+            assert_eq!(ws["name"], "alpha");
+            assert_eq!(ws["role"], "owner");
+            assert_eq!(ws["plan"], "free", "{path}");
+        }
+        let (st, _, v) = raw(
+            &h.router,
+            "GET",
+            &format!("/workspaces/{pid}/keys"),
+            &[("cookie", oc.clone())],
+            None,
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK, "{v}");
+        assert!(
+            v["keys"][0]["created_at_ms"].as_i64().unwrap_or(0) > 0,
+            "key row carries its birth stamp: {v}"
         );
     }
 }

@@ -65,6 +65,7 @@ struct KeyRow {
     revoked: bool,
     last_used_at_ms: Option<i64>,
     created_by: Option<u64>,
+    created_at_ms: i64,
 }
 
 impl KeyRow {
@@ -82,6 +83,7 @@ impl KeyRow {
             created_by: self
                 .created_by
                 .and_then(|a| inner.accounts.get(&a).map(|acc| acc.public_id)),
+            created_at_ms: self.created_at_ms,
         }
     }
 }
@@ -366,6 +368,7 @@ impl AccountStore for Memory {
                 revoked: false,
                 last_used_at_ms: None,
                 created_by,
+                created_at_ms: now_ms(),
             },
         );
         Ok(inner
@@ -457,6 +460,7 @@ impl AccountStore for Memory {
                 revoked: false,
                 last_used_at_ms: None,
                 created_by,
+                created_at_ms: now_ms(),
             },
         );
         let info = inner

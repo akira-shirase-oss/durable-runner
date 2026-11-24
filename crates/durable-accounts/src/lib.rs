@@ -125,6 +125,8 @@ pub struct ApiKeyInfo {
     /// The member account that issued it (its public id — internal
     /// account ids never leave the store), when self-service created it.
     pub created_by: Option<uuid::Uuid>,
+    /// unix millis — the row's birth stamp, surfaced for the dashboard.
+    pub created_at_ms: i64,
 }
 
 /// One handler registered for a workspace.
