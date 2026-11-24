@@ -83,6 +83,11 @@ cd $CHECKOUT
 deploy/install.sh           # user, dirs, keys, units; enables + starts
 ```
 
+`install.sh` (and `upgrade.sh`) first refuse a lab build — a
+`cargo build --features lab` binary, which `examples/pilot/run-workspaces.sh`
+leaves in the same `target/release` — so rebuild with a plain
+`cargo build --release` if it says so (D-062).
+
 `install.sh` generated `DURABLE_API_KEY`/`DURABLE_READ_KEY` into
 `/etc/durable/durable.env` (0600). Write `/etc/durable/handlers` — one
 `name=url` per step handler (the `step=…` allowlist) — then

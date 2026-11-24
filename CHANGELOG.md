@@ -157,6 +157,16 @@ contract + reference verifier ship in `docs/HANDLERS.md`.
 
 ### Security
 
+- **One IPv6 /48 can no longer pin its own cap.** A /48 whose 256 /64
+  entries went idle frees them for newcomers instead of sending every
+  new /64 in it to one shared bucket until restart (D-062).
+- **A failed registry save never turns the retry into a no-op.** The
+  armed view behind the `unchanged` PUT answer is set only after the
+  snapshot write is acknowledged (PUT, secret rotation, reconcile), and
+  forgotten before DELETE's write (D-062).
+- **The deploy refuses a lab build.** `install.sh` and `upgrade.sh` stop
+  on a binary built with `--features lab` (its `--help` lists
+  `--allow-local-tenant-handlers`); `smoke.sh` fails one (D-062).
 - Internal sequential workspace ids never appear in routes, response
   bodies, tokens or headers — workspaces cannot be enumerated or
   counted. A regression test scans every affected response for the u64.

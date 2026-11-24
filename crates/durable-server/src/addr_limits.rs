@@ -195,7 +195,9 @@ pub struct RateLimit {
     max_addrs: usize,
     addrs: HashMap<LimitKey, Bucket>,
     /// How many `Addr` (/64) entries each /48 holds now.
-    per_agg: HashMap<u128, usize>,
+    /// Each /48's own /64 entries (their address keys): the count the cap
+    /// reads, and the list a full /48 is reclaimed from.
+    per_agg: HashMap<u128, std::collections::HashSet<IpAddr>>,
     /// When the full table was last scanned for idle entries.
     last_reclaim: Option<Instant>,
     /// Scans run so far (tests: the scan is rate-limited).
@@ -291,10 +293,10 @@ impl RateLimit {
             // ATTACK(limiter-idle-clock)
             let keep = idle.is_none_or(|i| b.active > i);
             if !keep {
-                if let Some(agg) = Self::agg_of_key(k, v6_prefix) {
-                    if let Some(n) = per_agg.get_mut(&agg) {
-                        *n = n.saturating_sub(1);
-                        if *n == 0 {
+                if let (Some(agg), LimitKey::Addr(a)) = (Self::agg_of_key(k, v6_prefix), k) {
+                    if let Some(set) = per_agg.get_mut(&agg) {
+                        set.remove(a);
+                        if set.is_empty() {
                             per_agg.remove(&agg);
                         }
                     }
@@ -302,6 +304,31 @@ impl RateLimit {
             }
             keep
         });
+    }
+
+    /// A /48 at its cap drops its OWN minute-idle /64 entries (S3 re-review
+    /// 1: the table-wide scan runs only on a full table, so a /48 filled
+    /// once by one-off /64s stayed capped for good and its never-seen
+    /// /64s shared one bucket until restart). O(cap) for that /48 only.
+    fn reclaim_agg(&mut self, agg: u128, now: Instant) {
+        let Some(idle) = now.checked_sub(IDLE_EVICT) else {
+            return;
+        };
+        let Some(set) = self.per_agg.get_mut(&agg) else {
+            return;
+        };
+        let addrs = &mut self.addrs;
+        set.retain(|a| {
+            let key = LimitKey::Addr(*a);
+            let gone = addrs.get(&key).is_none_or(|b| b.active <= idle);
+            if gone {
+                addrs.remove(&key);
+            }
+            !gone
+        });
+        if set.is_empty() {
+            self.per_agg.remove(&agg);
+        }
     }
 
     /// The bucket for `key`, creating it while there is room — otherwise
@@ -312,8 +339,10 @@ impl RateLimit {
             self.reclaim(now);
             if self.addrs.len() < self.max_addrs {
                 self.addrs.insert(key, Bucket::full(burst, now));
-                if let Some(agg) = Self::agg_of_key(&key, self.v6_prefix) {
-                    *self.per_agg.entry(agg).or_default() += 1;
+                if let (Some(agg), LimitKey::Addr(a)) =
+                    (Self::agg_of_key(&key, self.v6_prefix), key)
+                {
+                    self.per_agg.entry(agg).or_default().insert(a);
                 }
             }
         }
@@ -363,11 +392,14 @@ impl RateLimit {
         }
         let mut addr_key = self.addr_key(addr);
         if let Some(p) = agg {
-            if !self.addrs.contains_key(&addr_key)
+            let at_cap = |l: &Self| l.per_agg.get(&p).map_or(0, |s| s.len()) >= MAX_V6_PER_AGG;
+            if !self.addrs.contains_key(&addr_key) && at_cap(self) {
+                // ATTACK(v6-agg-idle-reclaim)
+                self.reclaim_agg(p, now);
                 // ATTACK(v6-per-agg-cap)
-                && self.per_agg.get(&p).copied().unwrap_or(0) >= MAX_V6_PER_AGG
-            {
-                addr_key = LimitKey::V6Shared(p);
+                if at_cap(self) {
+                    addr_key = LimitKey::V6Shared(p);
+                }
             }
         }
         let wait = self.wait(addr_key, now).max(agg_wait);
@@ -788,8 +820,41 @@ mod tests {
             let _ = lim.check(slash64(i), t0 + Duration::from_millis(u64::from(i)));
         }
         // DECISIVE(v6-per-agg-cap)
-        assert_eq!(lim.per_agg.values().copied().max(), Some(MAX_V6_PER_AGG));
+        assert_eq!(
+            lim.per_agg.values().map(|s| s.len()).max(),
+            Some(MAX_V6_PER_AGG)
+        );
         assert!(lim.tracked() <= MAX_V6_PER_AGG + 2, "{}", lim.tracked());
+    }
+
+    /// S3 re-review 1: a /48 whose cap was filled by one-off /64s does not
+    /// stay capped once they go idle — a never-seen /64 in it gets its own
+    /// bucket instead of the shared one, without the table being full.
+    #[test]
+    fn a_slash48_cap_frees_once_its_slash64s_go_idle() {
+        let mut lim = RateLimit::new(1_000.0, MAX_LIMITED_ADDRS, 64);
+        let t0 = Instant::now();
+        for i in 0..MAX_V6_PER_AGG as u32 {
+            assert!(lim
+                .check(slash64(i), t0 + Duration::from_millis(u64::from(i)))
+                .is_ok());
+        }
+        let p = slash64(0);
+        let agg = lim.agg_prefix(p).unwrap_or_else(|| panic!("a /48"));
+        assert_eq!(lim.per_agg.get(&agg).map(|s| s.len()), Some(MAX_V6_PER_AGG));
+        // An hour later every one of them is idle; the table is far from full.
+        let later = t0 + Duration::from_secs(3_600);
+        let fresh = slash64(60_000);
+        assert!(lim.check(fresh, later).is_ok());
+        // DECISIVE(v6-agg-idle-reclaim)
+        assert!(
+            lim.addrs.contains_key(&lim.addr_key(fresh)),
+            "the /48 stayed capped by idle /64s: the new /64 shares one bucket"
+        );
+        assert!(lim
+            .per_agg
+            .get(&agg)
+            .is_some_and(|s| s.len() < MAX_V6_PER_AGG));
     }
 
     /// A refused flood never keeps its entry young: past a minute of only

@@ -99,17 +99,17 @@ S2 + main merged give us, already built:
 
 ## Decision records to add
 
-Numbered from D-062 — ruling 1 numbered them from D-059, then the S2 line
-landed D-057–D-061 first and this plan's records shifted +3 at that merge
-(2026-11-24).
+Numbered from D-063 — ruling 1 numbered them from D-059; at the S2 merge
+main had taken D-057–D-061 (+3 → D-062–D-072), and at the c95cdd6 merge
+main's S3 round took D-062 (+1 → D-063–D-073, 2026-11-24).
 
-- **D-062 — Open sign-up with email verification; invite-only kill
+- **D-063 — Open sign-up with email verification; invite-only kill
   switch.** Accounts are created `unverified` and sign in immediately,
   but every workspace-level mutation answers `403 email_unverified`
   until `POST /auth/verify` consumes a token mailed at sign-up.
   `DURABLE_INVITE_ONLY=1` restricts sign-up to invite tokens (abuse
   emergency, ops-set at boot).
-- **D-063 — Server-side sessions, not signed cookies.** A `sessions`
+- **D-064 — Server-side sessions, not signed cookies.** A `sessions`
   row per session: 256-bit opaque token, SHA-256 stored, idle expiry
   14 d, absolute expiry 30 d, rotation on sign-in and on every
   privilege-affecting change, revoke-one and revoke-all. Rationale:
@@ -121,7 +121,7 @@ landed D-057–D-061 first and this plan's records shifted +3 at that merge
   invalidation), so a Neon outage keeps signed-in dashboards working for
   cached sessions and fails closed (`accounts_unavailable`) for new
   ones — the same posture as submits.
-- **D-064 — Cookie session + synchroniser CSRF.** Cookie
+- **D-065 — Cookie session + synchroniser CSRF.** Cookie
   `__Host-dr_session`: `Secure; HttpOnly; SameSite=Lax; Path=/`, no
   `Domain` (so no sibling subdomain can plant or read it; the `__Host-`
   prefix makes the browser enforce that). `Lax`, not `Strict`: it
@@ -136,7 +136,7 @@ landed D-057–D-061 first and this plan's records shifted +3 at that merge
   check; and when `Origin`/`Sec-Fetch-Site` headers are present they
   must say this origin/`same-origin`. Bearer-key requests are exempt
   (header auth is not ambient authority).
-- **D-065 — Member principals on the flat API via
+- **D-066 — Member principals on the flat API via
   `x-durable-workspace`.** `Authorized`/`ReadAuthorized` grow a second
   principal kind: session cookie + `x-durable-workspace: <public_id>`
   resolves to `{account, ws, role}` by a membership lookup (cached like
@@ -147,15 +147,15 @@ landed D-057–D-061 first and this plan's records shifted +3 at that merge
   `sessionStorage`, so two tabs can hold different workspaces; a bearer
   request ignores the header (its ws comes from the key). Role < member
   cannot mutate; viewer reads. Sessions also carry the CSRF check on
-  mutations (D-064).
-- **D-066 — Plan-aware free tier.** `plans(id, name, limits jsonb)`
+  mutations (D-065).
+- **D-067 — Plan-aware free tier.** `plans(id, name, limits jsonb)`
   seeded with one `free` row; `workspaces.plan_id` defaults to it.
   Limits are enforced at ingress (server admission and the account
   store), never inside the engine's commit path; the engine's uniform
   per-workspace bounds stay as the hard backstop. The usage page reads
   the same row, so "what the plan allows" and "what the meter says"
   cannot drift.
-- **D-067 — Transactional email through an outbox table with bounded
+- **D-068 — Transactional email through an outbox table with bounded
   retries.** Every mail is enqueued in `email_outbox` **in the same
   transaction** as the fact that needs it (account row, invite row), so
   "account exists but mail was lost" cannot happen. A drain worker
@@ -167,7 +167,7 @@ landed D-057–D-061 first and this plan's records shifted +3 at that merge
   rendered bodies contain links with tokens; there is no reason to keep
   them. Per-address cap 3 mails/hour so the outbox cannot amplify
   sign-up spam into a mail flood.
-- **D-068 — Workflows are saved, versioned job definitions; Run now goes
+- **D-069 — Workflows are saved, versioned job definitions; Run now goes
   through the normal submit path.** A workflow = name + immutable
   `spec` versions (`steps`, default `input_b64`). `POST
   /workspaces/{pid}/workflows/{wid}/run` generates the operation key
@@ -175,23 +175,23 @@ landed D-057–D-061 first and this plan's records shifted +3 at that merge
   admission, same dedup, same journal — and records the link in
   `workflow_runs`. It replaces the Submit page; it does not add a second
   way into the engine.
-- **D-069 — The handler test call goes through the signed, SSRF-guarded
+- **D-070 — The handler test call goes through the signed, SSRF-guarded
   dispatch path and is never journaled.** `POST /handlers/{name}/test`
   (the flat route, reachable by write keys and member+ sessions via
-  D-065) builds the handler via `handler_factory.make_signed` (same
+  D-066) builds the handler via `handler_factory.make_signed` (same
   `PolicyResolver`, same signing, same timeout and bounded reply) and
   makes one call with `idem_key = "test/<uuidv7>"` and no `Call`
   context (run/step/attempt sign as `-`). A refused target is refused
   before dial, exactly like a real call. Rate-limited per workspace and
   per address. It is not a run: nothing is journaled, no at-least-once
   semantics, documented as such.
-- **D-070 — `last_used` and session `last_seen` are flushed, not written
+- **D-071 — `last_used` and session `last_seen` are flushed, not written
   per request.** Verified uses mark an in-memory dirty map (`key_id →
   at`); a task flushes every 60 s in one `UPDATE … WHERE id = ANY`;
   shutdown tries one final flush with a short deadline. A crash loses
   at most 60 s of timestamps — the honest alternative (one write per
   request) prices a read in Neon writes. Documented loss window.
-- **D-071 — Workspace deletion is soft, and job data leaves on the
+- **D-072 — Workspace deletion is soft, and job data leaves on the
   journal's own schedule.** `workspaces.deleted_at`: admission refuses
   `410 workspace_closed` at once, keys are revoked write-through,
   members lose it from their lists, queued runs are cancelled by the
@@ -202,7 +202,7 @@ landed D-057–D-061 first and this plan's records shifted +3 at that merge
   plainly on the delete dialog (data-controls note): deleting a
   workspace stops new work and access immediately; already-finished job
   records expire like all finished history.
-- **D-072 — API keys stay data-plane only; sessions own the control
+- **D-073 — API keys stay data-plane only; sessions own the control
   plane.** A key (read or write) can submit, cancel, read, spec, manage
   handlers and test-call — never manage members, invites, workspaces,
   other keys, sessions, or plan data. `POST /handler-secret` tightens
@@ -488,7 +488,7 @@ unbounded read on a hot path.
   Unverified accounts sign in (they see the verify-wall; workspace
   mutations refuse `email_unverified`).
 
-### Sessions (D-063)
+### Sessions (D-064)
 
 - Token: `drs_` + hex(16 B random ∥ 16 B tag) where
   `tag = HMAC-SHA256(session_key, random)[..16]` — **self-authenticating**
@@ -514,7 +514,7 @@ unbounded read on a hot path.
   so a mailed link can never sign the opener's browser in as the
   account — review #17). Re-sign-up of an unverified address also
   revokes its sessions (the pre-registration takeover's second leg).
-- `last_seen_at` flushes per D-070 (60 s flush; idle-expiry checks use
+- `last_seen_at` flushes per D-071 (60 s flush; idle-expiry checks use
   the flushed value — a session may over-live by ≤ 60 s + flush lag,
   documented).
 - **Cache-fill generations (review #10).** Every cache filled after an
@@ -540,7 +540,7 @@ unbounded read on a hot path.
 - Max absolute lifetime bounds "stolen laptop" exposure; idle bounds
   shared-machine exposure.
 
-### CSRF (D-064)
+### CSRF (D-065)
 
 - `sessions.csrf_seed` = 32 random bytes drawn at session creation; the
   CSRF token is `hex(HMAC-SHA256(seed, "csrf"))`, computed on demand —
@@ -638,7 +638,7 @@ keys need no header: the workspace is in the key.
 | `PUT /handlers/{name}` | ✓ | ✓ | — | ✓ | ✓ | ✓ | — |
 | `DELETE /handlers/{name}` | ✓ | ✓ | — | ✓ | ✓ | ✓ | — |
 | `POST /handlers/{name}/test` (new) | ✓ | ✓ | — | ✓ | ✓ | ✓ | — |
-| `POST /handler-secret` | ✓ | **—** (D-072, tightened) | — | ✓ | ✓ | — | — |
+| `POST /handler-secret` | ✓ | **—** (D-073, tightened) | — | ✓ | ✓ | — | — |
 | `POST /admin/compact`, `/admin/backup`, `GET /admin/diagnostics`, `/admin/workspaces*` | ✓ | — | — | — | — | — | — |
 | `POST /auth/*` (login etc.) | — | — | — | open | open | open | open |
 | `GET /auth/session`, `POST /auth/logout`, `GET /me*` | — | — | — | ✓ | ✓ | ✓ | ✓ |
@@ -707,7 +707,7 @@ workspace `public_id` (UUIDv7). Session-authed routes also accept
 | `POST /workspaces` | `{name}` | verified acct | returns `{public_id,name,handler_secret}` — secret shown once here; ≤ `workspaces_per_account` |
 | `GET /workspaces/{pid}` | — | viewer+ | `{public_id,name,plan,role,created_at}` |
 | `PATCH /workspaces/{pid}` | `{name}` | admin+ | |
-| `DELETE /workspaces/{pid}` | `{confirm:"delete <name>"}` | owner | soft delete (D-071); live runs cancelled; keys revoked write-through |
+| `DELETE /workspaces/{pid}` | `{confirm:"delete <name>"}` | owner | soft delete (D-072); live runs cancelled; keys revoked write-through |
 | `GET /workspaces/{pid}/members` | — | viewer+ | `[{account:{public_id,email},role,since}]` |
 | `POST /workspaces/{pid}/members` | `{email,role}` | admin+ | creates an **invite** (never a silent add) → `{invite:{public_id,email,role,expires_at}, invite_url}` — `invite_url` carries the token once, shown to the inviter for out-of-band sharing; `409 invite_pending` on a live dup; re-inviting = revoke + create |
 | `PATCH /workspaces/{pid}/members/{account_pid}` | `{role}` | admin+ | owner row immutable (`403 owner_required`/`last_owner`) |
@@ -729,13 +729,13 @@ workspace `public_id` (UUIDv7). Session-authed routes also accept
 ### Handlers (session + key; viewer GET only for session)
 
 Existing `/handlers`, `/handlers/{name}`, `/handler-secret` stay
-unchanged for keys; session principals reach them via D-065 with the
+unchanged for keys; session principals reach them via D-066 with the
 role column above — no `/workspaces/{pid}/handlers` aliases, one path.
 Changes to the flat route's behaviour:
 
 | Method | Path | Notes |
 |---|---|---|
-| `POST /handlers/{name}/test` (new) | `{input_b64?}` (≤ 8 KiB) → `{status:"ok\|failed\|refused\|lost", http_status, latency_ms, reply_excerpt_b64 ≤1KiB}` — the D-069 path, write key or member+ |
+| `POST /handlers/{name}/test` (new) | `{input_b64?}` (≤ 8 KiB) → `{status:"ok\|failed\|refused\|lost", http_status, latency_ms, reply_excerpt_b64 ≤1KiB}` — the D-070 path, write key or member+ |
 | `GET /handlers` (extended) | each entry gains `health:{last_test_at,last_test_status,last_test_latency_ms, p50_ms, p95_ms}` — test columns from the store row, p-values from the ws-scoped observer rings |
 
 ### Usage, onboarding, workflows
@@ -904,7 +904,7 @@ on submit (reset, invite-accept's "Accept" button).
   (`last_owner`/`owner_required` toasts). Viewer: sees the table, no
   mutations.
 - **Settings** — workspace rename (admin+), delete workspace (owner,
-  confirm-phrase + the D-071 data note), and the personal section:
+  confirm-phrase + the D-072 data note), and the personal section:
   password change, sessions list + revoke-all, theme. Compat mode shows
   the legacy key-paste card here instead.
 
@@ -926,7 +926,7 @@ the `/inspector` mount — it is the operator console, not a tenant page.
 
 ## Transactional email
 
-Through the outbox (D-067) + `Mailer` trait: `Resend` (HTTPS, deadline
+Through the outbox (D-068) + `Mailer` trait: `Resend` (HTTPS, deadline
 10 s, `RESEND_API_KEY` env — never argv/logs), `Log` (dev only: prints
 the mail body including the link to stderr, gated by
 `DURABLE_MAILER=log`, never compiled into the deploy path's default),
@@ -969,7 +969,7 @@ pending old one.
 | Host-header reset-link poisoning | links built from configured `--public-origin` |
 | Neon outage | grant/session caches + fail-closed unknowns; accepted runs unaffected (invariant) |
 | Deleted-workspace resurrection | `deleted_at` filters every lookup; keys revoked write-through; admission refuses; queued runs cancelled |
-| Write amplification (`last_used`, `last_seen`) | dirty-map flush 60 s (D-070) — measured loss window, not silent writes |
+| Write amplification (`last_used`, `last_seen`) | dirty-map flush 60 s (D-071) — measured loss window, not silent writes |
 | Response-side u64 leak | `public_id`/pubid everywhere; S2's no-u64-leak scan extended to every new route's response |
 | DoS via oversized names/inputs | existing byte caps; new text fields bounded (names ≤128, emails ≤254, bodies by `MAX_REQUEST_BYTES`) |
 | Timing on token verify | sha256 of high-entropy token → unique-index lookup; digest compare constant-time; timing carries no usable signal |
@@ -1009,11 +1009,11 @@ mutated in `prove-attacks.sh` — new `// ATTACK(name)` markers) /
 | S3-0 | Session plumbing + sign-up + login | Migration `0002`; `AccountStore` methods for accounts/sessions; `Principal` enum (review #4) + `SessionAuth` + generation-checked session cache (#10); self-authenticating `drs_` tokens (#8); argon2id on `spawn_blocking` behind the **bounded** semaphore (#9); Origin/Sec-Fetch-Site on unauthenticated `/auth` POSTs (#17); signup hashes on every branch; `POST /auth/signup` (+token+outbox one tx), `POST /auth/login`, `POST /auth/logout`, `GET /auth/session`. *A full sign-up→login→session round-trip works end to end against the Memory store.* | sign-up → 202 + account row unverified; login → cookie + `{csrf}`; a request with the cookie resolves `{account}`; forged/expired/revoked token 401s **before** store I/O (tag check); cookie attributes asserted (Secure/HttpOnly/SameSite=Lax/Path=/ /no Domain); `busy` 503 + Retry-After when the argon2 queue saturates; `Cache-Control: no-store` + `Vary: Cookie` asserted | `session-forge` (random `drs_` value → 401, denied on tag before the store — mutation removes the tag check), `csrf` (mutation without/with wrong `x-durable-csrf` → 403), `csrf-open-post` (Origin/Sec-Fetch-Site refusal on unauthenticated `/auth` POSTs), `cookie-attrs` | session verify at battery rate on the cached path; Neon-down drill: cached sessions proceed, uncached → `accounts_unavailable` |
 | S3-1 | Verify + reset + outbox worker + enumeration | `POST /auth/verify`, `/auth/resend-verification`, `/auth/forgot`, `/auth/reset`; `email_tokens`; outbox drain (bounded batch, backoff, `failed`); `Mailer` impls (`Memory`, `Log`, `Resend` wired at deploy); `DURABLE_INVITE_ONLY` | verify → verified; reused token → 410; reset-kind token refused at `/auth/verify`; forgot/reset round-trip; invite-only flag blocks sign-up without a token | `token-replay`, `token-kind-confusion`, `enumeration` (unknown vs known email → identical 202 + identical body; dummy-verify counter shows equal work), `invite-required` | outbox drain: 10k pending rows bounded-batch + backoff; mailer-down drill: retries then `failed`, never lost; Resend send deadline |
 | S3-2 | Session lifecycle + /me | rotation on sign-in/privilege change, idle+absolute expiry, revoke-one + revoke-all, sessions list, `/me/password`; per-account login cool-off | reset revokes all sessions; the 21st session LRU-evicts the oldest-idle; idle-expired token → 401; cool-off shape after 10 failures | `session-fixation` (a pre-set cookie value never becomes a session; login mints fresh), `reset-token-replay`, `cooloff` (429 shape, not silence), `idle-timeout` (clock-injected expiry check) | login throughput vs the argon2 semaphore (memory bounded under concurrency — measured) |
-| S3-3 | Workspaces + members + roles + invites | `POST /workspaces` (+ owner member row + `handler_secret` shown once), PATCH rename, DELETE soft (D-071), members via invites only, role changes, remove; the matrix enforced in `SessionAuth` for every member route | member of A on B's routes → 404; viewer mutation → 403; invite accept with mismatched session email → 403; deleted ws: keys dead immediately, admission 410, live runs cancelled | `idor-workspace`, `role-escalation` (viewer PATCH member; member DELETE ws; admin demotes owner), `invite-hijack`, `last-owner` (remove/demote owner → 409), `deleted-ws-key` (key of a deleted ws → 401 same request) | two-workspace membership churn vs cached lookups; delete drill: a live run is cancelled honestly, finished history untouched |
+| S3-3 | Workspaces + members + roles + invites | `POST /workspaces` (+ owner member row + `handler_secret` shown once), PATCH rename, DELETE soft (D-072), members via invites only, role changes, remove; the matrix enforced in `SessionAuth` for every member route | member of A on B's routes → 404; viewer mutation → 403; invite accept with mismatched session email → 403; deleted ws: keys dead immediately, admission 410, live runs cancelled | `idor-workspace`, `role-escalation` (viewer PATCH member; member DELETE ws; admin demotes owner), `invite-hijack`, `last-owner` (remove/demote owner → 409), `deleted-ws-key` (key of a deleted ws → 401 same request) | two-workspace membership churn vs cached lookups; delete drill: a live run is cancelled honestly, finished history untouched |
 | S3-4 | Plans + usage + enforcement | `plans` + `plan_id`; per-ws submit bucket; store-side count limits; `GET …/usage`; the limit envelope | 11th key → 429 `plan_limit{"limit":"api_keys"}`; 61st submit in a minute → 429 + `Retry-After`; usage numbers == the plan row | `plan-bypass` (a second key/member of the same ws shares ONE bucket — the bucket is ws-keyed, not caller-keyed), `limit-message-shape` | submit battery through the plan bucket: 60/min admitted, excess refused honestly, other ws unaffected; `uptime` reported |
-| S3-5 | Keys self-service | `GET/POST/DELETE/rotate …/keys`; `last_used` flush (D-070); `created_by` | create → `dr_` shown once; list shows prefix only; rotate → old key 401 on the next call; viewer POST → 403 | `key-self-escalation` (a write key cannot reach any `/workspaces/*` or `/auth/*` route), `cross-ws-key-create` (session on A POSTs a key under B's pid → 404), `last-used-amplification` (N verifies → ≤ 1 UPDATE per flush) | 1M submits through the cached key path with the flush task live — zero per-request Neon writes (counted) |
-| S3-6 | Handlers mgmt + test call | session roles on `/handlers*`; `POST /handlers/{name}/test` (D-069); health columns on `GET /handlers`; `handler-secret` tightened to session admin+ (D-072) | test call to the fixture → `{status:"ok",latency_ms}`; private target → `refused`, zero packets; rotate → old signatures die | `ssrf-testcall` (private listener fixture asserts no packet on a refused test call), `secret-in-get` (response scan: no GET carries `handler_secret`), `testcall-abuse` (31st/hr → 429), `handler-secret-key` (write key → 403 — the S2 tightening) | test calls at the plan bound under a full submit battery — dispatch accounting asserted unaffected |
-| S3-7 | Workflows + Run now | `workflows` + `workflow_versions` + `workflow_runs`; Run now → `submit_scoped` (D-068); migration `0003` | create/edit → version n+1, old versions immutable; run → `{run_id}` lands a journaled run visible in `/jobs`; spec with a foreign handler → `unregistered_handler` before the row exists | `idor-workflow` (B reads/runs A's workflow → 404), `runnow-opkey` (every Run now is a fresh uuidv7 key — a retried client click is a new run, honest), `viewer-runnow` → 403 | 1k Run-now submits inside the battery — admission cost == direct submit (measured, not assumed) |
+| S3-5 | Keys self-service | `GET/POST/DELETE/rotate …/keys`; `last_used` flush (D-071); `created_by` | create → `dr_` shown once; list shows prefix only; rotate → old key 401 on the next call; viewer POST → 403 | `key-self-escalation` (a write key cannot reach any `/workspaces/*` or `/auth/*` route), `cross-ws-key-create` (session on A POSTs a key under B's pid → 404), `last-used-amplification` (N verifies → ≤ 1 UPDATE per flush) | 1M submits through the cached key path with the flush task live — zero per-request Neon writes (counted) |
+| S3-6 | Handlers mgmt + test call | session roles on `/handlers*`; `POST /handlers/{name}/test` (D-070); health columns on `GET /handlers`; `handler-secret` tightened to session admin+ (D-073) | test call to the fixture → `{status:"ok",latency_ms}`; private target → `refused`, zero packets; rotate → old signatures die | `ssrf-testcall` (private listener fixture asserts no packet on a refused test call), `secret-in-get` (response scan: no GET carries `handler_secret`), `testcall-abuse` (31st/hr → 429), `handler-secret-key` (write key → 403 — the S2 tightening) | test calls at the plan bound under a full submit battery — dispatch accounting asserted unaffected |
+| S3-7 | Workflows + Run now | `workflows` + `workflow_versions` + `workflow_runs`; Run now → `submit_scoped` (D-069); migration `0003` | create/edit → version n+1, old versions immutable; run → `{run_id}` lands a journaled run visible in `/jobs`; spec with a foreign handler → `unregistered_handler` before the row exists | `idor-workflow` (B reads/runs A's workflow → 404), `runnow-opkey` (every Run now is a fresh uuidv7 key — a retried client click is a new run, honest), `viewer-runnow` → 403 | 1k Run-now submits inside the battery — admission cost == direct submit (measured, not assumed) |
 | S3-8 | Dashboard | the IA above: signed-out pages, shell + switcher, all workspace pages, onboarding card, verify-wall, compat key-paste mode | page-contract specs red first per page; `GET /auth/session` bootstrap drives signed-in vs signed-out vs compat mode | `session-xss-surface` (CSP hash manifest still pins `index.html`; no `unsafe-inline` scripts), `bearer-csrf-exempt` (API clients unaffected by the CSRF layer) | `vite build` + `scripts/check.sh`; UI before/after screenshots 1440+390, light+dark, per the UI rule |
 | S3-9 | The gate | SAAS_PLAN S3 exit gate end-to-end | the journey spec itself | whole matrix green on the merged build; `prove-attacks.sh` covers every new marker | `neon-sweep.sh` on 0002+0003 clean against real Neon; the Playwright journey |
 
@@ -1085,8 +1085,9 @@ The coordinator's answers to this plan's open questions, binding for the
 build:
 
 1. **D-numbers** — number from D-059 as planned; the coordinator
-   renumbers at merge if main moves first. *(At the S2 merge, 2026-11-24:
-   main took D-057–D-061, so this plan's records shifted +3 — D-062–D-072.)*
+   renumbers at merge if main moves first. *(Renumbered twice 2026-11-24:
+   +3 at the S2 merge for main's D-057–D-061, then +1 at the c95cdd6
+   merge for main's D-062 — this plan's records are D-063–D-073.)*
 2. **Hostname and mount** — `durablerunnerapp.404human.dev`. ONE
    dashboard build (signed-in SaaS mode + the compat key-paste mode for
    self-hosters) mounted at `/app`; `/inspector` answers 308 → `/app`

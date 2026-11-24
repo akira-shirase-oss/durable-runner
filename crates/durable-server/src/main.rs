@@ -614,7 +614,16 @@ impl HandlerFactory {
     /// An API-registered handler that signs with the workspace's secret,
     /// under the store policy.
     fn make_signed(&self, url: &str, secret: Option<Arc<[u8; 32]>>) -> Arc<HttpHandler> {
-        self.build(url, secret, &self.client, &self.store_policy)
+        self.build(
+            url,
+            secret,
+            // The store's client: its resolver judges every name at dial.
+            // ATTACK(signed-store-client)
+            &self.client,
+            // The store's policy: the call-time check of a literal address.
+            // ATTACK(signed-store-policy)
+            &self.store_policy,
+        )
     }
 
     fn build(
@@ -1096,6 +1105,7 @@ async fn registry_sync(
     }
     let mut all = Vec::new();
     let mut preserve_ws = Vec::new();
+    let mut touched: Vec<u64> = Vec::new();
     let mut refused = 0u64;
     for ws in &workspaces {
         // Finding 4: the read and the apply are one critical section
@@ -1163,6 +1173,7 @@ async fn registry_sync(
             ws.id,
             accepted.iter().map(|e| (e.name.clone(), e.url.clone())),
         );
+        touched.push(ws.id);
         all.extend(accepted);
     }
     if refused > 0 {
@@ -1171,8 +1182,24 @@ async fn registry_sync(
              handler row(s) whose URL fails the SSRF policy"
         );
     }
+    // S3 re-review 2: the views above go up before the file write; a pass
+    // whose snapshot does not land forgets them again. Forgetting is
+    // always safe — it costs the next PUT its no-op skip, nothing else.
+    let forget = |why: &str| {
+        // ATTACK(reconcile-forgets)
+        for ws in &touched {
+            view.replace_ws(*ws, std::iter::empty());
+        }
+        if !touched.is_empty() {
+            eprintln!(
+                "durable-server: registry reconcile {why}; {} workspace view(s) forgotten",
+                touched.len()
+            );
+        }
+    };
     if stale() {
         eprintln!("durable-server: registry reconcile discarded a pass overtaken by a mutation");
+        forget("was overtaken");
         return Ok(());
     }
     // The writer checks the epoch again under its own serialization —
@@ -1188,11 +1215,17 @@ async fn registry_sync(
         .is_err()
     {
         eprintln!("durable-server: registry writer unavailable; the file keeps last-known-good");
+        forget("could not reach the writer");
         return Ok(());
     }
     // The pass is settled when the writer decides — applied or dropped
     // as stale, either way a bounded wait hears about it.
-    match tokio::time::timeout(std::time::Duration::from_secs(10), ack_rx).await {
+    let settled = tokio::time::timeout(std::time::Duration::from_secs(10), ack_rx).await;
+    // Acked but overtaken: the writer dropped the pass as stale.
+    if !matches!(settled, Ok(Ok(Ok(())))) || stale() {
+        forget("did not land");
+    }
+    match settled {
         Ok(Ok(Ok(()))) => Ok(()),
         Ok(Ok(Err(e))) => {
             eprintln!("durable-server: registry writer could not persist a reconcile pass: {e}");
@@ -1831,7 +1864,7 @@ const LOCKOUT_FAILS: u32 = 10;
 const LOCKOUT_WINDOW_MS: i64 = 10 * 60 * 1000;
 const LOCKOUT_COOLOFF_MS: i64 = 15 * 60 * 1000;
 const LOCKOUT_CAP: usize = 10_000;
-/// Outbox drain (D-067): bounded batch, per-send deadline, claim
+/// Outbox drain (D-068): bounded batch, per-send deadline, claim
 /// deadline that makes a worker crash reclaimable.
 const OUTBOX_BATCH: u32 = 25;
 const OUTBOX_SEND_DEADLINE: Duration = Duration::from_secs(10);
@@ -2074,7 +2107,7 @@ impl MailBudget {
     }
 }
 
-/// Drain one bounded batch (D-067): sweep dead rows, claim due rows,
+/// Drain one bounded batch (D-068): sweep dead rows, claim due rows,
 /// send each under its deadline, mark the outcome. `failed` and
 /// `dropped` are terminal states the sweep owns — a mail is never
 /// lost, only dead-lettered or intentionally dropped.
@@ -2145,7 +2178,7 @@ fn spawn_mail_drain(app: App) {
     });
 }
 
-/// Idle-expiry sliding (D-070): requests record touches in memory; one
+/// Idle-expiry sliding (D-071): requests record touches in memory; one
 /// batched monotonic store update per tick keeps `idle_expires_at`
 /// moving without a write per request. A missed flush only slides
 /// less — never serves a dead session.
@@ -2178,13 +2211,13 @@ fn spawn_session_flush(app: App) {
 /// and its account (revoke-all, verify, reset, password change) — so an
 /// account-wide revocation dies in cache too, not just in the store.
 /// The bump maps are bounded; overflow clears the grants — a safe
-/// global invalidation. `touches` is the pending idle slide (D-070).
+/// global invalidation. `touches` is the pending idle slide (D-071).
 struct SessionCache {
     grants: Mutex<HashMap<[u8; 32], SessionEntry>>,
     bumps: Mutex<HashMap<[u8; 32], Instant>>,
     account_bumps: Mutex<HashMap<u64, Instant>>,
     /// token_hash → last-seen unix ms, flushed to the store on the
-    /// D-070 interval; bounded — overflow clears (a lost touch slides
+    /// D-071 interval; bounded — overflow clears (a lost touch slides
     /// less, never serves a dead session).
     touches: Mutex<HashMap<[u8; 32], i64>>,
 }
@@ -2632,7 +2665,7 @@ impl FromRequestParts<App> for SessionAuth {
             Err(_) => return Err(accounts_unavailable()),
         };
         // The idle check takes the pending-touch floor too — a slide
-        // queued but not yet flushed still counts as use (D-070).
+        // queued but not yet flushed still counts as use (D-071).
         let idle = grant.idle_expires_at_ms.max(app.sessions.touch_idle(&hash));
         // ATTACK(idle-timeout)
         if grant.expires_at_ms <= now || idle <= now {
@@ -4786,6 +4819,12 @@ async fn put_handler(
             serde_json::json!({ "name": name, "url": url, "unchanged": true }),
         ));
     }
+    // S3 re-review 2: the view claims only what the engine armed AND the
+    // file holds. Drop the entry before anything changes; it comes back
+    // only once the writer acks the save — so a PUT that fails anywhere
+    // below (store, engine, file) leaves nothing for a retry to skip on.
+    // ATTACK(registry-view-invalidate)
+    app.registry.remove(auth.ws(), name);
     // The 256 bound lives in the engine, but the store must never hold a
     // row the engine refuses: one over-limit row would poison every
     // later reconcile of this workspace's set. Check before writing —
@@ -4834,8 +4873,7 @@ async fn put_handler(
             app.handler_factory.make_signed(&url, secret.clone()),
         )
         .await?;
-    app.registry.set(auth.ws(), name, &url);
-    registry_file_upsert(
+    let saved = registry_file_upsert(
         &app,
         RegistryEntry {
             ws: auth.ws(),
@@ -4844,7 +4882,12 @@ async fn put_handler(
             secret: secret.as_deref().map(|s| hex(s)),
         },
     )
-    .await?;
+    .await;
+    // ATTACK(registry-set-after-save)
+    if saved.is_ok() {
+        app.registry.set(auth.ws(), name, &url);
+    }
+    saved?;
     Ok(Json(serde_json::json!({ "name": name, "url": url })))
 }
 
@@ -4865,6 +4908,10 @@ async fn rotate_handler_secret(
     // Finding 4: rotate + re-arm + snapshot under the ws stripe, same
     // section as PUT/DELETE and the reconciler's list+apply.
     let _ws_guard = app.registry_locks.stripe(auth.ws()).lock().await;
+    // Same rule as PUT: nothing claims armed until the new set is saved
+    // (a failed save left the view whole, so a retried PUT skipped and
+    // the file kept the dead secret).
+    app.registry.replace_ws(auth.ws(), std::iter::empty());
     let Some(secret) = store
         .rotate_handler_secret(auth.ws())
         .await
@@ -4899,11 +4946,16 @@ async fn rotate_handler_secret(
         });
     }
     app.engine.set_workspace_handlers(auth.ws(), set).await?;
-    app.registry.replace_ws(
-        auth.ws(),
-        entries.iter().map(|e| (e.name.clone(), e.url.clone())),
-    );
-    registry_file_replace_ws(&app, auth.ws(), entries).await?;
+    let view: Vec<(String, String)> = entries
+        .iter()
+        .map(|e| (e.name.clone(), e.url.clone()))
+        .collect();
+    let saved = registry_file_replace_ws(&app, auth.ws(), entries).await;
+    // ATTACK(rotate-set-after-save)
+    if saved.is_ok() {
+        app.registry.replace_ws(auth.ws(), view);
+    }
+    saved?;
     Ok(Json(serde_json::json!({ "secret": hex(&secret) })))
 }
 
@@ -4932,6 +4984,11 @@ async fn delete_handler(
         ));
     }
     app.engine.delete_handler(auth.ws(), &name)?;
+    // Forget BEFORE the save, not after (S3 re-review 2): the engine has
+    // already dropped the handler, so a view kept on a failed save would
+    // make a later PUT of the same URL answer `unchanged` while nothing
+    // is armed. A missing entry only ever costs a PUT its no-op skip.
+    // ATTACK(registry-delete-forgets)
     app.registry.remove(auth.ws(), &name);
     registry_file_remove(&app, auth.ws(), &name).await?;
     Ok(Json(serde_json::json!({ "deleted": name })))
@@ -5444,9 +5501,9 @@ async fn main() -> Result<()> {
     if let Some(store) = &store {
         spawn_registry_reconcile(store.clone(), &app, registry_stale);
         // The outbox drain owns every send — the mail row committed in
-        // the same transaction as its fact is the only truth (D-067).
+        // the same transaction as its fact is the only truth (D-068).
         spawn_mail_drain(app.clone());
-        // Idle-expiry slides in one batched store write per tick (D-070).
+        // Idle-expiry slides in one batched store write per tick (D-071).
         spawn_session_flush(app.clone());
     }
     let router = router(app.clone(), args.ui_dir.as_deref());
@@ -9572,6 +9629,201 @@ mod tests {
         assert_eq!(saves(), saves0 + 1, "a changed URL is saved");
     }
 
+    /// Makes the registry writer's saves fail: a directory where its temp
+    /// file goes (holds as root too, unlike a read-only directory).
+    struct SaveBlock(PathBuf);
+    impl SaveBlock {
+        fn on(h: &Harness) -> Self {
+            let p = h.app.registry_file.with_extension("json.tmp");
+            std::fs::create_dir(&p).unwrap_or_else(|e| panic!("{e}"));
+            Self(p)
+        }
+    }
+    impl Drop for SaveBlock {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir(&self.0);
+        }
+    }
+
+    async fn put_h(h: &Harness, key: &str, url: &str) -> (StatusCode, serde_json::Value) {
+        call(
+            &h.router,
+            "PUT",
+            "/handlers/h",
+            Some(key),
+            Some(json!({ "url": url })),
+        )
+        .await
+    }
+
+    fn file_url(h: &Harness) -> Option<String> {
+        load_registry_file(&h.app.registry_file)
+            .unwrap_or_else(|e| panic!("{e}"))
+            .into_iter()
+            .find(|e| e.name == "h")
+            .map(|e| e.url)
+    }
+
+    /// S3 re-review 2: a PUT whose file save failed answers 503 and arms
+    /// nothing in the view — its retry writes instead of `unchanged`.
+    #[tokio::test]
+    async fn a_put_whose_save_failed_is_retried_not_skipped() {
+        let (h, _store, key_a, _) = two_tenant_registry().await;
+        {
+            let _block = SaveBlock::on(&h);
+            let (status, v) = put_h(&h, key_a, "http://127.0.0.1:9/a").await;
+            assert_eq!(
+                (status, v["code"].clone()),
+                (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    json!("registry_write_failed")
+                ),
+                "{v}"
+            );
+        }
+        assert_eq!(file_url(&h), None, "control: the failed save wrote nothing");
+        let (status, v) = put_h(&h, key_a, "http://127.0.0.1:9/a").await;
+        assert_eq!(status, StatusCode::OK, "{v}");
+        // DECISIVE(registry-set-after-save)
+        assert_ne!(
+            v["unchanged"],
+            json!(true),
+            "the retry was skipped: the failed save left the view armed"
+        );
+        assert_eq!(file_url(&h).as_deref(), Some("http://127.0.0.1:9/a"));
+    }
+
+    /// S3 re-review 2: after a good PUT of A, a PUT of B that armed B but
+    /// failed its save must not leave A in the view — a PUT back to A
+    /// would answer `unchanged` while B is what dispatch calls.
+    #[tokio::test]
+    async fn a_failed_put_never_leaves_the_old_url_claiming_armed() {
+        let (h, _store, key_a, _) = two_tenant_registry().await;
+        let (status, v) = put_h(&h, key_a, "http://127.0.0.1:9/a").await;
+        assert_eq!(status, StatusCode::OK, "{v}");
+        {
+            let _block = SaveBlock::on(&h);
+            let (status, v) = put_h(&h, key_a, "http://127.0.0.1:9/b").await;
+            assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{v}");
+        }
+        let (status, v) = put_h(&h, key_a, "http://127.0.0.1:9/a").await;
+        assert_eq!(status, StatusCode::OK, "{v}");
+        // DECISIVE(registry-view-invalidate)
+        assert_ne!(
+            v["unchanged"],
+            json!(true),
+            "a PUT back to A was skipped while the failed PUT's B stayed armed"
+        );
+        assert_eq!(file_url(&h).as_deref(), Some("http://127.0.0.1:9/a"));
+    }
+
+    /// S3 re-review 2: a DELETE forgets the view before its save, so a
+    /// failed save never makes the next PUT of the same URL a no-op while
+    /// nothing is armed (the order the review proposed would).
+    #[tokio::test]
+    async fn a_delete_whose_save_failed_lets_the_same_put_rearm() {
+        let (h, _store, key_a, _) = two_tenant_registry().await;
+        let (status, v) = put_h(&h, key_a, "http://127.0.0.1:9/a").await;
+        assert_eq!(status, StatusCode::OK, "{v}");
+        {
+            let _block = SaveBlock::on(&h);
+            let (status, v) = call(&h.router, "DELETE", "/handlers/h", Some(key_a), None).await;
+            assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{v}");
+        }
+        let (status, v) = put_h(&h, key_a, "http://127.0.0.1:9/a").await;
+        assert_eq!(status, StatusCode::OK, "{v}");
+        // DECISIVE(registry-delete-forgets)
+        assert_ne!(
+            v["unchanged"],
+            json!(true),
+            "the PUT after a deleted handler was skipped: nothing is armed"
+        );
+    }
+
+    /// S3 re-review 2: a rotate whose save failed keeps nothing in the
+    /// view, so the next PUT writes the new secret instead of skipping
+    /// and leaving the dead one in the file.
+    #[tokio::test]
+    async fn a_rotate_whose_save_failed_lets_a_put_save_the_new_secret() {
+        let (h, _store, key_a, _) = two_tenant_registry().await;
+        let (status, v) = put_h(&h, key_a, "http://127.0.0.1:9/a").await;
+        assert_eq!(status, StatusCode::OK, "{v}");
+        let secret_in_file = || {
+            load_registry_file(&h.app.registry_file)
+                .unwrap_or_else(|e| panic!("{e}"))
+                .into_iter()
+                .find(|e| e.name == "h")
+                .and_then(|e| e.secret)
+        };
+        let old = secret_in_file();
+        {
+            let _block = SaveBlock::on(&h);
+            let (status, v) = call(&h.router, "POST", "/handler-secret", Some(key_a), None).await;
+            assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{v}");
+        }
+        let (status, v) = put_h(&h, key_a, "http://127.0.0.1:9/a").await;
+        assert_eq!(status, StatusCode::OK, "{v}");
+        // DECISIVE(rotate-set-after-save)
+        assert_ne!(
+            v["unchanged"],
+            json!(true),
+            "the PUT after a failed rotate was skipped: the file keeps the dead secret"
+        );
+        assert_ne!(
+            secret_in_file(),
+            old,
+            "the file still carries the rotated-out secret"
+        );
+    }
+
+    /// S3 re-review 2: a reconcile pass whose snapshot did not land
+    /// forgets the views it set, so the PUT of what it armed still writes.
+    #[tokio::test]
+    async fn a_reconcile_pass_that_did_not_land_forgets_its_views() {
+        let (h, store, key_a, _) = two_tenant_registry().await;
+        let (status, v) = put_h(&h, key_a, "http://127.0.0.1:9/a").await;
+        assert_eq!(status, StatusCode::OK, "{v}");
+        let ws = load_registry_file(&h.app.registry_file)
+            .unwrap_or_else(|e| panic!("{e}"))
+            .into_iter()
+            .find(|e| e.name == "h")
+            .map(|e| e.ws)
+            .unwrap_or_else(|| panic!("the PUT saved its row"));
+        // The store moves to B behind the API (another instance's write).
+        store
+            .put_handler(ws, "h", "http://127.0.0.1:9/b")
+            .await
+            .unwrap_or_else(|e| panic!("{e}"));
+        let r = {
+            let _block = SaveBlock::on(&h);
+            registry_sync(
+                &h.app
+                    .keyring
+                    .store
+                    .clone()
+                    .unwrap_or_else(|| panic!("store")),
+                &h.app.engine,
+                &h.app.handler_factory,
+                &h.app.flag_handlers,
+                &h.app.registry_tx,
+                &h.app.registry_epoch,
+                &h.app.registry_locks,
+                &h.app.registry,
+            )
+            .await
+        };
+        assert!(r.is_err(), "control: the pass's snapshot could not land");
+        let (status, v) = put_h(&h, key_a, "http://127.0.0.1:9/b").await;
+        assert_eq!(status, StatusCode::OK, "{v}");
+        // DECISIVE(reconcile-forgets)
+        assert_ne!(
+            v["unchanged"],
+            json!(true),
+            "the PUT was skipped on a view the failed pass left behind"
+        );
+        assert_eq!(file_url(&h).as_deref(), Some("http://127.0.0.1:9/b"));
+    }
+
     /// Re-review S2-4: each workspace's registry mutations are rate
     /// limited (2/s, burst 20) — past the burst a mutation is 429 with
     /// Retry-After and no store work; another workspace is unaffected.
@@ -10049,6 +10301,68 @@ mod tests {
             escaped.is_err(),
             "a packet reached a literal local target — the call-time check failed"
         );
+    }
+
+    /// S3 re-review 4: an API-registered (signed) handler is built with the
+    /// store's client and policy, never the flag pair — even when the
+    /// operator's `--allow-local-handlers` opens the flag pair. A name
+    /// resolving to loopback is the client's to refuse (its resolver); a
+    /// loopback literal is the policy's (the call-time check). The flag
+    /// pair reaching the same listener is the control.
+    #[tokio::test]
+    async fn a_signed_handler_uses_the_store_pair_not_the_flag_pair() {
+        let factory = HandlerFactory::new(
+            ssrf::Policy::strict(),
+            ssrf::Policy::open(),
+            Duration::from_secs(2),
+            1024,
+            pubid::PubId::ephemeral(),
+        )
+        .unwrap_or_else(|e| panic!("{e}"));
+        let secret = Some(Arc::new([7u8; 32]));
+        let bind = || async {
+            let l = tokio::net::TcpListener::bind("127.0.0.1:0")
+                .await
+                .unwrap_or_else(|e| panic!("{e}"));
+            let port = l.local_addr().unwrap_or_else(|e| panic!("{e}")).port();
+            (l, port)
+        };
+        let reached = |l: tokio::net::TcpListener| async move {
+            tokio::time::timeout(Duration::from_millis(400), l.accept())
+                .await
+                .is_ok()
+        };
+        // The control: the flag pair (open) reaches a loopback name.
+        let (l, port) = bind().await;
+        let flag = factory.make(&format!("http://localhost:{port}/step"));
+        let reach = tokio::spawn(async move { flag.execute(&spec_of("s"), b"hi", "k").await });
+        assert!(
+            tokio::time::timeout(Duration::from_secs(5), l.accept())
+                .await
+                .is_ok_and(|r| r.is_ok()),
+            "control: the open flag pair must reach localhost here"
+        );
+        reach.abort();
+        // A name: only the store client's resolver stands in the way.
+        let (l, port) = bind().await;
+        let h = factory.make_signed(&format!("http://localhost:{port}/step"), secret.clone());
+        let outcome = h.execute(&spec_of("s"), b"hi", "k").await;
+        // DECISIVE(signed-store-client)
+        assert!(
+            !reached(l).await,
+            "a signed handler dialed loopback by name: it has the flag client"
+        );
+        assert!(matches!(outcome, Outcome::Failed), "{outcome:?}");
+        // A literal: no resolver runs, so the store policy's check must.
+        let (l, port) = bind().await;
+        let h = factory.make_signed(&format!("http://127.0.0.1:{port}/step"), secret);
+        let outcome = h.execute(&spec_of("s"), b"hi", "k").await;
+        // DECISIVE(signed-store-policy)
+        assert!(
+            !reached(l).await,
+            "a signed handler dialed a loopback literal: it has the flag policy"
+        );
+        assert!(matches!(outcome, Outcome::Failed), "{outcome:?}");
     }
 
     /// White-hat finding A, end to end: a handler URL naming a
@@ -11750,12 +12064,19 @@ mod tests {
                 .await
                 .unwrap_or_else(|e| panic!("{e}"));
             let mut reply = Vec::new();
-            tokio::time::timeout(Duration::from_secs(5), probe.read_to_end(&mut reply))
-                .await
-                .unwrap_or_else(|_| panic!("{src}: the lane conn got no answer — it was dropped"))
-                // DECISIVE(overload-lane)
-                .unwrap_or_else(|e| panic!("{src}: the lane conn was reset, not answered: {e}"));
-            let text = String::from_utf8_lossy(&reply);
+            let read =
+                tokio::time::timeout(Duration::from_secs(5), probe.read_to_end(&mut reply)).await;
+            // An unanswered conn shows up three ways, all the same failure:
+            // a reset (the close found our request bytes queued — usual on
+            // macOS), a bare EOF (closed before they arrived — usual on
+            // Linux), or a hang. Each lands on the one assertion the lane
+            // guards: the conn READ a 503.
+            let text = match read {
+                Ok(Ok(_)) => String::from_utf8_lossy(&reply).into_owned(),
+                Ok(Err(e)) => format!("<reset, no answer: {e}>"),
+                Err(_) => "<no answer within 5 s>".to_string(),
+            };
+            // DECISIVE(overload-lane)
             assert!(
                 text.starts_with("HTTP/1.1 503"),
                 "{src}: expected the lane's 503, got: {text}"
@@ -14667,7 +14988,7 @@ mod tests {
     }
 
     /// The drain claims due rows, sends through the Mailer under the
-    /// deadline and marks `sent` — never re-claims a sent row (D-067).
+    /// deadline and marks `sent` — never re-claims a sent row (D-068).
     #[tokio::test]
     async fn s31_outbox_drain_sends() {
         let store = Arc::new(Memory::new());

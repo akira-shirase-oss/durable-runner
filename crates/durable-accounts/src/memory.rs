@@ -527,7 +527,7 @@ impl AccountStore for Memory {
         self.check_up()?;
         let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         // LRU eviction at the cap: the least-idle live sessions lose
-        // their seats so this sign-in always lands (D-063).
+        // their seats so this sign-in always lands (D-064).
         let mut live: Vec<u64> = inner
             .sessions
             .iter()

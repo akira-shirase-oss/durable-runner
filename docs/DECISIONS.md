@@ -1258,3 +1258,189 @@ Proved by `the_hosts_own_addresses_are_refused_by_both_layers`,
 `deploy/test-proxy-hop.sh` (with known-bad copies); `ATTACK(ssrf-own-address)`,
 `ATTACK(ssrf-deny-cidr)` and `ATTACK(peer-canonical)` have mutation rows.
 
+
+## D-062: the S3 round after the 2710d76..52e893b re-review
+
+*(four S3 findings of the independent re-review; two tracked)*
+
+- **A /48's cap frees itself.** The per-/48 cap of 256 /64 entries
+  (D-061's limiter) was decremented only by the table-wide reclaim, which
+  runs only on a full table — so 256 one-off /64s capped a /48 for good
+  and every never-seen /64 in it shared the `V6Shared` bucket an attacker
+  could drain until restart. Each /48 now keeps its own key set; a /48 at
+  its cap drops its own minute-idle /64 entries before refusing a
+  newcomer (O(256) for that /48 only, and only for a newcomer the /48's
+  aggregate bucket admitted — a refusing /48 returns before the scan).
+  The key sets hold one address per table entry, so at most 65,536 in
+  all; the worst case, every /64 in its own /48, is about 10 MiB
+  (estimated from the layout, not measured).
+- **The armed view claims only what is saved.** The view behind the
+  no-op PUT skip was set before the snapshot write, so a failed save
+  answered 503 while a retried PUT answered `unchanged` without writing.
+  The rule now: a mutation drops its view entry before it changes
+  anything and sets it only once the writer acks the save — for PUT,
+  the secret rotation and the reconcile pass (a pass whose snapshot does
+  not land, or is overtaken, forgets its views). DELETE forgets *before*
+  its save on purpose: the engine has already dropped the handler, so a
+  view kept on a failed save would make the next PUT of that URL a no-op
+  while nothing is armed. A missing entry only ever costs a PUT its skip.
+- **The deploy refuses a lab build.** A `--features lab` build shares
+  `target/release` with the production one; `deploy/lab-build-guard.sh`
+  refuses any binary whose `--help` lists `--allow-local-tenant-handlers`
+  (or fails, or is not durable-server's). `install.sh` and `upgrade.sh`
+  run it before anything else, and `smoke.sh` fails an installed lab build.
+- **Signed handlers' store pairing is proved.** `make_signed` takes the
+  store's client (its resolver judges names) and the store's policy (the
+  call-time check of literals); each has a mutation row against a factory
+  whose two pairs differ (strict store, open flag).
+
+Tracked, not built:
+
+- **The overflow bucket is one global bucket.** A newcomer that finds the
+  table full shares a single overflow bucket. Reaching it needs about 256
+  /48s each at its cap, or about 65k IPv4 addresses held active inside a
+  minute; past that, newcomers share it until entries idle out. Shard the
+  overflow by a keyed hash of the aggregate later.
+- **The observer's in-flight gauge can under-report after churn.** A
+  workspace evicted past the 256-tenant cap while its calls are in flight
+  comes back with a fresh entry; those calls' finishes saturate its
+  in-flight count at 0 rather than going negative, so the gauge reads low
+  until they drain. It never over-reports and never grows memory.
+
+Proved by `a_slash48_cap_frees_once_its_slash64s_go_idle`,
+`a_put_whose_save_failed_is_retried_not_skipped`,
+`a_failed_put_never_leaves_the_old_url_claiming_armed`,
+`a_delete_whose_save_failed_lets_the_same_put_rearm`,
+`a_rotate_whose_save_failed_lets_a_put_save_the_new_secret`,
+`a_reconcile_pass_that_did_not_land_forgets_its_views`,
+`a_signed_handler_uses_the_store_pair_not_the_flag_pair` and
+`deploy/test-lab-guard.sh` (with known-bad copies); each protection has an
+`ATTACK` row in `tests/attacks/prove-attacks.sh`.
+
+
+## D-063: open sign-up with email verification; invite-only kill switch
+
+*(S3 slice S3-0/1)*
+
+Accounts are created unverified and can sign in, but workspace-level
+mutations answer `403 email_unverified` until a verify link is opened.
+`DURABLE_INVITE_ONLY` restricts sign-up to addresses holding a live
+invite. Sign-up, verify, resend, forgot and reset all run through the
+mail outbox; `email_tokens` are single-use, kind-checked
+(verify/reset), superseded on reissue, and the consume path installs
+the pending password hash so a pre-registration attacker's credential
+never survives verification.
+
+
+## D-064: server-side sessions, not signed cookies
+
+*(S3 slice S3-0/2)*
+
+`drs_` session tokens are self-authenticating (HMAC tag dies before any
+store I/O), the store sees only sha256. Login rotates the session
+(`replaces` retires the predecessor — fixation), sessions carry idle
+(14 d, sliding) and absolute (30 d) expiry, and revocation is
+per-session by `public_id`, all-but-current, or all (verify / reset /
+password change). A generation-checked cache fills after store reads;
+a bump on every revoke drops fills that raced the invalidation.
+Argon2id runs on `spawn_blocking` behind a bounded semaphore (3 public
+permits + 1 known-device reserve).
+
+
+## D-065: synchroniser CSRF for the cookie surface
+
+*(S3 slice S3-0/2)*
+
+The login answer issues a `csrf` seed; every session-authed mutation
+must echo it in `x-durable-csrf` (constant-time compare). Cookies are
+`__Host-drs` (Secure, HttpOnly, SameSite=Lax, Path=/, no Domain), so
+the seed can't ride a cross-site POST. Unauthenticated `/auth` POSTs
+additionally check Origin/Sec-Fetch-Site.
+
+
+## D-066: member principals resolve through `x-durable-workspace`
+
+*(S3 slice S3-3)*
+
+Session + `x-durable-workspace: <public_id>` resolves to
+`{account, ws, role}` by membership lookup (generation-checked cache
+like key grants). On `/workspaces/{pid}/*` the path is the only
+authority: a header naming another workspace is a 400. Role <
+member cannot mutate; a non-member gets 404, never 403. ws 0 stays
+key-only — no member row can mint ops authority
+(`members_ws_nonzero` CHECK).
+
+
+## D-067: plan-aware free tier
+
+*(S3 slice S3-4 — not yet implemented)*
+
+`plans(id, name, limits jsonb)` seeds one `free` row;
+`workspaces.plan_id` defaults to it. Limits are enforced at ingress
+(server admission and the account store), never inside the engine's
+commit path; the engine's per-workspace bounds stay the hard backstop.
+
+
+## D-068: transactional email through an outbox table
+
+*(S3 slice S3-1)*
+
+Every mail is a journaled outbox row before it is an HTTP call:
+bounded claim batch (25 rows, 30 s claim window), per-send deadline
+(10 s), per-mail exponential backoff, 8 consecutive failures opens a
+5 min breaker, provider 4xx is terminal `failed`, a 500/day global
+budget refuses. `RESEND_API_KEY` wires the Resend mailer; the default
+`LogMailer` records metadata only.
+
+
+## D-069: workflows are saved, versioned job definitions
+
+*(S3 slice S3-7 — not yet implemented)*
+
+`workflows` + `workflow_versions` (immutable, one row per spec change)
++ `workflow_runs` joined through `scoped_run`. Run now submits a
+fresh uuidv7 op key via `submit_scoped` — a retried click is a new
+run, honestly.
+
+
+## D-070: the handler test call goes through the signed SSRF path
+
+*(S3 slice S3-6)*
+
+`POST /handlers/{name}/test` builds the target with the same
+`handler_factory.make_signed` store policy as real dispatch, so a test
+call can never reach an address a job step can't. The onboarding
+sample is an in-process `builtin:echo` handler — no network hop, no
+reflector, per-workspace rate-limited like every test call.
+
+
+## D-071: `last_used`/`last_seen` flush, not write-per-request
+
+*(S3 slice S3-2)*
+
+Use is recorded in memory and flushed in one batched store write per
+tick (60 s idle slides, 30 s touches). A lost flush slides a deadline
+forward *less*, never serves a dead session — expiry checks take the
+pending-touch floor too.
+
+
+## D-072: workspace deletion is soft
+
+*(S3 slice S3-3)*
+
+`workspaces.deleted_at`: admission refuses `410 workspace_closed`,
+keys are revoked write-through (cache invalidation in the same
+breath), members lose it from their lists, queued runs are cancelled
+by the engine. Journal records leave on the normal 7-day expiry;
+account-graph rows purge after a grace period.
+
+
+## D-073: API keys are data-plane only; sessions own the control plane
+
+*(S3 slice S3-3/S3-5)*
+
+A key (read or write) can submit, cancel, read, spec, manage handlers
+and test-call — never manage members, invites, workspaces, keys,
+sessions or plan data. `POST /handler-secret` is session admin/owner
+only: a leaked write key cannot mint the signing secret it would need
+to forge handler calls.

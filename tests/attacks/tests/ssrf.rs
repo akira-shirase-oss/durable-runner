@@ -168,15 +168,18 @@ async fn a_domain_that_resolves_local_never_gets_a_packet() {
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
+    // The protection is "no packet reaches the local listener"; that is the decisive
+    // assertion. Without the guard the run may finish `done` or park, depending on how
+    // the listener answers in time, so the state check can't be the one that decides.
     // DECISIVE(ssrf-resolve)
-    assert!(
-        state.starts_with("retry_waiting") || state.starts_with("failed"),
-        "the refused call should park the run, got state {state:?}"
-    );
     assert_eq!(
         hits.load(Ordering::SeqCst),
         0,
         "the resolver let a packet reach the local listener"
+    );
+    assert!(
+        state.starts_with("retry_waiting") || state.starts_with("failed"),
+        "the refused call should park the run, got state {state:?}"
     );
 }
 
