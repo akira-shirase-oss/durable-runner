@@ -894,8 +894,9 @@ impl Journal {
         tighten(&lock_path, FILE_MODE);
         tighten(&manifest_path_of(dir), FILE_MODE);
         tighten(&shape_path(dir), FILE_MODE);
-        // A crash can orphan the sidecar's temp file; it is not journal
-        // content and the next write_shape recreates it anyway.
+        tighten(&dir.join("public_id.key"), FILE_MODE); // the server's id key
+                                                        // A crash can orphan the sidecar's temp file; it is not journal
+                                                        // content and the next write_shape recreates it anyway.
         let _ = fs::remove_file(dir.join("journal.shape.tmp"));
 
         // Manifest: keep the last valid one. First open creates generation
@@ -1382,18 +1383,21 @@ impl Journal {
                 File::open(&gd)?.sync_data()?;
             }
         }
-        // journal.shape stays OUT of the backup (S2 re-review): the open
-        // path rebuilds it from the replayed maxima, and a backup listing
-        // it would no longer restore under the v1.0.1 CLI (its file list
-        // admits generation paths only). public_id.key travels when the
-        // directory holds one — only an S2-restored dir does, and the
-        // permutation key is the one piece of install identity a backup
-        // cannot regenerate: dropping it orphans every public id.
-        let key = self.root.join("public_id.key");
-        if key.exists() {
-            let (bytes, crc32) = copy_file_durably(&key, &partial.join("public_id.key"))?;
+        // The flat sidecars travel too (D-057 — S2 writes both):
+        // `journal.shape` preserves claims a replay alone cannot
+        // reconstruct (a ws scope claim survives the compaction that
+        // deleted its records), and `public_id.key` is install identity —
+        // without it every opaque public id a client holds orphans to a
+        // 404 on the restored instance. Neither is a journal file, but
+        // both are journal-dir state a faithful backup must carry.
+        for flat in ["journal.shape", "public_id.key"] {
+            let src = self.root.join(flat);
+            if !src.exists() {
+                continue;
+            }
+            let (bytes, crc32) = copy_file_durably(&src, &partial.join(flat))?;
             list.files.push(BackupFile {
-                path: "public_id.key".into(),
+                path: flat.into(),
                 bytes,
                 crc32: Some(crc32),
             });
@@ -1430,11 +1434,13 @@ impl Journal {
 
 impl Journal {
     /// Bytes a backup copies: every generation's log and snapshot plus the
-    /// manifest, and `public_id.key` when the directory holds one.
+    /// manifest, and the journal-dir flats it carries.
     fn backup_bytes(&self) -> Result<u64, JournalError> {
         let mut total = fs::metadata(self.root.join("manifest.json"))?.len();
-        if let Ok(m) = fs::metadata(self.root.join("public_id.key")) {
-            total += m.len();
+        for flat in ["journal.shape", "public_id.key"] {
+            if let Ok(m) = fs::metadata(self.root.join(flat)) {
+                total += m.len();
+            }
         }
         for entry in fs::read_dir(&self.root)? {
             let entry = entry?;
@@ -2887,6 +2893,66 @@ mod tests {
         );
     }
 
+    /// The pilot caught this: a backup without the server's
+    /// `public_id.key` restored fine, but the fresh instance generated a
+    /// different permutation key — every public id a client held decoded
+    /// to nothing (404). The journal-dir sidecars travel with the
+    /// backup, checksummed and owner-only, so a restore keeps the ids.
+    #[test]
+    fn the_flat_sidecars_ride_the_backup() {
+        let d = tempfile::tempdir().unwrap_or_else(|e| panic!("{e}"));
+        let src = d.path().join("src");
+        let mut j = Journal::open(&src).unwrap_or_else(|e| panic!("{e}"));
+        j.append(&record(0)).unwrap_or_else(|e| panic!("{e}"));
+        let key = [7u8; 32];
+        fs::write(src.join("public_id.key"), key).unwrap_or_else(|e| panic!("{e}"));
+        write_shape(
+            &src,
+            Shape {
+                records: 2,
+                snapshots: 1,
+                max_ws: 0,
+            },
+        )
+        .unwrap_or_else(|e| panic!("{e}"));
+        drop(j);
+        let backup = d.path().join("backup");
+        Journal::open(&src)
+            .unwrap_or_else(|e| panic!("{e}"))
+            .backup_to(&backup)
+            .unwrap_or_else(|e| panic!("{e}"));
+        let to = d.path().join("to");
+        restore_backup(&backup, &to).unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(
+            fs::read(to.join("public_id.key")).unwrap_or_else(|e| panic!("{e}")),
+            key,
+            "the restored key differs — every public id would rename"
+        );
+        assert!(to.join("journal.shape").exists());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                fs::metadata(to.join("public_id.key"))
+                    .unwrap_or_else(|e| panic!("{e}"))
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o600,
+                "the restored key must stay owner-only"
+            );
+        }
+        // And a target already holding a stale key is refused — the old
+        // key must never silently survive a restore that lacks one.
+        let stale = d.path().join("stale");
+        fs::create_dir(&stale).unwrap_or_else(|e| panic!("{e}"));
+        fs::write(stale.join("public_id.key"), [9u8; 32]).unwrap_or_else(|e| panic!("{e}"));
+        assert!(
+            restore_backup(&backup, &stale).is_err(),
+            "restored onto a stale public_id.key"
+        );
+    }
+
     /// Review V2: a file list with a duplicate entry failed as a raw
     /// `io: File exists`, and `"crc32": null` silently skipped the check
     /// of a listed file. Both are named refusals now.
@@ -3430,44 +3496,13 @@ mod tests {
         );
     }
 
-    /// The sidecar stays OUT of backup.json: a v1.0.1 restore tool refuses
-    /// any path outside a generation, so carrying it would brick
-    /// cross-version restores. A restored journal rebuilds it from replayed
-    /// maxima at open.
-    #[test]
-    fn the_sidecar_stays_out_of_the_backup() {
-        let d = tempfile::tempdir().unwrap_or_else(|e| panic!("{e}"));
-        let src = d.path().join("src");
-        {
-            let mut j = Journal::open(&src).unwrap_or_else(|e| panic!("{e}"));
-            j.append(&record(0)).unwrap_or_else(|e| panic!("{e}"));
-            // Force a sidecar the backup must NOT carry.
-            write_shape(&src, SHAPE).unwrap_or_else(|e| panic!("{e}"));
-            assert!(shape_path(&src).exists());
-        }
-        let dest = d.path().join("backup");
-        {
-            let j = Journal::open(&src).unwrap_or_else(|e| panic!("{e}"));
-            j.backup_to(&dest).unwrap_or_else(|e| panic!("{e}"));
-        }
-        assert!(
-            !dest.join("journal.shape").exists(),
-            "sidecar leaked into the backup"
-        );
-        let to = d.path().join("to");
-        restore_backup(&dest, &to).unwrap_or_else(|e| panic!("{e}"));
-        assert!(!shape_path(&to).exists(), "restore materialized a sidecar");
-        let j = Journal::open(&to).unwrap_or_else(|e| panic!("{e}"));
-        assert_eq!(j.records_written(), 1);
-    }
-
-    /// The agreed backup set (S2 re-review finding 7): an S2 backup lists
-    /// the journal-dir flats `journal.shape` and `public_id.key` beside
-    /// the generations. This build never writes them into a backup — the
-    /// sidecar is derivable at open and v1.0.1's restore admits only
-    /// generation paths — but restore must ACCEPT them: an S2 backup of
-    /// a still-v2 journal is a legitimate rollback target, and the key
-    /// must land intact or every public id the install issued orphans.
+    /// The agreed backup set (S2 re-review finding 7, D-057): an S2
+    /// backup lists the journal-dir flats `journal.shape` and
+    /// `public_id.key` beside the generations — this build writes them
+    /// (`the_flat_sidecars_ride_the_backup`), and restore must ACCEPT
+    /// them: an S2 backup of a still-v2 journal is a legitimate rollback
+    /// target, and the key must land intact or every public id the
+    /// install issued orphans.
     #[test]
     fn restore_accepts_the_s2_backup_set() {
         let d = tempfile::tempdir().unwrap_or_else(|e| panic!("{e}"));
@@ -3660,5 +3695,103 @@ mod tests {
             },
             "serialized writes must land the component-wise max of both"
         );
+    }
+}
+
+/// Never-panics fuzzing for every decoder of outside input (D-018's
+/// missing practices): the framed record stream, `journal.shape`, and
+/// `manifest.json`. Each `fuzz_*` test replays the seed corpus under
+/// `fuzz/corpus/<target>/` then runs a bounded proptest pass — a panic
+/// anywhere is a red-first bug.
+#[cfg(test)]
+mod fuzz {
+    use super::*;
+    use proptest::prelude::*;
+    use std::io::Write;
+
+    fn corpus(name: &str) -> Vec<Vec<u8>> {
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../fuzz/corpus")
+            .join(name);
+        let mut out: Vec<Vec<u8>> = std::fs::read_dir(&dir)
+            .unwrap_or_else(|e| panic!("corpus {dir:?}: {e}"))
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_type().is_ok_and(|t| t.is_file()))
+            .filter_map(|e| std::fs::read(e.path()).ok())
+            .collect();
+        out.sort();
+        out
+    }
+
+    fn at(dir: &Path, file: &str, bytes: &[u8]) -> PathBuf {
+        let p = dir.join(file);
+        let mut f = std::fs::File::create(&p).unwrap_or_else(|e| panic!("{e}"));
+        f.write_all(bytes).unwrap_or_else(|e| panic!("{e}"));
+        p
+    }
+
+    /// Bytes as journal.log: replay iterates to torn-tail or Corrupt —
+    /// never a panic, however the frames lie.
+    fn replay_bytes(bytes: &[u8]) {
+        let d = tempfile::tempdir().unwrap_or_else(|e| panic!("{e}"));
+        std::fs::write(d.path().join("journal.log"), bytes).unwrap_or_else(|e| panic!("{e}"));
+        if let Ok(Some(rs)) = records(d.path()) {
+            for r in rs {
+                let _ = r;
+            }
+        }
+    }
+
+    #[test]
+    fn fuzz_records_seed_corpus() {
+        for b in corpus("journal-records") {
+            replay_bytes(&b);
+        }
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::default())]
+        #[test]
+        fn fuzz_records_never_panics(bytes in proptest::collection::vec(any::<u8>(), 0..=8192)) {
+            replay_bytes(&bytes);
+        }
+    }
+
+    #[test]
+    fn fuzz_shape_seed_corpus() {
+        for b in corpus("journal-shape") {
+            let d = tempfile::tempdir().unwrap_or_else(|e| panic!("{e}"));
+            at(d.path(), "journal.shape", &b);
+            let _ = read_shape(d.path());
+        }
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::default())]
+        #[test]
+        fn fuzz_shape_never_panics(bytes in any::<Vec<u8>>()) {
+            let d = tempfile::tempdir().unwrap_or_else(|e| panic!("{e}"));
+            at(d.path(), "journal.shape", &bytes);
+            let _ = read_shape(d.path());
+        }
+    }
+
+    #[test]
+    fn fuzz_manifest_seed_corpus() {
+        for b in corpus("journal-manifest") {
+            let d = tempfile::tempdir().unwrap_or_else(|e| panic!("{e}"));
+            at(d.path(), "manifest.json", &b);
+            let _ = read_manifest(d.path());
+        }
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::default())]
+        #[test]
+        fn fuzz_manifest_never_panics(text in any::<String>()) {
+            let d = tempfile::tempdir().unwrap_or_else(|e| panic!("{e}"));
+            at(d.path(), "manifest.json", text.as_bytes());
+            let _ = read_manifest(d.path());
+        }
     }
 }

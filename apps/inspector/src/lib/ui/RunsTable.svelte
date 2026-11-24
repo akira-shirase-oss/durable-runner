@@ -20,7 +20,7 @@
 		runs: RunItem[];
 		now: number;
 		canCancel: boolean;
-		oncancel?: (id: number) => void;
+		oncancel?: (id: string) => void;
 		caption: string;
 	} = $props();
 
@@ -31,7 +31,7 @@
 		return now - t < 20 * 3_600_000 ? fmtClock(t) : fmtDateTime(t, now);
 	}
 
-	function rowClick(e: MouseEvent, id: number) {
+	function rowClick(e: MouseEvent, id: string) {
 		const t = e.target as HTMLElement;
 		if (t.closest('a, button')) return;
 		if (window.getSelection()?.toString()) return;

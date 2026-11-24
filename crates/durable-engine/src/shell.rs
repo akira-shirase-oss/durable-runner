@@ -7,14 +7,15 @@
 //! carries the same key `{operation_key}/{step}`, so a repeating remote call
 //! can be de-duplicated on the far side (contract §04, at-least-once).
 
-use crate::observe::{CallGuard, CallResult, IndexCounts, Observer};
+use crate::observe::{CallGuard, CallResult, IndexCounts, Observer, Scope};
 use crate::writer::{self, GroupCommit, Writer, WriterMsg};
 use crate::{EngineCore, EngineError, RunSummary, Submitted};
 use durable_domain::{
     Effect, JobSpec, Limits, Millis, OperationKey, Run, RunId, RunState, StepIndex, StepSpec,
 };
 use durable_journal::{JournalError, JournalOptions};
-use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+use std::cmp::Reverse;
+use std::collections::{BTreeMap, BinaryHeap, HashMap, HashSet, VecDeque};
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{SyncSender, TrySendError};
@@ -75,26 +76,82 @@ pub trait StepHandler: Send + Sync {
     }
 }
 
-/// Named handlers, populated by configuration. A step naming a handler not
-/// in the registry fails its attempt — it never silently runs.
+/// Handlers a single workspace may register (D-021 bound): enough for a
+/// tenant's real surface, small enough that a registration flood cannot
+/// grow the dispatch map without limit.
+pub const MAX_HANDLERS_PER_WS: usize = 256;
+
+/// Named handlers, populated by configuration, scoped per workspace
+/// (S2-4): a step naming a handler not registered *in the submitting
+/// workspace* fails its attempt — it never silently runs, and it never
+/// borrows another workspace's registration.
 #[derive(Default, Clone)]
 pub struct Registry {
-    handlers: HashMap<String, Arc<dyn StepHandler>>,
+    /// Workspace → its own name → handler: a lookup, a count and a
+    /// listing cost O(that workspace's registrations), never a walk of
+    /// every tenant's (a `/metrics` read lists one workspace's names).
+    handlers: HashMap<u64, HashMap<String, Arc<dyn StepHandler>>>,
 }
 
 impl Registry {
+    /// Compat registration: `--handler` flags land in workspace 0.
     pub fn register(&mut self, name: &str, h: Arc<dyn StepHandler>) {
-        self.handlers.insert(name.to_string(), h);
+        self.handlers
+            .entry(0)
+            .or_default()
+            .insert(name.to_string(), h);
     }
-    fn get(&self, name: &str) -> Option<Arc<dyn StepHandler>> {
-        self.handlers.get(name).cloned()
+    fn get(&self, ws: u64, name: &str) -> Option<Arc<dyn StepHandler>> {
+        self.handlers.get(&ws)?.get(name).cloned()
     }
-    pub fn contains(&self, name: &str) -> bool {
-        self.handlers.contains_key(name)
+    pub fn contains(&self, ws: u64, name: &str) -> bool {
+        self.handlers.get(&ws).is_some_and(|m| m.contains_key(name))
     }
-    /// Every registered name (the observer keeps stats for each).
-    pub fn names(&self) -> Vec<String> {
-        self.handlers.keys().cloned().collect()
+    /// Insert or replace one registration. Refuses past the per-workspace
+    /// bound — the account store also bounds, this is the engine's own.
+    fn put(&mut self, ws: u64, name: &str, h: Arc<dyn StepHandler>) -> Result<(), EngineError> {
+        let m = self.handlers.entry(ws).or_default();
+        if !m.contains_key(name) && m.len() >= MAX_HANDLERS_PER_WS {
+            return Err(EngineError::RegistryFull);
+        }
+        m.insert(name.to_string(), h);
+        Ok(())
+    }
+    fn remove(&mut self, ws: u64, name: &str) {
+        if let Some(m) = self.handlers.get_mut(&ws) {
+            m.remove(name);
+            if m.is_empty() {
+                self.handlers.remove(&ws);
+            }
+        }
+    }
+    /// Replace a workspace's whole set — how the store reconciler syncs.
+    /// Refuses past the bound; an oversized store answer is refused whole.
+    fn set_ws(
+        &mut self,
+        ws: u64,
+        handlers: Vec<(String, Arc<dyn StepHandler>)>,
+    ) -> Result<(), EngineError> {
+        if handlers.len() > MAX_HANDLERS_PER_WS {
+            return Err(EngineError::RegistryFull);
+        }
+        if handlers.is_empty() {
+            self.handlers.remove(&ws);
+            return Ok(());
+        }
+        self.handlers.insert(ws, handlers.into_iter().collect());
+        Ok(())
+    }
+    /// The names registered in one workspace, sorted (what its `/metrics`
+    /// lists; never another workspace's).
+    pub fn names(&self, ws: u64) -> Vec<String> {
+        let mut n: Vec<String> = self
+            .handlers
+            .get(&ws)
+            .map(|m| m.keys().cloned().collect())
+            .unwrap_or_default();
+        n.sort();
+        n
     }
 }
 
@@ -109,6 +166,7 @@ pub fn idem_key(key: &OperationKey, step: StepIndex) -> String {
 
 enum Cmd {
     Submit {
+        ws: u64,
         key: OperationKey,
         spec: JobSpec,
         not_before: Option<Millis>,
@@ -125,6 +183,25 @@ enum Cmd {
         dest: std::path::PathBuf,
         reply: oneshot::Sender<Result<(), EngineError>>,
     },
+    /// A handler registration written through the API (S2-4): the engine
+    /// learns it on the command channel — never by the actor reading a
+    /// database.
+    PutHandler {
+        ws: u64,
+        name: String,
+        handler: Arc<dyn StepHandler>,
+        reply: oneshot::Sender<Result<(), EngineError>>,
+    },
+    DeleteHandler {
+        ws: u64,
+        name: String,
+    },
+    /// The store reconciler's whole-set sync for one workspace.
+    SetWorkspaceHandlers {
+        ws: u64,
+        handlers: Vec<(String, Arc<dyn StepHandler>)>,
+        reply: oneshot::Sender<Result<(), EngineError>>,
+    },
 }
 
 /// Reads travel on their own bounded channel: a burst of (open,
@@ -136,6 +213,7 @@ enum Read {
         reply: oneshot::Sender<Option<Run>>,
     },
     List {
+        ws: u64,
         order: Order,
         limit: usize,
         reply: oneshot::Sender<RunPage>,
@@ -143,18 +221,36 @@ enum Read {
     Diag {
         reply: oneshot::Sender<crate::Diagnostics>,
     },
+    /// One workspace's diagnostics — the tenant-facing read.
+    DiagWs {
+        ws: u64,
+        reply: oneshot::Sender<crate::WorkspaceDiagnostics>,
+    },
     /// A run's list fields, never its spec or input.
     Summary {
         run: RunId,
         reply: oneshot::Sender<Option<RunSummary>>,
     },
-    /// The operation keys of up to `MAX_PAGE` runs (`None`: not in the index).
+    /// The operation keys of up to `MAX_PAGE` runs of workspace `ws`
+    /// (`None`: not in the index, or another workspace's run).
     Keys {
+        ws: u64,
         runs: Vec<RunId>,
         reply: oneshot::Sender<Vec<Option<OperationKey>>>,
     },
     /// State counts and index sizes, O(1).
     Counts { reply: oneshot::Sender<IndexCounts> },
+    /// One scope's counts and registered handler names (`/metrics`).
+    MetricsIndex {
+        scope: Scope,
+        reply: oneshot::Sender<MetricsIndex>,
+    },
+    /// Test probe: the actor's scheduler memory per run —
+    /// `(parked entries, dead_since markers, dead_retry tuples)`.
+    #[cfg(test)]
+    SchedCounts {
+        reply: oneshot::Sender<(usize, usize, usize)>,
+    },
 }
 
 /// Handle to the running engine. Cheap to clone; the channel capacities
@@ -210,6 +306,21 @@ struct Health {
 /// The most runs one list call returns, whatever the caller asks for.
 pub const MAX_PAGE: usize = 1000;
 
+/// How long an in-grace dead-handler entry waits on `dead_retry`
+/// between presence re-checks (S3 re-review N7): a 30 s grace costs ~30
+/// examinations per entry instead of one per tick, and the heap's
+/// `min(first + grace, now + this)` still parks on the exact deadline.
+const DEAD_RECHECK_MS: u64 = 1_000;
+
+/// While a batch rides the writer pipeline, outbound accumulates until
+/// at least this many records are queued — fsyncs then carry real groups
+/// and the writer's own gather merges what is already in its channel.
+/// The moment the pipeline is idle, whatever has accumulated ships. The
+/// strict one-batch gate serialized every fsync through the actor's wake
+/// latency (~tens of ms under a saturated offer), capping durable
+/// throughput near one tiny batch per cycle.
+const MIN_SHIP_RECORDS: usize = 256;
+
 /// Which end a list page starts from, with its cursor.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Order {
@@ -259,18 +370,29 @@ impl Engine {
     }
 
     pub async fn submit(&self, key: OperationKey, spec: JobSpec) -> Result<RunId, EngineError> {
-        self.submit_inner(key, spec, None).await.map(|s| s.run)
+        self.submit_scoped(0, key, spec).await
     }
 
-    /// Submit (delayed if `not_before` is set), saying whether the key
-    /// named an existing run.
+    /// Submit into workspace 0 (delayed if `not_before` is set), saying
+    /// whether the key named an existing run.
     pub async fn submit_with(
         &self,
         key: OperationKey,
         spec: JobSpec,
         not_before: Option<Millis>,
     ) -> Result<Submitted, EngineError> {
-        self.submit_inner(key, spec, not_before).await
+        self.submit_in(0, key, spec, not_before).await
+    }
+
+    /// `submit_with` into workspace `ws` (dedup per `(ws, key)`).
+    pub async fn submit_in(
+        &self,
+        ws: u64,
+        key: OperationKey,
+        spec: JobSpec,
+        not_before: Option<Millis>,
+    ) -> Result<Submitted, EngineError> {
+        self.submit_inner(ws, key, spec, not_before).await
     }
 
     /// Submit with a delayed start: the run queues until `not_before`.
@@ -280,19 +402,43 @@ impl Engine {
         spec: JobSpec,
         not_before: Millis,
     ) -> Result<RunId, EngineError> {
-        self.submit_inner(key, spec, Some(not_before))
+        self.submit_at_scoped(0, key, spec, not_before).await
+    }
+
+    /// Submit into a workspace: dedup is scoped to `(ws, key)`, so the
+    /// same key can run independently in different workspaces.
+    pub async fn submit_scoped(
+        &self,
+        ws: u64,
+        key: OperationKey,
+        spec: JobSpec,
+    ) -> Result<RunId, EngineError> {
+        self.submit_inner(ws, key, spec, None).await.map(|s| s.run)
+    }
+
+    /// `submit_at` scoped to a workspace.
+    pub async fn submit_at_scoped(
+        &self,
+        ws: u64,
+        key: OperationKey,
+        spec: JobSpec,
+        not_before: Millis,
+    ) -> Result<RunId, EngineError> {
+        self.submit_inner(ws, key, spec, Some(not_before))
             .await
             .map(|s| s.run)
     }
 
     async fn submit_inner(
         &self,
+        ws: u64,
         key: OperationKey,
         spec: JobSpec,
         not_before: Option<Millis>,
     ) -> Result<Submitted, EngineError> {
         let (reply, rx) = oneshot::channel();
         self.send(Cmd::Submit {
+            ws,
             key,
             spec,
             not_before,
@@ -322,16 +468,71 @@ impl Engine {
         answer(rx, self.admin_timeout).await?
     }
 
-    /// One page of the live index in id order: at most
-    /// `min(limit, MAX_PAGE)` runs with id > `after`.
-    pub async fn list(&self, after: Option<RunId>, limit: usize) -> Result<RunPage, EngineError> {
-        self.list_in(Order::Oldest { after }, limit).await
+    /// Register or replace a handler in one workspace's registry (S2-4).
+    /// The caller (an API route) has already persisted it to the account
+    /// store; this updates the dispatch view on the command channel.
+    pub async fn put_handler(
+        &self,
+        ws: u64,
+        name: &str,
+        handler: Arc<dyn StepHandler>,
+    ) -> Result<(), EngineError> {
+        let (reply, rx) = oneshot::channel();
+        self.send(Cmd::PutHandler {
+            ws,
+            name: name.to_string(),
+            handler,
+            reply,
+        })?;
+        answer(rx, self.reply_timeout).await?
+    }
+
+    /// Remove one registration. Fire-and-forget: there is nothing to
+    /// refuse — a run already in flight keeps its resolved handler.
+    pub fn delete_handler(&self, ws: u64, name: &str) -> Result<(), EngineError> {
+        self.send(Cmd::DeleteHandler {
+            ws,
+            name: name.to_string(),
+        })
+    }
+
+    /// Replace a workspace's whole handler set — the store reconciler's
+    /// sync point. Refuses an oversized set whole.
+    pub async fn set_workspace_handlers(
+        &self,
+        ws: u64,
+        handlers: Vec<(String, Arc<dyn StepHandler>)>,
+    ) -> Result<(), EngineError> {
+        let (reply, rx) = oneshot::channel();
+        self.send(Cmd::SetWorkspaceHandlers {
+            ws,
+            handlers,
+            reply,
+        })?;
+        answer(rx, self.admin_timeout).await?
+    }
+
+    /// One page of `ws`'s runs oldest-first (scoped: the caller's
+    /// workspace, never the global index).
+    pub async fn list(
+        &self,
+        ws: u64,
+        after: Option<RunId>,
+        limit: usize,
+    ) -> Result<RunPage, EngineError> {
+        self.list_in(ws, Order::Oldest { after }, limit).await
     }
 
     /// One page in either order, at most `min(limit, MAX_PAGE)` runs.
-    pub async fn list_in(&self, order: Order, limit: usize) -> Result<RunPage, EngineError> {
+    pub async fn list_in(
+        &self,
+        ws: u64,
+        order: Order,
+        limit: usize,
+    ) -> Result<RunPage, EngineError> {
         let (reply, rx) = oneshot::channel();
         self.send_read(Read::List {
+            ws,
             order,
             limit: limit.clamp(1, MAX_PAGE),
             reply,
@@ -343,6 +544,14 @@ impl Engine {
     pub async fn diag(&self) -> Result<crate::Diagnostics, EngineError> {
         let (reply, rx) = oneshot::channel();
         self.send_read(Read::Diag { reply })?;
+        answer(rx, self.reply_timeout).await
+    }
+
+    /// One workspace's diagnostics — the tenant-facing subset, never
+    /// another tenant's totals (S1 review).
+    pub async fn diag_ws(&self, ws: u64) -> Result<crate::WorkspaceDiagnostics, EngineError> {
+        let (reply, rx) = oneshot::channel();
+        self.send_read(Read::DiagWs { ws, reply })?;
         answer(rx, self.reply_timeout).await
     }
 
@@ -428,14 +637,25 @@ impl Engine {
     }
 
     /// The operation keys of `runs` (at most `MAX_PAGE`; more are cut),
-    /// in order; `None` for a run no longer in the index.
+    /// in order; `None` for a run no longer in the index or not in `ws`
+    /// (a workspace never learns another's keys).
     pub async fn keys(
         &self,
+        ws: u64,
         mut runs: Vec<RunId>,
     ) -> Result<Vec<Option<OperationKey>>, EngineError> {
         runs.truncate(MAX_PAGE);
         let (reply, rx) = oneshot::channel();
-        self.send_read(Read::Keys { runs, reply })?;
+        self.send_read(Read::Keys { ws, runs, reply })?;
+        answer(rx, self.reply_timeout).await
+    }
+
+    /// One scope's state counts, index sizes and registered handler names
+    /// ([`Scope::All`]: every workspace's counts, workspace 0's names), in
+    /// O(that workspace's handlers) on the actor.
+    pub async fn metrics_index(&self, scope: Scope) -> Result<MetricsIndex, EngineError> {
+        let (reply, rx) = oneshot::channel();
+        self.send_read(Read::MetricsIndex { scope, reply })?;
         answer(rx, self.reply_timeout).await
     }
 
@@ -450,6 +670,23 @@ impl Engine {
     pub fn observer(&self) -> &Arc<Observer> {
         &self.obs
     }
+
+    /// Test probe: the actor's scheduler memory (parked entries,
+    /// dead_since markers, dead_retry tuples).
+    #[cfg(test)]
+    async fn sched_counts(&self) -> Result<(usize, usize, usize), EngineError> {
+        let (reply, rx) = oneshot::channel();
+        self.send_read(Read::SchedCounts { reply })?;
+        answer(rx, self.reply_timeout).await
+    }
+}
+
+/// What `/metrics` needs from the actor for one scope.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct MetricsIndex {
+    pub counts: IndexCounts,
+    /// The scope's registered handler names, sorted.
+    pub handlers: Vec<String>,
 }
 
 /// Runtime knobs, all bounded.
@@ -457,12 +694,34 @@ impl Engine {
 pub struct ShellConfig {
     /// Maximum handler calls (attempts and reconcile probes) in flight.
     /// A dispatch is journaled only while holding one of these permits.
+    /// Under a submit burst the permits saturate instantly and the rest
+    /// defer to the tick scheduler — measured the drain bound (S2-7):
+    /// 32 permits held ~640 runs/s against a fast fixture while 256 gave
+    /// ~5k/s; the journal/fsync path itself sustains ~33k/s (Echo bench).
     pub max_in_flight: usize,
+    /// The share of `max_in_flight` one workspace may hold at once (S2
+    /// review #6): without it a single tenant's slow handler parks every
+    /// permit and starves the rest — the measured default of 256 held
+    /// entirely by one tenant was the cross-tenant DoS. 50 keeps one
+    /// tenant under a fifth of the pool while it is full, so four
+    /// saturated tenants leave a fifth able to dispatch; a ws below
+    /// its cap can still use idle capacity up to the global bound.
+    /// Compat (ws-0 only) deployments wanting more raise the flag.
+    pub max_in_flight_per_ws: usize,
     /// Upper bound on dispatches (and on deadline expiries) per tick, so a
-    /// backlog of due runs cannot monopolise the actor.
+    /// backlog of due runs cannot monopolise the actor. This is the drain
+    /// ceiling once permits stop throttling: 64 per 50 ms tick caps a
+    /// deferred backlog at ~1,280 dispatches/s (measured ~1,356/s), which
+    /// is what bounded the 50k-run workspaces load to ~1.3k/s (S2-7).
     pub max_dispatch_per_tick: usize,
     /// Scheduler/deadline-sweep cadence.
     pub tick_ms: u64,
+    /// How long a run whose handler left the registry stays in the due
+    /// rotation before it parks (S2 re-review finding 5): within grace a
+    /// registration blip costs the run nothing; past grace it leaves the
+    /// rotation until the handler returns, instead of being re-examined
+    /// every tick forever.
+    pub dead_handler_grace_ms: u64,
     /// Command channel capacity (submit back-pressure bound).
     pub cmd_capacity: usize,
     /// Read channel capacity (inspect/list/diagnostics), separate so reads
@@ -500,9 +759,11 @@ pub struct ShellConfig {
 impl Default for ShellConfig {
     fn default() -> Self {
         Self {
-            max_in_flight: 32,
-            max_dispatch_per_tick: 64,
+            max_in_flight: 256,
+            max_in_flight_per_ws: 50,
+            max_dispatch_per_tick: 512,
             tick_ms: 50,
+            dead_handler_grace_ms: 30_000,
             cmd_capacity: 1024,
             read_capacity: 256,
             limits: Limits::default(),
@@ -528,7 +789,7 @@ pub fn spawn(dir: &Path, registry: Registry, mut cfg: ShellConfig) -> Result<Eng
     cfg.group_commit = cfg.group_commit.clamped();
     cfg.limits.validate().map_err(EngineError::Config)?;
     // Replay feeds the observer's timelines and feed; its metrics begin now.
-    let obs = Arc::new(Observer::new(wall_ms(), registry.names()));
+    let obs = Arc::new(Observer::new(wall_ms()));
     let mut core = EngineCore::open_observed(dir, cfg.journal.clone(), Some(obs.clone()))?;
     core.limits = cfg.limits;
     let counts = core.index_counts();
@@ -666,11 +927,13 @@ impl Monitor {
     }
 }
 
-/// An attempt's result comes back with the permit it ran under, so a
-/// chained step (the checkpoint that moves the run to its next step) can
-/// inherit it instead of racing other runs for capacity.
-type AttemptJoin = (RunId, StepIndex, Outcome, OwnedSemaphorePermit);
-type ProbeJoin = (RunId, StepIndex, bool, OwnedSemaphorePermit);
+/// An attempt's result comes back with the permit AND the workspace
+/// slot it ran under, so a chained step (the checkpoint that moves the
+/// run to its next step) inherits both instead of racing other runs for
+/// capacity — a freed slot could otherwise be handed to a backlog run
+/// before the finished call's effects ran (S1).
+type AttemptJoin = (RunId, StepIndex, Outcome, OwnedSemaphorePermit, WsSlot);
+type ProbeJoin = (RunId, StepIndex, bool, OwnedSemaphorePermit, WsSlot);
 
 /// Sends a held answer: `None` once durable, `Some(err)` if the commit failed.
 type HeldReply = Box<dyn FnOnce(Option<&Arc<JournalError>>) + Send>;
@@ -681,15 +944,21 @@ enum Held {
     /// An answer to a caller. `Some(err)`: the commit failed — the caller
     /// gets `CommitFailed` (or, for a read, the engine stops).
     Reply(HeldReply),
+    /// A dispatch whose record is not yet durable. The workspace slot is
+    /// charged from `dispatch`, through this wait, to the task's end —
+    /// the share a run owns exists from the journal write, not the spawn
+    /// (S2 re-review N3).
     Fire {
         run: RunId,
         step: StepIndex,
         permit: OwnedSemaphorePermit,
+        slot: WsSlot,
     },
     Probe {
         run: RunId,
         step: StepIndex,
         permit: OwnedSemaphorePermit,
+        slot: WsSlot,
     },
 }
 
@@ -763,11 +1032,15 @@ impl Pipeline {
         }
     }
 
-    /// Hand queued messages to the writer, but only once everything sent
-    /// before is durable: one batch is in flight while the next one
-    /// accumulates (that is the group commit). False if the writer is gone.
+    /// Hand queued messages to the writer the moment it is idle, and
+    /// while it is busy once at least `MIN_SHIP_RECORDS` have accumulated:
+    /// several batches ride the fsync pipeline so the writer never waits
+    /// on the actor's wake latency between fsyncs (that is the group
+    /// commit). False if the writer is gone.
     fn flush(&mut self) -> bool {
-        if self.sent_upto > self.durable || self.outbound.is_empty() {
+        if self.outbound.is_empty()
+            || (self.sent_upto > self.durable && self.outbound_records < MIN_SHIP_RECORDS)
+        {
             return true;
         }
         let Some(tx) = &self.tx else { return true };
@@ -958,6 +1231,10 @@ fn refuse(cmd: Cmd) {
         Cmd::Backup { reply, .. } => {
             let _ = reply.send(Err(EngineError::Stopped));
         }
+        Cmd::PutHandler { reply, .. } | Cmd::SetWorkspaceHandlers { reply, .. } => {
+            let _ = reply.send(Err(EngineError::Stopped));
+        }
+        Cmd::DeleteHandler { .. } => {}
     }
 }
 
@@ -1050,7 +1327,7 @@ async fn drain(
 
 async fn actor(
     mut core: EngineCore,
-    registry: Registry,
+    mut registry: Registry,
     cfg: ShellConfig,
     (mut rx, mut read_rx, mut drain_rx): (
         mpsc::Receiver<Cmd>,
@@ -1066,6 +1343,24 @@ async fn actor(
     let mut probes: JoinSet<ProbeJoin> = JoinSet::new();
     let mut live: HashMap<(RunId, StepIndex), AbortHandle> = HashMap::new();
     let mut waiting_probes = ProbeQueue::default();
+    let inflight = WsInflight::default();
+    // The scheduler's per-workspace due queues: `pop_due` drains the
+    // time-ordered index into these once, `due_order` rotates the
+    // workspaces so a tick round-robins fairly, and a workspace at its
+    // in-flight share is skipped whole — its queue is never examined
+    // (S2 re-review finding 5). A run whose handler left the registry
+    // parks out of the queues after `dead_handler_grace_ms`; the handler
+    // re-registering re-queues it.
+    let mut due_by_ws: BTreeMap<u64, VecDeque<(RunId, StepIndex, u32)>> = BTreeMap::new();
+    let mut due_order: VecDeque<u64> = VecDeque::new();
+    let mut parked: HashMap<u64, Vec<Parked>> = HashMap::new();
+    let mut dead_since: HashMap<RunId, Millis> = HashMap::new();
+    // In-grace dead-handler entries sit HERE between re-checks, not in
+    // the dispatch queues: `(next_check, run, step, attempt)` pops back
+    // into `due_by_ws` when due, so a dead entry costs one examination
+    // per re-check interval instead of one per tick (S3 re-review N7).
+    let mut dead_retry: BinaryHeap<Reverse<(u64, u64, u32, u32)>> = BinaryHeap::new();
+    let mut spawned: HashMap<tokio::task::Id, (RunId, StepIndex)> = HashMap::new();
     let sem = Arc::new(Semaphore::new(cfg.max_in_flight));
     let mut status = writer.status;
     let mut pipe = Pipeline::new(
@@ -1091,8 +1386,19 @@ async fn actor(
                 attempts: &mut attempts,
                 probes: &mut probes,
                 live: &mut live,
+                inflight: &inflight,
+                spawned: &mut spawned,
+                ws_cap: cfg.max_in_flight_per_ws as u32,
                 waiting_probes: &mut waiting_probes,
+                due_by_ws: &mut due_by_ws,
+                due_order: &mut due_order,
+                parked: &mut parked,
+                dead_since: &mut dead_since,
+                dead_retry: &mut dead_retry,
+                dead_grace_ms: cfg.dead_handler_grace_ms,
                 per_tick: cfg.max_dispatch_per_tick,
+                #[cfg(test)]
+                examined: 0,
                 mon: &mut mon,
                 pipe: &mut pipe,
                 obs: &obs,
@@ -1102,14 +1408,10 @@ async fn actor(
 
     // Crash-window orphans: a run journaled Reconciling whose probe died
     // with the last process gets a fresh probe. Reconcile verdicts are
-    // idempotent — a run that moved on refuses NothingToReconcile. Parked
-    // (ws ≠ 0) runs are never probed here either: the registry is
-    // workspace-blind, so the probe would be a tenant's call made on the
-    // operator's handler.
+    // idempotent — a run that moved on refuses NothingToReconcile.
     let orphaned: Vec<(RunId, StepIndex)> = core
         .runs()
         .filter_map(|r| match r.state {
-            _ if r.ws != 0 => None,
             RunState::Reconciling { step, .. } => Some((r.id, step)),
             _ => None,
         })
@@ -1120,6 +1422,12 @@ async fn actor(
             ex.probe(&mut core, run, step);
         }
     }
+
+    // DURABLE_ACTOR_TRACE: per-branch latency for wedge hunts — the env
+    // is read once and only a slow arm or slow tick phase is logged.
+    let trace = actor_trace();
+    let mut arm_ms: std::collections::BTreeMap<&'static str, (u64, u128)> = Default::default();
+    let mut ws_gauges_at: Millis = 0;
 
     loop {
         if core.is_poisoned() || writer_lost {
@@ -1144,21 +1452,23 @@ async fn actor(
         let (backlog_records, backlog_bytes) = pipe.backlog(&core);
         let accepting =
             backlog_records < cfg.max_outbox_records && backlog_bytes < cfg.max_outbox_bytes;
+        let t_iter = trace.then(std::time::Instant::now);
+        let mut arm = "idle";
         tokio::select! {
-            cmd = rx.recv(), if accepting => match cmd {
-                Some(Cmd::Submit { key, spec, not_before, reply }) => {
+            cmd = rx.recv(), if accepting => { arm = "cmd"; match cmd {
+                Some(Cmd::Submit { ws, key, spec, not_before, reply }) => {
                     let now = wall_ms();
                     // Admission is where the allowlist bites: a step naming a
-                    // handler outside the registry is a spec error, refused
-                    // before anything is journaled.
+                    // handler outside *this workspace's* registry is a spec
+                    // error, refused before anything is journaled.
                     let missing = spec
                         .steps
                         .iter()
-                        .find(|s| !registry.contains(&s.handler))
+                        .find(|s| !registry.contains(ws, &s.handler))
                         .map(|s| s.handler.clone());
                     let r = match missing {
                         Some(name) => Err(EngineError::UnregisteredHandler(name)),
-                        None => core.submit_checked(0, key, spec, not_before.unwrap_or(now), now),
+                        None => core.submit_checked(ws, key, spec, not_before.unwrap_or(now), now),
                     };
                     if let Err(e) = &r {
                         mon.returned(e);
@@ -1166,7 +1476,28 @@ async fn actor(
                     pipe.answer(core.last_index(), reply, r);
                 }
                 Some(Cmd::Cancel { run, reply }) => {
+                    // The run may hold scheduler memory: a parked entry
+                    // (handler dead past grace) or a dead_since marker
+                    // (in grace). Drop both now — a cancelled run's entry
+                    // must not wait on its dead handler's return (S2
+                    // re-review N2).
+                    // Only a waiting run can hold scheduler entries: a
+                    // cancel of a running or finished run touches none
+                    // (re-review #5).
+                    let ws = core
+                        .run(run)
+                        .filter(|r| {
+                            matches!(
+                                r.state,
+                                RunState::Queued { .. } | RunState::RetryWaiting { .. }
+                            )
+                        })
+                        .map(|r| r.ws);
                     let r = core.cancel(run, wall_ms()).map(|_| ());
+                    if let Some(w) = ws {
+                        // ATTACK(parked-untrack)
+                        exec!().untrack(w, run);
+                    }
                     if let Err(e) = &r {
                         mon.returned(e);
                     }
@@ -1191,19 +1522,30 @@ async fn actor(
                     pipe.collect(&mut core);
                     pipe.outbound.push_back(WriterMsg::Backup { dest, reply });
                 }
+                Some(Cmd::PutHandler { ws, name, handler, reply }) => {
+                    pipe.answer(core.last_index(), reply, registry.put(ws, &name, handler));
+                    exec!().unpark(&core, ws); // a handler's return revives parked runs
+                }
+                Some(Cmd::DeleteHandler { ws, name }) => {
+                    registry.remove(ws, &name);
+                }
+                Some(Cmd::SetWorkspaceHandlers { ws, handlers, reply }) => {
+                    pipe.answer(core.last_index(), reply, registry.set_ws(ws, handlers));
+                    exec!().unpark(&core, ws);
+                }
                 None => {
                     pipe.shutdown().await;
                     return StopReason::Dropped;
                 }
-            },
-            read = read_rx.recv() => match read {
+            }},
+            read = read_rx.recv() => { arm = "read"; match read {
                 Some(Read::Inspect { run, reply }) => {
                     pipe.answer_read(core.last_index(), reply, core.run(run).cloned());
                 }
-                Some(Read::List { order, limit, reply }) => {
+                Some(Read::List { ws, order, limit, reply }) => {
                     let (runs, next) = match order {
-                        Order::Oldest { after } => core.page(after, limit),
-                        Order::Newest { before } => core.page_newest(before, limit),
+                        Order::Oldest { after } => core.page(ws, after, limit),
+                        Order::Newest { before } => core.page_newest(ws, before, limit),
                     };
                     pipe.answer_read(core.last_index(), reply, RunPage { runs, next });
                 }
@@ -1212,42 +1554,104 @@ async fn actor(
                     d.errors = mon.errors.clone();
                     pipe.answer_read(core.last_index(), reply, d);
                 }
+                Some(Read::DiagWs { ws, reply }) => {
+                    pipe.answer_read(core.last_index(), reply, core.diagnostics_for(ws));
+                }
                 Some(Read::Summary { run, reply }) => {
                     let s = core.run(run).map(RunSummary::of);
                     pipe.answer_read(core.last_index(), reply, s);
                 }
-                Some(Read::Keys { runs, reply }) => {
-                    let keys = runs.iter().map(|r| core.run(*r).map(|r| r.key.clone())).collect();
+                Some(Read::Keys { ws, runs, reply }) => {
+                    let keys = runs
+                        .iter()
+                        // ATTACK(keys-scope)
+                        .map(|r| core.run(*r).filter(|r| r.ws == ws).map(|r| r.key.clone()))
+                        .collect();
                     pipe.answer_read(core.last_index(), reply, keys);
                 }
                 Some(Read::Counts { reply }) => {
                     pipe.answer_read(core.last_index(), reply, core.index_counts());
+                }
+                #[cfg(test)]
+                Some(Read::SchedCounts { reply }) => {
+                    let parked_n = parked.values().map(Vec::len).sum();
+                    let _ = reply.send((parked_n, dead_since.len(), dead_retry.len()));
+                }
+                Some(Read::MetricsIndex { scope, reply }) => {
+                    let m = match scope {
+                        Scope::All => MetricsIndex {
+                            counts: core.index_counts(),
+                            handlers: registry.names(0),
+                        },
+                        Scope::Ws(ws) => MetricsIndex {
+                            counts: core.index_counts_for(ws),
+                            handlers: registry.names(ws),
+                        },
+                    };
+                    pipe.answer_read(core.last_index(), reply, m);
                 }
                 // Every handle is gone (the command channel closes with it).
                 None => {
                     pipe.shutdown().await;
                     return StopReason::Dropped;
                 }
-            },
-            Some(Ok((run, step, outcome, permit))) = attempts.join_next() => {
-                live.remove(&(run, step));
-                let (out, fail) = match outcome {
-                    Outcome::Checkpoint(o) => (Some(o), None),
-                    Outcome::Failed => (None, Some("failed".to_string())),
-                    Outcome::Lost => (None, None),
-                };
-                let mut ex = exec!();
-                // Not journaled (e.g. NoSpace): counted; the run stays
-                // Running and its deadline sweep reconciles the effect.
-                let effects = ex.mon.effects(core.step_finished(run, step, out, fail, wall_ms()));
-                run_effects(&mut core, &mut ex, effects, run, Some(permit));
-            }
-            Some(Ok((run, step, found, permit))) = probes.join_next() => {
-                let mut ex = exec!();
-                let effects = ex.mon.effects(core.reconciled(run, step, found, wall_ms()));
-                run_effects(&mut core, &mut ex, effects, run, Some(permit));
-            }
-            r = compaction_done(&mut pending_compaction) => {
+            }},
+            Some(res) = attempts.join_next() => { arm = "attempt"; match res {
+                Ok((run, step, outcome, permit, slot)) => {
+                    live.remove(&(run, step));
+                    spawned.retain(|_, k| *k != (run, step));
+                    let (out, fail) = match outcome {
+                        Outcome::Checkpoint(o) => (Some(o), None),
+                        Outcome::Failed => (None, Some("failed".to_string())),
+                        Outcome::Lost => (None, None),
+                    };
+                    let mut ex = exec!();
+                    // Not journaled (e.g. NoSpace): counted; the run stays
+                    // Running and its deadline sweep reconciles the effect.
+                    let effects = ex.mon.effects(core.step_finished(run, step, out, fail, wall_ms()));
+                    run_effects(&mut core, &mut ex, effects, run, Some(permit), Some(slot));
+                }
+                // A panicked or aborted attempt: the WsSlot already
+                // returned the workspace's share on drop. The call's
+                // outcome is unknown → journaled as Lost so
+                // at-least-once retry reconciles it.
+                Err(e) => {
+                    eprintln!("durable: handler task died: {e}");
+                    if let Some((run, step)) = spawned.remove(&e.id()) {
+                        live.remove(&(run, step));
+                        let mut ex = exec!();
+                        let effects = ex.mon.effects(core.step_finished(
+                            run,
+                            step,
+                            None,
+                            None,
+                            wall_ms(),
+                        ));
+                        run_effects(&mut core, &mut ex, effects, run, None, None);
+                    }
+                }
+            }},
+            Some(res) = probes.join_next() => { arm = "probe"; match res {
+                Ok((run, step, found, permit, slot)) => {
+                    spawned.retain(|_, k| *k != (run, step));
+                    let mut ex = exec!();
+                    let effects = ex.mon.effects(core.reconciled(run, step, found, wall_ms()));
+                    run_effects(&mut core, &mut ex, effects, run, Some(permit), Some(slot));
+                }
+                // Same release rule for a dead probe; its verdict is
+                // unknown, so it reconciles as not-found — at-least-once
+                // retries the call under the same idempotency key.
+                Err(e) => {
+                    eprintln!("durable: probe task died: {e}");
+                    if let Some((run, step)) = spawned.remove(&e.id()) {
+                        let mut ex = exec!();
+                        let effects =
+                            ex.mon.effects(core.reconciled(run, step, false, wall_ms()));
+                        run_effects(&mut core, &mut ex, effects, run, None, None);
+                    }
+                }
+            }},
+            r = compaction_done(&mut pending_compaction) => { arm = "compact_done";
                 if let Some(c) = pending_compaction.take() {
                     let answer = match r {
                         Ok(Ok(generation)) => {
@@ -1273,7 +1677,7 @@ async fn actor(
                     }
                 }
             }
-            changed = status.changed() => match changed {
+            changed = status.changed() => { arm = "status"; match changed {
                 Ok(()) => {
                     let st = status.borrow_and_update().clone();
                     core.observe(&st);
@@ -1285,8 +1689,9 @@ async fn actor(
                     release(&mut core, &mut ex);
                 }
                 Err(_) => writer_lost = true,
-            },
+            }},
             _ = ticker.tick() => {
+                arm = "tick";
                 let mut ex = exec!();
                 tick(&mut core, &mut ex);
             }
@@ -1325,8 +1730,37 @@ async fn actor(
         if !pipe.flush() {
             writer_lost = true;
         }
+        if let Some(t) = t_iter {
+            let us = t.elapsed().as_micros();
+            let e = arm_ms.entry(arm).or_default();
+            e.0 += 1;
+            e.1 += us;
+            // Only a slow arm is worth the log line — normal work is
+            // silent even under the flag.
+            if us > 20_000 {
+                eprintln!(
+                    "actor-trace arm={arm} us={us} held={} backlog={backlog_records}B{backlog_bytes} [{}]",
+                    pipe.held.len(),
+                    arm_ms
+                        .iter()
+                        .map(|(k, (n, t))| format!("{k}:{n}x{:.0}us", t / (*n).max(1) as u128))
+                        .collect::<Vec<_>>()
+                        .join(" ")
+                );
+            }
+        }
         let counts = core.index_counts();
         obs.set_index_gauges(counts.live_runs, counts.active_runs);
+        // Per-workspace gauges: O(tracked workspaces), so at most once per
+        // sample period, not every iteration.
+        let now = wall_ms();
+        if now.saturating_sub(ws_gauges_at) >= crate::observe::SAMPLE_EVERY_MS {
+            ws_gauges_at = now;
+            obs.set_ws_index_gauges(|ws| {
+                let c = core.index_counts_for(ws);
+                (c.live_runs, c.active_runs)
+            });
+        }
     }
 }
 
@@ -1343,11 +1777,25 @@ fn release(core: &mut EngineCore, ex: &mut Exec<'_>) {
         };
         match held {
             Held::Reply(answer) => answer(None),
-            Held::Fire { run, step, permit } => ex.start_attempt(core, run, step, permit),
-            Held::Probe { run, step, permit } => ex.start_probe(core, run, step, permit),
+            Held::Fire {
+                run,
+                step,
+                permit,
+                slot,
+            } => ex.start_attempt(core, run, step, permit, slot),
+            Held::Probe {
+                run,
+                step,
+                permit,
+                slot,
+            } => ex.start_probe(core, run, step, permit, slot),
         }
     }
 }
+
+/// A parked dead-handler wait: the queued dispatch tuple plus the
+/// handler name whose return revives it.
+type Parked = (RunId, StepIndex, u32, Arc<str>);
 
 /// Reconcile probes waiting for a permit, oldest first, each run once.
 /// Bounded by the live index: a run is queued at most once.
@@ -1368,6 +1816,66 @@ impl ProbeQueue {
         self.queued.remove(&item);
         Some(item)
     }
+    /// Entries waiting right now — the tick's drain is bounded by this
+    /// so a queue that only refills cannot spin the actor (S2 N1).
+    fn len(&self) -> usize {
+        self.order.len()
+    }
+}
+
+/// In-flight handler work per workspace (attempts + probes), shared
+/// with the tasks it counts: a `WsSlot` owns one slot and releases it
+/// on drop — a completed call, a panicking handler, or an aborted task
+/// all give it back. The join arms only retire bookkeeping; the count
+/// itself can never be stranded by a dead task (S2 re-review).
+#[derive(Clone, Default)]
+struct WsInflight(Arc<std::sync::Mutex<HashMap<u64, u32>>>);
+
+impl WsInflight {
+    fn count(&self, ws: u64) -> u32 {
+        self.0
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&ws)
+            .copied()
+            .unwrap_or(0)
+    }
+}
+
+/// One workspace's in-flight slot: taken under the counter's lock (the
+/// check and the claim are one step) and returned on drop.
+struct WsSlot {
+    shared: WsInflight,
+    ws: u64,
+}
+
+impl WsSlot {
+    fn take(shared: &WsInflight, ws: u64) -> Self {
+        *shared
+            .0
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .entry(ws)
+            .or_default() += 1;
+        Self {
+            shared: shared.clone(),
+            ws,
+        }
+    }
+}
+
+impl Drop for WsSlot {
+    fn drop(&mut self) {
+        if let Some(n) = self
+            .shared
+            .0
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get_mut(&self.ws)
+        {
+            *n = n.saturating_sub(1);
+        }
+    }
 }
 
 /// The executor's plumbing, bundled so helpers stay under the arg limit.
@@ -1380,8 +1888,31 @@ struct Exec<'a> {
     /// local call and free its permit (cancelling cannot undo a remote
     /// effect; the reconcile probe decides that).
     live: &'a mut HashMap<(RunId, StepIndex), AbortHandle>,
+    /// The fairness counter for `max_in_flight_per_ws` — each spawned
+    /// task carries a `WsSlot` off it.
+    inflight: &'a WsInflight,
+    /// Task id → (run, step) for every spawned call and probe: the
+    /// join-ERROR arm gets no tuple, so this is how it learns which
+    /// step's task died.
+    spawned: &'a mut HashMap<tokio::task::Id, (RunId, StepIndex)>,
+    ws_cap: u32,
     waiting_probes: &'a mut ProbeQueue,
+    /// Per-workspace dispatch queues + rotation — see the declarations
+    /// the `exec!` macro wires these to.
+    due_by_ws: &'a mut BTreeMap<u64, VecDeque<(RunId, StepIndex, u32)>>,
+    due_order: &'a mut VecDeque<u64>,
+    parked: &'a mut HashMap<u64, Vec<Parked>>,
+    dead_since: &'a mut HashMap<RunId, Millis>,
+    /// `(next_check, run, step, attempt)` — in-grace dead entries
+    /// between re-checks; the field types are raw ints so the heap
+    /// orders without `Ord` on the domain ids.
+    dead_retry: &'a mut BinaryHeap<Reverse<(u64, u64, u32, u32)>>,
+    dead_grace_ms: u64,
     per_tick: usize,
+    /// Queue entries this tick examined — the test counter proving the
+    /// rotation skips a full workspace's queue without touching it.
+    #[cfg(test)]
+    examined: usize,
     mon: &'a mut Monitor,
     pipe: &'a mut Pipeline,
     obs: &'a Arc<Observer>,
@@ -1390,33 +1921,42 @@ struct Exec<'a> {
 impl Exec<'_> {
     /// Invoke a step's handler for the run's current attempt under
     /// `permit` — once the record that made it `Running` (committed only
-    /// because this permit was held) is durable. Until then it is held.
+    /// because this permit was held) is durable. Until then it is held,
+    /// and its workspace slot rides with it (S2 N3).
     fn fire(
         &mut self,
         core: &EngineCore,
         run: RunId,
         step: StepIndex,
         permit: OwnedSemaphorePermit,
+        slot: WsSlot,
     ) {
         let needs = core.last_index();
         if needs <= self.pipe.durable {
-            self.start_attempt(core, run, step, permit);
+            self.start_attempt(core, run, step, permit, slot);
         } else {
-            self.pipe
-                .held
-                .push_back((needs, Held::Fire { run, step, permit }));
+            self.pipe.held.push_back((
+                needs,
+                Held::Fire {
+                    run,
+                    step,
+                    permit,
+                    slot,
+                },
+            ));
         }
     }
 
     /// The call itself, for a run still `Running` this step (a cancel
     /// committed while the dispatch was held means no call: the permit
-    /// returns).
+    /// and the workspace slot return).
     fn start_attempt(
         &mut self,
         core: &EngineCore,
         run: RunId,
         step: StepIndex,
         permit: OwnedSemaphorePermit,
+        slot: WsSlot,
     ) {
         let Some(r) = core.run(run) else { return };
         let attempt = match r.state {
@@ -1428,7 +1968,7 @@ impl Exec<'_> {
         let Some(sspec) = r.spec.steps.get(step.0 as usize).cloned() else {
             return;
         };
-        let Some(handler) = self.registry.get(&sspec.handler) else {
+        let Some(handler) = self.registry.get(r.ws, &sspec.handler) else {
             return;
         };
         let idem = idem_key(&r.key, step);
@@ -1436,7 +1976,7 @@ impl Exec<'_> {
         let call = Call { run, step, attempt };
         // Counts the call in flight; records its latency and result, or —
         // dropped by an abort at its deadline — a lost reply.
-        let guard = CallGuard::start(self.obs, self.obs.handler_index(&sspec.handler));
+        let guard = CallGuard::start(self.obs, r.ws, Some(&sspec.handler));
         let handle = self.attempts.spawn(async move {
             let outcome = handler.execute_call(call, &sspec, &input, &idem).await;
             guard.finish(match &outcome {
@@ -1444,8 +1984,13 @@ impl Exec<'_> {
                 Outcome::Failed => CallResult::Failed,
                 Outcome::Lost => CallResult::Lost,
             });
-            (run, step, outcome, permit)
+            // The slot returns WITH the outcome so the run's next step
+            // can inherit it like the permit: dropping it here freed the
+            // share to a backlog run before the effect pass, and the
+            // journaled-Running next step was never called (S1).
+            (run, step, outcome, permit, slot)
         });
+        self.spawned.insert(handle.id(), (run, step));
         self.live.insert((run, step), handle);
     }
 
@@ -1454,35 +1999,52 @@ impl Exec<'_> {
         let effects =
             self.mon
                 .effects(core.step_finished(run, step, None, Some(why.to_string()), wall_ms()));
-        run_effects(core, self, effects, run, None);
+        run_effects(core, self, effects, run, None, None);
     }
 
     /// Probe for a reconciling step; the verdict returns through the loop.
-    /// A probe is a handler call, so it takes a permit like any other; with
-    /// none free it waits in `waiting_probes` for the next tick.
+    /// A probe is a handler call, so it takes a permit and a workspace
+    /// slot like any other; with either missing it waits in
+    /// `waiting_probes` for the next tick.
     fn probe(&mut self, core: &mut EngineCore, run: RunId, step: StepIndex) {
+        // A probe is a handler call: the workspace fairness cap applies
+        // exactly like a dispatch's.
+        let Some(ws) = core.run(run).map(|r| r.ws) else {
+            return;
+        };
+        if self.inflight.count(ws) >= self.ws_cap {
+            self.waiting_probes.push((run, step));
+            return;
+        }
         match self.sem.clone().try_acquire_owned() {
-            Ok(permit) => self.probe_with(core, run, step, permit),
+            Ok(permit) => self.probe_with(core, run, step, permit, WsSlot::take(self.inflight, ws)),
             Err(_) => self.waiting_probes.push((run, step)),
         }
     }
 
     /// A probe is a handler call too: held until the record that made the
-    /// run `Reconciling` is durable.
+    /// run `Reconciling` is durable — its workspace slot rides along.
     fn probe_with(
         &mut self,
         core: &mut EngineCore,
         run: RunId,
         step: StepIndex,
         permit: OwnedSemaphorePermit,
+        slot: WsSlot,
     ) {
         let needs = core.last_index();
         if needs <= self.pipe.durable {
-            self.start_probe(core, run, step, permit);
+            self.start_probe(core, run, step, permit, slot);
         } else {
-            self.pipe
-                .held
-                .push_back((needs, Held::Probe { run, step, permit }));
+            self.pipe.held.push_back((
+                needs,
+                Held::Probe {
+                    run,
+                    step,
+                    permit,
+                    slot,
+                },
+            ));
         }
     }
 
@@ -1492,6 +2054,7 @@ impl Exec<'_> {
         run: RunId,
         step: StepIndex,
         permit: OwnedSemaphorePermit,
+        slot: WsSlot,
     ) {
         let Some(r) = core.run(run) else { return };
         let attempt = match r.state {
@@ -1501,23 +2064,111 @@ impl Exec<'_> {
         let Some(sspec) = r.spec.steps.get(step.0 as usize).cloned() else {
             return;
         };
-        let Some(handler) = self.registry.get(&sspec.handler) else {
+        let Some(handler) = self.registry.get(r.ws, &sspec.handler) else {
             // Cannot probe an unregistered handler — reconcile as not-found
             // rather than leave the run stuck.
             let effects = self
                 .mon
                 .effects(core.reconciled(run, step, false, wall_ms()));
-            run_effects(core, self, effects, run, Some(permit));
+            run_effects(core, self, effects, run, Some(permit), Some(slot));
             return;
         };
         let idem = idem_key(&r.key, step);
         let call = Call { run, step, attempt };
-        let guard = CallGuard::start(self.obs, None); // in flight only
-        self.probes.spawn(async move {
+        let guard = CallGuard::start(self.obs, r.ws, None); // in flight only
+        let handle = self.probes.spawn(async move {
             let found = handler.probe_call(call, &sspec, &idem).await;
             drop(guard);
-            (run, step, found, permit)
+            // Same rule as an attempt: the slot rides home with the
+            // verdict so a DispatchStep the reconcile produces keeps
+            // the share the probe was run under.
+            (run, step, found, permit, slot)
         });
+        self.spawned.insert(handle.id(), (run, step));
+    }
+
+    /// Drop every scheduler entry a run holds — an in-grace `dead_since`
+    /// marker, its `dead_retry` tuple, and a parked entry (S2 re-review
+    /// N2). Called when the run leaves waiting for a reason no queue
+    /// pass will see: a cancel.
+    ///
+    /// Cheap for a run the scheduler never marked (re-review #5): the
+    /// heap is rebuilt only for a run with an in-grace marker (only such a
+    /// run has `dead_retry` tuples), and a parked list only loses the run
+    /// it holds. Returns whether there was anything to drop.
+    fn untrack(&mut self, ws: u64, run: RunId) -> bool {
+        let mut dropped = false;
+        if self.dead_since.remove(&run).is_some() {
+            self.dead_retry.retain(|Reverse((_, r, ..))| *r != run.0);
+            dropped = true;
+        }
+        if let Some(v) = self.parked.get_mut(&ws) {
+            if let Some(i) = v.iter().position(|p| p.0 == run) {
+                v.remove(i);
+                dropped = true;
+            }
+            if v.is_empty() {
+                self.parked.remove(&ws);
+            }
+        }
+        dropped
+    }
+
+    /// A registry change on `ws` may bring a parked run's handler back:
+    /// re-queue every parked entry whose name resolves again, still
+    /// longest-waiting-first at the queue's head. Entries whose run left
+    /// waiting while parked (a cancel lands nowhere else) are pruned
+    /// here — the map is the only other place they could die.
+    fn unpark(&mut self, core: &EngineCore, ws: u64) {
+        let Some(mut entries) = self.parked.remove(&ws) else {
+            return;
+        };
+        let mut i = 0;
+        while i < entries.len() {
+            // A run that left waiting while parked (cancelled, expired)
+            // drops out here — parked entries must not outlive the run's
+            // interest in dispatch (S2 re-review N2).
+            let run = entries[i].0;
+            let waiting = core.run(run).is_some_and(|r| {
+                matches!(
+                    r.state,
+                    RunState::Queued { .. } | RunState::RetryWaiting { .. }
+                )
+            });
+            if !waiting {
+                entries.swap_remove(i);
+                continue;
+            }
+            if self.registry.contains(ws, &entries[i].3) {
+                let (run, step, attempt, _) = entries.swap_remove(i);
+                // Absent-or-empty queue ⇔ the workspace is not in the
+                // rotation (the invariant `requeue_ws` maintains).
+                if self.due_by_ws.get(&ws).is_none_or(|q| q.is_empty()) {
+                    self.due_order.push_back(ws);
+                }
+                self.due_by_ws
+                    .entry(ws)
+                    .or_default()
+                    .push_front((run, step, attempt));
+            } else {
+                i += 1;
+            }
+        }
+        if !entries.is_empty() {
+            self.parked.insert(ws, entries);
+        }
+    }
+
+    /// `ws` re-enters the due rotation iff its queue still holds entries —
+    /// the invariant `due_order holds ws ⇔ due_by_ws[ws] is non-empty`,
+    /// which is what makes the at-share skip O(1) and keeps drained
+    /// workspaces out of the rotation entirely.
+    fn requeue_ws(&mut self, ws: u64) {
+        if self.due_by_ws.get(&ws).is_some_and(|q| !q.is_empty()) {
+            self.due_order.push_back(ws);
+        } else {
+            self.due_by_ws.remove(&ws);
+        }
     }
 }
 
@@ -1526,7 +2177,29 @@ impl Exec<'_> {
 /// A permit is taken **before** `StepDispatched` is journaled: with none
 /// free the run stays queued (nothing happened, nothing is recorded).
 fn tick(core: &mut EngineCore, exec: &mut Exec<'_>) {
-    let now = wall_ms();
+    tick_at(core, exec, wall_ms());
+}
+
+/// DURABLE_ACTOR_TRACE, resolved once for the process — the actor loop
+/// and tick_at share the same answer instead of re-reading the env per
+/// iteration.
+fn actor_trace() -> bool {
+    static TRACE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *TRACE.get_or_init(|| std::env::var_os("DURABLE_ACTOR_TRACE").is_some())
+}
+
+/// The scheduler's pass at an explicit `now` — production calls it via
+/// `tick`; tests drive the re-check/grace clocks deterministically.
+fn tick_at(core: &mut EngineCore, exec: &mut Exec<'_>, now: Millis) {
+    let trace = actor_trace();
+    let mut ph = [0u128; 4];
+    let mut tp = std::time::Instant::now();
+    let mut mark = |i: usize| {
+        if trace {
+            ph[i] = tp.elapsed().as_micros();
+            tp = std::time::Instant::now();
+        }
+    };
     // Below the reserve nothing new can be journaled: no expiry, no
     // dispatch (a call whose outcome cannot be recorded is not started).
     // In-flight work waits; readiness reports `no_space`.
@@ -1539,92 +2212,310 @@ fn tick(core: &mut EngineCore, exec: &mut Exec<'_>) {
     // it reconciles, never silently repeats. `live` only tracks attempts
     // this process fired; a run orphaned by a restart has no entry, and
     // gating on it would strand every crash-surviving Running run.
-    for (run, step) in core.expired_attempts(now).into_iter().take(exec.per_tick) {
+    // The batch is popped before it is processed: on an early exit the
+    // remainder was already de-indexed, so every entry the sweep never
+    // reached loses its deadline until the next restart's recount (R1:
+    // a run that broke the sweep requeued itself but dropped the rest).
+    let mut popped = core.pop_expired(now, exec.per_tick).into_iter().peekable();
+    while let Some((run, step)) = popped.next() {
         if let Some(call) = exec.live.remove(&(run, step)) {
             call.abort(); // frees its permit; the remote effect is reconciled
         }
-        let effects = exec
-            .mon
-            .effects(core.step_finished(run, step, None, None, now));
-        run_effects(core, exec, effects, run, None);
+        match core.step_finished(run, step, None, None, now) {
+            Ok(effects) => run_effects(core, exec, effects, run, None, None),
+            Err(e) => {
+                let stale = matches!(e, EngineError::Refused(_));
+                exec.mon.handled(&e);
+                if stale {
+                    continue; // the run moved on without the popped entry
+                }
+                // A real commit error (NoSpace, a failed group commit):
+                // the attempt still owes its lost-reply record — put the
+                // deadline back and stop the sweep; every step_finished
+                // behind it fails the same way (S2 re-review N1).
+                // pop_expired already removed the whole batch from the
+                // index — re-index every remaining entry, not just the
+                // failure, or crash-surviving Running runs strand here
+                // until a restart's recount (R1).
+                core.requeue_deadline(run);
+                for (rest, _step) in popped.by_ref() {
+                    // ATTACK(deadline-drop): without it the popped batch strands until restart.
+                    core.requeue_deadline(rest);
+                }
+                break;
+            }
+        }
     }
-    // Probes that found no permit when their run started reconciling.
-    while let Some((run, step)) = exec.waiting_probes.pop() {
-        let Ok(permit) = exec.sem.clone().try_acquire_owned() else {
-            exec.waiting_probes.push((run, step)); // back of the queue: no starvation of others
+    // Probes that found no permit or workspace share when their run
+    // started reconciling. Each entry gets ONE try per tick, bounded by
+    // the queue's length at entry (S2 re-review N1): a queue full of
+    // over-share workspaces used to spin this loop forever — submits,
+    // dispatch and the shutdown drain all starved behind it.
+    mark(0);
+    let mut probes_left = exec.waiting_probes.len();
+    while probes_left > 0 {
+        probes_left -= 1;
+        let Some((run, step)) = exec.waiting_probes.pop() else {
             break;
         };
-        exec.probe_with(core, run, step, permit);
+        exec.probe(core, run, step);
     }
-    // Dispatch: permit first, then the journal commits StepDispatched,
-    // then the handler is invoked — a crash between the commit and the
-    // call can only lose a journaled fact, and no commit is ever made for
-    // a call that capacity would not allow.
-    for (run, step, attempt) in core.due(now).into_iter().take(exec.per_tick) {
-        let Some(name) = core
-            .run(run)
-            .and_then(|r| r.spec.steps.get(step.0 as usize))
-            .map(|s| s.handler.clone())
-        else {
+    mark(1);
+    // Dispatch: permit and workspace slot first, then the journal commits
+    // StepDispatched, then the handler is invoked — a crash between the
+    // commit and the call can only lose a journaled fact, and no commit
+    // is ever made for a call that capacity would not allow.
+    //
+    // Newly-due work leaves the time-ordered index for the per-workspace
+    // queues once (S2 re-review finding 5): a tick's scan cost is the
+    // newly-due count, never the retained set, and entries already queued
+    // are re-examined only while their workspace can still take work.
+    for (ws, run, step, attempt) in core.pop_due(now) {
+        if !exec.due_by_ws.contains_key(&ws) {
+            exec.due_order.push_back(ws);
+        }
+        exec.due_by_ws
+            .entry(ws)
+            .or_default()
+            .push_back((run, step, attempt));
+    }
+    // In-grace dead entries whose re-check is due come back through the
+    // same rotation — a handler that returned dispatches this visit, a
+    // still-absent one goes back to the heap once (S3 re-review N7: they
+    // used to re-examine on every tick of their grace window).
+    while exec
+        .dead_retry
+        .peek()
+        .is_some_and(|Reverse((due, ..))| *due <= now)
+    {
+        let Some(Reverse((_, run, step, attempt))) = exec.dead_retry.pop() else {
+            break;
+        };
+        let Some(ws) = core.run(RunId(run)).map(|r| r.ws) else {
+            exec.dead_since.remove(&RunId(run)); // the run is gone entirely
             continue;
         };
-        if !exec.registry.contains(&name) {
-            // The handler left the registry after this run was accepted:
-            // it stays queued — registry repair or a cancel resolves it.
-            // Refusing an event here would be noise; there is nothing to
-            // journal because nothing happened.
-            continue;
+        if !exec.due_by_ws.contains_key(&ws) {
+            exec.due_order.push_back(ws);
         }
-        let Ok(permit) = exec.sem.clone().try_acquire_owned() else {
-            break; // at capacity: the rest stay queued for a later tick
+        exec.due_by_ws
+            .entry(ws)
+            .or_default()
+            .push_back((RunId(run), StepIndex(step), attempt));
+    }
+    mark(2);
+    // The per-tick budget counts only dispatch that actually happens
+    // (S2 re-review N2): an entry that cannot dispatch — its handler left
+    // the registry, its workspace is at share — is skipped for free, so
+    // a tenant whose queue heads the due order can never starve the runs
+    // behind it. Workspaces rotate: each live queue loses at most one
+    // head entry per round, and a queue at share is passed over whole.
+    let mut budget = exec.per_tick;
+    // Workspace visits since the last dispatch: when every workspace in
+    // the rotation was visited once with nothing dispatchable — full,
+    // dead-handler-only, stale — a further pass can only repeat that,
+    // so the tick ends without draining the budget.
+    let mut idle = 0usize;
+    while budget > 0 && idle < exec.due_order.len() {
+        let Some(ws) = exec.due_order.pop_front() else {
+            break;
         };
-        if let Err(e) = core.dispatch(run, step, attempt, now) {
-            exec.mon.handled(&e); // stale claim or no space; the permit returns
+        if exec.inflight.count(ws) >= exec.ws_cap {
+            idle += 1;
+            exec.due_order.push_back(ws); // full: skipped whole, queue untouched
             continue;
         }
-        exec.fire(core, run, step, permit);
+        // This visit examines each queued entry at most once (`pass` is
+        // the queue's length at entry): a dead-handler or stale head
+        // cannot hide the live work behind it, and a skipped entry that
+        // re-queues waits for the workspace's next turn.
+        let mut dispatched = false;
+        let mut starved = false;
+        {
+            let Some(queue) = exec.due_by_ws.get_mut(&ws) else {
+                idle += 1;
+                continue; // emptied between rotations — leaves the rotation
+            };
+            let mut pass = queue.len();
+            while pass > 0 {
+                pass -= 1;
+                let Some((run, step, attempt)) = queue.pop_front() else {
+                    break;
+                };
+                #[cfg(test)]
+                {
+                    exec.examined += 1;
+                }
+                let Some((name, waiting)) = core.run(run).and_then(|r| {
+                    r.spec.steps.get(step.0 as usize).map(|s| {
+                        (
+                            s.handler.clone(),
+                            matches!(
+                                r.state,
+                                RunState::Queued { .. } | RunState::RetryWaiting { .. }
+                            ),
+                        )
+                    })
+                }) else {
+                    exec.dead_since.remove(&run); // the run is gone entirely
+                    continue; // stale queue entry — spec/step the run lost
+                };
+                if !waiting {
+                    exec.dead_since.remove(&run); // in-grace marker dies with the wait
+                    continue; // cancelled or already dispatched — stale
+                }
+                if !exec.registry.contains(ws, &name) {
+                    // The handler left the registry after this run was
+                    // accepted: it stays queued — registry repair or a
+                    // cancel resolves it. Within grace it waits out the
+                    // re-check interval on the `dead_retry` heap — not
+                    // in this queue, so a dead backlog is not re-scanned
+                    // every tick; past grace it parks out of the
+                    // rotation until the handler returns (findings 5/N7).
+                    let first = *exec.dead_since.entry(run).or_insert(now);
+                    if now.saturating_sub(first) >= exec.dead_grace_ms {
+                        exec.dead_since.remove(&run);
+                        exec.parked
+                            .entry(ws)
+                            .or_default()
+                            .push((run, step, attempt, name.into()));
+                    } else {
+                        let next = first
+                            .saturating_add(exec.dead_grace_ms)
+                            .min(now.saturating_add(DEAD_RECHECK_MS));
+                        exec.dead_retry
+                            .push(Reverse((next, run.0, step.0, attempt)));
+                    }
+                    continue;
+                }
+                let Ok(permit) = exec.sem.clone().try_acquire_owned() else {
+                    // At capacity: the entry stays next-due for a later tick.
+                    queue.push_front((run, step, attempt));
+                    starved = true;
+                    break;
+                };
+                // The workspace share is charged AT the dispatch (S2
+                // re-review N3): the slot rides the held-fire through the
+                // fsync wait, so a run waiting undurable already owns its
+                // place — charging at spawn let one workspace take the
+                // whole pool in a single tick.
+                let slot = WsSlot::take(exec.inflight, ws);
+                if let Err(e) = core.dispatch(run, step, attempt, now) {
+                    let stale = matches!(e, EngineError::Refused(_));
+                    exec.mon.handled(&e);
+                    if stale {
+                        continue; // stale claim; permit + slot return
+                    }
+                    // A real commit error (NoSpace, a failed group
+                    // commit): the entry is live work, not a stale claim
+                    // — put it back and end the tick; every dispatch
+                    // behind it fails the same way (S2 re-review N1:
+                    // dropping it left runs queued-with-no-index-entry
+                    // until a restart's recount).
+                    queue.push_front((run, step, attempt));
+                    starved = true;
+                    break;
+                }
+                exec.fire(core, run, step, permit, slot);
+                // The run left the wait — its in-grace marker dies here,
+                // AFTER the dispatch took. Dropping it earlier let a
+                // PUT/DELETE flap restart the grace clock every time the
+                // handler was seen present but the run stayed queued
+                // (starved permit, full workspace share) — N7.
+                exec.dead_since.remove(&run);
+                budget -= 1;
+                dispatched = true;
+                break; // one dispatch per visit — the rotation stays fair
+            }
+        }
+        idle = if dispatched { 0 } else { idle + 1 };
+        exec.requeue_ws(ws);
+        if starved {
+            break; // global capacity — every later workspace starves too
+        }
+    }
+    mark(3);
+    // Only a slow phase earns the log line: a tick whose parts all fit
+    // inside the arm-level bound stays silent under the flag.
+    if trace && (ph.iter().sum::<u128>() > 20_000 || ph.iter().any(|p| *p > 5_000)) {
+        eprintln!(
+            "tick-phase sweep={}us probes={}us pour={}us rotate={}us dueq={}",
+            ph[0],
+            ph[1],
+            ph[2],
+            ph[3],
+            exec.due_by_ws.values().map(|q| q.len()).sum::<usize>()
+        );
     }
 }
 
-/// Carry out the reducer's effects. `permit` is the capacity the event
-/// arrived with (a finished attempt or probe); a `DispatchStep` effect —
-/// the run already journaled Running on its next step — inherits it.
+/// Carry out the reducer's effects. `permit` and `slot` are the
+/// capacity the event arrived with (a finished attempt or probe); a
+/// `DispatchStep` effect — the run already journaled Running on its
+/// next step — inherits both. The slot MUST ride with the event: the
+/// share count still includes it, so checking the cap against it would
+/// see the run's own predecessor as a rival (S1: the next step stayed
+/// journaled Running and was never called).
 fn run_effects(
     core: &mut EngineCore,
     exec: &mut Exec<'_>,
     effects: Vec<Effect>,
     run: RunId,
     mut permit: Option<OwnedSemaphorePermit>,
+    mut slot: Option<WsSlot>,
 ) {
     for eff in effects {
         match eff {
             // The checkpoint commit already moved the run to Running — the
             // record IS this step's durable dispatch; just invoke it.
             Effect::DispatchStep { step, .. } => {
-                let name = core
+                let (ws, name) = core
                     .run(run)
-                    .and_then(|r| r.spec.steps.get(step.0 as usize))
-                    .map(|s| s.handler.clone())
+                    .and_then(|r| {
+                        r.spec
+                            .steps
+                            .get(step.0 as usize)
+                            .map(|s| (r.ws, s.handler.clone()))
+                    })
                     .unwrap_or_default();
-                if !exec.registry.contains(&name) {
+                if !exec.registry.contains(ws, &name) {
                     exec.fail(core, run, step, "unregistered handler");
                     continue;
                 }
+                // The inherited slot already owns its share — the cap
+                // check is only for a DispatchStep that arrives with
+                // none (a restart's effect, a sweep): then the fresh
+                // slot must fit, else the run stays journaled Running
+                // and the deadline sweep reconciles it (S2 N3).
+                let slot = match slot.take() {
+                    Some(s) => Some(s),
+                    None if exec.inflight.count(ws) < exec.ws_cap => {
+                        Some(WsSlot::take(exec.inflight, ws))
+                    }
+                    None => None,
+                };
                 // Every DispatchStep comes from an event carrying a permit,
                 // so this always fires; if it ever cannot, the run stays
                 // journaled Running and the deadline sweep reconciles it —
                 // it is never silently skipped.
-                if let Some(p) = permit
-                    .take()
-                    .or_else(|| exec.sem.clone().try_acquire_owned().ok())
-                {
-                    exec.fire(core, run, step, p);
+                if let (Some(p), Some(s)) = (
+                    permit
+                        .take()
+                        .or_else(|| exec.sem.clone().try_acquire_owned().ok()),
+                    slot,
+                ) {
+                    exec.fire(core, run, step, p, s);
                 }
             }
-            Effect::Reconcile { step } => match permit.take() {
-                Some(p) => exec.probe_with(core, run, step, p),
-                None => exec.probe(core, run, step),
-            },
+            Effect::Reconcile { step } => {
+                // The finishing call's permit and slot are spent on its
+                // verdict, so the probe re-enters the normal path — it
+                // queues if the workspace is at share or the pool is
+                // empty (S2 N1/N3).
+                drop(permit.take());
+                drop(slot.take());
+                exec.probe(core, run, step);
+            }
             // Wakes are covered by the ticker; checkpoints are already in
             // the journaled record; terminal transitions are recorded.
             Effect::ScheduleWake { .. }
@@ -1639,6 +2530,15 @@ fn run_effects(
 mod tests {
     use super::*;
     use durable_domain::RunState;
+
+    /// S2 re-review N4: the shipped in-flight share must leave headroom —
+    /// four tenants each at their cap must not tile the permit pool, or a
+    /// fifth workspace's dispatches starve on capacity it never touched.
+    #[test]
+    fn shipped_in_flight_share_leaves_the_fifth_tenant_headroom() {
+        let c = ShellConfig::default();
+        assert!(4 * c.max_in_flight_per_ws < c.max_in_flight);
+    }
 
     struct Echo;
     #[async_trait::async_trait]
@@ -1692,6 +2592,21 @@ mod tests {
         }
         async fn probe(&self, _s: &StepSpec, _k: &str) -> bool {
             self.calls.load(std::sync::atomic::Ordering::SeqCst) > 0
+        }
+    }
+
+    /// Its first call panics inside the task; later calls answer. The
+    /// probe keeps the default "not found", so a journaled Lost re-fires.
+    struct PanicOnce {
+        calls: Arc<std::sync::atomic::AtomicUsize>,
+    }
+    #[async_trait::async_trait]
+    impl StepHandler for PanicOnce {
+        async fn execute(&self, _s: &StepSpec, _i: &[u8], _k: &str) -> Outcome {
+            if self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+                panic!("handler blew up inside the task");
+            }
+            Outcome::Checkpoint(b"ok".to_vec())
         }
     }
 
@@ -1754,7 +2669,7 @@ mod tests {
     }
 
     async fn running_count(eng: &Engine) -> usize {
-        eng.list(None, MAX_PAGE)
+        eng.list(0, None, MAX_PAGE)
             .await
             .unwrap_or_default()
             .runs
@@ -1953,6 +2868,156 @@ mod tests {
         panic!("run never reached a terminal state");
     }
 
+    /// Drain-rate measurement for the S2-7 investigation: N one-step Echo
+    /// runs, time from last submit to all-Done. Run with
+    /// `cargo test -p durable-engine drain_rate -- --ignored --nocapture`.
+    /// Echo removes the network — whatever bounds this bounds the engine.
+    #[tokio::test]
+    #[ignore = "measurement, not a regression test"]
+    async fn drain_rate_under_default_caps() {
+        async fn measure(per_tick: usize, in_flight: usize, tick_ms: u64, n: usize) -> f64 {
+            let d = tempfile::tempdir().unwrap_or_else(|e| panic!("{e}"));
+            let mut reg = Registry::default();
+            reg.register("e", Arc::new(Echo));
+            let cfg = ShellConfig {
+                tick_ms,
+                max_dispatch_per_tick: per_tick,
+                max_in_flight: in_flight,
+                limits: Limits {
+                    max_step_deadline_ms: 30_000,
+                    ..Limits::default()
+                },
+                ..Default::default()
+            };
+            let eng = spawn(d.path(), reg, cfg).unwrap_or_else(|e| panic!("{e}"));
+            for i in 0..n {
+                eng.submit(
+                    OperationKey(format!("drain-{i}")),
+                    JobSpec {
+                        version: 1,
+                        input: b"x".to_vec(),
+                        steps: vec![StepSpec {
+                            name: "s".into(),
+                            handler: "e".into(),
+                        }],
+                    },
+                )
+                .await
+                .unwrap_or_else(|e| panic!("submit {i}: {e}"));
+            }
+            let start = std::time::Instant::now();
+            let deadline = start + Duration::from_secs(120);
+            loop {
+                let d = eng.diag().await.unwrap_or_else(|e| panic!("{e}"));
+                let done = d
+                    .states
+                    .iter()
+                    .filter(|(k, _)| matches!(**k, "done" | "failed" | "cancelled"))
+                    .map(|(_, c)| *c as usize)
+                    .sum::<usize>();
+                if done >= n {
+                    break;
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "drain stalled at {done}/{n}"
+                );
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+            let secs = start.elapsed().as_secs_f64();
+            eprintln!(
+                "per_tick={per_tick} in_flight={in_flight} tick_ms={tick_ms}: \
+                 {n} done in {secs:.1}s = {:.0} runs/s",
+                n as f64 / secs
+            );
+            n as f64 / secs
+        }
+        let base = measure(64, 32, 50, 2000).await;
+        let raised = measure(512, 256, 50, 2000).await;
+        let tight = measure(64, 128, 10, 2000).await;
+        eprintln!("summary: default={base:.0}/s per_tick512={raised:.0}/s tick10={tight:.0}/s");
+    }
+
+    /// The per-workspace bound: `put` accepts 256 distinct names for one
+    /// workspace and refuses the 257th — an update to an existing name
+    /// never counts against the bound, and another workspace's names do
+    /// not either.
+    #[tokio::test(flavor = "current_thread")]
+    async fn the_registry_bound_is_per_workspace() {
+        let d = tempfile::tempdir().unwrap_or_else(|e| panic!("{e}"));
+        let eng = spawn(
+            d.path(),
+            Registry::default(),
+            ShellConfig {
+                tick_ms: 5,
+                ..Default::default()
+            },
+        )
+        .unwrap_or_else(|e| panic!("{e}"));
+        for i in 0..MAX_HANDLERS_PER_WS {
+            eng.put_handler(7, &format!("h{i}"), Arc::new(Echo))
+                .await
+                .unwrap_or_else(|e| panic!("h{i}: {e}"));
+        }
+        assert!(matches!(
+            eng.put_handler(7, "one-too-many", Arc::new(Echo)).await,
+            Err(EngineError::RegistryFull)
+        ));
+        // An update to an existing name is not a new registration.
+        eng.put_handler(7, "h0", Arc::new(Echo))
+            .await
+            .unwrap_or_else(|e| panic!("{e}"));
+        // …and workspace 8's bound is untouched by 7's full set.
+        eng.put_handler(8, "h0", Arc::new(Echo))
+            .await
+            .unwrap_or_else(|e| panic!("{e}"));
+    }
+
+    /// S2 review #6: a tenant whose handler never answers may hold at
+    /// most `max_in_flight_per_ws` calls — the rest of the pool stays
+    /// free for everyone else. ws 7 parks its cap; ws 8's runs still
+    /// dispatch and finish. Without the cap ws 7 would hold every
+    /// permit in the global pool.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_full_workspace_cannot_starve_another() {
+        let d = tempfile::tempdir().unwrap_or_else(|e| panic!("{e}"));
+        let eng = spawn(
+            d.path(),
+            Registry::default(),
+            ShellConfig {
+                tick_ms: 5,
+                max_in_flight: 8,
+                max_in_flight_per_ws: 2,
+                ..Default::default()
+            },
+        )
+        .unwrap_or_else(|e| panic!("{e}"));
+        // ws 7's handler blocks every call forever; ws 8's is instant.
+        eng.put_handler(7, "block", Arc::new(Gated::default()))
+            .await
+            .unwrap_or_else(|e| panic!("{e}"));
+        eng.put_handler(8, "fast", Arc::new(Echo))
+            .await
+            .unwrap_or_else(|e| panic!("{e}"));
+        for i in 0..4 {
+            eng.submit_scoped(7, OperationKey(format!("a-{i}")), spec("block"))
+                .await
+                .unwrap_or_else(|e| panic!("a-{i}: {e}"));
+        }
+        // Give ws 7's dispatches a moment to land and park.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        for i in 0..4 {
+            let run = eng
+                .submit_scoped(8, OperationKey(format!("b-{i}")), spec("fast"))
+                .await
+                .unwrap_or_else(|e| panic!("b-{i}: {e}"));
+            assert!(
+                matches!(until_done(&eng, run).await, RunState::Done),
+                "b-{i} must finish while ws 7's calls hang forever"
+            );
+        }
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn submit_runs_to_done() {
         let d = tempfile::tempdir().unwrap_or_else(|e| panic!("{e}"));
@@ -1997,6 +3062,46 @@ mod tests {
         assert!(matches!(until_done(&eng, run).await, RunState::Done));
     }
 
+    /// S2 re-review: a panicking handler task must not strand the
+    /// workspace's in-flight share — the WsSlot returns on drop, so the
+    /// journaled Lost can reconcile and retry. With
+    /// `max_in_flight_per_ws = 1` a leaked slot would stall the probe
+    /// and every later call forever: reaching `Done` proves the count
+    /// came back to zero.
+    #[tokio::test(flavor = "current_thread")]
+    async fn panicking_handler_releases_the_workspace_slot() {
+        let d = tempfile::tempdir().unwrap_or_else(|e| panic!("{e}"));
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut reg = Registry::default();
+        reg.register(
+            "panic-once",
+            Arc::new(PanicOnce {
+                calls: calls.clone(),
+            }),
+        );
+        let eng = spawn(
+            d.path(),
+            reg,
+            ShellConfig {
+                tick_ms: 5,
+                max_in_flight_per_ws: 1,
+                limits: fast_limits(),
+                ..Default::default()
+            },
+        )
+        .unwrap_or_else(|e| panic!("{e}"));
+        let run = eng
+            .submit(OperationKey("panic-slot".into()), spec1("panic-once"))
+            .await
+            .unwrap_or_else(|e| panic!("{e}"));
+        assert!(matches!(until_done(&eng, run).await, RunState::Done));
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "the panicked call was retried, not stranded"
+        );
+    }
+
     // --- D-058: the observer, fed by the actor and the executor ----------
 
     fn echo_engine(dir: &Path) -> Engine {
@@ -2016,9 +3121,11 @@ mod tests {
 
     fn totals(eng: &Engine) -> crate::observe::MetricsOut {
         eng.observer().metrics(
+            Scope::All,
             crate::observe::Window::M15,
             wall_ms(),
             IndexCounts::default(),
+            &["echo".to_string(), "flaky".to_string()],
         )
     }
 
@@ -2100,7 +3207,7 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(50)).await;
         assert!(!submit.is_finished());
         assert!(
-            eng.observer().feed(50).is_empty(),
+            eng.observer().feed(0, 50, wall_ms()).1.is_empty(),
             "nothing before the fsync"
         );
         assert_eq!(totals(&eng).totals.counters.accepted, 0);
@@ -2137,7 +3244,7 @@ mod tests {
         let t = eng.observer().timeline(run);
         assert!(t.complete, "{t:?}");
         assert_eq!(t.events.len(), 6);
-        assert_eq!(eng.observer().feed(1)[0].0, run);
+        assert_eq!(eng.observer().feed(0, 1, wall_ms()).1[0].0, run);
         assert_eq!(
             totals(&eng).totals.counters,
             crate::observe::Counters::default()
@@ -2181,12 +3288,13 @@ mod tests {
         )
     }
 
-    /// The S2-review scenario end to end: replay a journal carrying
-    /// tenant runs on this workspace-blind binary — a queued one and a
-    /// crash-orphaned Reconciling one — and neither may ever produce a
-    /// handler call or a probe, while workspace-0 work proceeds.
+    /// The S2-review scenario end to end on the workspace-aware binary:
+    /// replay a journal carrying tenant runs — a queued one and a
+    /// crash-orphaned Reconciling one — and each resolves its handler in
+    /// its OWN workspace's registry, never borrowing workspace 0's.
+    /// Diagnostics expose the journal shape the rollback guard reads.
     #[tokio::test(flavor = "current_thread")]
-    async fn replayed_tenant_runs_never_reach_a_handler() {
+    async fn replayed_tenant_runs_dispatch_in_their_workspace() {
         let d = tempfile::tempdir().unwrap_or_else(|e| panic!("{e}"));
         commit_v3(d.path(), 1, 7, &v3_accepted("tenant"));
         commit_v3(d.path(), 2, 8, &v3_accepted("other-tenant"));
@@ -2201,13 +3309,14 @@ mod tests {
         let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let probes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let mut reg = Registry::default();
-        reg.register(
-            "echo",
-            Arc::new(Counting {
-                calls: calls.clone(),
-                probes: probes.clone(),
-            }),
-        );
+        let h = Arc::new(Counting {
+            calls: calls.clone(),
+            probes: probes.clone(),
+        });
+        reg.register("echo", h.clone()); // workspace 0 (compat path)
+        reg.put(7, "echo", h.clone())
+            .unwrap_or_else(|e| panic!("{e}"));
+        reg.put(8, "echo", h).unwrap_or_else(|e| panic!("{e}"));
         let eng = spawn(
             d.path(),
             reg,
@@ -2217,23 +3326,24 @@ mod tests {
             },
         )
         .unwrap_or_else(|e| panic!("{e}"));
-        // Workspace 0 runs to done — the engine itself is healthy.
-        assert!(matches!(until_done(&eng, RunId(3)).await, RunState::Done));
-        // Parked runs would have every chance to misbehave by now.
-        tokio::time::sleep(Duration::from_millis(50)).await;
+        for run in [RunId(1), RunId(2), RunId(3)] {
+            assert!(
+                matches!(until_done(&eng, run).await, RunState::Done),
+                "run {run:?} must finish in its own workspace"
+            );
+        }
         assert_eq!(
             calls.load(std::sync::atomic::Ordering::SeqCst),
-            1, // ws-0's single step — and only that one
-            "a parked run reached the handler"
+            2, // the two queued runs — ws-7's and ws-0's
+            "each workspace's run called its own registration"
         );
         assert_eq!(
             probes.load(std::sync::atomic::Ordering::SeqCst),
-            0,
-            "a parked run was probed"
+            1, // ws-8's orphaned Reconciling run was re-probed
+            "the tenant orphan reconciled through its own workspace"
         );
         let diag = eng.diag().await.unwrap_or_else(|e| panic!("{e}"));
         assert_eq!(diag.journal_max_ws, 8);
-        assert_eq!(diag.parked_runs, 2);
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -2258,7 +3368,7 @@ mod tests {
             .unwrap_or_else(|| panic!("unregistered handler must be refused"));
         assert!(matches!(err, EngineError::UnregisteredHandler(_)));
         assert!(eng
-            .list(None, MAX_PAGE)
+            .list(0, None, MAX_PAGE)
             .await
             .unwrap_or_default()
             .runs
@@ -2311,6 +3421,178 @@ mod tests {
         assert!(h.peak.load(SeqCst) <= 2);
     }
 
+    /// Calls by step name — lets a test tell step 2's call from the
+    /// backlog run's, where a global count would conflate them.
+    #[derive(Clone, Default)]
+    struct NamedCalls {
+        calls: Arc<std::sync::Mutex<HashMap<String, usize>>>,
+    }
+    #[async_trait::async_trait]
+    impl StepHandler for NamedCalls {
+        async fn execute(&self, s: &StepSpec, _i: &[u8], _k: &str) -> Outcome {
+            *self
+                .calls
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .entry(s.name.clone())
+                .or_default() += 1;
+            Outcome::Checkpoint(b"ok".to_vec())
+        }
+    }
+
+    fn spec2(handler: &str) -> JobSpec {
+        JobSpec {
+            version: 1,
+            input: b"payload".to_vec(),
+            steps: vec![
+                StepSpec {
+                    name: "one".into(),
+                    handler: handler.into(),
+                },
+                StepSpec {
+                    name: "two".into(),
+                    handler: handler.into(),
+                },
+            ],
+        }
+    }
+
+    /// S1 re-review (B, finding 1): a finishing call must hand its
+    /// workspace slot to the run's next step — the journaled-Running
+    /// claim for step n+1 was paid for by the call that just ended.
+    /// Before the fix the task dropped its `WsSlot` before the join was
+    /// processed; a tick could give the freed share to a backlog run,
+    /// the `DispatchStep` then saw the workspace at cap and skipped —
+    /// the step sat `Running` until its deadline and burned an attempt
+    /// without ever being called.
+    ///
+    /// Drives `Exec`/`tick` directly (like `dispatch_per_tick_is_capped`):
+    /// the interposition is exact — the tick runs between the finished
+    /// call's join and its effect pass, which is the race window.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_finished_steps_workspace_slot_flows_to_the_next_step() {
+        let d = tempfile::tempdir().unwrap_or_else(|e| panic!("{e}"));
+        let mut core = EngineCore::open(d.path()).unwrap_or_else(|e| panic!("{e}"));
+        // One workspace, cap 1: run A needs two steps, run B is the
+        // backlog that would steal the freed share.
+        let a = core
+            .submit(OperationKey("a".into()), spec2("gated"), 0)
+            .unwrap_or_else(|e| panic!("{e}"));
+        let b = core
+            .submit(OperationKey("b".into()), spec1("gated"), 0)
+            .unwrap_or_else(|e| panic!("{e}"));
+        let h = NamedCalls::default();
+        let mut reg = Registry::default();
+        reg.register("gated", Arc::new(h.clone()));
+        let sem = Arc::new(Semaphore::new(8));
+        let (mut attempts, mut probes) = (JoinSet::new(), JoinSet::new());
+        let (mut live, mut waiting) = (HashMap::new(), ProbeQueue::default());
+        let (mut due_by_ws, mut due_order) = (BTreeMap::new(), VecDeque::new());
+        let (mut parked, mut dead_since) = (HashMap::new(), HashMap::new());
+        let mut dead_retry = BinaryHeap::new();
+        let inflight = WsInflight::default();
+        let mut spawned = HashMap::new();
+        let mut mon = Monitor {
+            health: Arc::default(),
+            errors: BTreeMap::new(),
+        };
+        let mut pipe = Pipeline::new(None, 1024, usize::MAX);
+        let obs = Arc::new(Observer::new(0));
+        macro_rules! ex {
+            () => {
+                Exec {
+                    registry: &reg,
+                    sem: sem.clone(),
+                    attempts: &mut attempts,
+                    probes: &mut probes,
+                    live: &mut live,
+                    inflight: &inflight,
+                    spawned: &mut spawned,
+                    ws_cap: 1,
+                    waiting_probes: &mut waiting,
+                    due_by_ws: &mut due_by_ws,
+                    due_order: &mut due_order,
+                    parked: &mut parked,
+                    dead_since: &mut dead_since,
+                    dead_retry: &mut dead_retry,
+                    dead_grace_ms: 0,
+                    per_tick: 8,
+                    examined: 0,
+                    mon: &mut mon,
+                    pipe: &mut pipe,
+                    obs: &obs,
+                }
+            };
+        }
+        // The single slot dispatches A's step 1; B stays queued.
+        {
+            let mut ex = ex!();
+            tick(&mut core, &mut ex);
+        }
+        assert_eq!(inflight.count(0), 1);
+        assert_eq!(attempts.len(), 1);
+        let calls = |h: &NamedCalls, name: &str| {
+            h.calls
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .get(name)
+                .copied()
+                .unwrap_or(0)
+        };
+        // Take the finished call's result: its slot must still be held —
+        // the count may not dip before the effect pass runs.
+        let (run, step, outcome, permit, slot) = attempts
+            .join_next()
+            .await
+            .unwrap_or_else(|| panic!("no attempt join"))
+            .unwrap_or_else(|e| panic!("attempt join: {e}"));
+        assert_eq!(run, a);
+        assert_eq!(
+            inflight.count(0),
+            1,
+            "the finished call returned its slot before its effects ran"
+        );
+        let (out, fail) = match outcome {
+            Outcome::Checkpoint(o) => (Some(o), None),
+            _ => panic!("step 1 did not checkpoint"),
+        };
+        let effects = mon.effects(core.step_finished(run, step, out, fail, wall_ms()));
+        {
+            let mut ex = ex!();
+            // The race window: a tick between the call's end and its
+            // effect pass must NOT give the slot to B — A still holds it.
+            tick(&mut core, &mut ex);
+            assert_eq!(
+                calls(&h, "only"),
+                0,
+                "the backlog run stole the finished call's workspace slot"
+            );
+            assert!(!matches!(
+                core.run(b).map(|r| &r.state),
+                Some(RunState::Running { .. })
+            ));
+            // The effect pass: step 2's DispatchStep inherits the slot
+            // and fires — it must not stop at the share check with a
+            // count that still includes its own predecessor.
+            run_effects(&mut core, &mut ex, effects, run, Some(permit), Some(slot));
+        }
+        assert_eq!(
+            attempts.len(),
+            1,
+            "step 2 was journaled Running but never called"
+        );
+        assert_eq!(calls(&h, "one"), 1);
+        // Step 2 completes; its returned permit+slot go back here.
+        let (_, _, _, permit, slot) = attempts
+            .join_next()
+            .await
+            .unwrap_or_else(|| panic!("no attempt join"))
+            .unwrap_or_else(|e| panic!("attempt join: {e}"));
+        drop((permit, slot));
+        assert_eq!(calls(&h, "two"), 1, "step 2 was never called");
+        assert_eq!(calls(&h, "only"), 0);
+    }
+
     /// One tick dispatches at most `max_dispatch_per_tick` runs, oldest
     /// first, even with permits to spare — a backlog cannot monopolise the
     /// actor (and every dispatch is an fsync).
@@ -2330,21 +3612,36 @@ mod tests {
         let sem = Arc::new(Semaphore::new(10));
         let (mut attempts, mut probes) = (JoinSet::new(), JoinSet::new());
         let (mut live, mut waiting) = (HashMap::new(), ProbeQueue::default());
+        let (mut due_by_ws, mut due_order) = (BTreeMap::new(), VecDeque::new());
+        let (mut parked, mut dead_since) = (HashMap::new(), HashMap::new());
+        let mut dead_retry = BinaryHeap::new();
+        let inflight = WsInflight::default();
+        let mut spawned = HashMap::new();
         let mut mon = Monitor {
             health: Arc::default(),
             errors: BTreeMap::new(),
         };
         // Direct-mode core: every commit is durable when it returns.
         let mut pipe = Pipeline::new(None, 1024, usize::MAX);
-        let obs = Arc::new(Observer::new(0, reg.names()));
+        let obs = Arc::new(Observer::new(0));
         let mut ex = Exec {
             registry: &reg,
             sem: sem.clone(),
             attempts: &mut attempts,
             probes: &mut probes,
             live: &mut live,
+            inflight: &inflight,
+            spawned: &mut spawned,
+            ws_cap: 64,
             waiting_probes: &mut waiting,
+            due_by_ws: &mut due_by_ws,
+            due_order: &mut due_order,
+            parked: &mut parked,
+            dead_since: &mut dead_since,
+            dead_retry: &mut dead_retry,
+            dead_grace_ms: 0,
             per_tick: 3,
+            examined: 0,
             mon: &mut mon,
             pipe: &mut pipe,
             obs: &obs,
@@ -2364,6 +3661,705 @@ mod tests {
         ));
         tick(&mut core, &mut ex);
         assert_eq!(running(&core), 6);
+    }
+
+    /// The scheduler state a `tick` test needs — the same fields the
+    /// actor loop owns and lends to `Exec`.
+    struct Sched {
+        sem: Arc<Semaphore>,
+        attempts: JoinSet<AttemptJoin>,
+        probes: JoinSet<ProbeJoin>,
+        live: HashMap<(RunId, StepIndex), AbortHandle>,
+        inflight: WsInflight,
+        spawned: HashMap<tokio::task::Id, (RunId, StepIndex)>,
+        waiting: ProbeQueue,
+        due_by_ws: BTreeMap<u64, VecDeque<(RunId, StepIndex, u32)>>,
+        due_order: VecDeque<u64>,
+        parked: HashMap<u64, Vec<Parked>>,
+        dead_since: HashMap<RunId, Millis>,
+        dead_retry: BinaryHeap<Reverse<(u64, u64, u32, u32)>>,
+        mon: Monitor,
+        pipe: Pipeline,
+        obs: Arc<Observer>,
+    }
+    impl Sched {
+        fn new(sem_permits: usize) -> Self {
+            Self {
+                sem: Arc::new(Semaphore::new(sem_permits)),
+                attempts: JoinSet::new(),
+                probes: JoinSet::new(),
+                live: HashMap::new(),
+                inflight: WsInflight::default(),
+                spawned: HashMap::new(),
+                waiting: ProbeQueue::default(),
+                due_by_ws: BTreeMap::new(),
+                due_order: VecDeque::new(),
+                parked: HashMap::new(),
+                dead_since: HashMap::new(),
+                dead_retry: BinaryHeap::new(),
+                mon: Monitor {
+                    health: Arc::default(),
+                    errors: BTreeMap::new(),
+                },
+                pipe: Pipeline::new(None, 1024, usize::MAX),
+                obs: Arc::new(Observer::new(0)),
+            }
+        }
+        fn exec<'a>(
+            &'a mut self,
+            registry: &'a Registry,
+            ws_cap: u32,
+            dead_grace_ms: u64,
+            per_tick: usize,
+        ) -> Exec<'a> {
+            Exec {
+                registry,
+                sem: self.sem.clone(),
+                attempts: &mut self.attempts,
+                probes: &mut self.probes,
+                live: &mut self.live,
+                inflight: &self.inflight,
+                spawned: &mut self.spawned,
+                ws_cap,
+                waiting_probes: &mut self.waiting,
+                due_by_ws: &mut self.due_by_ws,
+                due_order: &mut self.due_order,
+                parked: &mut self.parked,
+                dead_since: &mut self.dead_since,
+                dead_retry: &mut self.dead_retry,
+                dead_grace_ms,
+                per_tick,
+                examined: 0,
+                mon: &mut self.mon,
+                pipe: &mut self.pipe,
+                obs: &self.obs,
+            }
+        }
+    }
+
+    /// A tick's index read is the due prefix, never the retained set
+    /// (S2 re-review finding 5): forty not-yet-due runs behind three due
+    /// ones cost three examinations, not forty-three.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_tick_examines_only_the_due_prefix() {
+        let d = tempfile::tempdir().unwrap_or_else(|e| panic!("{e}"));
+        let mut core = EngineCore::open(d.path()).unwrap_or_else(|e| panic!("{e}"));
+        let far = wall_ms() + 3_600_000;
+        for i in 0..40 {
+            core.submit_at(
+                0,
+                OperationKey(format!("later-{i}")),
+                spec1("gated"),
+                far,
+                wall_ms(),
+            )
+            .unwrap_or_else(|e| panic!("{e}"));
+        }
+        for i in 0..3 {
+            core.submit(OperationKey(format!("now-{i}")), spec1("gated"), wall_ms())
+                .unwrap_or_else(|e| panic!("{e}"));
+        }
+        let mut reg = Registry::default();
+        reg.register("gated", Arc::new(HangAlways));
+        let mut sched = Sched::new(8);
+        core.examined.set(0);
+        {
+            let mut ex = sched.exec(&reg, 64, 0, 8);
+            tick(&mut core, &mut ex);
+            assert_eq!(ex.examined, 3, "queue examinations beyond the due work");
+        }
+        assert_eq!(
+            core.examined.get(),
+            3,
+            "the tick scanned runs that were not due"
+        );
+        assert!(!sched.due_by_ws.contains_key(&0), "all due work dispatched");
+        assert_eq!(sched.attempts.len(), 3);
+    }
+
+    /// S2 re-review N1: a dispatch whose commit fails for a real reason
+    /// (NoSpace) keeps its queue entry — it is live work, not a stale
+    /// claim — and the run dispatches on a later tick once space is back,
+    /// with no restart. The unfixed code dropped every queued entry on
+    /// the error, leaving runs queued-but-unindexed until a recount.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_failed_dispatch_keeps_its_queue_entry() {
+        let d = tempfile::tempdir().unwrap_or_else(|e| panic!("{e}"));
+        let free = Arc::new(std::sync::atomic::AtomicU64::new(u64::MAX));
+        let probe_free = free.clone();
+        let mut core = EngineCore::open_with(
+            d.path(),
+            JournalOptions {
+                space: durable_journal::SpaceProbe::new(move |_| {
+                    Ok(probe_free.load(std::sync::atomic::Ordering::SeqCst))
+                }),
+                ..JournalOptions::default()
+            },
+        )
+        .unwrap_or_else(|e| panic!("{e}"));
+        core.submit(OperationKey("k".into()), spec1("hang"), wall_ms())
+            .unwrap_or_else(|e| panic!("{e}"));
+        let mut reg = Registry::default();
+        reg.register("hang", Arc::new(HangAlways));
+        let mut sched = Sched::new(8);
+        // Space at exactly the reserve: `space_ok` still admits the tick
+        // but the commit is refused NoSpace — the entry must survive,
+        // queued again, not dropped.
+        free.store(
+            durable_journal::DEFAULT_RESERVE_BYTES,
+            std::sync::atomic::Ordering::SeqCst,
+        );
+        {
+            let mut ex = sched.exec(&reg, 64, 0, 8);
+            tick(&mut core, &mut ex);
+        }
+        assert_eq!(
+            sched.due_by_ws.get(&0).map(VecDeque::len),
+            Some(1),
+            "the NoSpace-dropped entry left the queue"
+        );
+        assert_eq!(sched.attempts.len(), 0, "nothing dispatched while full");
+        // Space back: the queued entry dispatches on the next tick.
+        free.store(u64::MAX, std::sync::atomic::Ordering::SeqCst);
+        {
+            let mut ex = sched.exec(&reg, 64, 0, 8);
+            tick(&mut core, &mut ex);
+        }
+        assert_eq!(sched.attempts.len(), 1, "the run never dispatched");
+        assert!(
+            sched.due_by_ws.get(&0).is_none_or(VecDeque::is_empty),
+            "the entry was not consumed by dispatch"
+        );
+    }
+
+    /// S3 re-review N7: an in-grace dead-handler entry re-checks on the
+    /// cadence, not every tick. Ticks inside the re-check interval
+    /// examine nothing — the entry waits on `dead_retry` — and it still
+    /// parks at the exact grace deadline.
+    #[tokio::test(flavor = "current_thread")]
+    async fn an_in_grace_dead_entry_rechecks_on_a_cadence() {
+        let d = tempfile::tempdir().unwrap_or_else(|e| panic!("{e}"));
+        let mut core = EngineCore::open(d.path()).unwrap_or_else(|e| panic!("{e}"));
+        let t0 = wall_ms();
+        core.submit_at(0, OperationKey("dead".into()), spec1("gone"), t0, t0)
+            .unwrap_or_else(|e| panic!("{e}"));
+        let reg = Registry::default(); // "gone" never resolves
+        let mut sched = Sched::new(8);
+        {
+            let mut ex = sched.exec(&reg, 64, 10_000, 8);
+            tick_at(&mut core, &mut ex, t0);
+            assert_eq!(ex.examined, 1, "the first sighting marked it");
+        }
+        // Ticks inside the re-check interval re-examine nothing.
+        for i in 1..=4u64 {
+            let mut ex = sched.exec(&reg, 64, 10_000, 8);
+            tick_at(&mut core, &mut ex, t0 + i * 100);
+            assert_eq!(
+                ex.examined, 0,
+                "tick {i} re-examined an in-grace dead entry"
+            );
+        }
+        assert_eq!(
+            sched.dead_retry.len(),
+            1,
+            "the in-grace entry waits on the heap"
+        );
+        // At the re-check boundary it is examined exactly once more…
+        {
+            let mut ex = sched.exec(&reg, 64, 10_000, 8);
+            tick_at(&mut core, &mut ex, t0 + 1_000);
+            assert_eq!(ex.examined, 1, "the re-check did not happen");
+        }
+        // …and it parks on the grace deadline, not a tick early or late.
+        {
+            let mut ex = sched.exec(&reg, 64, 10_000, 8);
+            tick_at(&mut core, &mut ex, t0 + 10_000);
+        }
+        assert_eq!(sched.parked.get(&0).map(Vec::len), Some(1));
+        assert!(sched.dead_since.is_empty(), "the marker outlived parking");
+    }
+
+    /// S3 re-review N7, the reconcile arm itself: a handler that returns
+    /// DURING the grace window must see its waiters come off `dead_retry`
+    /// at the re-check and dispatch — not wait out the whole grace and
+    /// park with their handler already present. Without the pour back
+    /// into the rotation the run strands until a restart's recount.
+    #[tokio::test(flavor = "current_thread")]
+    async fn an_in_grace_entry_dispatches_when_its_handler_returns() {
+        let d = tempfile::tempdir().unwrap_or_else(|e| panic!("{e}"));
+        let mut core = EngineCore::open(d.path()).unwrap_or_else(|e| panic!("{e}"));
+        let t0 = wall_ms();
+        core.submit_at(0, OperationKey("revive".into()), spec1("gone"), t0, t0)
+            .unwrap_or_else(|e| panic!("{e}"));
+        let mut reg = Registry::default(); // absent at the first sighting
+        let mut sched = Sched::new(8);
+        {
+            let mut ex = sched.exec(&reg, 64, 10_000, 8);
+            tick_at(&mut core, &mut ex, t0); // marker = t0, due back t0+1000
+        }
+        assert_eq!(sched.dead_retry.len(), 1, "the entry waits on the heap");
+        // The handler returns mid-grace; at the next re-check tick the
+        // entry must re-enter the rotation and dispatch.
+        let h = NamedCalls::default();
+        reg.put(0, "gone", Arc::new(h.clone()))
+            .unwrap_or_else(|e| panic!("{e}"));
+        {
+            let mut ex = sched.exec(&reg, 64, 10_000, 8);
+            tick_at(&mut core, &mut ex, t0 + 1_000);
+        }
+        assert_eq!(sched.attempts.len(), 1, "the revived run dispatched");
+        assert!(
+            sched.dead_retry.is_empty(),
+            "the re-check tuple stayed on the heap"
+        );
+        let (r, _, outcome, _permit, _slot) = sched
+            .attempts
+            .join_next()
+            .await
+            .unwrap_or_else(|| panic!("no attempt join"))
+            .unwrap_or_else(|e| panic!("attempt join: {e}"));
+        assert!(
+            matches!(outcome, Outcome::Checkpoint(_)),
+            "{r:?} {outcome:?}"
+        );
+    }
+
+    /// S3 re-review N7: a PUT/DELETE flap must not restart the
+    /// dead-handler grace clock. The old code dropped `dead_since` the
+    /// moment a present handler was *seen* — even when the run stayed
+    /// queued (here, a starved permit) — so a DELETE before the next
+    /// absence check minted a fresh grace window and the entry never
+    /// parked. The marker now dies only when the run leaves the wait.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_delete_put_flap_does_not_restart_the_dead_grace() {
+        let d = tempfile::tempdir().unwrap_or_else(|e| panic!("{e}"));
+        let mut core = EngineCore::open(d.path()).unwrap_or_else(|e| panic!("{e}"));
+        let t0 = wall_ms();
+        core.submit_at(0, OperationKey("flap".into()), spec1("h"), t0, t0)
+            .unwrap_or_else(|e| panic!("{e}"));
+        let mut reg = Registry::default(); // absent at the first sighting
+        let mut sched = Sched::new(0); // zero permits: present-but-starved
+        {
+            let mut ex = sched.exec(&reg, 64, 2_000, 8);
+            tick_at(&mut core, &mut ex, t0); // marker = t0; due back t0+1000
+        }
+        assert_eq!(
+            sched.dead_since.values().copied().collect::<Vec<_>>(),
+            vec![t0],
+            "the marker did not record the first absence"
+        );
+        // PUT: present at the re-check, but the run cannot dispatch.
+        reg.put(0, "h", Arc::new(HangAlways))
+            .unwrap_or_else(|e| panic!("{e}"));
+        {
+            let mut ex = sched.exec(&reg, 64, 2_000, 8);
+            tick_at(&mut core, &mut ex, t0 + 1_000);
+        }
+        assert_eq!(sched.attempts.len(), 0, "nothing may dispatch on 0 permits");
+        assert_eq!(
+            sched.dead_since.values().copied().collect::<Vec<_>>(),
+            vec![t0],
+            "a present sighting must not erase the marker while the run waits"
+        );
+        // DELETE again — the flap. Under the old marker policy this
+        // minted a fresh grace at t0+1500.
+        reg.remove(0, "h");
+        {
+            let mut ex = sched.exec(&reg, 64, 2_000, 8);
+            tick_at(&mut core, &mut ex, t0 + 1_500);
+        }
+        {
+            let mut ex = sched.exec(&reg, 64, 2_000, 8);
+            tick_at(&mut core, &mut ex, t0 + 2_000);
+        }
+        assert_eq!(
+            sched.parked.get(&0).map(Vec::len),
+            Some(1),
+            "the flap restarted the grace clock — the entry did not park"
+        );
+    }
+
+    fn pipe(
+        sent_upto: u64,
+        durable: u64,
+        records: usize,
+    ) -> (Pipeline, std::sync::mpsc::Receiver<WriterMsg>) {
+        let (tx, rx) = std::sync::mpsc::sync_channel(8);
+        let mut p = Pipeline::new(Some((tx, std::thread::spawn(|| ()))), 1024, 4 << 20);
+        p.sent_upto = sent_upto;
+        p.durable = durable;
+        if records > 0 {
+            let bytes = 8 * records;
+            p.outbound.push_back(WriterMsg::Append {
+                records: vec![vec![0u8; 8]; records],
+                bytes,
+                upto: sent_upto + records as u64,
+            });
+            p.outbound_records = records;
+            p.outbound_bytes = bytes;
+        }
+        (p, rx)
+    }
+
+    #[test]
+    fn a_busy_writer_pipeline_still_gets_fed() {
+        // Regression for the one-batch-in-flight gate: it withheld every
+        // later batch until the previous fsync reported durable, so each
+        // fsync paid a full actor wake round trip (~tens of ms under a
+        // saturated offer — the 1M battery's submit-latency collapse).
+        // A busy pipeline must ship once MIN_SHIP_RECORDS accumulate.
+        let (mut p, rx) = pipe(1, 0, MIN_SHIP_RECORDS + 44);
+        assert!(p.flush());
+        let shipped: usize = rx.try_iter().map(|m| m.records()).sum();
+        assert_eq!(
+            shipped,
+            MIN_SHIP_RECORDS + 44,
+            "a busy pipeline shipped {shipped} records"
+        );
+    }
+
+    #[test]
+    fn a_busy_writer_pipeline_coalesces_small_accumulations() {
+        // The other half of the gate: below MIN_SHIP_RECORDS, keep
+        // accumulating so fsyncs carry real groups (the
+        // queued_commits_share_one_fsync property), then ship the moment
+        // the pipeline drains.
+        let (mut p, rx) = pipe(1, 0, MIN_SHIP_RECORDS - 156);
+        assert!(p.flush());
+        assert_eq!(
+            rx.try_iter().count(),
+            0,
+            "small accumulations shipped early"
+        );
+        p.durable = p.sent_upto;
+        assert!(p.flush());
+        assert_eq!(rx.try_iter().count(), 1, "an idle pipeline did not ship");
+    }
+
+    /// A workspace at its in-flight share is skipped whole — its queued
+    /// entries are not examined at all (finding 5). The O(1) skip is the
+    /// evidence: a second tick over a full workspace's forty-deep queue
+    /// examines zero entries.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_full_workspace_skips_its_whole_queue() {
+        let d = tempfile::tempdir().unwrap_or_else(|e| panic!("{e}"));
+        let mut core = EngineCore::open(d.path()).unwrap_or_else(|e| panic!("{e}"));
+        for i in 0..41 {
+            core.submit_at(
+                1,
+                OperationKey(format!("w1-{i}")),
+                spec1("gated"),
+                0,
+                wall_ms(),
+            )
+            .unwrap_or_else(|e| panic!("{e}"));
+        }
+        core.submit_at(2, OperationKey("w2".into()), spec1("gated"), 0, wall_ms())
+            .unwrap_or_else(|e| panic!("{e}"));
+        let mut reg = Registry::default();
+        reg.put(1, "gated", Arc::new(HangAlways))
+            .unwrap_or_else(|e| panic!("{e}"));
+        reg.put(2, "gated", Arc::new(HangAlways))
+            .unwrap_or_else(|e| panic!("{e}"));
+        let mut sched = Sched::new(8);
+        // ws_cap 1: tick 1 dispatches ws 1's first run (which hangs,
+        // holding the share) and ws 2's run.
+        {
+            let mut ex = sched.exec(&reg, 1, 0, 8);
+            tick(&mut core, &mut ex);
+        }
+        assert_eq!(sched.attempts.len(), 2);
+        assert_eq!(sched.inflight.count(1), 1, "ws 1's share is held");
+        assert_eq!(sched.due_by_ws[&1].len(), 40, "ws 1's backlog stays queued");
+        // Tick 2: ws 1 is at share — its forty-entry queue must cost
+        // zero examinations while it sits out the rotation.
+        let mut ex = sched.exec(&reg, 1, 0, 8);
+        tick(&mut core, &mut ex);
+        assert_eq!(
+            ex.examined, 0,
+            "a full workspace's queue was examined entry by entry"
+        );
+        assert_eq!(sched.due_by_ws[&1].len(), 40, "skipped entries stay queued");
+        assert_eq!(sched.attempts.len(), 2, "nothing else dispatched");
+    }
+
+    /// A run whose handler left the registry parks after the grace
+    /// period — it leaves the due rotation entirely instead of being
+    /// re-examined every tick — and re-dispatches when the handler
+    /// returns (finding 5: dead-handler runs never leave the due set).
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_dead_handler_run_parks_until_its_handler_returns() {
+        let d = tempfile::tempdir().unwrap_or_else(|e| panic!("{e}"));
+        let mut core = EngineCore::open(d.path()).unwrap_or_else(|e| panic!("{e}"));
+        let run = core
+            .submit(OperationKey("orphaned".into()), spec1("ghost"), wall_ms())
+            .unwrap_or_else(|e| panic!("{e}"));
+        let mut reg = Registry::default(); // "ghost" is never registered — yet
+        let mut sched = Sched::new(8);
+        // Grace 0: the first examination parks it.
+        {
+            let mut ex = sched.exec(&reg, 64, 0, 8);
+            tick(&mut core, &mut ex);
+            assert_eq!(ex.examined, 1);
+        }
+        assert!(
+            sched.parked[&0].iter().any(|(r, ..)| *r == run),
+            "the dead-handler run did not park"
+        );
+        assert!(
+            matches!(
+                core.run(run).map(|r| &r.state),
+                Some(RunState::Queued { .. })
+            ),
+            "a parked run stays queued — it was never called"
+        );
+        assert!(
+            !sched.due_by_ws.contains_key(&0),
+            "parked left the rotation"
+        );
+        // The next tick examines nothing: the parked run is out of the
+        // rotation, not re-scanned on every pass.
+        {
+            let mut ex = sched.exec(&reg, 64, 0, 8);
+            tick(&mut core, &mut ex);
+            assert_eq!(
+                ex.examined, 0,
+                "the parked run was re-examined — it never left the due set"
+            );
+        }
+        // The handler returning revives it: it re-queues and dispatches.
+        let h = NamedCalls::default();
+        reg.put(0, "ghost", Arc::new(h.clone()))
+            .unwrap_or_else(|e| panic!("{e}"));
+        let mut ex = sched.exec(&reg, 64, 0, 8);
+        ex.unpark(&core, 0);
+        tick(&mut core, &mut ex);
+        assert_eq!(
+            ex.examined, 1,
+            "the revived run should be the only examination"
+        );
+        assert_eq!(sched.attempts.len(), 1, "the revived run dispatched");
+        let (r, _, outcome, _permit, _slot) = sched
+            .attempts
+            .join_next()
+            .await
+            .unwrap_or_else(|| panic!("no attempt join"))
+            .unwrap_or_else(|e| panic!("attempt join: {e}"));
+        assert_eq!(r, run);
+        assert!(matches!(outcome, Outcome::Checkpoint(_)));
+        assert_eq!(
+            h.calls
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .get("only")
+                .copied()
+                .unwrap_or(0),
+            1,
+            "the parked run's handler was finally called"
+        );
+    }
+
+    /// S2 re-review N2: a cancelled run drops its scheduler entries —
+    /// the parked slot and the in-grace dead_since marker — at cancel
+    /// time, not whenever its dead handler happens to return. Without
+    /// the drop, a register/submit/delete/cancel cycle accumulates an
+    /// entry per cancelled run forever.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_cancelled_dead_handler_run_leaves_no_scheduler_entry() {
+        let d = tempfile::tempdir().unwrap_or_else(|e| panic!("{e}"));
+        let mut core = EngineCore::open(d.path()).unwrap_or_else(|e| panic!("{e}"));
+        let parked_run = core
+            .submit(OperationKey("parked".into()), spec1("ghost"), wall_ms())
+            .unwrap_or_else(|e| panic!("{e}"));
+        let grace_run = core
+            .submit(OperationKey("grace".into()), spec1("ghost"), wall_ms())
+            .unwrap_or_else(|e| panic!("{e}"));
+        let reg = Registry::default(); // "ghost" never registered
+        let mut sched = Sched::new(8);
+        // Park the first run (grace 0) — the second is parked directly
+        // for the unpark-prune check below.
+        {
+            let mut ex = sched.exec(&reg, 64, 0, 8);
+            tick(&mut core, &mut ex);
+        }
+        assert_eq!(sched.parked.get(&0).map(Vec::len), Some(2));
+        sched.dead_since.insert(grace_run, wall_ms()); // an in-grace marker survives
+        sched
+            .dead_retry
+            .push(Reverse((wall_ms() + 1_000, grace_run.0, 0, 1))); // and its re-check tuple rides the heap
+                                                                    // The cancel path drops every collection's entries for the run —
+                                                                    // the heap's too (N2: dropping only the marker left the tuple to
+                                                                    // re-queue the run at its re-check).
+        core.cancel(parked_run, wall_ms())
+            .unwrap_or_else(|e| panic!("{e}"));
+        core.cancel(grace_run, wall_ms())
+            .unwrap_or_else(|e| panic!("{e}"));
+        {
+            let mut ex = sched.exec(&reg, 64, 0, 8);
+            ex.untrack(0, parked_run);
+            ex.untrack(0, grace_run);
+        }
+        assert!(
+            sched.parked.get(&0).is_none_or(Vec::is_empty),
+            "a cancelled run's parked entry survived"
+        );
+        assert!(
+            sched.dead_since.is_empty(),
+            "a cancelled run's in-grace marker survived"
+        );
+        assert!(
+            sched.dead_retry.is_empty(),
+            "a cancelled run's re-check tuple survived on the heap"
+        );
+        // And the reconcile-time sweep prunes a cancelled parked run
+        // even when nothing tracked the cancel (belt for the same leak).
+        let stale = core
+            .submit(OperationKey("stale".into()), spec1("ghost"), wall_ms())
+            .unwrap_or_else(|e| panic!("{e}"));
+        {
+            let mut ex = sched.exec(&reg, 64, 0, 8);
+            tick(&mut core, &mut ex);
+        }
+        assert_eq!(sched.parked.get(&0).map(Vec::len), Some(1));
+        core.cancel(stale, wall_ms())
+            .unwrap_or_else(|e| panic!("{e}"));
+        let mut ex = sched.exec(&reg, 64, 0, 8);
+        ex.unpark(&core, 0);
+        assert!(
+            sched.parked.get(&0).is_none_or(Vec::is_empty),
+            "unpark kept a cancelled run's entry"
+        );
+    }
+
+    /// S2 re-review N2, the wiring: a cancel that goes THROUGH THE ACTOR
+    /// drops the run's scheduler memory at once — the parked entry (past
+    /// grace) and, in grace, the dead_since marker and its dead_retry
+    /// tuple. The unit test above calls `untrack` itself, so it stays
+    /// green if the actor's cancel arm stops calling it; this one does not.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_cancel_through_the_actor_drops_the_runs_scheduler_entries() {
+        for (grace_ms, want_before) in [(0, (1, 0, 0)), (60_000, (0, 1, 1))] {
+            let d = tempfile::tempdir().unwrap_or_else(|e| panic!("{e}"));
+            let mut reg = Registry::default();
+            reg.register("gone", Arc::new(Echo));
+            let eng = spawn(
+                d.path(),
+                reg,
+                ShellConfig {
+                    tick_ms: 5,
+                    dead_handler_grace_ms: grace_ms,
+                    ..Default::default()
+                },
+            )
+            .unwrap_or_else(|e| panic!("{e}"));
+            // Admitted while the handler exists, due once it is gone. The
+            // delete is fire-and-forget; the put after it answers only
+            // once the actor has processed both (one command channel, in
+            // order), and the run must still be queued then — else the
+            // machine was too slow for the margin and the test says so.
+            let run = eng
+                .submit_at(
+                    OperationKey("ghost".into()),
+                    spec1("gone"),
+                    wall_ms() + 2_500,
+                )
+                .await
+                .unwrap_or_else(|e| panic!("{e}"));
+            eng.delete_handler(0, "gone")
+                .unwrap_or_else(|e| panic!("{e}"));
+            eng.put_handler(0, "sync", Arc::new(Echo))
+                .await
+                .unwrap_or_else(|e| panic!("{e}"));
+            let queued = eng.inspect(run).await.unwrap_or_else(|e| panic!("{e}"));
+            assert!(
+                matches!(queued.map(|r| r.state), Some(RunState::Queued { .. })),
+                "the run became due before its handler was deleted"
+            );
+            let deadline = std::time::Instant::now() + Duration::from_secs(10);
+            loop {
+                let c = eng.sched_counts().await.unwrap_or_else(|e| panic!("{e}"));
+                if c == want_before {
+                    break;
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "grace {grace_ms}: never reached {want_before:?}, at {c:?}"
+                );
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+            eng.cancel(run).await.unwrap_or_else(|e| panic!("{e}"));
+            // The cancel's answer comes after its arm ran: no wait needed.
+            // DECISIVE(parked-untrack)
+            assert_eq!(
+                eng.sched_counts().await.unwrap_or_else(|e| panic!("{e}")),
+                (0, 0, 0),
+                "grace {grace_ms}: the cancelled run's scheduler entries survived"
+            );
+        }
+    }
+
+    /// Re-review #5: untracking a run the scheduler never marked drops
+    /// nothing and rebuilds nothing — other runs' heap tuples and parked
+    /// entries stay exactly as they were.
+    #[tokio::test(flavor = "current_thread")]
+    async fn untracking_an_unmarked_run_touches_nothing() {
+        let mut sched = Sched::new(8);
+        for r in 0..1_000u64 {
+            sched
+                .dead_retry
+                .push(Reverse((wall_ms() + 1_000 + r, r + 10_000, 0, 1)));
+            sched.dead_since.insert(RunId(r + 10_000), wall_ms());
+        }
+        sched
+            .parked
+            .entry(0)
+            .or_default()
+            .push((RunId(77), StepIndex(0), 1, Arc::from("gone")));
+        let reg = Registry::default();
+        let mut ex = sched.exec(&reg, 64, 0, 8);
+        for r in 1_000..1_100u64 {
+            assert!(!ex.untrack(0, RunId(r)), "run {r} was never marked");
+        }
+        assert!(ex.untrack(0, RunId(77)), "a parked run is dropped");
+        assert!(ex.untrack(0, RunId(10_005)), "an in-grace run is dropped");
+        assert_eq!(sched.dead_retry.len(), 999);
+        assert_eq!(sched.dead_since.len(), 999);
+        assert!(sched.parked.is_empty());
+    }
+
+    /// Re-review #10: the feed's key lookup answers only the asking
+    /// workspace's runs — another workspace's run is `None`, like a run
+    /// that left the index.
+    #[tokio::test(flavor = "current_thread")]
+    async fn keys_never_answer_another_workspaces_run() {
+        let d = tempfile::tempdir().unwrap_or_else(|e| panic!("{e}"));
+        let eng = spawn(
+            d.path(),
+            Registry::default(),
+            ShellConfig {
+                tick_ms: 5,
+                ..Default::default()
+            },
+        )
+        .unwrap_or_else(|e| panic!("{e}"));
+        eng.put_handler(1, "echo", Arc::new(Echo))
+            .await
+            .unwrap_or_else(|e| panic!("{e}"));
+        let run = eng
+            .submit_at_scoped(1, OperationKey("ws1-key".into()), spec1("echo"), FAR)
+            .await
+            .unwrap_or_else(|e| panic!("{e}"));
+        let mine = eng
+            .keys(1, vec![run])
+            .await
+            .unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(mine, vec![Some(OperationKey("ws1-key".into()))], "control");
+        let theirs = eng
+            .keys(2, vec![run])
+            .await
+            .unwrap_or_else(|e| panic!("{e}"));
+        // DECISIVE(keys-scope)
+        assert_eq!(theirs, vec![None], "workspace 2 learned workspace 1's key");
     }
 
     /// Never answers; its probe reports the effect landed.
@@ -2537,6 +4533,91 @@ mod tests {
         assert!(eng.readiness().ready);
     }
 
+    /// R1: the deadline sweep pops a batch, then processes it — on a real
+    /// commit error it stopped after re-indexing only the entry that
+    /// failed, dropping every other popped deadline until the next
+    /// restart's recount. Two expired attempts at exactly the reserve:
+    /// the first's lost-reply commit fails NoSpace, and BOTH entries must
+    /// survive to re-fire once space returns. S3 re-review F5: the clock
+    /// is injected — `tick_at` and an explicit `now`, no sleeps, no
+    /// machine-speed dependence.
+    #[tokio::test(flavor = "current_thread")]
+    async fn the_sweep_requeues_every_popped_deadline_on_commit_error() {
+        use std::sync::atomic::{AtomicU64, Ordering::SeqCst};
+        let d = tempfile::tempdir().unwrap_or_else(|e| panic!("{e}"));
+        let free = Arc::new(AtomicU64::new(u64::MAX));
+        let probe_free = free.clone();
+        let reserve = 4096u64;
+        let mut core = EngineCore::open_with(
+            d.path(),
+            JournalOptions {
+                reserve_bytes: reserve,
+                space: durable_journal::SpaceProbe::new(move |_| Ok(probe_free.load(SeqCst))),
+                ..JournalOptions::default()
+            },
+        )
+        .unwrap_or_else(|e| panic!("{e}"));
+        core.limits.max_step_deadline_ms = 60;
+        // An injected epoch — the wall clock never enters this test.
+        let t0: Millis = 1_000_000;
+        let a = core
+            .submit_at(0, OperationKey("sweep-a".into()), spec1("gated"), 0, t0)
+            .unwrap_or_else(|e| panic!("{e}"));
+        let b = core
+            .submit_at(0, OperationKey("sweep-b".into()), spec1("gated"), 0, t0)
+            .unwrap_or_else(|e| panic!("{e}"));
+        let gate = Arc::new(Semaphore::new(0));
+        let mut reg = Registry::default();
+        reg.register("gated", Arc::new(GateThenFound(gate.clone())));
+        let mut sched = Sched::new(8);
+        // Dispatch both at t0: two attempts in flight, deadlines at
+        // t0+60 in the index.
+        {
+            let mut ex = sched.exec(&reg, 64, 0, 8);
+            tick_at(&mut core, &mut ex, t0);
+        }
+        assert_eq!(sched.attempts.len(), 2, "both runs dispatched");
+        // Exactly at the reserve: the sweep's space gate still passes
+        // but every record commit refuses NoSpace — the break path.
+        free.store(reserve + 1, SeqCst);
+        // Both deadlines fire under the failed commit: the popped batch
+        // holds a and b; a's lost-reply commit fails first and the fix
+        // re-indexes EVERY remaining entry, not just a's.
+        {
+            let mut ex = sched.exec(&reg, 64, 0, 8);
+            tick_at(&mut core, &mut ex, t0 + 61);
+        }
+        // Space back: the requeued deadlines re-fire on the next sweep —
+        // b's only existed if the requeue kept it.
+        free.store(u64::MAX, SeqCst);
+        {
+            let mut ex = sched.exec(&reg, 64, 0, 8);
+            tick_at(&mut core, &mut ex, t0 + 62);
+        }
+        // Both expired attempts reconcile: the probes find the effect
+        // (GateThenFound::probe is true) — a reconcile that never fired
+        // leaves its run Running until a restart's recount.
+        let mut reconciled = 0;
+        while let Some(join) = sched.probes.join_next().await {
+            let (run, step, found, permit, slot) =
+                join.unwrap_or_else(|e| panic!("probe died: {e}"));
+            let mut ex = sched.exec(&reg, 64, 0, 8);
+            let effects = ex.mon.effects(core.reconciled(run, step, found, t0 + 62));
+            run_effects(&mut core, &mut ex, effects, run, Some(permit), Some(slot));
+            reconciled += 1;
+        }
+        // DECISIVE(deadline-drop)
+        assert_eq!(reconciled, 2, "both popped deadlines re-fired");
+        for run in [a, b] {
+            assert!(
+                matches!(core.run(run).map(|r| &r.state), Some(RunState::Done)),
+                "run {:?} did not reconcile: {:?}",
+                run,
+                core.run(run).map(|r| &r.state)
+            );
+        }
+    }
+
     // ---- group commit (D-014 rules, D-015) --------------------------------
 
     use durable_journal::faults::Faults;
@@ -2705,34 +4786,110 @@ mod tests {
     /// caller now gets `Timeout` within the reply deadline; the stuck
     /// submit may still commit later (its outcome was unknown, not
     /// refused), and a retry with the same op_key finds it.
+    ///
+    /// The clock is frozen for the whole test and `advance` is the only
+    /// thing that moves it: a deadline's firing is asserted as an
+    /// ordering fact (the task ends while syncs are still held, before
+    /// `release_syncs`), never as a wall-clock race a loaded machine
+    /// can lose.
     #[tokio::test]
     async fn replies_have_a_deadline_while_the_journal_is_stuck() {
+        tokio::time::pause();
+        // A paused clock still auto-advances to the next pending timer
+        // whenever the runtime has no runnable work — left alone it would
+        // fast-forward straight into every armed reply deadline while a
+        // real fsync is still in flight. A parked blocking task inhibits
+        // auto-advance, so `advance` below is the only thing that moves
+        // time.
+        let (uninhibit, inhibit_rx) = std::sync::mpsc::channel::<()>();
+        let inhibit = tokio::task::spawn_blocking(move || {
+            let _ = inhibit_rx.recv();
+        });
+        const DEADLINE: Duration = Duration::from_millis(300);
+        // `j` must finish within `by` of paused time — i.e. its reply
+        // deadline fired. A deadline-less implementation leaves it
+        // running (red-first against a mutant that drops the deadline).
+        async fn deadline_fires<Out: Send + 'static>(
+            j: tokio::task::JoinHandle<Out>,
+            by: Duration,
+        ) -> Out {
+            for _ in 0..4 {
+                tokio::task::yield_now().await; // let it arm its deadline
+            }
+            tokio::time::advance(by).await;
+            for _ in 0..20 {
+                if j.is_finished() {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+            assert!(
+                j.is_finished(),
+                "the reply deadline did not fire — the caller is hung"
+            );
+            j.await.unwrap_or_else(|e| panic!("join: {e}"))
+        }
         let d = tempfile::tempdir().unwrap_or_else(|e| panic!("{e}"));
         let faults = Arc::new(Faults::default());
         let cfg = ShellConfig {
-            reply_timeout: Duration::from_millis(300),
+            reply_timeout: DEADLINE,
             ..piped(&faults, GroupCommit::default())
         };
         let eng = spawn(d.path(), echo_registry(), cfg).unwrap_or_else(|e| panic!("{e}"));
+        // Frozen + inhibited: this submit's deadline cannot fire — only
+        // the real journal answer resolves it, however slow the fsync.
         let early = eng
             .submit_at(OperationKey("early".into()), spec1("echo"), FAR)
             .await
             .unwrap_or_else(|e| panic!("{e}"));
         faults.hold_syncs();
-        let r = bounded(eng.submit_at(OperationKey("stuck".into()), spec1("echo"), FAR)).await;
+        // Every deadline error below is asserted while the commit is
+        // still stuck — `release_syncs` has not been called.
+        let r = deadline_fires(
+            tokio::spawn({
+                let e = eng.clone();
+                async move {
+                    e.submit_at(OperationKey("stuck".into()), spec1("echo"), FAR)
+                        .await
+                }
+            }),
+            DEADLINE + Duration::from_millis(1),
+        )
+        .await;
         assert!(matches!(r, Err(EngineError::Timeout)), "{r:?}");
-        let r = bounded(eng.inspect(early)).await;
+        let r = deadline_fires(
+            tokio::spawn({
+                let e = eng.clone();
+                async move { e.inspect(early).await }
+            }),
+            DEADLINE + Duration::from_millis(1),
+        )
+        .await;
         assert!(
             matches!(r, Err(EngineError::Timeout)),
             "a read waits on the stuck commit: {r:?}"
         );
-        let r = bounded(eng.list(None, 10)).await;
+        let r = deadline_fires(
+            tokio::spawn({
+                let e = eng.clone();
+                async move { e.list(0, None, 10).await }
+            }),
+            DEADLINE + Duration::from_millis(1),
+        )
+        .await;
         assert!(matches!(r, Err(EngineError::Timeout)), "{r:?}");
         faults.release_syncs();
-        let again = bounded(eng.submit_at(OperationKey("stuck".into()), spec1("echo"), FAR))
+        // Still frozen: the retried submit cannot time out — it resolves
+        // when the real fsync lands, and dedup proves the timed-out
+        // original committed exactly once.
+        let again = eng
+            .submit_at(OperationKey("stuck".into()), spec1("echo"), FAR)
             .await
             .unwrap_or_else(|e| panic!("{e}"));
         assert_eq!(again, RunId(2), "the timed-out submit committed once");
+        drop(uninhibit);
+        tokio::time::resume();
+        inhibit.await.unwrap_or_else(|e| panic!("join: {e}"));
     }
 
     /// Answers Lost once its gate opens; counts its probes (which find the
@@ -3073,10 +5230,12 @@ mod tests {
         }
     }
 
-    /// The same with a real OS error: a journal root the process can write
-    /// into but not open for reading fails the sidecar's directory fsync
-    /// (EACCES) BEFORE the manifest swap — an ordinary compaction error,
-    /// so the engine carries on and loses nothing (review 2d).
+    /// A real OS error BEFORE the swap point — a journal root the process
+    /// can write into but not open for reading fails the sidecar's
+    /// directory fsync (EACCES) — is an ordinary compaction error:
+    /// the engine serves on, nothing is poisoned. (A post-rename fault
+    /// still stops it; `compaction_error_at_any_step` covers step 3, and
+    /// a permissions trick cannot reach past the sidecar write anymore.)
     #[cfg(unix)]
     #[tokio::test(flavor = "current_thread")]
     async fn real_io_error_before_manifest_swap_is_not_fatal() {
@@ -3385,7 +5544,7 @@ mod tests {
         let reads: Vec<_> = (0..200)
             .map(|_| {
                 let e = eng.clone();
-                tokio::spawn(async move { e.list(None, MAX_PAGE).await.map(|p| p.runs.len()) })
+                tokio::spawn(async move { e.list(0, None, MAX_PAGE).await.map(|p| p.runs.len()) })
             })
             .collect();
         let e = eng.clone();
@@ -3611,5 +5770,255 @@ mod tests {
             "a full command channel must refuse, not queue ({landed} landed)"
         );
         assert!(landed >= 1, "the channel still admits what fits");
+    }
+    /// S2 re-review N1: a waiting-probe queue whose every entry belongs
+    /// to a full workspace must not spin the actor — each entry gets one
+    /// try per tick, then waits for the next. ws 7: one run's execute
+    /// hangs holding the workspace's only share; the deadline sweep
+    /// reconciles it and the probe queues on the full workspace. ws 8's
+    /// submit must still answer.
+    // The engine runs on its own thread+runtime: a pinned actor deadlocks
+    // whatever runtime hosts it, and on the test's own runtime the pin
+    // would stop the test's timeout from ever being polled — the failure
+    // would hang the suite instead of being reported.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_full_waiting_probe_queue_cannot_pin_the_actor() {
+        let d = tempfile::tempdir().unwrap_or_else(|e| panic!("{e}"));
+        let dir = d.path().to_path_buf();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap_or_else(|e| panic!("rt: {e}"))
+                .block_on(async move {
+                    let eng = spawn(
+                        &dir,
+                        Registry::default(),
+                        ShellConfig {
+                            tick_ms: 5,
+                            max_in_flight: 4,
+                            max_in_flight_per_ws: 1,
+                            limits: fast_limits(),
+                            ..Default::default()
+                        },
+                    )
+                    .unwrap_or_else(|e| panic!("{e}"));
+                    let _ = tx.send(eng);
+                    std::future::pending::<()>().await; // host the actor
+                });
+        });
+        let eng = rx
+            .recv_timeout(Duration::from_secs(5))
+            .unwrap_or_else(|e| panic!("engine spawn: {e}"));
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let entered = Arc::new(tokio::sync::Notify::new());
+        eng.put_handler(
+            7,
+            "hang",
+            Arc::new(HangOnce {
+                calls: calls.clone(),
+                freeze: None,
+                entered: entered.clone(),
+            }),
+        )
+        .await
+        .unwrap_or_else(|e| panic!("{e}"));
+        eng.put_handler(8, "fast", Arc::new(Echo))
+            .await
+            .unwrap_or_else(|e| panic!("{e}"));
+        // ws 7's only share is held by an execute that never returns;
+        // when the deadline sweep reconciles it the queued probe finds
+        // the workspace full and waits in `waiting_probes`. The old
+        // `while let pop` drain then pops and re-pushes that one entry
+        // forever — the tick never ends, and the actor can never answer
+        // another workspace again.
+        let _r1 = eng
+            .submit_scoped(7, OperationKey("a-0".into()), spec("hang"))
+            .await
+            .unwrap_or_else(|e| panic!("a-0: {e}"));
+        bounded(entered.notified()).await; // the attempt is in-flight
+                                           // 300 ms covers the 100 ms deadline, the sweep's probe() → queue,
+                                           // and the drain tick that would spin on it.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        // The actor must still answer other workspaces' commands.
+        let run = bounded(eng.submit_scoped(8, OperationKey("b-0".into()), spec("fast")))
+            .await
+            .unwrap_or_else(|e| panic!("b-0: {e}"));
+        assert!(matches!(
+            bounded(until_done(&eng, run)).await,
+            RunState::Done
+        ));
+    }
+
+    /// S2 re-review N2: a due entry that cannot dispatch (its handler is
+    /// gone, its workspace at share) must not consume the per-tick
+    /// budget — otherwise dead-head entries starve every later due run.
+    /// ws 7's handler was deleted after its runs were submitted; ws 8's
+    /// run sits behind hundreds of them in due order and must still run.
+    #[tokio::test(flavor = "current_thread")]
+    async fn dead_head_due_entries_do_not_starve_dispatch() {
+        let d = tempfile::tempdir().unwrap_or_else(|e| panic!("{e}"));
+        let eng = spawn(
+            d.path(),
+            Registry::default(),
+            ShellConfig {
+                tick_ms: 10,
+                max_dispatch_per_tick: 1,
+                ..Default::default()
+            },
+        )
+        .unwrap_or_else(|e| panic!("{e}"));
+        eng.put_handler(7, "ghost", Arc::new(Echo))
+            .await
+            .unwrap_or_else(|e| panic!("{e}"));
+        eng.put_handler(8, "fast", Arc::new(Echo))
+            .await
+            .unwrap_or_else(|e| panic!("{e}"));
+        // Dozen runs whose handler is about to vanish, due together
+        // shortly — `not_before` keeps every one of them queued at the
+        // head of ws 8's run in due order (lower ids win ties), so none
+        // drain before the victim submits. One dead-head entry would
+        // suffice under per-tick=1; twelve is margin.
+        let due_at = wall_ms() + 300;
+        for i in 0..12 {
+            eng.submit_at_scoped(7, OperationKey(format!("g-{i}")), spec("ghost"), due_at)
+                .await
+                .unwrap_or_else(|e| panic!("g-{i}: {e}"));
+        }
+        eng.delete_handler(7, "ghost")
+            .unwrap_or_else(|e| panic!("{e}"));
+        let run = eng
+            .submit_at_scoped(8, OperationKey("b-0".into()), spec("fast"), due_at)
+            .await
+            .unwrap_or_else(|e| panic!("b-0: {e}"));
+        assert!(matches!(
+            bounded(until_done(&eng, run)).await,
+            RunState::Done
+        ));
+    }
+
+    /// S2 re-review N3: the per-workspace share is charged when the
+    /// dispatch is journaled, not when the task spawns — otherwise every
+    /// dispatch held behind the writer's fsync passes a stale check and
+    /// one workspace takes the whole permit pool in a single tick.
+    #[tokio::test(flavor = "current_thread")]
+    async fn the_workspace_share_is_charged_at_dispatch() {
+        use std::sync::atomic::Ordering::SeqCst;
+        let d = tempfile::tempdir().unwrap_or_else(|e| panic!("{e}"));
+        let faults = Arc::new(Faults::default());
+        let h = Gated::default();
+        let eng = spawn(
+            d.path(),
+            Registry::default(),
+            ShellConfig {
+                max_in_flight: 8,
+                max_in_flight_per_ws: 2,
+                max_dispatch_per_tick: 8,
+                ..piped(&faults, GroupCommit::default())
+            },
+        )
+        .unwrap_or_else(|e| panic!("{e}"));
+        eng.put_handler(7, "block", Arc::new(h.clone()))
+            .await
+            .unwrap_or_else(|e| panic!("{e}"));
+        // All eight runs become due together AFTER the writer's fsync is
+        // frozen: every StepDispatched waits undurable in the pipeline,
+        // and under the old accounting (load rises at spawn) all eight
+        // pass the workspace check — no task's spawn can raise the
+        // counter while the fsync is held. Submitting without
+        // `not_before` would let each run dispatch and spawn during the
+        // submit loop itself, closing the race window this test needs.
+        let due_at = wall_ms() + 300;
+        let mut runs = Vec::new();
+        for i in 0..8 {
+            runs.push(
+                eng.submit_at_scoped(7, OperationKey(format!("a-{i}")), spec1("block"), due_at)
+                    .await
+                    .unwrap_or_else(|e| panic!("a-{i}: {e}")),
+            );
+        }
+        faults.hold_syncs();
+        tokio::time::sleep(Duration::from_millis(450)).await;
+        faults.release_syncs();
+        // The gate stays closed: every task that spawned parks inside
+        // the handler's `in_flight` count. Under charge-at-spawn all 8
+        // spawn and park; under charge-at-dispatch only the share of 2
+        // can ever exist. Poll for the parked plateau rather than a
+        // fixed sleep — spawn scheduling under load is not the
+        // measurement.
+        let mut stable = 0u32;
+        let mut last = 0usize;
+        for _ in 0..300 {
+            let now = h.calls.load(SeqCst);
+            if now == last {
+                stable += 1;
+            } else {
+                stable = 0;
+                last = now;
+            }
+            if stable >= 15 {
+                break; // parked plateau: nothing else is coming
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(
+            h.peak.load(SeqCst) <= 2,
+            "ws 7 held {} in-flight calls over its share of 2",
+            h.peak.load(SeqCst)
+        );
+        h.gate.add_permits(8);
+        for r in runs {
+            assert!(matches!(bounded(until_done(&eng, r)).await, RunState::Done));
+        }
+    }
+
+    /// S2 re-review N4: the index byte bound is per-workspace as well as
+    /// global — one tenant's max-size runs must not put every workspace
+    /// at_capacity.
+    #[tokio::test(flavor = "current_thread")]
+    async fn one_workspace_cannot_fill_the_whole_index() {
+        let d = tempfile::tempdir().unwrap_or_else(|e| panic!("{e}"));
+        // Bound the whole index at about four runs: under a global-only
+        // bound one workspace can hold all four shares.
+        let per = Limits::run_bytes(&OperationKey("seed".into()), &spec("echo"));
+        let eng = spawn(
+            d.path(),
+            Registry::default(),
+            ShellConfig {
+                tick_ms: 5,
+                limits: Limits {
+                    max_index_bytes: per * 4,
+                    ..Limits::default()
+                },
+                ..Default::default()
+            },
+        )
+        .unwrap_or_else(|e| panic!("{e}"));
+        eng.put_handler(7, "echo", Arc::new(Echo))
+            .await
+            .unwrap_or_else(|e| panic!("{e}"));
+        eng.put_handler(8, "echo", Arc::new(Echo))
+            .await
+            .unwrap_or_else(|e| panic!("{e}"));
+        eng.submit_scoped(7, OperationKey("seed".into()), spec("echo"))
+            .await
+            .unwrap_or_else(|e| panic!("seed: {e}"));
+        // ws 7 can fill its own share — but not the whole index.
+        let mut refused = 0;
+        for i in 0..8 {
+            match eng
+                .submit_scoped(7, OperationKey(format!("a-{i}")), spec("echo"))
+                .await
+            {
+                Ok(_) => {}
+                Err(EngineError::Refused(durable_domain::Refusal::WorkspaceQuota)) => refused += 1,
+                Err(e) => panic!("a-{i}: {e}"),
+            }
+        }
+        assert!(refused >= 4, "ws 7 admitted past a fair share of the index");
+        eng.submit_scoped(8, OperationKey("b-0".into()), spec("echo"))
+            .await
+            .unwrap_or_else(|e| panic!("ws 8 must still admit while ws 7 is full: {e}"));
     }
 }

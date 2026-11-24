@@ -19,16 +19,22 @@ test('every nav link is a hash route, and only overview + handlers are monitorin
 	assert.deepEqual(NAV.filter((n) => n.monitoring).map((n) => n.section), ['overview', 'handlers']);
 });
 
-test('run ids: digits only, safe integers, never NaN', () => {
-	assert.equal(parseRunId('10'), 10);
-	assert.equal(parseRunId(' 10418 '), 10418);
-	assert.equal(parseRunId('#42'), 42);
-	assert.equal(parseRunId('0'), 0);
+test('run ids: the opaque 11-character public id, or a legacy all-digit id; never anything else', () => {
+	assert.equal(parseRunId('WBwXuaDUPWc'), 'WBwXuaDUPWc');
+	assert.equal(parseRunId(' vsU_JP1NAXg '), 'vsU_JP1NAXg');
+	assert.equal(parseRunId('#BhVDb6-n1cs'), 'BhVDb6-n1cs');
+	assert.equal(parseRunId('WBwXuaDUPW'), null); // 10 characters
+	assert.equal(parseRunId('WBwXuaDUPWc0'), null); // 12 characters
+	assert.equal(parseRunId('WBwXua/UPWc'), null);
+	assert.equal(parseRunId('10'), '10');
+	assert.equal(parseRunId(' 10418 '), '10418');
+	assert.equal(parseRunId('#42'), '42');
 	assert.equal(parseRunId('-1'), null);
 	assert.equal(parseRunId('1e3'), null);
 	assert.equal(parseRunId('10abc'), null);
 	assert.equal(parseRunId(''), null);
 	assert.equal(parseRunId(undefined), null);
 	assert.equal(parseRunId('99999999999999999'), null); // past MAX_SAFE_INTEGER
-	assert.equal(runHref(10), '#/runs/10');
+	assert.equal(runHref('WBwXuaDUPWc'), '#/runs/WBwXuaDUPWc');
+	assert.equal(runHref('10'), '#/runs/10');
 });

@@ -1,9 +1,12 @@
 # The million-scale load battery on hosted runners — the ship gate's heavy
 # half (laptop smokes stay local: `perf/battery.sh`). Manual only: a full run
-# is ~3 h. Results land in perf/results/ with machine spec + commit and are
-# uploaded as an artifact (a FAIL uploads too — misses are evidence, never
-# rerun to green). The coordinator commits them through a reviewed branch;
-# this workflow never pushes.
+# is ~3 h split over four matrix legs — sustained, workspaces x memory,
+# workspaces x postgres, and everything else — each under its own timeout
+# with its own artifact (one leg's timeout can no longer take the whole
+# battery down with it). Results land in perf/results/ with machine spec +
+# commit and are uploaded as an artifact (a FAIL uploads too — misses are
+# evidence, never rerun to green). The coordinator commits them through a
+# reviewed branch; this workflow never pushes.
 name: load
 
 on:
@@ -29,11 +32,40 @@ jobs:
   battery:
     # Pinned image, not -latest: machine spec must stay comparable between runs.
     runs-on: ubuntu-24.04
-    timeout-minutes: 360
+    timeout-minutes: 300
+    strategy:
+      # One leg red must not take the others' evidence with it.
+      fail-fast: false
+      matrix:
+        group: [sustained, workspaces-memory, workspaces-postgres, rest]
+    services:
+      # The workspaces-postgres leg runs at million scale against this
+      # service (the other legs pay its few seconds of startup rather
+      # than duplicating the job). Named PG_DATABASE_URL (not
+      # DATABASE_URL) so no other scenario's spawned server silently
+      # picks up the account store and changes what it measures;
+      # battery.sh activates it only for the pg run.
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: durable_load
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres -d durable_load"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
     env:
       BATTERY: ${{ inputs.battery }}
+      GROUP: ${{ matrix.group }}
       RUN_ID: ${{ github.run_id }}
       PERF_HOST_LABEL: github-ubuntu-24.04
+      PG_DATABASE_URL: postgres://postgres:postgres@localhost:5432/durable_load
+      # Per-run, per-leg results dir: the artifact uploads only this
+      # leg's files, never the committed laptop history in perf/results/.
+      RESULTS_DIR: perf/results/${{ github.run_id }}-${{ matrix.group }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -51,16 +83,23 @@ jobs:
         with:
           node-version: "22"
 
+      - name: Clean-checkout import gate (no node_modules — 44894875049 died to a bare specifier)
+        run: perf/check-clean-imports.sh
+
       - name: Build the release server the harness spawns
-        run: cargo build --release --locked -p durable-server
+        # `lab` adds only --allow-local-tenant-handlers (the workspaces
+        # scenario's tenants register the loopback fixture; a shipped
+        # build refuses that, re-review S1-1). Same code paths otherwise.
+        run: cargo build --release --locked -p durable-server --features lab
 
-      - name: Battery
-        run: perf/battery.sh "--$BATTERY"
+      - name: Battery (${{ matrix.group }})
+        run: perf/battery.sh "--$BATTERY" "$GROUP"
 
-      # Upload even on a failed battery: the miss is evidence.
+      # Upload even on a failed battery: the miss is evidence. Only this
+      # leg's directory goes up; ${{ }} expands where $VAR did not.
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         if: always()
         with:
-          name: perf-results-$RUN_ID
-          path: perf/results/*.json
+          name: perf-results-${{ github.run_id }}-${{ matrix.group }}
+          path: perf/results/${{ github.run_id }}-${{ matrix.group }}/
           if-no-files-found: warn

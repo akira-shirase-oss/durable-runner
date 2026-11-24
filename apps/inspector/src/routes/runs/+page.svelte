@@ -18,8 +18,8 @@
 	const PAGE = 50;
 
 	let order = $state<Order>('desc');
-	let cursor = $state<number | null>(null);
-	let trail = $state<(number | null)[]>([]);
+	let cursor = $state<string | null>(null);
+	let trail = $state<(string | null)[]>([]);
 	let filter = $state<string>('all');
 	let search = $state('');
 	let jump = $state('');
@@ -68,7 +68,7 @@
 		trail = trail.slice(0, -1);
 	}
 
-	async function cancel(id: number) {
+	async function cancel(id: string) {
 		try {
 			await cancelRun(id, session.apiKey);
 			session.notice = `Run ${id} cancelled. A step already sent to its handler cannot be undone.`;

@@ -5,12 +5,26 @@ HTTP handler registry behind an SSRF guard, signed handler calls. S1 (droplet)
 is blocked on the maintainer; S3 (dashboard, signup/login) consumes this API
 and is **not** built here.
 
-**Status (2026-11-19): approved by the coordinator** with three decisions
+**Status (2026-11-20): approved by the coordinator** with three decisions
 folded in below — store-trait testing, opaque external workspace ids, and
-S2-0 tagging its own v1.0.1 release. Implementation is **held** behind the
-maintainer's project ordering (Colophon ships first, then jsrt and Durable
-Runner); S2-0 builds when the hold is released. Backend only: no design or
-UI work for Durable Runner until the maintainer designs it.
+S2-0 tagging its own v1.0.1 release. The hold lifted 2026-11-19
+(maintainer: complete every in-development project). Landed on
+`devin/dr-s2`: **S2-0** (`e528686` + `e6951b5`, tagged v1.0.1 by the
+coordinator), **S2-1** (account store, keyring + cache, scoped submit,
+visible-skip Neon job), **S2-2** (scoped `/jobs`, workspace management
+routes by `public_id`, key lifecycle, no-u64-leak test), **S2-3**
+(writer emits v3; v1.0.1 is the rollback floor), **S2-4** (per-workspace
+handler registry: store-authoritative rows, engine `(ws,name)` set,
+last-known-good snapshot + 30 s reconciler, `registry_stale` in
+diagnostics, 256-per-workspace bound), **S2-5** (SSRF guard: resolver-
+integrated `is_local` + `PolicyResolver`, literal-local refusal at
+registration, `--allow-local-handlers` opt-out, zero-packet assertion),
+**S2-6** (signed calls: per-workspace HMAC secrets, `POST
+/handler-secret` rotation that re-arms the engine in-request, signed
+probes, secret inside `handlers.json`, `docs/HANDLERS.md` + reference
+verifier, signature counting in the workspace load scenario).
+Backend only: no design or UI work for Durable Runner until the
+maintainer designs it.
 
 Exit gate (unchanged): **workspace A can never see, cancel or run handlers for
 workspace B; SSRF tests refuse private targets.** Plus the standing rule: every
@@ -29,7 +43,7 @@ Invariants this plan must not break:
 
 ---
 
-## D-057 — Account records in Neon Postgres; the journal remains sole job authority
+## D-059 — Account records in Neon Postgres; the journal remains sole job authority
 
 *(proposed; lands in DECISIONS.md with the implementing change)*
 
@@ -229,14 +243,20 @@ retrievably in Neon, never logged, never returned by `GET`).
 Headers added alongside the existing D-050 set:
 
 - `x-durable-timestamp` — unix seconds.
-- `x-durable-signature` — hex `HMAC_SHA256(secret, ts.run.step.attempt.idem_key.SHA256(body))` —
-  binds the call identity, the idempotency key, and the exact body. Probe
-  requests sign `ts.run.step.attempt.idem_key.` (empty body digest).
+- `x-durable-signature` — hex `HMAC_SHA256(secret,
+  "ts\nmethod\nauthority\npath\nrun\nstep\nattempt\nidem_key\nSHA256(body)")` —
+  newline-joined (dot-joined fields re-split under an `idem_key` carrying
+  `.`); `authority` is the registered handler URL's authority — never
+  the request's `Host` header, which the caller chooses (a Host-verified
+  signature minted for `a/step` replays at `b/step` with `Host: a`
+  forged; HANDLERS.md); `run` is the opaque public id.
+  Probe requests sign the same canonical with an empty body digest.
 
 Handler-side contract (documented in `docs/HANDLERS.md`, S2-6): recompute
-with its copy of the secret; reject `|now − ts| > 300 s`; dedupe by
-`(ts, idem_key)` — replay-bounded by the timestamp window and the key the
-handler already honors. A verification example fixture ships with the slice.
+with its copy of the secret; reject `|now − ts| > 300 s`; a signature
+already seen is replay — keyed on the signature itself so a re-minted
+variant cannot masquerade as the same call. A verification example
+fixture ships with the slice.
 
 ---
 

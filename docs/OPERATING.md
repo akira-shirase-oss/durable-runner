@@ -25,7 +25,8 @@ target/release/durable-server \
   --listen 127.0.0.1:58300 \
   --ui-dir apps/inspector/build \
   --backup-root data/backups \
-  --handler step=http://127.0.0.1:58320/step
+  --handler step=http://127.0.0.1:58320/step \
+  --allow-local-handlers   # loopback handler — dev only
 ```
 
 - **Reserve.** `--reserve-bytes N` (default 64 MiB) must stay free on the
@@ -33,10 +34,15 @@ target/release/durable-server \
 - **Capacity.** `--max-live-runs` (100,000 non-terminal runs) and
   `--max-index-bytes` (512 MiB of retained runs) bound the index; past them
   a submit is `503 at_capacity` (nothing journaled; retry with the same
-  `op_key`). `--max-in-flight` (32 handler calls) and
-  `--max-dispatch-per-tick` (64 per 50 ms tick) bound execution; raise
-  them if dispatch is the bottleneck. `GET /admin/diagnostics` shows
-  `active_runs` and `index_bytes`.
+  `op_key`). Each workspace's share is bounded separately —
+  `--max-live-runs-per-ws` (20,000) and `--max-index-bytes-per-ws`
+  (100 MiB, and never more than a quarter of the global index); a tenant
+  over its share is `429 workspace_quota` while other workspaces still
+  admit. `--max-in-flight` (256 handler calls) and
+  `--max-dispatch-per-tick` (512 per 50 ms tick) bound execution — sized
+  after the S2-7 drain measurement (32/64 held ~640–1,300 runs/s against a
+  fast handler; 256/512 reached ~5k/s; the journal itself sustains ~33k/s).
+  `GET /admin/diagnostics` shows `active_runs` and `index_bytes`.
 
   *Memory sizing (D-031).* Plan for a peak RSS of about
   `2.6 × max_index_bytes + 100 MiB`. Measured, restart and steady state
@@ -44,9 +50,13 @@ target/release/durable-server \
   size, as the review saw on the HTTP server. The 512 MiB default keeps
   that within 1.5 GiB of a 2 GB host. On a bigger host raise
   `--max-index-bytes` in proportion, and leave the OS at least 0.5 GiB.
-  The observability layer (D-058) adds at most about 65 MiB plus 0.4 MiB
-  per registered handler on top, whatever the traffic — see
-  "Observability" below; it fits in the 100 MiB term, but uses most of it.
+  The observability layer (D-058, D-060) adds at most about 110 MiB by
+  its size bound (plan ~125 MiB with allocator overhead, measured) plus
+  0.4 MiB per workspace-0 handler on top, whatever the traffic — see
+  "Observability" below. In compat mode (workspace 0 only) the tenant
+  views never allocate and it stays at about 61 MiB, inside the 100 MiB
+  term; with tenants, plan for the larger figure (it passes that term by
+  ~25 MiB once 256 tenants are each busy in every bucket).
 
   *Capacity arithmetic.* A run is charged `160 + key + Σ(48 + step name +
   handler name) + input` bytes while it is live. When it finishes its
@@ -63,6 +73,21 @@ target/release/durable-server \
   such jobs/s on a 2 GB host; more needs a bigger host. Without scheduled
   compaction the records never leave, and `503 at_capacity` comes once
   about `max_index_bytes ÷ 230 B` jobs have run.
+
+- **Overload scope — the claim is deliberately narrow.** Under a flood
+  from ONE host the server holds three things: per-address/prefix
+  fairness (a flooding bucket can hold at most its share of work slots,
+  reserve slots, and lane slots — legitimate buckets keep getting
+  served); a readable `503 overloaded` + `Retry-After` for EVERY refusal
+  the server chooses to make (never a silent drop the client cannot tell
+  from a crash); and `/health` answering throughout (the liveness reserve
+  is bounded per address, so the flood cannot take it). What is NOT
+  claimed: resistance to a DISTRIBUTED flood — many source addresses at
+  once is the edge's job, not this process's. The SaaS puts Cloudflare in
+  front (the deploy package already does); a self-hosted install needs a
+  CDN/reverse-proxy layer or firewall conntrack limits for the same
+  reason — the single-host fairness above is for a neighbour who
+  misbehaves, not for a botnet.
 - **Retention.** Compaction runs only when asked (`durable compact`) unless
   you pass `--compact-every-secs N` (default 0 = off; see D-018 for why it
   is opt-in). Each compaction removes the dedup records of runs that
@@ -106,6 +131,21 @@ target/release/durable-server \
   `DURABLE_API_KEY` (reads fall back to `DURABLE_READ_KEY`); the
   inspector asks for a key and sends it on every call. The pilot
   generates a fresh random key per run and exports it.
+- **Account store (S2).** `DATABASE_URL` pointing at Postgres (Neon in
+  production, `sslmode=verify-full` required there) enables the account
+  graph: store-issued API keys verify through a 60 s positive / 5 s
+  negative cache (bounded at 10k entries), and a submit under such a key
+  lands in the key's workspace — dedup keys on `(workspace, op_key)`.
+  Unset, the server runs exactly as before: the env keys are the only
+  keys and everything is workspace 0. The pool is lazy and migrations
+  run best-effort at startup, so a Neon outage never stops startup:
+  cached keys keep authenticating inside the TTL, uncached bearers fail
+  closed as `503 accounts_unavailable`, and already-accepted runs keep
+  executing — the store is never on the commit or dispatch path.
+  `DURABLE_ACCOUNTS_BACKEND=memory` (dev/test only — announced loudly at
+  startup) serves the same graph from an in-memory store: workspaces and
+  keys die with the process. It conflicts with `DATABASE_URL` — set one
+  or the other, never both.
 - **Backup root.** `--backup-root DIR` is the only place backups are
   written; without it `/admin/backup` answers `403 backups_disabled`.
 
@@ -132,17 +172,59 @@ target/release/durable-server \
   in flight are abandoned and reconcile after the restart. Give the
   supervisor at least twice the drain timeout (systemd
   `TimeoutStopSec=70`).
+- **Registry mutations are bounded per workspace** (re-review S2-4):
+  `PUT`/`DELETE /handlers/{name}` and `POST /handler-secret` admit 2 per
+  second per workspace with a burst of 20, else `429
+  registry_rate_limited` with `Retry-After` (before any store query). A
+  `PUT` of exactly the URL already armed is a no-op (`"unchanged": true`:
+  no store query, no file write). `handlers.json` is written by one thread
+  that keeps the file in memory, drains every queued change and saves once
+  per batch (one tmp-write and two fsyncs), none for a batch that changed
+  nothing. A row edited in the store outside the API is reconciled within
+  30 s.
 - A handler call is `POST URL` with `{"input": [bytes], "idem_key":
   "<op_key>/<step index>"}` and the headers `x-idempotency-key` (the same
   key), `x-durable-run-id`, `x-durable-step` (the step's index) and
   `x-durable-attempt` (1 for the first try). A reconcile probe is `GET
   URL?idem_key=…` with the same run, step and attempt headers (the
-  attempt it reconciles); 200 means "it landed" (D-050).
+  attempt it reconciles); 200 means "it landed" (D-050). Calls from
+  store-registered handlers are additionally signed — `x-durable-timestamp`
+  + `x-durable-signature`; verification and rotation are the contract in
+  `docs/HANDLERS.md` (S2-6).
 - `--handler name=URL` is the allowlist — repeatable, `http://` or
   `https://` only; a submit naming a handler outside it is refused 409
   with `unregistered handler`. Calls go only to that URL: redirects are
   not followed (a 3xx fails the attempt) and the proxy environment
   variables are ignored (D-039).
+- **SSRF guard (S2-5):** handler URLs targeting loopback, private,
+  link-local or other non-global addresses are refused — literal forms
+  at registration, and any name that *resolves* to one at call time,
+  inside the client's DNS resolver (a DNS answer that flips local after
+  registration still sends zero packets). `--allow-local-handlers` opts
+  out **for the operator's own `--handler` flags only** (workspace 0;
+  development, fixtures, a same-host handler — every loopback example here
+  needs it). A handler registered through the API, by any workspace, is
+  always checked against the full policy whatever that flag says
+  (re-review S1-1): it has its own client and resolver. Only a lab build
+  (`cargo build --features lab`) has `--allow-local-tenant-handlers`, for
+  the workspace load scenario's loopback fixtures; `scripts/check.sh`
+  refuses a default build that enables it, and `install.sh`, `upgrade.sh`
+  and `smoke.sh` refuse a lab binary (`deploy/lab-build-guard.sh`, D-062). **This host's own addresses are refused too** (D-061): at startup
+  the server lists every interface address, both families — the
+  droplet's public IPv4/IPv6 included — and refuses them with the local
+  blocks, because Linux delivers a connection to the host's own public
+  address over `lo`, reaching anything listening on 0.0.0.0/[::] (sshd,
+  exporters, Docker-published ports, other products on a shared
+  droplet). The server refuses to start if the interfaces cannot be
+  listed. An address that reaches this host without being on one of its
+  interfaces — a DigitalOcean reserved IP, a load balancer's address —
+  goes in `--deny-cidr ADDR[/PREFIX]` (repeatable; on the droplet, one
+  per line in `/etc/durable/deny-cidrs`), refused even with
+  `--allow-local-handlers`. Interface addresses are read once at
+  startup: restart after attaching a new one (tracked, D-061). The startup log says how
+  many host addresses and deny ranges the guard holds. Pair it with the
+  egress firewall in `docs/DEPLOY.md`: the guard decides by address, the
+  firewall by destination at the kernel.
 - The journal directory is created on first run: `LOCK`, `manifest.json`,
   `gen-00000N/{journal.log,snapshot.bin}`, owner-only (directories 0700,
   files 0600; backups and restores too, D-038). Run the server as the
@@ -193,11 +275,18 @@ the next attempt or the next server start removes.
 same run id, nothing re-executes. Cancel stops scheduling — it never
 undoes a remote effect already attempted.
 
-## Observability (D-058)
+## Observability (D-058, D-060)
 
 Three reads, each taking the read key or the API key (or nothing under
 `--open-reads`, loopback Host only), rate-limited per address like every
-request, and answered with `Cache-Control: no-store`. All of it is derived
+request, and answered with `Cache-Control: no-store`. Each answers the
+caller's workspace (D-060): a tenant key (admin or read) sees only its
+own runs' timelines, its own feed and its own metrics — counters,
+latency, gauges, state counts and registered handlers; another
+workspace's run is `404` exactly like `GET /jobs/{id}`. A workspace-0 key
+(the env keys, `--open-reads`) gets the global `/metrics` — every
+workspace's counts with workspace 0's handlers — and workspace 0's runs
+in the two event views. Run ids are the opaque public ids. All of it is derived
 in memory from the journal and bounded; nothing here is authority, and
 nothing shows a job's input, a checkpoint's output, or a record before
 its fsync returned.
@@ -226,10 +315,20 @@ its fsync returned.
   overflow), capped at the exact `max` — so they over-report by at most
   one bucket width (a third, above 4 ms). `states` are the current
   counts by state (the same as `/admin/diagnostics`, all seven keys).
-  `handlers` lists every registered handler by name with its calls,
-  `ok`, `failed`, `replies_lost` (a reply that vanished, a timeout, or a
-  call cut off at its deadline) and `step_ms` over the window, and its
-  latest `last_ok_at` / `last_failure_at` since `since`.
+  `handlers` lists every handler registered in the scope (workspace 0's
+  for the global view) by name with its calls, `ok`, `failed`,
+  `replies_lost` (a reply that vanished, a timeout, or a call cut off at
+  its deadline) and `step_ms` over the window, its latest `last_ok_at` /
+  `last_failure_at`, and `since`: when its counting began — later than
+  the view's `since` when a tenant's handler stats were dropped for the
+  cap (its 16 most recently called handlers are kept) and started again —
+  and `resolution_ms`, the bucket they are kept in: the window's own
+  bucket for workspace 0, one hour for a tenant (a window counts the last
+  ⌈window / 1 h⌉ hour buckets, the current one included). A tenant's own
+  view uses 5-minute buckets for every window (`bucket_ms` 300,000: 3
+  points for 15m, 288 for 24h). A tenant view's `since` is when its
+  entry was created (the server's start, for one rebuilt by replay); a
+  workspace with no entry answers the read's own time.
 - `GET /jobs/{id}/events`: one run's timeline in commit order — kinds
   `accepted`, `dispatched`, `checkpointed`, `step_failed`, `reply_lost`,
   `reconciled`, `cancel_requested`, and the derived `finished` (`outcome`
@@ -241,28 +340,39 @@ its fsync returned.
   after is shown), or `truncated` (over 96 events: the first 16 and the
   last 80 are kept).
 - `GET /events?limit=N` (1-200, default 50; else `400 invalid_limit`):
-  the activity feed across runs, newest first, the same events with
-  `run` and `key` added (`key` is `null` only for a run that has since
-  left the index). It and the timelines are rebuilt from replay at
-  startup; `since` is the server's start, as in `/metrics`.
+  the caller's workspace's activity feed, newest first, the same events
+  with `run` and `key` added (`key` is `null` only for a run that has
+  since left the index). Each workspace keeps its own last 200 events.
+  The feeds and the timelines are rebuilt from replay at startup;
+  `since` is as in that workspace's `/metrics`.
 
 **Caps and memory** (constants in `durable-engine/src/observe.rs`):
 
 | Structure | Cap | Memory |
 |---|---|---|
-| Metrics rings | 360 × 10 s + 1,440 × 60 s buckets | 1,800 × 328 B ≈ 0.6 MiB |
-| Per-handler stats | the same rings per registered handler | 1,800 × 240 B ≈ 0.4 MiB each |
+| Metrics rings (global view) | 360 × 10 s + 1,440 × 60 s buckets | 1,800 × 328 B ≈ 0.6 MiB |
+| Workspace views | workspace 0 (full rings) + at most 256 tenants (scan-resistant LRU; evicted rings pooled, 8 kept); a tenant's ring is 288 × 5 min, allocated at its first live record, call or gauge sample | workspace 0 ≈ 0.6 MiB; a tenant 288 × 328 B ≈ 94 KB of ring + a 200-event feed (8 KB) |
+| Per-handler stats | workspace 0: full rings for each registered handler (≤ 256); a tenant: its 16 most recently called, 24 × 1 h buckets | 0.4 MiB each (workspace 0); 24 × 240 B ≈ 6 KB each (tenant), ≤ 256 × 16 ≈ 23 MiB |
 | Run timelines | 20,000 runs (LRU on the last event) × 96 events | 32 B per event + 90 B per run; at most ≈ 60 MiB (every run past 96 events), ≈ 4-12 MiB when runs carry 3-10 events |
-| Activity feed | 1,000 events | 40 KiB |
+| Activity feeds | 200 events per workspace view (one full page) | 8 KiB each |
 | Not-yet-durable observations | one per record not yet fsynced: the actor's outbox (16,384 records before it stops taking commands) plus the writer's queue (8 × 1,024) | 72 B each, about 1.7 MiB at the default bounds (and a reused hand-over buffer of about the same size) |
 
-So the worst case is about **65 MiB + 0.4 MiB per handler**, reached only
-when 20,000 runs each have more than 96 events, and it does not grow with
-traffic or uptime. Measured on the development laptop (a development
-observation, not capacity), with every structure filled to its cap and 10
-handlers, the probe's resident size grew about 66 MiB against a
-size-based bound of 65 MiB; feeding the observer cost about 66 ns per event, eviction
-churn included, which is what replay adds per record at startup:
+So the worst case is about **110 MiB + 0.4 MiB per workspace-0 handler**
+by size (`observe::memory_bound` = 113,290 KiB with none: ~61 MiB of
+timelines and the global rings, 256 tenant views at ~190 KB each with all
+16 handler slots filled, workspace 0 and the pools), reached only when
+20,000 runs each have more than 96 events and 256 tenants are active with
+16 busy handlers each; it does not grow with traffic, uptime or the number
+of workspaces. Measured with every structure filled and 10 workspace-0
+handlers, the probe's resident size grew 124 MiB against the
+size bound (114.8 MiB) — allocator overhead — so plan about 125 MiB. A compat install
+(workspace 0 only) never allocates a tenant view: about 61 MiB. Costs
+(release build, development laptop at load ~5-14, 2026-11-24 —
+observations, not capacity): ~150 ns per event replayed or live; 17 or 256
+tenants rotating 154-196 ns per record and ~208 ns per call; 257 rotating
+(every lookup a miss past the cap) 3.0 µs per record and 3.2 µs per call
+with allocations staying at 256 rings + 256 handler rings; one tenant
+rotating 17 handlers 449 ns per call:
 
 ```sh
 cargo test --release -p durable-engine --test observe_probe -- --ignored --nocapture
@@ -310,20 +420,19 @@ interrupted restore leaves generations without a manifest; a server
 refuses to start there, so remove the directory and restore again.
 
 The file set a backup may list is one agreed contract across versions
-(D-057): the generation files, plus the journal-dir flats
-`journal.shape` and `public_id.key`. This build writes generation
-files only (the sidecar is rebuilt at open, and listing it would
-break restore under v1.0.1), but it accepts all of them on restore —
-so an S2 backup whose journal this reader still opens (record ≤ 3,
-DRIX ≤ 2) restores here; a v3 journal's workspace-tagged runs park
-until an S2 binary picks it up. v1.0.2 issues no public ids, so a
-restored `public_id.key` only travels forward — to a later S2 boot,
-not into anything this release decodes — and a backup of a
-key-holding directory carries it, which makes that backup unrestorable
-under v1.0.1 (its file list admits generation paths only): the
-rollback floor there is this release. Newer file sets are never the
-blocker; the record/snapshot/ws versions and the D-056 format guard
-decide what the binary can run.
+(D-057): the generation files, plus the
+journal-dir flats `journal.shape` and `public_id.key`. This build
+writes both flats — the sidecar preserves forward claims a replay
+cannot reconstruct, and the key keeps every issued public id
+decodable on the restored instance. v1.0.x writes generation files
+only but accepts all of them on restore, so this build's backup of a
+still-record-v2 journal is a legitimate rollback target there. One
+asymmetry an operator must know: a v1.0.2 backup of a directory that
+holds `public_id.key` lists that key, and a backup listing it is
+refused by v1.0.1's restore (its file list admits generation paths
+only) — the rollback floor for a key-holding backup is v1.0.2.
+Whether the restored journal can then run is the unchanged D-056
+gate (record/snapshot/ws versions), never the file list.
 
 ## What "honest" looks like in the output
 
@@ -340,6 +449,12 @@ decide what the binary can run.
   terminal transition, unregistered handler, an existing backup name,
   `compaction_running` when a compaction is requested while one runs).
 - HTTP 401 — no or wrong API key on a mutating/admin route.
+- HTTP 429 `workspace_quota` — this workspace reached ITS share of the
+  bounds (`--max-live-runs-per-ws`, `--max-index-bytes-per-ws`, and never
+  more than a quarter of `--max-index-bytes`); the rest of the pool still
+  admits. Free this workspace's runs or raise its share. Compat mode (no
+  account store) exempts workspace 0 — a ws-0-only install admits up to
+  the global bounds exactly as v1.0.x did.
 - HTTP 503 — the server is bounded and said so instead of queueing
   silently. The `code` says which bound: `busy` (the command queue is
   full — retry with the same `op_key`), `at_capacity` (the live-run or
@@ -394,12 +509,22 @@ it):
   and limits each client address's request rate and each peer's
   connection count (D-052: IPv6 is keyed by /64 with a shared /48
   aggregate, so a spray of distinct /48s can still push a new real
-  client into the overflow bucket). It still has no TLS: put Cloudflare
-  (or a reverse proxy that does TLS) in front, and pass its ranges as
+  client into the overflow bucket). The overload claim covers a SINGLE
+  flooding host — a distributed flood overwhelms the per-address design
+  itself and is the edge's job (see "Overload scope" above). It still
+  has no TLS: put Cloudflare (or a reverse proxy that does TLS) in
+  front, and pass its ranges as
   `--trusted-proxy` so the per-address limits count real clients — the
   trusted edges then get `--max-conns-per-proxy` (4096) instead of the
   untrusted `--max-conns-per-addr` (64). Never combine a proxy with
-  `--open-reads`.
+  `--open-reads`. **Behind a proxy, single-host fairness holds for the
+  request rate only** (D-061, tracked): every connection comes from the
+  proxy, so the connection-level budgets — the ready reserve, the
+  overload lane, the per-address connection cap, fair-share eviction —
+  key on the proxy's address (and the trusted flag raises only the
+  connection cap, not the reserve or lane caps). They bound the server as
+  a whole; per-visitor connection fairness is the proxy's and the edge's
+  job (Caddy and Cloudflare on the droplet).
 - **Handler calls are unsigned.** A handler cannot tell a call came from
   this runner except by network placement (D-039); keep handlers on a
   private network.

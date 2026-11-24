@@ -20,7 +20,7 @@ use durable_domain::{
 };
 use durable_journal::{Journal, JournalError, JournalOptions, SpaceProbe};
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::ops::Bound;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -43,6 +43,10 @@ pub enum EngineError {
     Stopped,
     #[error("unregistered handler: {0}")]
     UnregisteredHandler(String),
+    /// The workspace's handler registry is at its bound
+    /// (`MAX_HANDLERS_PER_WS`): the registration was refused.
+    #[error("handler registry is full (256 per workspace)")]
+    RegistryFull,
     /// The group commit holding this request's record failed. Nothing
     /// decided on the strength of it left the process; the engine stops
     /// and restart replay decides what is durable.
@@ -83,11 +87,13 @@ pub enum EngineError {
 /// the transition actually happened, not the time it was replayed.
 /// The record format a writer emits (D-054). v1 has no `v` and carries
 /// `spec.input` as a JSON number array; v2 adds `v` and carries it as
-/// base64. Readers accept both forever.
-pub const ENVELOPE_VERSION: u8 = 2;
+/// base64; v3 adds `ws` (the owning workspace's internal id — S2). Readers
+/// accept all three forever.
+pub const ENVELOPE_VERSION: u8 = 3;
 /// The highest record version this binary can read. Per D-056 a format
-/// bump ships a reader one release before any writer emits it: S2-0 reads
-/// v3 (every record carries `ws`) while still writing v2.
+/// bump ships a reader one release before any writer emits it: v1.0.1
+/// (S2-0) shipped the v3 reader; this binary writes v3, so a rollback to
+/// v1.0.0 is refused but v1.0.1 remains a valid rollback floor.
 pub const READER_VERSION: u8 = 3;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -123,15 +129,36 @@ fn decode_envelope(payload: &[u8]) -> Result<Envelope, EngineError> {
 /// the v1.0.0 reader refuses v3 without shipping the old binary).
 fn decode_envelope_as(payload: &[u8], reader: u8) -> Result<Envelope, EngineError> {
     use serde::de::Error as _;
-    let env: Envelope = serde_json::from_slice(payload)?;
-    if env.v > reader {
+    // A shadow with `ws` optional: a v3 record that carries no ws is
+    // ambiguous — ws 0 only means "a pre-v3 record", so a v3 missing the
+    // field is corrupt, not workspace 0 (S3).
+    #[derive(Deserialize)]
+    struct Raw {
+        #[serde(default = "envelope_v1")]
+        v: u8,
+        ws: Option<u64>,
+        run: u64,
+        at: Millis,
+        event: Event,
+    }
+    let raw: Raw = serde_json::from_slice(payload)?;
+    if raw.v > reader {
         return Err(serde_json::Error::custom(format_args!(
             "record version {} is newer than this binary understands ({reader})",
-            env.v
+            raw.v
         ))
         .into());
     }
-    Ok(env)
+    if raw.v >= 3 && raw.ws.is_none() {
+        return Err(serde_json::Error::custom("v3 record without ws").into());
+    }
+    Ok(Envelope {
+        v: raw.v,
+        ws: raw.ws.unwrap_or(0),
+        run: raw.run,
+        at: raw.at,
+        event: raw.event,
+    })
 }
 
 /// Bounded diagnostics: aggregate counts only — safe to answer under load.
@@ -145,6 +172,9 @@ pub struct Diagnostics {
     pub active_runs: u64,
     pub index_bytes: u64,
     pub dedup_keys: u64,
+    /// Distinct workspaces with live runs — a count only, so diagnostics
+    /// never carries an internal workspace id.
+    pub workspaces_active: u64,
     pub states: std::collections::BTreeMap<&'static str, u64>,
     /// Whether the journal filesystem has its reserve free.
     pub space_ok: bool,
@@ -175,9 +205,21 @@ pub struct Diagnostics {
     /// v3-writing binary's tenant work is present and a rollback must
     /// know how to park it rather than run it on workspace-0 handlers.
     pub journal_max_ws: u64,
-    /// Non-terminal runs parked because they belong to a workspace ≠ 0:
-    /// replayed faithfully, never dispatched or probed by this binary.
-    pub parked_runs: u64,
+    /// Non-terminal runs belonging to a workspace ≠ 0 — the count a
+    /// rollback guard's target must be able to handle (park or execute).
+    pub workspace_scoped_live_runs: u64,
+}
+
+/// One workspace's own diagnostics — its shape only, never another
+/// tenant's (the S1 review: cross-tenant totals stay ops-only).
+#[derive(Debug, Clone, Serialize)]
+pub struct WorkspaceDiagnostics {
+    /// Runs this workspace holds in the index, terminal included.
+    pub live_runs: u64,
+    /// …of which are non-terminal.
+    pub active_runs: u64,
+    /// Run counts by state kind, this workspace only.
+    pub states: std::collections::BTreeMap<&'static str, u64>,
 }
 
 /// The index as snapshots before D-021 carried it (JSON, inputs as number
@@ -246,6 +288,8 @@ impl Pipe {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RunSummary {
     pub id: RunId,
+    /// The owning workspace (internal: never put in a response).
+    pub ws: u64,
     pub key: OperationKey,
     pub state: RunState,
     pub steps: usize,
@@ -256,6 +300,7 @@ impl RunSummary {
     pub(crate) fn of(r: &Run) -> Self {
         Self {
             id: r.id,
+            ws: r.ws,
             key: r.key.clone(),
             state: r.state.clone(),
             steps: r.spec.steps.len(),
@@ -304,9 +349,45 @@ pub struct EngineCore {
     by_op: HashMap<(u64, OperationKey), RunId>,
     next_run: u64,
     /// Non-terminal runs and the index's approximate bytes, kept current
-    /// so admission is O(1).
+    /// so admission is O(1). `ws_live` is the same count per workspace —
+    /// the per-tenant admission bound (S2 review #6).
     live: usize,
+    ws_live: HashMap<u64, usize>,
+    /// Run ids per workspace, kept current with `runs`: `page`/
+    /// `page_newest` read it instead of scanning the global index —
+    /// a tenant's list cost is its own size, never everyone's (S2 #6).
+    ws_index: HashMap<u64, BTreeSet<RunId>>,
     index_bytes: u64,
+    /// `index_bytes` split by workspace — the per-tenant share bound
+    /// (S2 re-review): one tenant's retained runs can never crowd the
+    /// whole index.
+    ws_index_bytes: HashMap<u64, u64>,
+    /// Retained runs by state kind, maintained with every transition so
+    /// `diagnostics` is O(states), not O(retained runs) (S2 re-review:
+    /// a tenant-readable diagnostics route must never stall the actor).
+    state_counts: std::collections::BTreeMap<&'static str, u64>,
+    /// The same histogram per workspace — `diagnostics_for` reads it,
+    /// so a tenant's diagnostics call is O(states) on the actor no
+    /// matter how many runs the workspace retains (S2 re-review N5:
+    /// the per-address limit is dodged with many addresses, so the
+    /// walk itself must be bounded).
+    ws_state_counts: HashMap<u64, std::collections::BTreeMap<&'static str, u64>>,
+    /// Non-terminal runs with `ws != 0` — `workspace_scoped_live_runs`
+    /// in diagnostics without a full scan.
+    scoped_live: u64,
+    /// Runs waiting on time — `Queued` and `RetryWaiting` — keyed by
+    /// `(next_run_at, run)` with the dispatch tuple `(ws, step, attempt)`
+    /// `due()` used to compute per scan. A tick pops the elapsed prefix
+    /// in O(newly due), never O(retained runs) (S2 re-review finding 5).
+    /// Maintained exactly with `runs` in `apply_committed`/`recount`.
+    due_index: BTreeMap<(Millis, RunId), (u64, StepIndex, u32)>,
+    /// `Running` attempts keyed by `(deadline, run)` — the expiry sweep
+    /// pops only what lapsed instead of scanning every retained run.
+    deadline_index: BTreeMap<(Millis, RunId), StepIndex>,
+    /// Entries the query paths examined — the test-only counter that
+    /// proves a tick's cost is its due prefix, not the retained set.
+    #[cfg(test)]
+    pub(crate) examined: std::cell::Cell<u64>,
     /// The torn tail the journal discarded when this core opened it.
     discarded_tail: Option<durable_journal::TornTail>,
     /// Highest record `v` present in the journal: bumped by replay and by
@@ -324,9 +405,6 @@ pub struct EngineCore {
     /// format-guard reads with the server down. Written BEFORE the
     /// journal change it describes and only ever upward.
     persisted: durable_journal::Shape,
-    /// Runs by state kind, kept current with every transition so a
-    /// count costs O(1) (recomputed after replay).
-    states: observe::StateCounts,
     /// Where committed records are reported (D-058); `None` = nowhere.
     obs: Option<Arc<observe::Observer>>,
     /// Piped mode: what each queued record contributes, by commit index,
@@ -343,6 +421,29 @@ pub struct EngineCore {
 /// the compaction that expires them also deletes the superseded generations
 /// that held their records.
 const TERMINAL_EXPIRY_MS: u64 = 7 * 24 * 60 * 60 * 1000;
+
+/// The `(next_run_at, step, attempt)` a waiting state contributes to the
+/// due index: `Queued` dispatches step 0 attempt 1; `RetryWaiting` the
+/// failed step's next attempt.
+fn waiting_entry(state: &RunState) -> Option<(Millis, StepIndex, u32)> {
+    match state {
+        RunState::Queued { next_run_at } => Some((*next_run_at, StepIndex(0), 1)),
+        RunState::RetryWaiting {
+            step,
+            attempt,
+            next_run_at,
+        } => Some((*next_run_at, *step, attempt + 1)),
+        _ => None,
+    }
+}
+
+/// The `(deadline, step)` a `Running` state contributes to the deadline index.
+fn deadline_entry(state: &RunState) -> Option<(Millis, StepIndex)> {
+    match state {
+        RunState::Running { step, deadline, .. } => Some((*deadline, *step)),
+        _ => None,
+    }
+}
 
 impl EngineCore {
     /// Open the journal at `dir` and rebuild every run: snapshot first if
@@ -377,7 +478,17 @@ impl EngineCore {
             by_op: HashMap::new(),
             next_run: 1,
             live: 0,
+            ws_live: HashMap::new(),
+            ws_index: HashMap::new(),
             index_bytes: 0,
+            ws_index_bytes: HashMap::new(),
+            state_counts: std::collections::BTreeMap::new(),
+            ws_state_counts: HashMap::new(),
+            due_index: BTreeMap::new(),
+            deadline_index: BTreeMap::new(),
+            #[cfg(test)]
+            examined: std::cell::Cell::new(0),
+            scoped_live: 0,
             discarded_tail,
             journal_record_version_max: 1,
             snapshot_version_max: 1,
@@ -387,7 +498,6 @@ impl EngineCore {
                 snapshots: 0,
                 max_ws: 0,
             },
-            states: observe::StateCounts::default(),
             obs,
             obs_pending: VecDeque::new(),
             obs_batch: Vec::new(),
@@ -712,13 +822,38 @@ impl EngineCore {
     pub fn finish_compaction(&mut self, expired: &[RunId]) {
         for id in expired {
             if let Some(run) = self.runs.remove(id) {
-                self.states.remove(&run.state);
-                self.index_bytes = self
-                    .index_bytes
-                    .saturating_sub(Limits::run_bytes(&run.key, &run.spec));
+                let bytes = Limits::run_bytes(&run.key, &run.spec);
+                self.index_bytes = self.index_bytes.saturating_sub(bytes);
+                if let Some(n) = self.ws_index_bytes.get_mut(&run.ws) {
+                    *n = n.saturating_sub(bytes);
+                }
+                if self.ws_index_bytes.get(&run.ws) == Some(&0) {
+                    self.ws_index_bytes.remove(&run.ws);
+                }
                 let dk = (run.ws, run.key.clone());
                 if self.by_op.get(&dk) == Some(id) {
                     self.by_op.remove(&dk);
+                }
+                if let Some(n) = self.state_counts.get_mut(run.state.kind()) {
+                    *n = n.saturating_sub(1);
+                }
+                let ws_bucket_empty = self.ws_state_counts.get_mut(&run.ws).is_some_and(|m| {
+                    if let Some(n) = m.get_mut(run.state.kind()) {
+                        *n = n.saturating_sub(1);
+                    }
+                    m.retain(|_, n| *n > 0);
+                    m.is_empty()
+                });
+                if ws_bucket_empty {
+                    self.ws_state_counts.remove(&run.ws);
+                }
+                // Only terminal runs expire — live counts are untouched;
+                // the per-ws index loses the id either way.
+                if let Some(set) = self.ws_index.get_mut(&run.ws) {
+                    set.remove(id);
+                }
+                if self.ws_index.get(&run.ws).is_some_and(|s| s.is_empty()) {
+                    self.ws_index.remove(&run.ws);
                 }
             }
         }
@@ -751,15 +886,40 @@ impl EngineCore {
             .values()
             .filter(|r| !r.state.is_terminal())
             .count();
-        self.states = observe::StateCounts::default();
+        self.ws_live.clear();
+        self.ws_index.clear();
+        self.ws_index_bytes.clear();
+        self.state_counts.clear();
+        self.ws_state_counts.clear();
+        self.due_index.clear();
+        self.deadline_index.clear();
+        self.scoped_live = 0;
+        self.index_bytes = 0;
         for r in self.runs.values() {
-            self.states.add(&r.state);
+            self.ws_index.entry(r.ws).or_default().insert(r.id);
+            *self.state_counts.entry(r.state.kind()).or_default() += 1;
+            *self
+                .ws_state_counts
+                .entry(r.ws)
+                .or_default()
+                .entry(r.state.kind())
+                .or_default() += 1;
+            let bytes = Limits::run_bytes(&r.key, &r.spec);
+            self.index_bytes += bytes;
+            *self.ws_index_bytes.entry(r.ws).or_default() += bytes;
+            if let Some((at, step, attempt)) = waiting_entry(&r.state) {
+                self.due_index.insert((at, r.id), (r.ws, step, attempt));
+            }
+            if let Some((d, step)) = deadline_entry(&r.state) {
+                self.deadline_index.insert((d, r.id), step);
+            }
+            if !r.state.is_terminal() {
+                *self.ws_live.entry(r.ws).or_default() += 1;
+                if r.ws != 0 {
+                    self.scoped_live += 1;
+                }
+            }
         }
-        self.index_bytes = self
-            .runs
-            .values()
-            .map(|r| Limits::run_bytes(&r.key, &r.spec))
-            .sum();
     }
 
     /// Compact (direct mode): expire 7-day-old terminal runs, snapshot the
@@ -829,11 +989,28 @@ impl EngineCore {
             }
             self.by_op.insert((ws, key.clone()), run_id);
             self.live += 1;
-            self.index_bytes += Limits::run_bytes(&key, &spec);
-            let run = Run::accepted(run_id, ws, key, spec, not_before);
-            self.states.add(&run.state);
-            self.runs.insert(run_id, Arc::new(run));
+            *self.ws_live.entry(ws).or_default() += 1;
+            if ws != 0 {
+                self.scoped_live += 1;
+            }
+            self.ws_index.entry(ws).or_default().insert(run_id);
+            let bytes = Limits::run_bytes(&key, &spec);
+            self.index_bytes += bytes;
+            *self.ws_index_bytes.entry(ws).or_default() += bytes;
+            let run = Arc::new(Run::accepted(run_id, ws, key, spec, not_before));
+            *self.state_counts.entry(run.state.kind()).or_default() += 1;
+            *self
+                .ws_state_counts
+                .entry(ws)
+                .or_default()
+                .entry(run.state.kind())
+                .or_default() += 1;
+            if let Some((at, step, attempt)) = waiting_entry(&run.state) {
+                self.due_index.insert((at, run_id), (ws, step, attempt));
+            }
+            self.runs.insert(run_id, run);
             let o = observe::Observed {
+                ws,
                 run: run_id,
                 at: now,
                 first: observe::Kind::Accepted { not_before },
@@ -851,8 +1028,9 @@ impl EngineCore {
                 run_ws: run.ws,
             });
         }
+        let old_kind = run.state.kind();
         let (state, effects) = reduce(run, &event, now, &self.limits, &self.retry)?;
-        let o = observe::Observed::derive(run_id, now, &event, Some(&run.state), &state);
+        let o = observe::Observed::derive(ws, run_id, now, &event, Some(&run.state), &state);
         // Copies the run only if a compaction's view still shares it.
         let run = Arc::make_mut(self.runs.get_mut(&run_id).ok_or(Refusal::StaleReply)?);
         if state.is_terminal() && run.finished_at.is_none() {
@@ -860,14 +1038,60 @@ impl EngineCore {
         }
         if state.is_terminal() && !run.state.is_terminal() {
             self.live = self.live.saturating_sub(1);
+            if let Some(n) = self.ws_live.get_mut(&run.ws) {
+                *n = n.saturating_sub(1);
+            }
+            if run.ws != 0 {
+                self.scoped_live = self.scoped_live.saturating_sub(1);
+            }
             // A finished run keeps only what dedup and inspection need (key,
             // state, step count, finish time): its input goes, and so do its
             // bytes from the capacity bound (D-030). Replay does the same.
             let input = std::mem::take(&mut run.spec.input);
             self.index_bytes = self.index_bytes.saturating_sub(input.len() as u64);
+            if let Some(n) = self.ws_index_bytes.get_mut(&run.ws) {
+                *n = n.saturating_sub(input.len() as u64);
+            }
         }
-        self.states.remove(&run.state);
-        self.states.add(&state);
+        if state.kind() != old_kind {
+            if let Some(n) = self.state_counts.get_mut(old_kind) {
+                *n = n.saturating_sub(1);
+            }
+            *self.state_counts.entry(state.kind()).or_default() += 1;
+            let empty_bucket = match self.ws_state_counts.get_mut(&run.ws) {
+                Some(m) => {
+                    if let Some(n) = m.get_mut(old_kind) {
+                        *n = n.saturating_sub(1);
+                        if *n == 0 {
+                            m.remove(old_kind);
+                        }
+                    }
+                    m.is_empty()
+                }
+                None => false,
+            };
+            if empty_bucket {
+                self.ws_state_counts.remove(&run.ws);
+            }
+            *self
+                .ws_state_counts
+                .entry(run.ws)
+                .or_default()
+                .entry(state.kind())
+                .or_default() += 1;
+        }
+        if let Some((at, ..)) = waiting_entry(&run.state) {
+            self.due_index.remove(&(at, run_id));
+        }
+        if let Some((d, ..)) = deadline_entry(&run.state) {
+            self.deadline_index.remove(&(d, run_id));
+        }
+        if let Some((at, step, attempt)) = waiting_entry(&state) {
+            self.due_index.insert((at, run_id), (run.ws, step, attempt));
+        }
+        if let Some((d, step)) = deadline_entry(&state) {
+            self.deadline_index.insert((d, run_id), step);
+        }
         run.state = state;
         Ok((effects, o))
     }
@@ -928,9 +1152,23 @@ impl EngineCore {
     /// Runs by state kind and the index sizes, O(1).
     pub fn index_counts(&self) -> observe::IndexCounts {
         observe::IndexCounts {
-            states: self.states,
+            states: observe::StateCounts::from_kinds(&self.state_counts),
             live_runs: self.runs.len() as u64,
             active_runs: self.live as u64,
+        }
+    }
+
+    /// One workspace's state counts and index sizes, O(1): what a tenant's
+    /// `GET /metrics` reports (never another workspace's counts).
+    pub fn index_counts_for(&self, ws: u64) -> observe::IndexCounts {
+        observe::IndexCounts {
+            states: self
+                .ws_state_counts
+                .get(&ws)
+                .map(observe::StateCounts::from_kinds)
+                .unwrap_or_default(),
+            live_runs: self.ws_index.get(&ws).map_or(0, |s| s.len() as u64),
+            active_runs: self.ws_live.get(&ws).copied().unwrap_or(0) as u64,
         }
     }
 
@@ -1036,6 +1274,7 @@ impl EngineCore {
     ) -> Result<Submitted, EngineError> {
         // Dedup first: a run accepted under an older (larger) key bound
         // must still return itself. The bound refuses new keys only.
+        // ATTACK(submit-dedup)
         if let Some(existing) = self.by_op.get(&(ws, key.clone())) {
             // duplicate: hand back the original run
             return Ok(Submitted {
@@ -1046,11 +1285,31 @@ impl EngineCore {
         self.limits.admits_key(&key)?;
         self.limits.admits(&spec)?; // limits refuse before anything is written
                                     // Capacity: a bounded index, refused explicitly (contract: "cap
-                                    // memory and disk; reject overload explicitly").
+                                    // memory and disk; reject overload explicitly"). The global
+                                    // bounds refuse `AtCapacity`; the per-workspace share — a tenant
+                                    // may use at most `max_index_bytes_per_ws`, and never more than
+                                    // a quarter of the global index (S2 re-review) — refuses the
+                                    // distinct `WorkspaceQuota`: only this workspace is full.
+        let run_bytes = Limits::run_bytes(&key, &spec);
         if self.live >= self.limits.max_live_runs
-            || self.index_bytes + Limits::run_bytes(&key, &spec) > self.limits.max_index_bytes
+            || self.index_bytes + run_bytes > self.limits.max_index_bytes
         {
             return Err(Refusal::AtCapacity.into());
+        }
+        // Compat mode exempts workspace 0 from the share bounds entirely
+        // (S2 re-review finding 6): a ws-0-only v1.0.x install that grew
+        // past a quarter of the index must keep admitting — v1.0.x knew
+        // only the global bounds, and "compat behaves as v1.0.x".
+        let exempt = ws == 0 && self.limits.ws0_share_exempt;
+        if !exempt
+            && (self.ws_live.get(&ws).copied().unwrap_or(0) >= self.limits.max_live_runs_per_ws
+                || self.ws_index_bytes.get(&ws).copied().unwrap_or(0) + run_bytes
+                    > self
+                        .limits
+                        .max_index_bytes_per_ws
+                        .min(self.limits.max_index_bytes / 4))
+        {
+            return Err(Refusal::WorkspaceQuota.into());
         }
         let run = RunId(self.next_run);
         self.commit_record(
@@ -1070,32 +1329,27 @@ impl EngineCore {
         })
     }
 
-    /// Every run whose wait has expired at `now` — the dispatch candidates
-    /// as (run, step, next attempt), longest-waiting first so a per-tick
-    /// dispatch cap cannot starve anyone.
-    pub fn due(&self, now: Millis) -> Vec<(RunId, StepIndex, u32)> {
-        let mut due: Vec<(Millis, RunId, StepIndex, u32)> = self
-            .runs
-            .iter()
-            // Runs of any workspace ≠ 0 are parked on this binary: it can
-            // replay their records but must never call a handler for them
-            // (the handler registry is name-keyed, workspace-blind — D-056
-            // floor safety, S2 review).
-            .filter_map(|(id, r)| match &r.state {
-                _ if r.ws != 0 => None,
-                RunState::Queued { next_run_at } if *next_run_at <= now => {
-                    Some((*next_run_at, *id, StepIndex(0), 1))
-                }
-                RunState::RetryWaiting {
-                    step,
-                    attempt,
-                    next_run_at,
-                } if *next_run_at <= now => Some((*next_run_at, *id, *step, *attempt + 1)),
-                _ => None,
-            })
-            .collect();
-        due.sort_unstable_by_key(|(at, id, ..)| (*at, id.0));
-        due.into_iter().map(|(_, id, s, a)| (id, s, a)).collect()
+    /// Pop every run whose wait expired at `now` as
+    /// `(ws, run, step, next attempt)`, longest-waiting first. The tick
+    /// moves the prefix into its per-workspace queues: popped entries are
+    /// the scheduler's until they dispatch, so a tick's read cost is the
+    /// newly-due count, never the retained set (S2 re-review finding 5).
+    /// A run that leaves its waiting state before its queued entry is
+    /// examined simply refuses the dispatch — a stale queue entry, never
+    /// a wrong one.
+    pub fn pop_due(&mut self, now: Millis) -> Vec<(u64, RunId, StepIndex, u32)> {
+        // The prefix is every key below (now+1, 0); at now = u64::MAX the
+        // whole map is due.
+        let rest = match now.checked_add(1) {
+            Some(next) => self.due_index.split_off(&(next, RunId(0))),
+            None => BTreeMap::new(),
+        };
+        let due = std::mem::replace(&mut self.due_index, rest);
+        #[cfg(test)]
+        self.examined.set(self.examined.get() + due.len() as u64);
+        due.into_iter()
+            .map(|((_, run), (ws, step, attempt))| (ws, run, step, attempt))
+            .collect()
     }
 
     /// Commit a dispatch: record StepDispatched, then the caller may invoke
@@ -1175,16 +1429,11 @@ impl EngineCore {
     }
 
     /// Bounded diagnostics: counts, never rows — O(number of states),
-    /// safe to expose on a busy server.
+    /// safe to expose on a busy server. The histogram and workspace
+    /// counts are the maintained counters, not a scan of the index:
+    /// a tenant-scoped caller hitting this route must never pin the
+    /// actor for O(retained runs) (S2 re-review).
     pub fn diagnostics(&self) -> Diagnostics {
-        // The same counts `GET /metrics` reports, kept incrementally; as
-        // before, a kind with no runs is absent here.
-        let states: std::collections::BTreeMap<&'static str, u64> = self
-            .states
-            .pairs()
-            .into_iter()
-            .filter(|(_, n)| *n > 0)
-            .collect();
         let (generation, records_written, stale_generations, batches) = match &self.log {
             Log::Direct(j) => (
                 j.generation(),
@@ -1211,7 +1460,15 @@ impl EngineCore {
             active_runs: self.live as u64,
             index_bytes: self.index_bytes,
             dedup_keys: self.by_op.len() as u64,
-            states,
+            workspaces_active: self.ws_index.len() as u64,
+            // The same counts `GET /metrics` reports, kept incrementally;
+            // as before, a kind with no runs is absent here.
+            states: self
+                .state_counts
+                .iter()
+                .filter(|(_, n)| **n > 0)
+                .map(|(k, n)| (*k, *n))
+                .collect(),
             space_ok: self.space_ok(),
             errors: std::collections::BTreeMap::new(),
             journal_batches,
@@ -1222,11 +1479,20 @@ impl EngineCore {
             journal_record_version_max: self.journal_record_version_max,
             journal_snapshot_version_max: self.snapshot_version_max,
             journal_max_ws: self.journal_max_ws,
-            parked_runs: self
-                .runs
-                .values()
-                .filter(|r| r.ws != 0 && !r.state.is_terminal())
-                .count() as u64,
+            workspace_scoped_live_runs: self.scoped_live,
+        }
+    }
+
+    /// One workspace's diagnostics — the tenant-facing subset, read from
+    /// counters kept current with every transition so the call is
+    /// O(states) on the actor, never O(this workspace's retained runs)
+    /// (S2 re-review N5: an address-limit dodge could repeat the walk
+    /// from as many addresses as the attacker controlled).
+    pub fn diagnostics_for(&self, ws: u64) -> WorkspaceDiagnostics {
+        WorkspaceDiagnostics {
+            live_runs: self.ws_index.get(&ws).map_or(0, |s| s.len() as u64),
+            active_runs: self.ws_live.get(&ws).copied().unwrap_or(0) as u64,
+            states: self.ws_state_counts.get(&ws).cloned().unwrap_or_default(),
         }
     }
 
@@ -1241,70 +1507,94 @@ impl EngineCore {
         self.runs.values().map(|r| &**r)
     }
 
-    /// One page of the live index: up to `limit` runs with id > `after`,
-    /// in id order, plus the cursor for the next page (if any).
-    pub fn page(&self, after: Option<RunId>, limit: usize) -> (Vec<RunSummary>, Option<RunId>) {
+    /// One page of the live index for one workspace: up to `limit` runs
+    /// with id > `after`, in id order, plus the cursor for the next page
+    /// (if any). Runs of other workspaces are skipped inside the scan, so
+    /// a page's cursor never reveals another workspace's ids.
+    pub fn page(
+        &self,
+        ws: u64,
+        after: Option<RunId>,
+        limit: usize,
+    ) -> (Vec<RunSummary>, Option<RunId>) {
+        // The per-workspace index: a tenant's page costs O(log n +
+        // limit) of *its own* runs, never a scan of everyone's.
+        let Some(set) = self.ws_index.get(&ws) else {
+            return (Vec::new(), None);
+        };
         let start = after.map_or(Bound::Unbounded, Bound::Excluded);
-        let mut it = self.runs.range((start, Bound::Unbounded));
+        let mut it = set.range((start, Bound::Unbounded));
         let page: Vec<RunSummary> = it
             .by_ref()
             .take(limit)
-            .map(|(_, r)| RunSummary::of(r))
+            .filter_map(|id| self.runs.get(id).map(|r| RunSummary::of(r)))
             .collect();
-        let next = match (page.last(), it.next()) {
-            (Some(last), Some(_)) => Some(last.id),
-            _ => None,
-        };
+        let next = page.last().and_then(|last| it.next().map(|_| last.id));
         (page, next)
     }
 
-    /// Attempts whose deadline passed at `now` — each is a lost reply until
-    /// a reconciler proves otherwise. Parked (ws ≠ 0) runs never expire
-    /// into a reconcile either: probing would call a workspace-blind
-    /// handler for a tenant's step.
-    pub fn expired_attempts(&self, now: Millis) -> Vec<(RunId, StepIndex)> {
-        self.runs
-            .iter()
-            .filter_map(|(id, r)| match &r.state {
-                _ if r.ws != 0 => None,
-                RunState::Running { step, deadline, .. } if *deadline < now => Some((*id, *step)),
-                _ => None,
-            })
-            .collect()
+    /// Pop up to `limit` attempts whose deadline passed at `now` — each a
+    /// lost reply until a reconciler proves otherwise. Popping (rather
+    /// than scanning) bounds the sweep by what it processes; the rest
+    /// stay indexed for later ticks.
+    pub fn pop_expired(&mut self, now: Millis, limit: usize) -> Vec<(RunId, StepIndex)> {
+        let mut out = Vec::new();
+        while out.len() < limit {
+            let Some(((deadline, run), step)) = self.deadline_index.pop_first() else {
+                break;
+            };
+            if deadline >= now {
+                self.deadline_index.insert((deadline, run), step);
+                break;
+            }
+            out.push((run, step));
+        }
+        #[cfg(test)]
+        self.examined.set(self.examined.get() + out.len() as u64);
+        out
     }
 
-    /// One page newest first: up to `limit` runs with id < `before` (all
-    /// when `None`), ids descending, plus the cursor for the next page.
+    /// Put a popped deadline back: the sweep's commit failed for a reason
+    /// other than a refusal (NoSpace, a poisoned writer), so the attempt
+    /// still owes its lost-reply record — the entry re-derives from the
+    /// run's own state, and a run that moved on queues nothing (S2
+    /// re-review N1: dropping it left Running runs unindexed until the
+    /// next restart's recount).
+    pub fn requeue_deadline(&mut self, run: RunId) {
+        if let Some(r) = self.runs.get(&run) {
+            if let Some((d, step)) = deadline_entry(&r.state) {
+                self.deadline_index.insert((d, run), step);
+            }
+        }
+    }
+
+    /// One page newest first for one workspace: up to `limit` runs with
+    /// id < `before` (all when `None`), ids descending, plus the cursor
+    /// for the next page. See `page` for the scan note.
     pub fn page_newest(
         &self,
+        ws: u64,
         before: Option<RunId>,
         limit: usize,
     ) -> (Vec<RunSummary>, Option<RunId>) {
+        let Some(set) = self.ws_index.get(&ws) else {
+            return (Vec::new(), None);
+        };
         let end = before.map_or(Bound::Unbounded, Bound::Excluded);
-        let mut it = self.runs.range((Bound::Unbounded, end)).rev();
+        let mut it = set.range((Bound::Unbounded, end)).rev();
         let page: Vec<RunSummary> = it
             .by_ref()
             .take(limit)
-            .map(|(_, r)| RunSummary::of(r))
+            .filter_map(|id| self.runs.get(id).map(|r| RunSummary::of(r)))
             .collect();
-        let next = match (page.last(), it.next()) {
-            (Some(last), Some(_)) => Some(last.id),
-            _ => None,
-        };
+        let next = page.last().and_then(|last| it.next().map(|_| last.id));
         (page, next)
     }
 
-    /// Millisecond clock values the dispatcher should re-arm for.
+    /// Millisecond clock values the dispatcher should re-arm for — the
+    /// head of the due index, O(1).
     pub fn next_wake(&self) -> Option<Millis> {
-        self.runs
-            .values()
-            .filter_map(|r| match &r.state {
-                RunState::Queued { next_run_at } | RunState::RetryWaiting { next_run_at, .. } => {
-                    Some(*next_run_at)
-                }
-                _ => None,
-            })
-            .min()
+        self.due_index.keys().next().map(|(at, _)| *at)
     }
 }
 
@@ -1561,7 +1851,7 @@ mod tests {
         );
         // D-056's rollback guard: the journal's highest version is what
         // upgrade/rollback compare a binary's reader against.
-        assert_eq!(e.diagnostics().journal_record_version_max, 2);
+        assert_eq!(e.diagnostics().journal_record_version_max, ENVELOPE_VERSION);
     }
 
     /// D-056: the version guard reads the journal's highest `v` — a v1
@@ -1600,16 +1890,33 @@ mod tests {
         assert!(matches!(err, EngineError::Serde(_)), "{err}");
     }
 
-    // --- S2-0: record format v3 reader (ws), still writes v2 -------------
+    // --- S2: record format v3 (ws); S2-0 read early, S2-3 writes it ------
 
-    /// Write one record in the shape the S2 writer will emit — `v:3` with
-    /// a workspace — straight into the journal.
+    /// Write one record in the shape the S2 writer emits — `v:3` with a
+    /// workspace — straight into the journal.
     fn commit_v3(dir: &std::path::Path, run: u64, ws: u64, event: &str) {
         let mut j = Journal::open(dir).unwrap_or_else(|e| panic!("{e}"));
         let payload =
             format!("{{\"v\":3,\"ws\":{ws},\"run\":{run},\"at\":1000,\"event\":{event}}}");
         j.append(payload.as_bytes())
             .unwrap_or_else(|e| panic!("{e}"));
+    }
+
+    /// Write one record in the v1.0.x writer's shape — `v:2`, no `ws`,
+    /// base64 input — straight into the journal.
+    fn commit_v2(dir: &std::path::Path, run: u64, event: &str) {
+        let mut j = Journal::open(dir).unwrap_or_else(|e| panic!("{e}"));
+        let payload = format!("{{\"v\":2,\"run\":{run},\"at\":1000,\"event\":{event}}}");
+        j.append(payload.as_bytes())
+            .unwrap_or_else(|e| panic!("{e}"));
+    }
+
+    fn v2_accepted(key: &str) -> String {
+        format!(
+            "{{\"Accepted\":{{\"key\":\"{key}\",\"spec\":{{\"version\":1,\
+             \"steps\":[{{\"name\":\"only\",\"handler\":\"echo\"}}],\"input\":\"aGk=\"}},\
+             \"not_before\":0}}}}"
+        )
     }
 
     fn v3_accepted(key: &str) -> String {
@@ -1646,6 +1953,34 @@ mod tests {
         assert_eq!(e.diagnostics().journal_record_version_max, 3);
     }
 
+    /// S3: a v3 record with no `ws` is ambiguous — ws 0 is a pre-v3
+    /// record's meaning, not a guess for a v3 that lost the field.
+    /// Startup must refuse it like any other corruption, not quietly
+    /// replay the run into the operator's workspace.
+    #[test]
+    fn a_v3_record_without_ws_is_refused() {
+        let d = tempfile::tempdir().unwrap_or_else(|e| panic!("{e}"));
+        let mut j = Journal::open(d.path()).unwrap_or_else(|e| panic!("{e}"));
+        // A syntactically valid v3 envelope — except `ws` is absent.
+        j.append(
+            format!(
+                "{{\"v\":3,\"run\":1,\"at\":1000,\"event\":{}}}",
+                v3_accepted("k")
+            )
+            .as_bytes(),
+        )
+        .unwrap_or_else(|e| panic!("{e}"));
+        drop(j); // release the writer lock before startup replays
+        match EngineCore::open(d.path()) {
+            Err(EngineError::Serde(m)) => {
+                let m = m.to_string();
+                assert!(m.contains("ws"), "{m}")
+            }
+            Err(e) => panic!("wrong error: {e}"),
+            Ok(_) => panic!("a v3 record without ws must not replay as ws 0"),
+        }
+    }
+
     /// Every record a v2 writer emits decodes under the v3 reader as
     /// workspace 0 — the back-compat direction of the bump.
     #[test]
@@ -1657,6 +1992,116 @@ mod tests {
         drop(e);
         let e = EngineCore::open(d.path()).unwrap_or_else(|e| panic!("{e}"));
         assert_eq!(e.run(run).unwrap_or_else(|| panic!("run")).ws, 0);
+    }
+
+    /// S2-2's isolation survives restart: scoped paging sees only its own
+    /// workspace's runs after a reopen — ws is journaled, not held.
+    #[test]
+    fn scoped_pages_stay_scoped_across_reopen() {
+        let (d, mut e) = open();
+        let a = e
+            .submit_at(1, OperationKey("shared".into()), spec(), 0, 0)
+            .unwrap_or_else(|e| panic!("{e}"));
+        let b = e
+            .submit_at(7, OperationKey("shared".into()), spec(), 0, 0)
+            .unwrap_or_else(|e| panic!("{e}"));
+        drop(e);
+        let e = EngineCore::open(d.path()).unwrap_or_else(|e| panic!("{e}"));
+        let (one, _) = e.page(1, None, 100);
+        assert_eq!(
+            one.iter().map(|s| s.id).collect::<Vec<_>>(),
+            vec![a],
+            "ws 1's page must not list ws 7's run"
+        );
+        let (seven, _) = e.page(7, None, 100);
+        assert_eq!(seven.iter().map(|s| s.id).collect::<Vec<_>>(), vec![b]);
+        let (none, _) = e.page(9, None, 100);
+        assert!(none.is_empty());
+    }
+
+    /// S2-3: the writer emits v3 — every committed record carries `v:3`
+    /// and its run's workspace, including compat-mode ws 0.
+    #[test]
+    fn the_writer_emits_v3_records_with_their_workspace() {
+        let (d, mut e) = open();
+        e.submit_at(7, OperationKey("seven".into()), spec(), 0, 0)
+            .unwrap_or_else(|e| panic!("{e}"));
+        e.submit(OperationKey("zero".into()), spec(), 0)
+            .unwrap_or_else(|e| panic!("{e}"));
+        drop(e);
+        let recs = durable_journal::replay_dir(&durable_journal::gen_dir_path(d.path(), 1))
+            .unwrap_or_else(|e| panic!("{e}"));
+        assert!(!recs.is_empty());
+        let mut saw_seven = false;
+        let mut saw_zero = false;
+        for r in &recs {
+            let v: serde_json::Value =
+                serde_json::from_slice(&r.payload).unwrap_or_else(|e| panic!("seq {}: {e}", r.seq));
+            assert_eq!(v["v"], 3, "record must be v3: {line:?}", line = v);
+            assert!(v.get("ws").is_some(), "record must carry ws: {v}");
+            saw_seven |= v["ws"] == 7;
+            saw_zero |= v["ws"] == 0;
+        }
+        assert!(saw_seven && saw_zero, "workspaces 7 and 0 both journaled");
+    }
+
+    /// A journal with v2 and v3 records interleaved — the state an in-place
+    /// upgrade leaves behind — replays each run into its own workspace and
+    /// the writer keeps appending v3.
+    #[test]
+    fn a_mixed_v2_v3_journal_replays_each_workspace() {
+        let d = tempfile::tempdir().unwrap_or_else(|e| panic!("{e}"));
+        commit_v2(d.path(), 1, &v2_accepted("old"));
+        commit_v3(d.path(), 2, 7, &v3_accepted("new"));
+        {
+            let mut e = EngineCore::open(d.path()).unwrap_or_else(|e| panic!("{e}"));
+            assert_eq!(e.run(RunId(1)).unwrap_or_else(|| panic!("1")).ws, 0);
+            assert_eq!(e.run(RunId(2)).unwrap_or_else(|| panic!("2")).ws, 7);
+            e.submit_at(7, OperationKey("after".into()), spec(), 0, 0)
+                .unwrap_or_else(|e| panic!("{e}"));
+            assert_eq!(e.diagnostics().journal_record_version_max, 3);
+        }
+        // …and the journal stays coherent across a second reopen.
+        let e = EngineCore::open(d.path()).unwrap_or_else(|e| panic!("{e}"));
+        let (seven, _) = e.page(7, None, 100);
+        assert_eq!(seven.len(), 2);
+        let (zero, _) = e.page(0, None, 100);
+        assert_eq!(zero.len(), 1);
+    }
+
+    /// Crash mid-write on a mixed-version journal: the committed v2+v3
+    /// head survives with its workspaces, the torn tail is discarded and
+    /// the journal keeps appending v3.
+    #[test]
+    fn a_torn_tail_on_a_mixed_journal_is_discarded() {
+        let d = tempfile::tempdir().unwrap_or_else(|e| panic!("{e}"));
+        commit_v2(d.path(), 1, &v2_accepted("old"));
+        commit_v3(d.path(), 2, 7, &v3_accepted("new"));
+        // Crash mid-append: a third v3 record's frame starts but the file
+        // ends inside it — the torn tail.
+        let log = durable_journal::gen_dir_path(d.path(), 1).join("journal.log");
+        let committed_len = std::fs::metadata(&log)
+            .unwrap_or_else(|e| panic!("{e}"))
+            .len();
+        commit_v3(d.path(), 3, 7, &v3_accepted("torn"));
+        let f = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&log)
+            .unwrap_or_else(|e| panic!("{e}"));
+        f.set_len(committed_len + 20)
+            .unwrap_or_else(|e| panic!("{e}"));
+        drop(f);
+        {
+            let mut e = EngineCore::open(d.path()).unwrap_or_else(|e| panic!("{e}"));
+            assert_eq!(e.run(RunId(1)).unwrap_or_else(|| panic!("1")).ws, 0);
+            assert_eq!(e.run(RunId(2)).unwrap_or_else(|| panic!("2")).ws, 7);
+            e.submit_at(7, OperationKey("after".into()), spec(), 0, 0)
+                .unwrap_or_else(|e| panic!("{e}"));
+        }
+        let e = EngineCore::open(d.path()).unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(e.diagnostics().journal_record_version_max, 3);
+        let (seven, _) = e.page(7, None, 100);
+        assert_eq!(seven.len(), 2, "torn run 3 is gone; the new submit kept");
     }
 
     /// The released v1.0.0 binary reads up to v2 only: a v3 record must
@@ -1731,34 +2176,37 @@ mod tests {
         assert!(matches!(err, EngineError::Serde(_)), "{err}");
     }
 
-    // --- v1.0.2: ws ≠ 0 runs are parked, never dispatched -----------------
+    // --- v1.0.2 telemetry on the workspace-aware binary -------------------
     //
-    // This binary's registry is name-keyed and workspace-blind. Running a
-    // replayed tenant run would POST the tenant's input and idempotency
-    // key to workspace 0's same-named handler — the S2-review rollback
-    // finding. Parked means: replayed faithfully, surfaced in
-    // diagnostics, and never scheduled, expired, or probed.
+    // This branch's registry is (ws, name)-keyed: tenant runs dispatch to
+    // their own workspace's handlers — nothing is parked here. What the
+    // merge keeps is the journal-shape telemetry the rollback guard keys
+    // on (D-056): a downgrade to a pre-v1.0.2 binary is refused once the
+    // journal shows workspace data, because that binary cannot park it.
 
-    /// A queued tenant run never leaves `due` — only workspace-0 work is
-    /// scheduled — and diagnostics expose it as parked, not lost.
+    /// Tenant runs are due like any other — the workspace-aware registry
+    /// resolves their handlers — and diagnostics still expose the shape.
     #[test]
-    fn tenant_runs_are_parked_not_dispatched() {
+    fn tenant_runs_dispatch_with_journal_shape_reported() {
         let d = tempfile::tempdir().unwrap_or_else(|e| panic!("{e}"));
         commit_v3(d.path(), 1, 7, &v3_accepted("tenant"));
         commit_v3(d.path(), 2, 0, &v3_accepted("ops"));
-        let e = EngineCore::open(d.path()).unwrap_or_else(|e| panic!("{e}"));
-        let due: Vec<RunId> = e.due(u64::MAX).into_iter().map(|(r, ..)| r).collect();
-        assert_eq!(due, vec![RunId(2)], "the tenant run must never be due");
+        let mut e = EngineCore::open(d.path()).unwrap_or_else(|e| panic!("{e}"));
+        let due: Vec<RunId> = e
+            .pop_due(u64::MAX)
+            .into_iter()
+            .map(|(_, r, ..)| r)
+            .collect();
+        assert_eq!(due, vec![RunId(1), RunId(2)]);
         let diag = e.diagnostics();
         assert_eq!(diag.journal_max_ws, 7);
-        assert_eq!(diag.parked_runs, 1);
+        assert_eq!(diag.workspace_scoped_live_runs, 1);
     }
 
-    /// A tenant attempt journaled Running past its deadline stays parked:
-    /// expiring it would start a probe — a handler call with the same
-    /// exposure the park exists to prevent.
+    /// Tenant attempts expire into reconciles on the same terms as
+    /// workspace 0's — the probe resolves through their own registry.
     #[test]
-    fn a_parked_attempt_never_expires_into_a_probe() {
+    fn tenant_attempts_expire_like_everyone_elses() {
         let d = tempfile::tempdir().unwrap_or_else(|e| panic!("{e}"));
         commit_v3(d.path(), 1, 7, &v3_accepted("tenant"));
         commit_v3(
@@ -1774,18 +2222,17 @@ mod tests {
             0,
             "{\"StepDispatched\":{\"step\":0,\"attempt\":1,\"deadline\":1000}}",
         );
-        let e = EngineCore::open(d.path()).unwrap_or_else(|e| panic!("{e}"));
+        let mut e = EngineCore::open(d.path()).unwrap_or_else(|e| panic!("{e}"));
         assert_eq!(
-            e.expired_attempts(2000),
-            vec![(RunId(2), StepIndex(0))],
-            "only the workspace-0 attempt may expire into a reconcile"
+            e.pop_expired(2000, usize::MAX),
+            vec![(RunId(1), StepIndex(0)), (RunId(2), StepIndex(0))]
         );
     }
 
-    /// A snapshot that already carries tenant runs parks them too — the
-    /// park is not a journal-tail property only.
+    /// A compacted journal reports its DRIX version and keeps tenant
+    /// scope — the guard's snapshot check keys on the same telemetry.
     #[test]
-    fn tenant_runs_stay_parked_through_a_snapshot() {
+    fn a_snapshot_reports_its_drix_version_and_scope() {
         let d = tempfile::tempdir().unwrap_or_else(|e| panic!("{e}"));
         commit_v3(d.path(), 1, 7, &v3_accepted("tenant"));
         {
@@ -1794,9 +2241,8 @@ mod tests {
         }
         let e = EngineCore::open(d.path()).unwrap_or_else(|e| panic!("{e}"));
         assert_eq!(e.run(RunId(1)).unwrap_or_else(|| panic!("run")).ws, 7);
-        assert!(e.due(u64::MAX).is_empty());
         let diag = e.diagnostics();
-        assert_eq!(diag.parked_runs, 1);
+        assert_eq!(diag.workspace_scoped_live_runs, 1);
         assert_eq!(diag.journal_snapshot_version_max, snapshot::VERSION);
         assert_eq!(diag.journal_max_ws, 7);
     }
@@ -1857,7 +2303,7 @@ mod tests {
             .submit(OperationKey("k".into()), spec(), 0)
             .unwrap_or_else(|e| panic!("{e}"));
         let (step0, _) = {
-            let (id, s, a) = e.due(0)[0];
+            let (_, id, s, a) = e.pop_due(0)[0];
             assert_eq!(id, run);
             (s, a)
         };
@@ -2305,6 +2751,117 @@ mod tests {
         ));
     }
 
+    /// S2 re-review finding 6: a ws-0-only v1.0.x install that grew past
+    /// a quarter of the index must keep admitting after upgrade — compat
+    /// mode (`ws0_share_exempt`) bounds ws 0 only by the global bounds,
+    /// exactly as v1.0.x did.
+    #[test]
+    fn a_compat_install_admits_past_the_tenant_share() {
+        let (_d, mut e) = open();
+        e.limits.ws0_share_exempt = true;
+        e.limits.max_live_runs = usize::MAX; // global bound off the table
+        e.limits.max_live_runs_per_ws = 1; // ws 0 ignores the share anyway
+        let job = || {
+            let mut s = spec();
+            s.input = vec![7u8; 4096];
+            s
+        };
+        let job_bytes = Limits::run_bytes(&OperationKey("x".into()), &job());
+        e.limits.max_index_bytes = 4 * job_bytes; // global room for ~3
+        e.limits.max_index_bytes_per_ws = job_bytes; // share = ~1 job
+        for i in 0..3 {
+            e.submit(OperationKey(format!("c-{i}")), job(), 0)
+                .unwrap_or_else(|e| panic!("compat ws 0 admits past the share: {e}"));
+        }
+        // The global bounds still bind ws 0 under compat — set the index
+        // to exactly full and the next submit is `AtCapacity`, not quota.
+        e.limits.max_index_bytes = e.diagnostics().index_bytes;
+        assert!(matches!(
+            e.submit(OperationKey("over".into()), job(), 0),
+            Err(EngineError::Refused(Refusal::AtCapacity))
+        ));
+    }
+
+    /// Review S2 #6: one tenant can no longer fill every live slot —
+    /// the per-workspace share refuses while other workspaces keep
+    /// admitting, and a finished run frees the share again. Replay keeps
+    /// the accounting (the counters are rebuilt from the index).
+    #[test]
+    fn live_run_quota_is_per_workspace() {
+        let (_d, mut e) = open();
+        e.limits.max_live_runs = 1_000_000; // global bound off the table
+        e.limits.max_live_runs_per_ws = 3;
+        for i in 0..3 {
+            e.submit_at(7, OperationKey(format!("a-{i}")), spec(), 0, 0)
+                .unwrap_or_else(|e| panic!("{e}"));
+        }
+        let written = e.diagnostics().records_written;
+        assert!(matches!(
+            e.submit_at(7, OperationKey("a-4".into()), spec(), 0, 0),
+            Err(EngineError::Refused(Refusal::WorkspaceQuota))
+        ));
+        assert_eq!(
+            e.diagnostics().records_written,
+            written,
+            "nothing journaled"
+        );
+        // A second workspace is unaffected — its own share is empty.
+        e.submit_at(8, OperationKey("b-0".into()), spec(), 0, 0)
+            .unwrap_or_else(|e| panic!("ws 8 must admit: {e}"));
+        // The share refusal is the distinct `WorkspaceQuota`, never the
+        // global `AtCapacity` — the rest of the pool still admits (S2
+        // re-review finding 6).
+        e.limits.max_live_runs_per_ws = 1;
+        e.submit_at(9, OperationKey("c-0".into()), spec(), 0, 0)
+            .unwrap_or_else(|e| panic!("{e}"));
+        assert!(matches!(
+            e.submit_at(9, OperationKey("c-1".into()), spec(), 0, 0),
+            Err(EngineError::Refused(Refusal::WorkspaceQuota))
+        ));
+        e.limits.max_live_runs_per_ws = 3;
+        // A finished run frees ws 7's share.
+        let id = e
+            .submit_at(8, OperationKey("b-1".into()), spec(), 0, 0)
+            .unwrap_or_else(|e| panic!("{e}"));
+        e.cancel(id, 1).unwrap_or_else(|e| panic!("{e}"));
+        let (page, _) = e.page(7, None, 10);
+        e.cancel(page[0].id, 1).unwrap_or_else(|e| panic!("{e}"));
+        e.submit_at(7, OperationKey("a-4".into()), spec(), 0, 0)
+            .unwrap_or_else(|e| panic!("a finished run frees the share: {e}"));
+    }
+
+    /// Review S2 #6: `page`/`page_newest` read the per-workspace index —
+    /// a tenant's page is its own runs only, and the cursor never
+    /// yields a foreign id.
+    #[test]
+    fn workspace_pages_read_only_that_workspace() {
+        let (_d, mut e) = open();
+        let a: Vec<RunId> = (0..5)
+            .map(|i| {
+                e.submit_at(1, OperationKey(format!("a-{i}")), spec(), 0, 0)
+                    .unwrap_or_else(|e| panic!("{e}"))
+            })
+            .collect();
+        let _b: Vec<RunId> = (0..50)
+            .map(|i| {
+                e.submit_at(2, OperationKey(format!("b-{i}")), spec(), 0, 0)
+                    .unwrap_or_else(|e| panic!("{e}"))
+            })
+            .collect();
+        let (page, next) = e.page(1, None, 3);
+        assert_eq!(page.len(), 3);
+        assert_eq!(page[0].id, a[0]);
+        let (rest, _) = e.page(1, next, 10);
+        assert_eq!(rest.len(), 2, "page walks only ws-1's five runs");
+        assert!(rest.iter().all(|r| a.contains(&r.id)));
+        // Newest-first is the same index walked backwards.
+        let (newest, _) = e.page_newest(1, None, 1);
+        assert_eq!(newest[0].id, a[4]);
+        // An empty workspace is an empty page, not a scan miss.
+        let (empty, none) = e.page(99, None, 10);
+        assert!(empty.is_empty() && none.is_none());
+    }
+
     /// Review finding 15(b): a run accepted with a key over today's bound
     /// (journaled before the bound, or under a larger one) must still
     /// deduplicate. The key bound applies to new keys only.
@@ -2403,10 +2960,17 @@ mod tests {
         let first = e
             .submit(OperationKey("cap-0".into()), job(), 0)
             .unwrap_or_else(|e| panic!("{e}"));
-        e.limits.max_index_bytes = e.diagnostics().index_bytes + 1000; // room for no second job
+        // Room for no second job under either bound: the per-workspace
+        // share is capped at a quarter of the global index (S2 re-review
+        // N4), so the global bound is raised enough for the quarter to
+        // admit exactly one job and no more.
+        let job_bytes = Limits::run_bytes(&OperationKey("cap-1".into()), &job());
+        let ws0_left = e.diagnostics().index_bytes; // ws 0's bytes so far
+        e.limits.max_index_bytes = ws0_left + 4 * job_bytes;
+        e.limits.max_index_bytes_per_ws = ws0_left - 4096 + job_bytes;
         assert!(matches!(
             e.submit(OperationKey("cap-1".into()), job(), 0),
-            Err(EngineError::Refused(Refusal::AtCapacity))
+            Err(EngineError::Refused(Refusal::WorkspaceQuota))
         ));
         e.cancel(first, 1).unwrap_or_else(|e| panic!("{e}"));
         e.submit(OperationKey("cap-1".into()), job(), 2)
@@ -2424,6 +2988,62 @@ mod tests {
         let e = EngineCore::open(d.path()).unwrap_or_else(|e| panic!("{e}"));
         assert_eq!(e.diagnostics().index_bytes, bytes);
         assert!(e.run(first).is_some_and(|r| r.spec.input.is_empty()));
+    }
+
+    /// S2 re-review N5: `diagnostics_for` must answer from counters kept
+    /// with every transition — a histogram that forgot a transition
+    /// lies forever, and a walk is what the actor cannot afford. Check
+    /// the answers against a ground-truth recount of the retained index
+    /// across dispatch, finish, cancel and replay.
+    #[test]
+    fn workspace_diagnostics_counts_track_every_transition() {
+        let (d, mut e) = open();
+        let truth = |e: &EngineCore, ws: u64| {
+            let mut states = std::collections::BTreeMap::new();
+            let (mut live, mut active) = (0u64, 0u64);
+            for r in e.runs.values().filter(|r| r.ws == ws) {
+                *states.entry(r.state.kind()).or_insert(0u64) += 1;
+                live += 1;
+                if !r.state.is_terminal() {
+                    active += 1;
+                }
+            }
+            (live, active, states)
+        };
+        let check = |e: &EngineCore, ws: u64| {
+            let (live, active, states) = truth(e, ws);
+            let d = e.diagnostics_for(ws);
+            assert_eq!(
+                (d.live_runs, d.active_runs, d.states),
+                (live, active, states)
+            );
+        };
+        assert_eq!(e.diagnostics_for(7).live_runs, 0);
+        let a = e
+            .submit_at(7, OperationKey("a".into()), spec(), 0, 0)
+            .unwrap_or_else(|e| panic!("{e}"));
+        let b = e
+            .submit_at(7, OperationKey("b".into()), spec(), 0, 0)
+            .unwrap_or_else(|e| panic!("{e}"));
+        e.submit_at(9, OperationKey("other".into()), spec(), 0, 0)
+            .unwrap_or_else(|e| panic!("{e}"));
+        check(&e, 7);
+        // Anchored, not vacuous: the checks above agree on empty maps.
+        assert_eq!(e.diagnostics_for(7).live_runs, 2);
+        e.dispatch(a, StepIndex(0), 1, 10)
+            .unwrap_or_else(|e| panic!("{e}"));
+        check(&e, 7);
+        e.step_finished(a, StepIndex(0), Some(b"out".to_vec()), None, 20)
+            .unwrap_or_else(|e| panic!("{e}"));
+        check(&e, 7);
+        e.cancel(b, 30).unwrap_or_else(|e| panic!("{e}"));
+        check(&e, 7);
+        check(&e, 9);
+        // Replay: the recount must rebuild the same per-ws histogram.
+        drop(e);
+        let e = EngineCore::open(d.path()).unwrap_or_else(|e| panic!("{e}"));
+        check(&e, 7);
+        check(&e, 9);
     }
 
     #[test]
@@ -2455,7 +3075,7 @@ mod tests {
     // --- D-058: observability is derived from the journal -----------------
 
     fn observed(dir: &Path) -> (EngineCore, Arc<observe::Observer>) {
-        let obs = Arc::new(observe::Observer::new(1_000, ["noop".to_string()]));
+        let obs = Arc::new(observe::Observer::new(1_000));
         let core = EngineCore::open_observed(dir, JournalOptions::default(), Some(obs.clone()))
             .unwrap_or_else(|e| panic!("{e}"));
         (core, obs)
@@ -2516,7 +3136,13 @@ mod tests {
                     outcome: observe::RunOutcome::Done
                 }
             );
-            let m = obs.metrics(observe::Window::M15, 1_010, e.index_counts());
+            let m = obs.metrics(
+                observe::Scope::All,
+                observe::Window::M15,
+                1_010,
+                e.index_counts(),
+                &[],
+            );
             let c = m.totals.counters;
             assert_eq!(
                 (
@@ -2539,12 +3165,18 @@ mod tests {
             kinds(&obs.timeline(gone)),
             ["accepted", "cancel_requested", "finished"]
         );
-        let feed = obs.feed(50);
+        let feed = obs.feed(0, 50, 0).1;
         assert_eq!(feed.len(), 9);
         assert_eq!(feed[0].0, gone, "newest first");
         assert_eq!(feed[0].1.at, 1_005);
         // Metrics begin at the new observer's start: nothing backfilled.
-        let m = obs.metrics(observe::Window::M15, 1_010, e.index_counts());
+        let m = obs.metrics(
+            observe::Scope::All,
+            observe::Window::M15,
+            1_010,
+            e.index_counts(),
+            &[],
+        );
         assert_eq!(m.totals.counters, observe::Counters::default());
         // …while the state counts are the index's.
         assert_eq!((m.states.done, m.states.cancelled), (1, 1));
@@ -2620,7 +3252,13 @@ mod tests {
         );
         let body = serde_json::to_string(&t.events).unwrap_or_else(|e| panic!("{e}"));
         assert!(!body.contains("SECRET"), "{body}");
-        let m = obs.metrics(observe::Window::M15, 5_010, e.index_counts());
+        let m = obs.metrics(
+            observe::Scope::All,
+            observe::Window::M15,
+            5_010,
+            e.index_counts(),
+            &[],
+        );
         let c = m.totals.counters;
         assert_eq!(
             (c.steps_failed, c.replies_lost, c.reconciled, c.completed),
@@ -2710,5 +3348,77 @@ mod tests {
             e2.run(run).unwrap_or_else(|| panic!("run")).state,
             RunState::Cancelled
         ));
+    }
+}
+
+/// Never-panics fuzzing for the outside-input decoders this crate owns:
+/// the record envelope (three reader versions) and the DRIX snapshot.
+/// Seed corpora live under `fuzz/corpus/<target>/`; a panic is a
+/// red-first bug.
+#[cfg(test)]
+mod fuzz {
+    use super::*;
+    use proptest::prelude::*;
+
+    fn corpus(name: &str) -> Vec<Vec<u8>> {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../fuzz/corpus")
+            .join(name);
+        let mut out: Vec<Vec<u8>> = std::fs::read_dir(&dir)
+            .unwrap_or_else(|e| panic!("corpus {dir:?}: {e}"))
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_type().is_ok_and(|t| t.is_file()))
+            .filter_map(|e| std::fs::read(e.path()).ok())
+            .collect();
+        out.sort();
+        out
+    }
+
+    fn envelope_bytes(bytes: &[u8]) {
+        let _ = decode_envelope(bytes);
+        for reader in [1u8, 2, 3] {
+            let _ = decode_envelope_as(bytes, reader);
+        }
+    }
+
+    #[test]
+    fn fuzz_envelope_seed_corpus() {
+        for b in corpus("envelope") {
+            envelope_bytes(&b);
+        }
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::default())]
+        #[test]
+        fn fuzz_envelope_never_panics(bytes in proptest::collection::vec(any::<u8>(), 0..=4096)) {
+            envelope_bytes(&bytes);
+        }
+
+        #[test]
+        fn fuzz_envelope_text_never_panics(text in any::<String>()) {
+            envelope_bytes(text.as_bytes());
+        }
+    }
+
+    fn snapshot_bytes(bytes: &[u8]) {
+        let _ = crate::snapshot::decode(bytes);
+        let mut cur = std::io::Cursor::new(bytes);
+        let _ = crate::snapshot::decode_from(&mut cur, bytes.len() as u64);
+    }
+
+    #[test]
+    fn fuzz_snapshot_seed_corpus() {
+        for b in corpus("snapshot") {
+            snapshot_bytes(&b);
+        }
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::default())]
+        #[test]
+        fn fuzz_snapshot_never_panics(bytes in proptest::collection::vec(any::<u8>(), 0..=8192)) {
+            snapshot_bytes(&bytes);
+        }
     }
 }

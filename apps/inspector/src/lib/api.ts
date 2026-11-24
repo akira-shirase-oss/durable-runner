@@ -3,7 +3,7 @@
 import { parseRetryAfter } from './poll.ts';
 
 export interface RunItem {
-	id: number;
+	id: string;
 	key: string;
 	state: string;
 	steps: number;
@@ -13,8 +13,8 @@ export interface RunItem {
 export interface RunPage {
 	runs: RunItem[];
 	/** Cursor for the next page; which key exists depends on `order`. */
-	next_before?: number | null;
-	next_after?: number | null;
+	next_before?: string | null;
+	next_after?: string | null;
 }
 
 export interface Diag {
@@ -153,7 +153,7 @@ export async function ready(signal?: AbortSignal): Promise<{ ready: boolean; cod
 export async function listRuns(
 	key: string,
 	order: 'asc' | 'desc',
-	cursor: number | null = null,
+	cursor: string | null = null,
 	limit = 50,
 	signal?: AbortSignal,
 ): Promise<RunPage> {
@@ -162,12 +162,12 @@ export async function listRuns(
 	return req(`/jobs?${q}`, key, { signal });
 }
 
-export async function inspect(key: string, id: number, signal?: AbortSignal): Promise<RunItem> {
+export async function inspect(key: string, id: string, signal?: AbortSignal): Promise<RunItem> {
 	return req(`/jobs/${id}`, key, { signal });
 }
 
 // The spec is API-key only (D-051): the input may be customer content.
-export async function spec(apiKey: string, id: number): Promise<{ spec: Spec }> {
+export async function spec(apiKey: string, id: string): Promise<{ spec: Spec }> {
 	return req(`/jobs/${id}/spec`, apiKey);
 }
 
@@ -175,11 +175,11 @@ export async function spec(apiKey: string, id: number): Promise<{ spec: Spec }> 
 export async function submitJob(
 	apiKey: string,
 	body: { op_key: string; spec: { version: number; steps: { name: string; handler: string }[]; input_b64: string }; not_before?: number },
-): Promise<{ run_id: number }> {
+): Promise<{ run_id: string }> {
 	return req('/jobs', apiKey, { method: 'POST', headers: { 'content-type': 'application/json', authorization: `Bearer ${apiKey}` }, body: JSON.stringify(body) });
 }
 
-export async function cancelRun(id: number, apiKey: string): Promise<void> {
+export async function cancelRun(id: string, apiKey: string): Promise<void> {
 	await req(`/jobs/${id}/cancel`, apiKey, { method: 'POST' });
 }
 
@@ -241,6 +241,8 @@ export interface HandlerStats {
 	step_ms: Percentiles;
 	last_ok_at: number | null;
 	last_failure_at: number | null;
+	/** when this handler's counting began (later than the window's start if its stats were dropped and restarted) */
+	since?: number;
 }
 
 export interface Metrics {
@@ -276,7 +278,8 @@ export interface RunEvent {
 }
 
 export interface RunTimeline {
-	run: number;
+	/** the run's opaque public id (S2): never the internal number */
+	run: string;
 	/** null when the run has left the index (expired) */
 	key: string | null;
 	state: string;
@@ -287,7 +290,8 @@ export interface RunTimeline {
 }
 
 export interface FeedEvent extends RunEvent {
-	run: number;
+	/** the run's opaque public id (S2) */
+	run: string;
 	/** null when the run has left the index (expired) */
 	key: string | null;
 }
@@ -302,7 +306,7 @@ export async function metrics(key: string, window: Window, signal?: AbortSignal)
 	return req(`/metrics?window=${window}`, key, { signal });
 }
 
-export async function runEvents(key: string, id: number, signal?: AbortSignal): Promise<RunTimeline> {
+export async function runEvents(key: string, id: string, signal?: AbortSignal): Promise<RunTimeline> {
 	return req(`/jobs/${id}/events`, key, { signal });
 }
 

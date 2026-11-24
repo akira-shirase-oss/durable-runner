@@ -14,3 +14,7 @@ apps/*/.svelte-kit/
 
 # Local data and load artifacts
 /data/
+
+# coordinator/worker scratch (never committed)
+.coord/
+perf/.heavy.slot/

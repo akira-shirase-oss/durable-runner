@@ -1,0 +1,44 @@
+{
+  "machine": {
+    "host": "maintainer-laptop",
+    "platform": "darwin/arm64",
+    "cpu": "Apple M2 Pro",
+    "cores": 12,
+    "mem_gb": 32,
+    "date": "2026-11-21T09:32:46.828Z",
+    "commit": "15480c1"
+  },
+  "scenario": "overload",
+  "peak_heap_mb": 35,
+  "undici_tos_races": 15,
+  "params": {
+    "flood_conns": 256,
+    "max_connections": 64,
+    "header_timeout_ms": "default (10 s)",
+    "smoke": false
+  },
+  "baseline_status": 200,
+  "answers_during_flood": {
+    "200": 10,
+    "503": 38
+  },
+  "health_during_flood": 200,
+  "health_failures": [],
+  "recovery": {
+    "submits_done": 40,
+    "ms": 596,
+    "codes": {
+      "200": 40
+    }
+  },
+  "thresholds": {
+    "offers": "each answered inside 20 s (200/503/tcp-refusal — no hang)",
+    "health": "200 on the dedicated listener, every probe <500 ms",
+    "recovery": "40 submits served <5 s after the flood"
+  },
+  "verdict": "FAIL",
+  "failures": [
+    "every offered request answered inside the bound"
+  ],
+  "note": "a conn hoard must not wedge work or liveness: reserve + slot rotation"
+}

@@ -18,6 +18,19 @@ fi
 
 step() { printf '\n== %s\n' "$1"; }
 
+step "no mutation markers in committed source"
+# A mutation marker in a tracked file means a mutation under test was
+# never reverted — it shipped. Mutations happen only on the scratch copy
+# in tests/attacks/prove-attacks.sh, so no marker may ever appear in a
+# tracked file. (The pattern is built by concatenation so this script
+# does not match itself.)
+marker='MUT''ANT\|MUT''ATION-MARK\|MUT''ATE-HERE'
+if git grep -nE "$marker" -- . >"${TMPDIR:-/tmp}/durable-mutants.$$"; then
+  cat "${TMPDIR:-/tmp}/durable-mutants.$$"
+  echo "a mutation marker is committed — revert it before committing" >&2
+  exit 1
+fi
+
 step "toolchain"
 cargo --version
 rustc --version
@@ -30,6 +43,12 @@ cargo clippy --workspace --all-targets --locked -- -D warnings
 
 step "tests"
 cargo test --workspace --locked
+
+step "fuzz smoke (never-panics decoders)"
+# Every outside-input parser/decoder has a fuzz_* proptest target with a
+# seed corpus in fuzz/corpus/. The suite runs each at the default count;
+# this pass runs them deeper — fixed iterations, not wall-clock time.
+PROPTEST_CASES="${FUZZ_CASES:-2048}" cargo test --workspace --locked fuzz
 
 step "architecture: the domain crate does no I/O"
 if grep -nE 'std::(fs|net|process|io|thread|env)|tokio|reqwest' crates/durable-domain/src/*.rs; then
@@ -51,6 +70,21 @@ for bin in durable-server durable-cli; do
   fi
 done
 
+step "architecture: the lab-only tenant opt-out is absent from the shipped server"
+# --allow-local-tenant-handlers exists only with `--features lab` (re-review
+# S1-1): a default build must not enable it. Known-bad proof: with the
+# feature the same probe must see it, or the check could never go red.
+shipped=$(cargo tree --locked -p durable-server -e features -i durable-server 2>/dev/null || true)
+labbed=$(cargo tree --locked -p durable-server -e features -i durable-server --features durable-server/lab 2>/dev/null || true)
+if [[ "$shipped" == *'feature "lab"'* ]]; then
+  echo "the default durable-server build enables the lab feature" >&2
+  exit 1
+fi
+if [[ "$labbed" != *'feature "lab"'* ]]; then
+  echo "the lab-feature probe cannot see the feature: the check above could never fail" >&2
+  exit 1
+fi
+
 step "cargo deny (advisories, licenses, bans, sources)"
 cargo deny --locked check
 
@@ -66,8 +100,20 @@ if [ "${SKIP_NPM:-0}" != 1 ]; then
   )
 fi
 
+step "perf: clean-imports gate (+ known-bad proof)"
+perf/check-clean-imports.sh
+
+step "perf: the heavy-slot proof (+ known-bad proof)"
+perf/test-heavy-held.sh
+
 step "deploy format guard (D-056)"
 deploy/test-format-guard.sh
+
+step "deploy proxy hop + deny-cidrs (white-hat A/B)"
+deploy/test-proxy-hop.sh
+
+step "deploy refuses a lab build (+ known-bad proof)"
+deploy/test-lab-guard.sh
 
 if [ "${SKIP_PILOT:-0}" != 1 ]; then
   step "pilot (release build)"

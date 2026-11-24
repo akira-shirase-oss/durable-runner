@@ -5,8 +5,10 @@
 # re-running replaces binaries and units, never the journal or env.
 set -euo pipefail
 cd "$(dirname "$0")/.."
-[[ $EUID -eq 0 ]] || { echo "run as root" >&2; exit 1; }
 [[ -f target/release/durable-server ]] || { echo "build first: cargo build --release" >&2; exit 1; }
+# Before anything else, root or not: never install a lab build (S3).
+deploy/lab-build-guard.sh target/release/durable-server || exit 1
+[[ $EUID -eq 0 ]] || { echo "run as root" >&2; exit 1; }
 
 id -u durable >/dev/null 2>&1 || useradd --system --no-create-home --shell /usr/sbin/nologin durable
 install -d -o durable -g durable -m 0750 /var/lib/durable /var/lib/durable/backups /var/lib/durable/journal
@@ -38,7 +40,7 @@ cat <<'EOF'
 installed. Next (docs/DEPLOY.md):
   1. /etc/durable/handlers        — one name=url per handler step
   2. deploy/cloudflare-ips.sh     — CF ranges to Caddy, trusted-proxies, ufw
-  3. /etc/caddy/origin.{pem,key} + cloudflare-origin-pull-ca.pem, Caddyfile
+  3. /etc/caddy/origin.{pem,key} + aop-zone-ca.pem (OUR zone AOP CA), Caddyfile
   4. /etc/durable/backup-age-recipient (+ offline private half)
   5. deploy/smoke.sh
 EOF

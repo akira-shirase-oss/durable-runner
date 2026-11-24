@@ -14,3 +14,7 @@ workspace = true
 base64 = { version = "0.23", default-features = false, features = ["std"] }
 serde.workspace = true
 thiserror.workspace = true
+
+[dev-dependencies]
+proptest = "1"
+serde_json = "1"

@@ -11,6 +11,13 @@ failures=0
 ok()  { printf '  ok    %s\n' "$1"; }
 bad() { printf '  FAIL  %s\n' "$1"; failures=$((failures + 1)); }
 
+echo "the binary"
+# A lab build turns the tenant SSRF guard off (S3 re-review 3).
+installed=${DURABLE_SERVER_BIN:-/usr/local/bin/durable-server}
+"$(dirname "$0")/lab-build-guard.sh" "$installed" 2>/dev/null \
+  && ok "$installed is a production build" \
+  || bad "$installed is a LAB build or unreadable — reinstall a plain cargo build --release"
+
 echo "services"
 for unit in durable-server caddy; do
   systemctl is-active --quiet "$unit" && ok "$unit active" || bad "$unit not active"
@@ -29,6 +36,33 @@ if [[ -s /etc/durable/trusted-proxies ]]; then
   (( n >= 10 )) && ok "trusted-proxies: $n Cloudflare ranges" || bad "only $n trusted ranges — rerun deploy/cloudflare-ips.sh"
 else
   bad "/etc/durable/trusted-proxies missing — CF-Connecting-IP untrusted, run deploy/cloudflare-ips.sh"
+fi
+# The server sees only the Caddy hop: Caddy must overwrite the header
+# with the client it resolved, and the server must trust that hop
+# (durable-run adds it for a loopback listener) — else every visitor
+# shares 127.0.0.1's bucket (white-hat finding B).
+if grep -q 'header_up CF-Connecting-IP {client_ip}' /etc/caddy/Caddyfile 2>/dev/null; then
+  ok "Caddy overwrites CF-Connecting-IP with its resolved client"
+else
+  bad "/etc/caddy/Caddyfile does not overwrite CF-Connecting-IP — install deploy/Caddyfile"
+fi
+# Zone-level Authenticated Origin Pulls with OUR CA (CREATE.md 3): the
+# global Cloudflare origin-pull CA would admit any Cloudflare zone.
+if grep -q 'trusted_ca_cert_file /etc/caddy/aop-zone-ca.pem' /etc/caddy/Caddyfile 2>/dev/null \
+  && [[ -s /etc/caddy/aop-zone-ca.pem ]]; then
+  ok "Caddy requires our zone-level origin-pull certificate"
+else
+  bad "Caddy does not require OUR zone AOP CA (/etc/caddy/aop-zone-ca.pem) — CREATE.md 3"
+fi
+pid=$(systemctl show -p MainPID --value durable-server 2>/dev/null || echo 0)
+argv=""
+if [[ "$pid" =~ ^[0-9]+$ ]] && (( pid > 0 )); then
+  argv=$(tr '\0' ' ' </proc/"$pid"/cmdline 2>/dev/null || true)
+fi
+if [[ "$argv" == *"--trusted-proxy 127.0.0.1/32"* ]]; then
+  ok "durable-server trusts the loopback proxy hop"
+else
+  bad "durable-server does not trust the loopback hop — install deploy/durable-run.sh"
 fi
 
 echo "backups"

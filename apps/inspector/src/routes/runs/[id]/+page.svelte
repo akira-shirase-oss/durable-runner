@@ -21,11 +21,11 @@
 
 	// polling stops once the run (and its timeline) are terminal: neither will change again
 	let finished = false;
-	const runRes: Resource<RunItem> = new Resource((signal) => inspect(session.readerKey, id ?? -1, signal), {
+	const runRes: Resource<RunItem> = new Resource((signal) => inspect(session.readerKey, id ?? '-', signal), {
 		interval: (): number => (finished ? 0 : POLL_MS),
 	});
 	poll(runRes, () => id);
-	const tlRes: Resource<RunTimeline> = new Resource((signal) => runEvents(session.readerKey, id ?? -1, signal), {
+	const tlRes: Resource<RunTimeline> = new Resource((signal) => runEvents(session.readerKey, id ?? '-', signal), {
 		interval: (): number => (finished && tlRes.data !== null && terminal(tlRes.data.state) ? 0 : POLL_MS),
 	});
 	poll(tlRes, () => id);
@@ -34,7 +34,7 @@
 	});
 
 	let specData = $state<Spec | null>(null);
-	let specFor = $state<number | null>(null);
+	let specFor = $state<string | null>(null);
 	let specError = $state<string | null>(null);
 	let actionError = $state<string | null>(null);
 	let notice = $state<string | null>(null);

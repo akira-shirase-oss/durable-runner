@@ -18,6 +18,12 @@ A background-task runner: submit versioned jobs, get durable acceptance,
 recover acknowledged state after process death. A framed append-only journal
 with one writer is the sole authority — no database queue, no Redis.
 
+**Overload scope:** under a flood from ONE host the server holds
+per-address fairness, answers every refusal it chooses with a readable
+`503 + Retry-After`, and keeps `/health` answering. A distributed flood
+is the edge's job — Cloudflare fronts the SaaS deploy; self-hosted,
+put a CDN or reverse proxy in front (`docs/OPERATING.md`).
+
 - `docs/END_GOAL.md` — what done means, the four required failure cases, the ship gate
 - `docs/ARCHITECTURE.md` — sources of truth, submit/step/recovery/compaction paths
 - `docs/ROADMAP.md` — D0 model → D1 journal → D2 execute → D3 maintain → D4 ship

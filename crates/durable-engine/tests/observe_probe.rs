@@ -1,5 +1,5 @@
-//! Probes for the observer's bounds (D-058): what it really costs at its
-//! caps, and per event. Ignored in the suite (they measure, they do not
+//! Probes for the observer's bounds (D-058, D-060): what it really costs
+//! at its caps, and per event. Ignored in the suite (they measure, they do not
 //! assert speed); run them in release:
 //!
 //! ```sh
@@ -8,9 +8,10 @@
 
 use durable_domain::RunId;
 use durable_engine::observe::{
-    memory_bound, CallResult, Kind, Observed, Observer, Window, COARSE_BUCKETS, COARSE_BUCKET_MS,
-    MAX_TIMELINES, MAX_TIMELINE_EVENTS,
+    memory_bound, CallGuard, CallResult, Kind, Observed, Observer, Scope, Window, COARSE_BUCKETS,
+    COARSE_BUCKET_MS, MAX_TIMELINES, MAX_TIMELINE_EVENTS, MAX_TRACKED_WORKSPACES,
 };
+use std::sync::Arc;
 use std::time::Instant;
 
 const T0: u64 = 1_764_000_000_000;
@@ -29,6 +30,8 @@ fn rss_kib() -> u64 {
 
 fn failed(run: u64, at: u64) -> Observed {
     Observed {
+        // Runs spread over every tracked tenant plus workspace 0.
+        ws: run % (MAX_TRACKED_WORKSPACES as u64 + 1),
         run: RunId(run),
         at,
         first: Kind::StepFailed { step: 0 },
@@ -36,15 +39,19 @@ fn failed(run: u64, at: u64) -> Observed {
     }
 }
 
-/// Fill every structure to its cap — 20,000 full timelines, the whole
-/// feed, every bucket of both rings, and ten handlers' rings — and report
-/// the RSS growth beside the size-based bound OPERATING.md quotes.
+/// Fill every structure to its cap — 20,000 full timelines, every
+/// workspace's feed and both rings in every bucket (workspace 0 and all
+/// tracked tenants), ten workspace-0 handlers and every tenant's handler
+/// stats — and report the RSS growth beside the size-based bound
+/// OPERATING.md quotes. Handler calls go through `CallGuard`, so their
+/// latencies are the probe's real elapsed times; the buckets are filled
+/// by sampling across the day.
 #[test]
 #[ignore = "probe: run in release with --nocapture"]
 fn observer_memory_at_its_caps() {
     let handlers: Vec<String> = (0..10).map(|i| format!("h{i}")).collect();
     let before = rss_kib();
-    let obs = Observer::new(T0, handlers.clone());
+    let obs = Arc::new(Observer::new(T0));
     let empty = rss_kib();
     // Every bucket of the day-long coarse ring (and so every fine one).
     let span = COARSE_BUCKETS as u64 * COARSE_BUCKET_MS;
@@ -56,6 +63,7 @@ fn observer_memory_at_its_caps() {
             n += 1;
             batch.push(if i == 0 {
                 Observed {
+                    ws: run % (MAX_TRACKED_WORKSPACES as u64 + 1),
                     run: RunId(run),
                     at,
                     first: Kind::Accepted { not_before: at },
@@ -71,15 +79,27 @@ fn observer_memory_at_its_caps() {
         }
     }
     obs.committed(&batch, true);
-    for (h, _) in handlers.iter().enumerate() {
-        for k in 0..(COARSE_BUCKETS as u64 * 6) {
-            let at = T0 + k * (COARSE_BUCKET_MS / 6);
-            obs.call_finished(h, CallResult::Ok, k % 70_000, at);
-            obs.sample(at);
+    // Every handler-stats slot: ten in workspace 0, the cap in each tenant.
+    for h in &handlers {
+        CallGuard::start(&obs, 0, Some(h)).finish(CallResult::Ok);
+    }
+    for ws in 1..=MAX_TRACKED_WORKSPACES as u64 {
+        for i in 0..durable_engine::observe::MAX_HANDLER_STATS_PER_WS {
+            CallGuard::start(&obs, ws, Some(&format!("t{i}"))).finish(CallResult::Ok);
         }
     }
+    obs.set_ws_index_gauges(|_| (1, 1));
+    for k in 0..(COARSE_BUCKETS as u64 * 6) {
+        obs.sample(T0 + k * (COARSE_BUCKET_MS / 6));
+    }
     let full = rss_kib();
-    let m = obs.metrics(Window::H24, T0 + span - 1, Default::default());
+    let m = obs.metrics(
+        Scope::All,
+        Window::H24,
+        T0 + span - 1,
+        Default::default(),
+        &handlers,
+    );
     assert_eq!(m.points.len(), COARSE_BUCKETS);
     assert_eq!(obs.timeline_stats().0, MAX_TIMELINES);
     println!(
@@ -100,7 +120,7 @@ fn observer_memory_at_its_caps() {
 fn observer_cost_per_event() {
     const EVENTS: u64 = 2_000_000;
     for live in [false, true] {
-        let obs = Observer::new(T0, ["h".to_string()]);
+        let obs = Observer::new(T0);
         let mut batch = Vec::with_capacity(1024);
         let started = Instant::now();
         for i in 0..EVENTS {
@@ -119,4 +139,76 @@ fn observer_cost_per_event() {
             obs.timeline_stats().1
         );
     }
+}
+
+/// Re-review S2-3: what a record and a call cost the actor/executor with
+/// tenants rotating — 17 (the old cap's first miss), the cap, the cap + 1
+/// (every lookup a miss, allocations reused), and one tenant rotating one
+/// handler more than its cap.
+#[test]
+#[ignore = "probe: run in release with --nocapture"]
+fn rotating_tenant_cost() {
+    use durable_engine::observe::MAX_HANDLER_STATS_PER_WS;
+    let accepted = |ws: u64, run: u64, at: u64| Observed {
+        ws,
+        run: RunId(run),
+        at,
+        first: Kind::Accepted { not_before: at },
+        then: None,
+    };
+    for tenants in [
+        17u64,
+        MAX_TRACKED_WORKSPACES as u64,
+        MAX_TRACKED_WORKSPACES as u64 + 1,
+    ] {
+        let obs = Arc::new(Observer::new(T0));
+        let rounds = 400u64;
+        let started = Instant::now();
+        let mut n = 0u64;
+        for round in 0..rounds {
+            for ws in 1..=tenants {
+                n += 1;
+                obs.committed(&[accepted(ws, n, T0 + round * 10_000 + ws)], true);
+            }
+        }
+        let per_record = started.elapsed().as_nanos() as f64 / n as f64;
+        let started = Instant::now();
+        let mut calls = 0u64;
+        for _ in 0..rounds {
+            for ws in 1..=tenants {
+                calls += 1;
+                CallGuard::start(&obs, ws, Some("h")).finish(CallResult::Ok);
+            }
+        }
+        let per_call = started.elapsed().as_nanos() as f64 / calls as f64;
+        let (tracked, evictions) = obs.workspace_stats();
+        let (rings, handler_rings) = obs.allocation_stats();
+        println!(
+            "{tenants} rotating tenants: {per_record:.0} ns/record, {per_call:.0} ns/call; \
+             tracked {tracked}, evictions {evictions}, allocations {rings} rings + {handler_rings} handler rings"
+        );
+    }
+    let obs = Arc::new(Observer::new(T0));
+    let names: Vec<String> = (0..=MAX_HANDLER_STATS_PER_WS)
+        .map(|i| format!("h{i}"))
+        .collect();
+    let started = Instant::now();
+    let mut calls = 0u64;
+    for _ in 0..2_000 {
+        for n in &names {
+            calls += 1;
+            CallGuard::start(&obs, 7, Some(n)).finish(CallResult::Ok);
+        }
+    }
+    let per_call = started.elapsed().as_nanos() as f64 / calls as f64;
+    println!(
+        "one tenant rotating {} handlers: {per_call:.0} ns/call, {} handler-ring allocations",
+        names.len(),
+        obs.allocation_stats().1
+    );
+    println!(
+        "memory bound (0 / 10 workspace-0 handlers): {} / {} KiB",
+        memory_bound(0) / 1024,
+        memory_bound(10) / 1024
+    );
 }

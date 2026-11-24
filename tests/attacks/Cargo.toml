@@ -1,0 +1,16 @@
+[package]
+name = "durable-attacks"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "Dynamic pentest regression suite: real attack requests against a running durable-server."
+
+[dependencies]
+tokio.workspace = true
+serde_json.workspace = true
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+tempfile = "3"
+
+[lints]
+workspace = true

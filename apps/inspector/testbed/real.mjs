@@ -3,7 +3,7 @@
 // PORT and PORT+1 (default 58723), seeds runs (ok, flaky with retries, scheduled, cancelled), loads every page
 // at 1440 and 390 and screenshots it; stops only the two processes it started.
 //   node testbed/real.mjs <durable-server binary> <ui build dir> <out-dir> <label> <new|old>
-import { spawn } from 'node:child_process';
+import { spawn, spawnSync } from 'node:child_process';
 import fs from 'node:fs';
 import path from 'node:path';
 const { chromium } = await import('playwright');
@@ -29,8 +29,11 @@ const handler = spawn('node', ['-e', `
     });
   }).listen(${HPORT}, '127.0.0.1');`], { stdio: 'ignore' });
 kids.push(handler);
+// A build with the S2 SSRF guard refuses loopback handler URLs unless told this is a fixture; older builds have no flag.
+const ssrfGuard = /--allow-local-handlers/.test(spawnSync(SRV, ['--help'], { encoding: 'utf8' }).stdout ?? '');
 const srv = spawn(SRV, ['--journal', `${dir}/journal`, '--listen', `127.0.0.1:${PORT}`, '--handler', `step=http://127.0.0.1:${HPORT}/step`,
-  '--handler', `flaky=http://127.0.0.1:${HPORT}/flaky`, '--handler', `slow=http://127.0.0.1:${HPORT}/slow`, '--ui-dir', UI, '--backup-root', `${dir}/backups`],
+  '--handler', `flaky=http://127.0.0.1:${HPORT}/flaky`, '--handler', `slow=http://127.0.0.1:${HPORT}/slow`, '--ui-dir', UI, '--backup-root', `${dir}/backups`,
+  ...(ssrfGuard ? ['--allow-local-handlers'] : [])],
   { stdio: ['ignore', 'ignore', 'pipe'], env: { ...process.env, DURABLE_API_KEY: API_KEY, DURABLE_READ_KEY: READ_KEY } });
 kids.push(srv);
 let stderr = '';

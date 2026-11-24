@@ -57,7 +57,8 @@ BIN=$TARGET/release
 SRV=$BIN/durable-server
 CLI="$BIN/durable-cli --server http://127.0.0.1:$SRV_PORT"
 SERVE=("$SRV" --journal "$WORK/journal" --listen "127.0.0.1:$SRV_PORT"
-  --backup-root "$WORK/backups" --handler "step=http://127.0.0.1:$HND_PORT/step")
+  --backup-root "$WORK/backups" --handler "step=http://127.0.0.1:$HND_PORT/step"
+  --allow-local-handlers)
 
 step "start the pilot handler + the server (UI mounted at /inspector)"
 python3 examples/pilot/handler.py "$HND_PORT" &
@@ -70,7 +71,10 @@ OUT=$($CLI submit --op-key pilot/onboarding-email \
       --step prepare=step --step deliver=step \
       --input '{"user":"alice","template":"welcome"}')
 echo "submit -> $OUT"
-ID=$(echo "$OUT" | grep -o '[0-9]*')
+# Submit answers {"run_id":"<opaque public id>"} — digits can't be
+# scraped out of it; take the field verbatim.
+ID=$(echo "$OUT" | sed -n 's/.*"run_id":"\([^"]*\)".*/\1/p')
+[ -n "$ID" ] || fail "submit returned no run_id: $OUT"
 AGAIN=$($CLI submit --op-key pilot/onboarding-email --step prepare=step --step deliver=step \
       --input '{"user":"alice","template":"welcome"}')
 [ "$AGAIN" = "$OUT" ] || fail "resubmitting the op_key gave $AGAIN, not $OUT"
@@ -113,7 +117,8 @@ kill -9 "$SRV_PID"
 wait "$SRV_PID" 2>/dev/null || true
 "$BIN/durable-cli" restore --from "$WORK/backups/pilot" --to "$WORK/restored"
 "$SRV" --journal "$WORK/restored" --listen "127.0.0.1:$RSRV_PORT" \
-  --handler "step=http://127.0.0.1:$HND_PORT/step" >"$WORK/restored.log" 2>&1 &
+  --handler "step=http://127.0.0.1:$HND_PORT/step" \
+  --allow-local-handlers >"$WORK/restored.log" 2>&1 &
 RSRV_PID=$!
 healthy "$RSRV_PORT"
 RCLI="$BIN/durable-cli --server http://127.0.0.1:$RSRV_PORT"

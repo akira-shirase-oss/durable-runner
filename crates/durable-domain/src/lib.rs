@@ -261,6 +261,12 @@ pub enum Refusal {
     ReserveExhausted,
     #[error("at capacity: live-run or index-byte bound reached")]
     AtCapacity,
+    /// One workspace hit ITS share of the bounds — a distinct refusal
+    /// from the global `AtCapacity`: the rest of the pool still admits,
+    /// and the answer tells the tenant to free its own runs or raise its
+    /// own share, never to wait for the whole runner (S2 re-review #6).
+    #[error("workspace quota: per-workspace live-run or index-byte share reached")]
+    WorkspaceQuota,
 }
 
 // -------------------------------------------------------------------- limits
@@ -315,9 +321,25 @@ pub struct Limits {
     /// Non-terminal runs the index may hold; submits beyond it are refused
     /// `AtCapacity` (dispatch drains them at a bounded rate).
     pub max_live_runs: usize,
+    /// One workspace's share of `max_live_runs` (S2 review #6): a single
+    /// tenant at this bound is refused `AtCapacity` while the rest of the
+    /// pool stays open — one tenant can never fill every live slot.
+    pub max_live_runs_per_ws: usize,
     /// Approximate bytes of every retained run (terminal ones stay seven
     /// days with their inputs); submits that would pass it are refused.
     pub max_index_bytes: u64,
+    /// One workspace's share of the index bytes (S2 re-review): a single
+    /// tenant's retained runs are refused `AtCapacity` past the smaller
+    /// of this bound and a quarter of `max_index_bytes` — the same
+    /// fairness share `max_live_runs_per_ws` gives the live pool, so no
+    /// one tenant's bytes can crowd every workspace out of the index.
+    pub max_index_bytes_per_ws: u64,
+    /// Compat mode (ws-0 only, no account store): workspace 0 is exempt
+    /// from both per-workspace shares and admits up to the global bounds
+    /// — exactly what v1.0.x did — so an upgrade never starts refusing
+    /// an install that already holds more than a quarter of the index
+    /// (S2 re-review finding 6). Real workspaces always obey shares.
+    pub ws0_share_exempt: bool,
 }
 
 impl Default for Limits {
@@ -331,10 +353,19 @@ impl Default for Limits {
             max_key_bytes: 256,
             max_name_bytes: 128,
             max_live_runs: 100_000,
+            // A fifth of the global pool: four tenants at their share
+            // fill four fifths, so a fifth tenant still admits (S2
+            // re-review N4 — quarter shares would let four fill it all).
+            max_live_runs_per_ws: 20_000,
             // Sized for a 2 GB host (D-031): peak RSS has been measured at
             // up to 1.6 × index bytes, plus up to one snapshot during a
             // compaction, plus ~100 MiB.
             max_index_bytes: 512 * 1024 * 1024,
+            // A fifth of the global index: four tenants at their share
+            // fill four fifths, so a fifth tenant still admits — the
+            // admission ceiling itself stays a quarter of the global.
+            max_index_bytes_per_ws: 100 * 1024 * 1024,
+            ws0_share_exempt: false,
         }
     }
 }
@@ -943,5 +974,51 @@ mod tests {
         let b = r.next_run_at(NOW, 1, RunId(7));
         assert_eq!(a, b);
         assert!(r.next_run_at(NOW, 40, RunId(7)) <= NOW + r.max_delay_ms + r.jitter_cap_ms);
+    }
+}
+
+/// Never-panics fuzzing for outside input: `JobSpec` deserialization
+/// (the `input_bytes` visitor accepts a base64 string or a byte array)
+/// and the admission rules on whatever survives it. A panic is a
+/// red-first bug.
+#[cfg(test)]
+mod fuzz {
+    use super::*;
+    use proptest::prelude::*;
+
+    fn jobspec_bytes(bytes: &[u8]) {
+        if let Ok(spec) = serde_json::from_slice::<JobSpec>(bytes) {
+            let l = Limits::default();
+            let _ = l.admits(&spec);
+        }
+    }
+
+    /// S2 re-review N4: the shipped per-tenant shares must leave headroom
+    /// — if four tenants each at their share tile a global bound exactly,
+    /// the fifth tenant is refused by capacity it never touched.
+    #[test]
+    fn shipped_shares_leave_the_fifth_tenant_headroom() {
+        let l = Limits::default();
+        assert!(4 * l.max_live_runs_per_ws < l.max_live_runs);
+        assert!(4 * l.max_index_bytes_per_ws < l.max_index_bytes);
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::default())]
+        #[test]
+        fn fuzz_jobspec_never_panics(bytes in proptest::collection::vec(any::<u8>(), 0..=4096)) {
+            jobspec_bytes(&bytes);
+        }
+
+        #[test]
+        fn fuzz_jobspec_text_never_panics(text in any::<String>()) {
+            jobspec_bytes(text.as_bytes());
+        }
+
+        #[test]
+        fn fuzz_opkey_never_panics(key in any::<String>()) {
+            let l = Limits::default();
+            let _ = l.admits_key(&OperationKey(key));
+        }
     }
 }

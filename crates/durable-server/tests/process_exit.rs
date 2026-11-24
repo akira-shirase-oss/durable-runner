@@ -1,7 +1,10 @@
 //! Process-level proof for the compaction swap rule (D-019): a real OS
-//! error at the manifest swap makes `durable-server` exit non-zero, nothing
-//! is acknowledged after it, and a restart replays everything acknowledged
-//! before it.
+//! error BEFORE the manifest swap — the unwritable journal root fails
+//! the `journal.shape` write — is an ordinary compaction error: the
+//! process keeps serving, SIGTERM drains it cleanly, and a restart
+//! replays everything acknowledged. A failure AT or after the rename
+//! still poisons; the in-process fault drill covers that (an external
+//! permissions trick cannot reach past the sidecar write anymore).
 #![cfg(unix)]
 
 use std::os::unix::fs::PermissionsExt;
@@ -40,6 +43,8 @@ fn server_cmd(journal: &Path, port: u16) -> Command {
         .args(["--listen", &format!("127.0.0.1:{port}")])
         .args(["--rate-limit-per-addr", &rate])
         .args(["--max-conns-per-addr", "0"])
+        // Every fixture handler lives on loopback — the S2-5 opt-out.
+        .arg("--allow-local-handlers")
         .env("DURABLE_API_KEY", KEY)
         .stdout(Stdio::null())
         .stderr(Stdio::null());
@@ -63,8 +68,21 @@ async fn wait_healthy(c: &reqwest::Client, base: &str) {
     panic!("server never became healthy");
 }
 
+/// The readiness signal a deployment probes: 200, not just a listener.
+async fn wait_ready(c: &reqwest::Client, base: &str) {
+    for _ in 0..200 {
+        if let Ok(r) = c.get(format!("{base}/ready")).send().await {
+            if r.status().is_success() {
+                return;
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    panic!("server never became ready");
+}
+
 /// Submit a delayed job; its run id if acknowledged.
-async fn submit(c: &reqwest::Client, base: &str, key: &str) -> Option<u64> {
+async fn submit(c: &reqwest::Client, base: &str, key: &str) -> Option<String> {
     let body = serde_json::json!({
         "op_key": key,
         "not_before": 9_999_999_999_999u64,
@@ -81,14 +99,18 @@ async fn submit(c: &reqwest::Client, base: &str, key: &str) -> Option<u64> {
     if !r.status().is_success() {
         return None;
     }
-    r.json::<serde_json::Value>().await.ok()?["run_id"].as_u64()
+    Some(
+        r.json::<serde_json::Value>().await.ok()?["run_id"]
+            .as_str()?
+            .to_string(),
+    )
 }
 
 /// Read an acknowledged run back and name what the answer means. Only a
 /// 404 (or a 200 naming a different run) is "lost". A 429 or 503 is the
 /// reader refused by a limit or by capacity — the run may be perfectly
 /// fine, and calling it lost costs a wrong diagnosis.
-async fn assert_run_survives(c: &reqwest::Client, base: &str, id: u64, across: &str) {
+async fn assert_run_survives(c: &reqwest::Client, base: &str, id: &str, across: &str) {
     let Ok(r) = c
         .get(format!("{base}/jobs/{id}"))
         .bearer_auth(KEY)
@@ -106,7 +128,7 @@ async fn assert_run_survives(c: &reqwest::Client, base: &str, id: u64, across: &
                 .await
                 .unwrap_or_else(|e| panic!("{e}"));
             assert_eq!(
-                body["id"].as_u64(),
+                body["id"].as_str(),
                 Some(id),
                 "acknowledged run {id} lost {across}: /jobs/{id} names a different run: {body}"
             );
@@ -127,8 +149,12 @@ impl Drop for Restore<'_> {
     }
 }
 
+/// A *pre-swap* compaction failure (the journal.shape write refused by an
+/// unwritable root) is an ordinary error, not a poison: the engine keeps
+/// serving, nothing is lost, and SIGTERM still drains to exit 0. The old
+/// name claimed the process exited — it asserted the opposite (re-review #8).
 #[tokio::test]
-async fn failed_manifest_swap_exits_the_process_and_loses_nothing() {
+async fn a_preswap_compaction_error_keeps_the_engine_and_loses_nothing() {
     let d = tempfile::tempdir().unwrap_or_else(|e| panic!("{e}"));
     let journal = d.path().join("journal");
     let port = free_port();
@@ -193,7 +219,7 @@ async fn failed_manifest_swap_exits_the_process_and_loses_nothing() {
     let mut server = start(&journal, port);
     wait_healthy(&c, &base).await;
     for id in &acked {
-        assert_run_survives(&c, &base, *id, "on restart").await;
+        assert_run_survives(&c, &base, id, "on restart").await;
     }
     let _ = server.kill();
     let _ = server.wait();
@@ -276,7 +302,7 @@ async fn sigterm_drains_in_flight_work_and_exits_zero() {
     let mut server = start(&journal, port);
     wait_healthy(&c, &base).await;
     for id in &acked {
-        assert_run_survives(&c, &base, *id, "across SIGTERM").await;
+        assert_run_survives(&c, &base, id, "across SIGTERM").await;
     }
     let _ = server.kill();
     let _ = server.wait();
@@ -393,6 +419,118 @@ async fn a_missing_or_short_key_refuses_startup() {
         "must differ",
     )
     .await;
+}
+
+/// Finding 2 (S1): a v1.0.x journal has committed runs but no public-id
+/// key — no v1.0.x binary ever wrote one. The S2 server must mint the
+/// key and come up on it: before the era check, every existing install
+/// crash-looped on upgrade (the key loader refused any non-empty
+/// journal). The same server must still refuse a pubid-era journal that
+/// lost its key — that refusal is the rename guard, kept by the unit
+/// test next to `load_or_generate`.
+#[tokio::test]
+async fn a_v1_journal_boots_and_reaches_ready() {
+    let d = tempfile::tempdir().unwrap_or_else(|e| panic!("{e}"));
+    let journal = d.path().join("journal");
+    // A journal exactly as v1.0.1 leaves it: manifest, writer lock and
+    // gen-000001 holding v2-envelope records — no journal.shape (that
+    // sidecar is v1.0.2) and never a public_id.key.
+    {
+        let mut j = durable_journal::Journal::open(&journal).unwrap_or_else(|e| panic!("{e}"));
+        j.append(
+            br#"{"v":2,"run":1,"at":1000,"event":{"Accepted":{"key":"legacy","spec":{"version":1,"steps":[{"name":"a","handler":"step"}],"input":"aGk="},"not_before":9999999999999}}}"#,
+        )
+        .unwrap_or_else(|e| panic!("{e}"));
+    }
+    assert!(
+        !journal.join("journal.shape").exists(),
+        "the fixture claims v1.0.1 — no sidecar"
+    );
+    assert!(
+        !journal.join("public_id.key").exists(),
+        "the fixture claims v1.0.1 — no key"
+    );
+
+    let port = free_port();
+    let base = format!("http://127.0.0.1:{port}");
+    let c = reqwest::Client::new();
+    let mut server = start(&journal, port);
+    wait_ready(&c, &base).await;
+
+    // The key was minted at boot, owner-only, and the upgrade mint is
+    // stable: the run the v1.0.1 writer committed can be read back by
+    // its S2-era public id.
+    assert_eq!(
+        std::fs::read(journal.join("public_id.key"))
+            .unwrap_or_else(|e| panic!("{e}"))
+            .len(),
+        32,
+        "upgrade minted the key"
+    );
+    let listed = c
+        .get(format!("{base}/jobs"))
+        .bearer_auth(KEY)
+        .timeout(Duration::from_secs(5))
+        .send()
+        .await
+        .unwrap_or_else(|e| panic!("{e}"));
+    assert_eq!(listed.status().as_u16(), 200);
+    let ids = listed
+        .json::<serde_json::Value>()
+        .await
+        .unwrap_or_else(|e| panic!("{e}"));
+    let run = &ids["runs"][0];
+    let id = run["id"]
+        .as_str()
+        .unwrap_or_else(|| panic!("{ids}"))
+        .to_string();
+    assert_eq!(
+        run["key"].as_str(),
+        Some("legacy"),
+        "the replayed run is listed under a public id: {ids}"
+    );
+    assert_run_survives(&c, &base, &id, "after the v1.0.x upgrade").await;
+    let _ = server.kill();
+    let _ = server.wait();
+}
+
+/// The other half of finding 2's contract at process level: a journal
+/// the S2 binary already wrote (v3 envelopes prove the era) that lost
+/// its public_id.key must refuse startup — minting would rename every
+/// public id clients hold.
+#[tokio::test]
+async fn a_pubid_era_journal_missing_its_key_refuses_to_start() {
+    let d = tempfile::tempdir().unwrap_or_else(|e| panic!("{e}"));
+    let journal = d.path().join("journal");
+    {
+        let mut j = durable_journal::Journal::open(&journal).unwrap_or_else(|e| panic!("{e}"));
+        j.append(
+            br#"{"v":3,"ws":0,"run":1,"at":1000,"event":{"Accepted":{"key":"era","spec":{"version":1,"steps":[{"name":"a","handler":"step"}],"input":[104,105]},"not_before":9999999999999}}}"#,
+        )
+        .unwrap_or_else(|e| panic!("{e}"));
+    }
+    let port = free_port();
+    let mut cmd = server_cmd(&journal, port);
+    cmd.args(["--handler", "step=http://127.0.0.1:9/unused"])
+        .stderr(Stdio::piped());
+    let mut server = cmd.spawn().unwrap_or_else(|e| panic!("{e}"));
+    let status = match exit_within(&mut server, Duration::from_secs(10)).await {
+        Some(s) => s,
+        None => {
+            let _ = server.kill();
+            let _ = server.wait();
+            panic!("a key-less pubid-era journal let the server start");
+        }
+    };
+    let mut err = String::new();
+    if let Some(mut e) = server.stderr.take() {
+        let _ = std::io::Read::read_to_string(&mut e, &mut err);
+    }
+    assert!(!status.success(), "exit {status}");
+    assert!(
+        err.contains("no public-id key"),
+        "stderr names the missing key: {err}"
+    );
 }
 
 /// Checklist P0: unauthenticated reads only on a loopback listener.

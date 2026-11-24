@@ -19,10 +19,14 @@
 //! `--max-conns-per-addr`. The per-address request rate still bounds
 //! each real client behind the proxy.
 //!
-//! Residual: an address space far wider than the table — a spray of
-//! distinct /48s — can still push new real clients into the shared
-//! overflow bucket. That is what the /48 aggregate is for: one /48
-//! cannot also mint the whole table of /64s.
+//! IPv6 sprays (re-review S2-2): the /48 aggregate is judged before any
+//! /64 bucket is created, so a refusing /48 fills nothing; one /48 holds
+//! at most `MAX_V6_PER_AGG` /64 entries (its further /64s share one
+//! bucket); idleness counts only admitted requests (a refused flood ages
+//! out); and the full table is scanned for idle entries at most once per
+//! second. Residual: a spray of distinct /48s — about 256 of them, a /40,
+//! to fill the default table — can still push new real clients into the
+//! shared overflow bucket; past that the edge (Cloudflare) carries it.
 
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv6Addr};
@@ -46,6 +50,16 @@ const V6_AGG_MULT: f64 = 10.0;
 
 /// Idle this long with a full bucket and the entry is reclaimable.
 const IDLE_EVICT: Duration = Duration::from_secs(60);
+
+/// At most this many `/64` entries per `/48` (re-review S2-2): past it,
+/// the /48's further /64s share ONE bucket at the address rate, so one
+/// /48 holds at most this many + 2 entries of the table.
+pub const MAX_V6_PER_AGG: usize = 256;
+
+/// A full table is scanned for idle entries at most this often: a miss
+/// flood must not run the O(table) scan under the limiter's lock per
+/// request (re-review S2-2: 259 µs per miss).
+const RECLAIM_EVERY: Duration = Duration::from_secs(1);
 
 /// An `ip/prefix` range (IPv4 or IPv6) a proxy address may come from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -116,9 +130,11 @@ pub fn client_addr(
     trusted: &TrustedProxies,
     cf_connecting_ip: Option<&str>,
 ) -> IpAddr {
+    // ATTACK(cf-header)
     if trusted.trusts(peer) {
         if let Some(ip) = cf_connecting_ip.and_then(|v| v.trim().parse::<IpAddr>().ok()) {
-            return ip;
+            // A mapped `::ffff:a.b.c.d` names an IPv4 client: key it as one.
+            return ip.to_canonical();
         }
     }
     peer
@@ -128,7 +144,12 @@ pub fn client_addr(
 #[derive(Debug, Clone, Copy)]
 struct Bucket {
     tokens: f64,
+    /// When the tokens were last refilled (the refill clock).
     updated: Instant,
+    /// When a request last proceeded on this bucket — the idleness clock.
+    /// A refusal never refreshes it (re-review S2-2: a refused flood kept
+    /// its entries forever young and the table full).
+    active: Instant,
 }
 
 impl Bucket {
@@ -136,6 +157,7 @@ impl Bucket {
         Self {
             tokens: burst,
             updated: now,
+            active: now,
         }
     }
 
@@ -156,6 +178,9 @@ enum LimitKey {
     /// An IPv6 /48 aggregate, so one /48 cannot spray through a fresh
     /// /64 bucket per request.
     V6Aggregate(u128),
+    /// The one address bucket a /48's /64s share once it holds
+    /// `MAX_V6_PER_AGG` of its own.
+    V6Shared(u128),
 }
 
 /// A bounded token-bucket table: one bucket per normalized client
@@ -169,6 +194,15 @@ pub struct RateLimit {
     v6_prefix: u8,
     max_addrs: usize,
     addrs: HashMap<LimitKey, Bucket>,
+    /// How many `Addr` (/64) entries each /48 holds now.
+    /// Each /48's own /64 entries (their address keys): the count the cap
+    /// reads, and the list a full /48 is reclaimed from.
+    per_agg: HashMap<u128, std::collections::HashSet<IpAddr>>,
+    /// When the full table was last scanned for idle entries.
+    last_reclaim: Option<Instant>,
+    /// Scans run so far (tests: the scan is rate-limited).
+    #[cfg(test)]
+    reclaims: u64,
     /// Every key that cannot get its own entry shares this one: a spray
     /// of distinct addresses limits itself, never evicts hot entries.
     overflow: Bucket,
@@ -188,6 +222,10 @@ impl RateLimit {
             v6_prefix: v6_prefix.min(128),
             max_addrs,
             addrs: HashMap::new(),
+            per_agg: HashMap::new(),
+            last_reclaim: None,
+            #[cfg(test)]
+            reclaims: 0,
             overflow: Bucket::full(rate.max(1.0), Instant::now()),
         }
     }
@@ -195,56 +233,117 @@ impl RateLimit {
     /// What a checked address is counted as: v4 as itself (a mapped v6
     /// unwrapped to the same key), v6 masked to `v6_prefix` bits.
     fn addr_key(&self, addr: IpAddr) -> LimitKey {
-        LimitKey::Addr(match addr {
-            IpAddr::V4(_) => addr,
-            IpAddr::V6(a) => match a.to_ipv4_mapped() {
-                Some(v4) => IpAddr::V4(v4),
-                None => {
-                    let masked = if self.v6_prefix == 0 {
-                        0
-                    } else {
-                        a.to_bits() & (!0u128 << (128 - self.v6_prefix))
-                    };
-                    IpAddr::V6(Ipv6Addr::from_bits(masked))
-                }
-            },
-        })
+        LimitKey::Addr(bucket_addr(addr, self.v6_prefix))
     }
 
     /// The `/48` aggregate for a real v6 address — only when it is
     /// strictly coarser than the address key (a `v6_prefix` of /48 or
     /// wider would make the aggregate the same bucket: charge once).
-    fn agg_key(&self, addr: IpAddr) -> Option<LimitKey> {
+    /// The /48 prefix of a real v6 address, when the aggregate applies —
+    /// only when it is strictly coarser than the address key (a
+    /// `v6_prefix` of /48 or wider would make it the same bucket).
+    fn agg_prefix(&self, addr: IpAddr) -> Option<u128> {
         if self.v6_prefix <= V6_AGG_PREFIX {
             return None;
         }
         match addr {
-            IpAddr::V6(a) if a.to_ipv4_mapped().is_none() => Some(LimitKey::V6Aggregate(
-                a.to_bits() & (!0u128 << (128 - V6_AGG_PREFIX)),
-            )),
+            IpAddr::V6(a) if a.to_ipv4_mapped().is_none() => {
+                Some(a.to_bits() & (!0u128 << (128 - V6_AGG_PREFIX)))
+            }
             _ => None,
         }
     }
 
     fn params(&self, key: LimitKey) -> (f64, f64) {
         match key {
-            LimitKey::Addr(_) => (self.rate, self.burst),
+            LimitKey::Addr(_) | LimitKey::V6Shared(_) => (self.rate, self.burst),
             LimitKey::V6Aggregate(_) => (self.agg_rate, self.agg_burst),
         }
     }
 
-    /// The bucket for `key`, creating it while there is room (reclaiming
-    /// minute-idle entries on a full table first) — otherwise the shared
-    /// overflow bucket.
+    /// The /48 an `Addr` key's /64 belongs to (for the per-/48 count).
+    fn agg_of_key(key: &LimitKey, v6_prefix: u8) -> Option<u128> {
+        match key {
+            LimitKey::Addr(IpAddr::V6(a)) if v6_prefix > V6_AGG_PREFIX => {
+                Some(a.to_bits() & (!0u128 << (128 - V6_AGG_PREFIX)))
+            }
+            _ => None,
+        }
+    }
+
+    /// On a full table, drop minute-idle entries — at most once per
+    /// `RECLAIM_EVERY`, never per request.
+    fn reclaim(&mut self, now: Instant) {
+        if self.addrs.len() < self.max_addrs
+            || self
+                .last_reclaim
+                .is_some_and(|t| now.saturating_duration_since(t) < RECLAIM_EVERY)
+        {
+            return;
+        }
+        self.last_reclaim = Some(now);
+        #[cfg(test)]
+        {
+            self.reclaims += 1;
+        }
+        let idle = now.checked_sub(IDLE_EVICT);
+        let v6_prefix = self.v6_prefix;
+        let per_agg = &mut self.per_agg;
+        self.addrs.retain(|k, b| {
+            // ATTACK(limiter-idle-clock)
+            let keep = idle.is_none_or(|i| b.active > i);
+            if !keep {
+                if let (Some(agg), LimitKey::Addr(a)) = (Self::agg_of_key(k, v6_prefix), k) {
+                    if let Some(set) = per_agg.get_mut(&agg) {
+                        set.remove(a);
+                        if set.is_empty() {
+                            per_agg.remove(&agg);
+                        }
+                    }
+                }
+            }
+            keep
+        });
+    }
+
+    /// A /48 at its cap drops its OWN minute-idle /64 entries (S3 re-review
+    /// 1: the table-wide scan runs only on a full table, so a /48 filled
+    /// once by one-off /64s stayed capped for good and its never-seen
+    /// /64s shared one bucket until restart). O(cap) for that /48 only.
+    fn reclaim_agg(&mut self, agg: u128, now: Instant) {
+        let Some(idle) = now.checked_sub(IDLE_EVICT) else {
+            return;
+        };
+        let Some(set) = self.per_agg.get_mut(&agg) else {
+            return;
+        };
+        let addrs = &mut self.addrs;
+        set.retain(|a| {
+            let key = LimitKey::Addr(*a);
+            let gone = addrs.get(&key).is_none_or(|b| b.active <= idle);
+            if gone {
+                addrs.remove(&key);
+            }
+            !gone
+        });
+        if set.is_empty() {
+            self.per_agg.remove(&agg);
+        }
+    }
+
+    /// The bucket for `key`, creating it while there is room — otherwise
+    /// the shared overflow bucket.
     fn bucket(&mut self, key: LimitKey, now: Instant) -> &mut Bucket {
         let (_, burst) = self.params(key);
         if !self.addrs.contains_key(&key) {
-            if self.addrs.len() >= self.max_addrs {
-                let idle = now - IDLE_EVICT;
-                self.addrs.retain(|_, b| b.updated > idle);
-            }
+            self.reclaim(now);
             if self.addrs.len() < self.max_addrs {
                 self.addrs.insert(key, Bucket::full(burst, now));
+                if let (Some(agg), LimitKey::Addr(a)) =
+                    (Self::agg_of_key(&key, self.v6_prefix), key)
+                {
+                    self.per_agg.entry(agg).or_default().insert(a);
+                }
             }
         }
         match self.addrs.get_mut(&key) {
@@ -254,6 +353,7 @@ impl RateLimit {
     }
 
     /// How long until `key`'s bucket holds a token (zero if it does now).
+    /// A refusal refills the tokens but never refreshes `active`.
     fn wait(&mut self, key: LimitKey, now: Instant) -> Duration {
         let (rate, burst) = self.params(key);
         let b = self.bucket(key, now);
@@ -270,25 +370,45 @@ impl RateLimit {
         let b = self.bucket(key, now);
         b.refill(now, rate, burst);
         b.tokens -= 1.0;
+        b.active = now;
     }
 
     /// Ok: this request may proceed. Err: refuse with that Retry-After —
     /// the longer wait of the address and aggregate buckets.
+    ///
+    /// The /48 aggregate is judged FIRST (re-review S2-2): a /48 that is
+    /// refusing never creates a /64 entry, so a spray of fresh /64s fills
+    /// nothing; and a /48 already holding `MAX_V6_PER_AGG` /64 entries
+    /// keys its further /64s at one shared bucket instead of new entries.
     pub fn check(&mut self, addr: IpAddr, now: Instant) -> Result<(), Duration> {
-        let addr_key = self.addr_key(addr);
-        let agg_key = self.agg_key(addr);
-        let wait = self.wait(addr_key, now);
-        let agg_wait = match agg_key {
-            Some(k) => self.wait(k, now),
-            None => Duration::ZERO,
-        };
-        let needed = wait.max(agg_wait);
-        if needed > Duration::ZERO {
-            return Err(needed);
+        let agg = self.agg_prefix(addr);
+        let mut agg_wait = Duration::ZERO;
+        if let Some(p) = agg {
+            // ATTACK(v6-agg-first)
+            agg_wait = self.wait(LimitKey::V6Aggregate(p), now);
+            if agg_wait > Duration::ZERO {
+                return Err(agg_wait);
+            }
+        }
+        let mut addr_key = self.addr_key(addr);
+        if let Some(p) = agg {
+            let at_cap = |l: &Self| l.per_agg.get(&p).map_or(0, |s| s.len()) >= MAX_V6_PER_AGG;
+            if !self.addrs.contains_key(&addr_key) && at_cap(self) {
+                // ATTACK(v6-agg-idle-reclaim)
+                self.reclaim_agg(p, now);
+                // ATTACK(v6-per-agg-cap)
+                if at_cap(self) {
+                    addr_key = LimitKey::V6Shared(p);
+                }
+            }
+        }
+        let wait = self.wait(addr_key, now).max(agg_wait);
+        if wait > Duration::ZERO {
+            return Err(wait);
         }
         self.spend(addr_key, now);
-        if let Some(k) = agg_key {
-            self.spend(k, now);
+        if let Some(p) = agg {
+            self.spend(LimitKey::V6Aggregate(p), now);
         }
         Ok(())
     }
@@ -299,25 +419,77 @@ impl RateLimit {
     }
 }
 
-/// Per-peer open connections. Over the cap the socket is closed at
-/// accept; the guard releases the slot when the connection ends. A peer
-/// inside the trusted-proxy ranges gets the larger `cap_trusted`: the
-/// peer is the proxy's edge, and one edge legitimately holds many real
-/// clients' connections (D-052). The global connection cap still bounds
-/// everything.
+/// The address a connection or request is counted under: v4 as itself
+/// (a v4-mapped v6 peer unwrapped to the same bucket), a real v6 masked
+/// to `v6_prefix` bits — one /64 is one bucket, so a host's 2^64 host
+/// bits cannot mint a fresh bucket per connection (S2 re-review F3: the
+/// conn cap used to key the exact address while the rate limiter keyed
+/// the prefix, giving one /64 an unbounded connection budget).
+fn bucket_addr(addr: IpAddr, v6_prefix: u8) -> IpAddr {
+    match addr {
+        IpAddr::V4(_) => addr,
+        IpAddr::V6(a) => match a.to_ipv4_mapped() {
+            Some(v4) => IpAddr::V4(v4),
+            None => {
+                let masked = if v6_prefix == 0 {
+                    0
+                } else {
+                    a.to_bits() & (!0u128 << (128 - v6_prefix))
+                };
+                IpAddr::V6(Ipv6Addr::from_bits(masked))
+            }
+        },
+    }
+}
+
+/// The bucket an address's fair share is counted under: a v4 address
+/// stands alone; a real v6 address's share is its /48 aggregate, so a
+/// host that owns a /48 cannot mint 65,536 share buckets (or escape the
+/// aggregate cap below) by spraying its /64s (S2 re-review N3, same
+/// convention as the rate limiter's /48 aggregate).
+fn share_bucket_addr(addr: IpAddr) -> IpAddr {
+    match addr {
+        IpAddr::V4(_) => addr,
+        IpAddr::V6(a) => match a.to_ipv4_mapped() {
+            Some(v4) => IpAddr::V4(v4),
+            None => IpAddr::V6(Ipv6Addr::from_bits(a.to_bits() & (!0u128 << (128 - 48)))),
+        },
+    }
+}
+
+/// The aggregate cap multiplier over a /48 — the rate limiter's
+/// convention, applied to connection counts (S2 re-review N3).
+const AGGREGATE_CAP_MULT: usize = 10;
+
+/// Per-peer open connections, counted under two keys: the configured
+/// prefix bucket for the per-address cap, and the /48 share bucket for
+/// the fair-share count and — for real v6 peers — an aggregate cap at
+/// `AGGREGATE_CAP_MULT` times the per-bucket cap. Over a cap the socket
+/// is refused at accept; the guard releases both slots when the
+/// connection ends. A peer inside the trusted-proxy ranges gets the
+/// larger `cap_trusted`: the peer is the proxy's edge, and one edge
+/// legitimately holds many real clients' connections (D-052). The
+/// global connection cap still bounds everything. The counts are kept
+/// even with no cap configured — fair-share accounting and the starved
+/// -accept eviction read them (S2 re-review F3 + N3).
 #[derive(Debug, Clone)]
 pub struct ConnLimit {
     cap_untrusted: usize,
     cap_trusted: usize,
-    counts: std::sync::Arc<std::sync::Mutex<HashMap<IpAddr, usize>>>,
+    v6_prefix: u8,
+    counts: Counts,
 }
 
+// The dual counters: configured-prefix caps first, /48 share buckets second.
+type Counts = std::sync::Arc<std::sync::Mutex<(HashMap<IpAddr, usize>, HashMap<IpAddr, usize>)>>;
+
 impl ConnLimit {
-    pub fn new(cap_untrusted: usize, cap_trusted: usize) -> Self {
+    pub fn new(cap_untrusted: usize, cap_trusted: usize, v6_prefix: u8) -> Self {
         Self {
             cap_untrusted,
             cap_trusted,
-            counts: std::sync::Arc::new(std::sync::Mutex::new(HashMap::new())),
+            v6_prefix: v6_prefix.min(128),
+            counts: std::sync::Arc::new(std::sync::Mutex::new((HashMap::new(), HashMap::new()))),
         }
     }
 
@@ -327,42 +499,84 @@ impl ConnLimit {
         } else {
             self.cap_untrusted
         };
+        let cap_bucket = bucket_addr(addr, self.v6_prefix);
+        let share_bucket = share_bucket_addr(addr);
         let mut counts = self.counts.lock().unwrap_or_else(|p| p.into_inner());
-        let n = counts.entry(addr).or_insert(0);
-        if cap > 0 && *n >= cap {
-            return None;
+        let (cap_counts, share_counts) = &mut *counts;
+        if cap > 0 {
+            if cap_counts.get(&cap_bucket).copied().unwrap_or(0) >= cap {
+                return None;
+            }
+            // The /48 aggregate bounds a real-v6 tenant to 10x one
+            // bucket's conns — subnet-hopping inside its /48 cannot mint
+            // an unlimited connection budget (S2 re-review N3).
+            if share_bucket.is_ipv6()
+                && share_counts.get(&share_bucket).copied().unwrap_or(0)
+                    >= cap.saturating_mul(AGGREGATE_CAP_MULT)
+            {
+                return None;
+            }
         }
-        *n += 1;
+        *cap_counts.entry(cap_bucket).or_insert(0) += 1;
+        *share_counts.entry(share_bucket).or_insert(0) += 1;
         Some(ConnGuard {
-            addr,
+            cap_bucket,
+            share_bucket,
             counts: self.counts.clone(),
         })
     }
 
-    #[cfg(test)]
-    fn held(&self, addr: IpAddr) -> usize {
-        *self
-            .counts
+    /// Conns held under `addr`'s share bucket — the fair-share
+    /// numerator (v6 answers for its whole /48).
+    pub fn held(&self, addr: IpAddr) -> usize {
+        let share = share_bucket_addr(addr);
+        self.counts
             .lock()
             .unwrap_or_else(|p| p.into_inner())
-            .get(&addr)
-            .unwrap_or(&0)
+            .1
+            .get(&share)
+            .copied()
+            .unwrap_or(0)
+    }
+
+    /// Distinct share buckets currently holding conns — the fair-share
+    /// denominator.
+    pub fn buckets(&self) -> usize {
+        self.counts
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .1
+            .len()
     }
 }
 
 #[derive(Debug)]
 pub struct ConnGuard {
-    addr: IpAddr,
-    counts: std::sync::Arc<std::sync::Mutex<HashMap<IpAddr, usize>>>,
+    cap_bucket: IpAddr,
+    share_bucket: IpAddr,
+    counts: Counts,
+}
+
+impl ConnGuard {
+    /// The conn's fair-share bucket — the victim ordering keys on it.
+    pub fn share_bucket(&self) -> IpAddr {
+        self.share_bucket
+    }
 }
 
 impl Drop for ConnGuard {
     fn drop(&mut self) {
         let mut counts = self.counts.lock().unwrap_or_else(|p| p.into_inner());
-        match counts.get_mut(&self.addr) {
-            Some(n) if *n > 1 => *n -= 1,
-            _ => {
-                counts.remove(&self.addr);
+        let (cap_counts, share_counts) = &mut *counts;
+        for (map, bucket) in [
+            (&mut *cap_counts, self.cap_bucket),
+            (&mut *share_counts, self.share_bucket),
+        ] {
+            match map.get_mut(&bucket) {
+                Some(n) if *n > 1 => *n -= 1,
+                _ => {
+                    map.remove(&bucket);
+                }
             }
         }
     }
@@ -554,6 +768,173 @@ mod tests {
         assert_eq!(refused, 15);
     }
 
+    /// `2001:db8:0:<n>::1` — the n-th /64 of one /48.
+    fn slash64(n: u32) -> IpAddr {
+        let n = (n % 65_536) as u16;
+        IpAddr::V6(Ipv6Addr::new(0x2001, 0xdb8, 0, n, 0, 0, 0, 1))
+    }
+
+    /// Re-review S2-2: 70,000 requests from distinct /64s of ONE /48 used
+    /// to insert a /64 entry before the aggregate refused — the table
+    /// filled (65,536/65,536) and new real clients shared the overflow.
+    /// Judged aggregate-first with a per-/48 cap, the flood leaves the
+    /// table almost empty and 200 new clients each get their own bucket.
+    #[test]
+    fn a_slash48_spray_leaves_room_for_new_clients() {
+        let mut lim = RateLimit::new(5.0, MAX_LIMITED_ADDRS, 64);
+        let t0 = Instant::now();
+        let mut admitted = 0;
+        for i in 0..70_000u32 {
+            if lim
+                .check(slash64(i), t0 + Duration::from_micros(u64::from(i)))
+                .is_ok()
+            {
+                admitted += 1;
+            }
+        }
+        // DECISIVE(v6-agg-first)
+        assert!(admitted <= 60, "the /48 aggregate held: {admitted}");
+        assert!(
+            lim.tracked() <= MAX_V6_PER_AGG + 2,
+            "one /48 filled the table: {} entries",
+            lim.tracked()
+        );
+        let t1 = t0 + Duration::from_millis(100);
+        let passed = (0..200u32)
+            .filter(|i| {
+                let a = IpAddr::from([198, 51, (100 + i / 200) as u8, (i % 200) as u8]);
+                lim.check(a, t1).is_ok()
+            })
+            .count();
+        assert_eq!(passed, 200, "new clients must not share an overflow bucket");
+    }
+
+    /// Past `MAX_V6_PER_AGG` /64 entries a /48's further /64s share one
+    /// bucket — admitted at the address rate, never new entries.
+    #[test]
+    fn a_slash48_holds_at_most_its_cap_of_slash64_entries() {
+        // A generous aggregate so the per-/48 cap is what binds.
+        let mut lim = RateLimit::new(1_000.0, MAX_LIMITED_ADDRS, 64);
+        let t0 = Instant::now();
+        for i in 0..(MAX_V6_PER_AGG as u32 + 500) {
+            let _ = lim.check(slash64(i), t0 + Duration::from_millis(u64::from(i)));
+        }
+        // DECISIVE(v6-per-agg-cap)
+        assert_eq!(
+            lim.per_agg.values().map(|s| s.len()).max(),
+            Some(MAX_V6_PER_AGG)
+        );
+        assert!(lim.tracked() <= MAX_V6_PER_AGG + 2, "{}", lim.tracked());
+    }
+
+    /// S3 re-review 1: a /48 whose cap was filled by one-off /64s does not
+    /// stay capped once they go idle — a never-seen /64 in it gets its own
+    /// bucket instead of the shared one, without the table being full.
+    #[test]
+    fn a_slash48_cap_frees_once_its_slash64s_go_idle() {
+        let mut lim = RateLimit::new(1_000.0, MAX_LIMITED_ADDRS, 64);
+        let t0 = Instant::now();
+        for i in 0..MAX_V6_PER_AGG as u32 {
+            assert!(lim
+                .check(slash64(i), t0 + Duration::from_millis(u64::from(i)))
+                .is_ok());
+        }
+        let p = slash64(0);
+        let agg = lim.agg_prefix(p).unwrap_or_else(|| panic!("a /48"));
+        assert_eq!(lim.per_agg.get(&agg).map(|s| s.len()), Some(MAX_V6_PER_AGG));
+        // An hour later every one of them is idle; the table is far from full.
+        let later = t0 + Duration::from_secs(3_600);
+        let fresh = slash64(60_000);
+        assert!(lim.check(fresh, later).is_ok());
+        // DECISIVE(v6-agg-idle-reclaim)
+        assert!(
+            lim.addrs.contains_key(&lim.addr_key(fresh)),
+            "the /48 stayed capped by idle /64s: the new /64 shares one bucket"
+        );
+        assert!(lim
+            .per_agg
+            .get(&agg)
+            .is_some_and(|s| s.len() < MAX_V6_PER_AGG));
+    }
+
+    /// A refused flood never keeps its entry young: past a minute of only
+    /// refusals the entry is reclaimable, and a new client takes its slot.
+    /// The scan itself runs at most once per `RECLAIM_EVERY`.
+    #[test]
+    fn refusals_do_not_refresh_idleness_and_the_scan_is_rate_limited() {
+        // One token per 1000 s: after its first request the flooder is
+        // refused for the whole minute.
+        let mut lim = RateLimit::new(0.001, 2, 64);
+        let t0 = Instant::now();
+        let flooder = ip("192.0.2.1");
+        let other = ip("192.0.2.2");
+        assert!(lim.check(flooder, t0).is_ok());
+        assert!(lim.check(other, t0).is_ok());
+        for ms in (1..61_000u64).step_by(5) {
+            assert!(lim.check(flooder, t0 + Duration::from_millis(ms)).is_err());
+        }
+        // Both entries are a minute idle: the refused one included.
+        let t1 = t0 + Duration::from_secs(62);
+        let new = ip("192.0.2.3");
+        assert!(lim.check(new, t1).is_ok());
+        assert!(
+            lim.addrs.contains_key(&lim.addr_key(new)),
+            "new took a slot"
+        );
+        // DECISIVE(limiter-idle-clock)
+        assert!(
+            !lim.addrs.contains_key(&lim.addr_key(flooder)),
+            "the refused flooder kept its slot by being refused"
+        );
+        // A thousand more misses inside the same second: one scan, not 1,000.
+        let before = lim.reclaims;
+        for i in 0..1000u32 {
+            let a = IpAddr::from([203, 0, (i >> 8) as u8, i as u8]);
+            let _ = lim.check(a, t1 + Duration::from_micros(u64::from(i)));
+        }
+        assert!(
+            lim.reclaims - before <= 1,
+            "{} scans",
+            lim.reclaims - before
+        );
+    }
+
+    /// Probe (release, ignored): the per-check cost of the re-review S2-2
+    /// flood — 70k distinct /64s of one /48 into a full-size table, then
+    /// 100k misses from fresh IPv4 addresses into a table full of active
+    /// entries (before the fix each miss scanned the whole table).
+    ///   cargo test --release -p durable-server --bin durable-server -- --ignored --nocapture limiter_cost
+    #[test]
+    #[ignore = "probe: run in release with --nocapture"]
+    fn limiter_cost_under_a_slash48_flood_and_a_miss_flood() {
+        let mut lim = RateLimit::new(5.0, MAX_LIMITED_ADDRS, 64);
+        let t0 = Instant::now();
+        let start = std::time::Instant::now();
+        for i in 0..70_000u32 {
+            let _ = lim.check(slash64(i), t0 + Duration::from_micros(u64::from(i)));
+        }
+        let flood = start.elapsed().as_nanos() as f64 / 70_000.0;
+        // Fill the table with active entries, then miss.
+        let mut full = RateLimit::new(1_000.0, MAX_LIMITED_ADDRS, 64);
+        for i in 0..MAX_LIMITED_ADDRS as u32 {
+            let _ = full.check(
+                IpAddr::from([10, (i >> 16) as u8, (i >> 8) as u8, i as u8]),
+                t0,
+            );
+        }
+        let start = std::time::Instant::now();
+        for i in 0..100_000u32 {
+            let a = IpAddr::from([11, (i >> 16) as u8, (i >> 8) as u8, i as u8]);
+            let _ = full.check(a, t0 + Duration::from_micros(u64::from(i)));
+        }
+        let miss = start.elapsed().as_nanos() as f64 / 100_000.0;
+        println!(
+            "limiter: {flood:.0} ns/check in the /48 flood ({} entries after), \
+             {miss:.0} ns/check per miss on a full table",
+            lim.tracked()
+        );
+    }
+
     /// Idle entries are reclaimed when the table fills; a hot entry is not.
     #[test]
     fn idle_entries_make_room_but_hot_entries_stay() {
@@ -581,7 +962,7 @@ mod tests {
 
     #[test]
     fn the_connection_cap_releases_on_drop() {
-        let limit = ConnLimit::new(2, 4);
+        let limit = ConnLimit::new(2, 4, DEFAULT_V6_PREFIX);
         let a = ip("192.0.2.1");
         let b = ip("192.0.2.2");
         let g1 = limit
@@ -606,7 +987,7 @@ mod tests {
     /// larger `cap_trusted`, the untrusted-peer cap does not apply.
     #[test]
     fn a_trusted_peer_gets_the_higher_cap() {
-        let limit = ConnLimit::new(2, 4);
+        let limit = ConnLimit::new(2, 4, DEFAULT_V6_PREFIX);
         let a = ip("192.0.2.1");
         let _held: Vec<ConnGuard> = (0..4)
             .map(|_| {
@@ -623,5 +1004,38 @@ mod tests {
             limit.acquire(ip("192.0.2.2"), false).is_some(),
             "an untrusted peer still gets its own count"
         );
+    }
+
+    /// S2 re-review F3: the conn cap keys the same bucket as the rate
+    /// limiter — a /64's 2^64 host addresses share one count, so a host
+    /// cannot mint a fresh connection budget per address. A v4-mapped v6
+    /// peer lands in its v4 bucket.
+    #[test]
+    fn a_slash64_shares_one_connection_budget() {
+        let limit = ConnLimit::new(2, 4, 64);
+        let a1 = ip("2001:db8::1");
+        let a2 = ip("2001:db8::2");
+        let _g1 = limit.acquire(a1, false).unwrap_or_else(|| panic!("conn 1"));
+        let _g2 = limit.acquire(a2, false).unwrap_or_else(|| panic!("conn 2"));
+        assert_eq!(limit.held(a1), 2, "one /64 is one bucket");
+        assert!(
+            limit.acquire(ip("2001:db8::3"), false).is_none(),
+            "a third address in the /64 is over the cap"
+        );
+        assert!(
+            limit.acquire(ip("2001:db8:1::1"), false).is_some(),
+            "a different /64 is a different bucket"
+        );
+        // The mapped v4 peer is its v4 self, not a fresh v6 bucket.
+        let mapped = limit.acquire(ip("::ffff:192.0.2.1"), false);
+        assert!(mapped.is_some(), "v4-mapped: its own bucket");
+        let _gv4 = limit
+            .acquire(ip("192.0.2.1"), false)
+            .unwrap_or_else(|| panic!("v4"));
+        assert!(
+            limit.acquire(ip("::ffff:192.0.2.1"), false).is_none(),
+            "the mapped form shares the v4 bucket"
+        );
+        drop(mapped);
     }
 }

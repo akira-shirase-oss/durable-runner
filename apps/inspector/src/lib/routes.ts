@@ -27,15 +27,16 @@ export function sectionOf(routeId: string | null | undefined): Section {
 	return hit ? hit.section : 'overview';
 }
 
-/** A run id from a route param or a "jump to run" field: digits only (an optional leading "#" or spaces are
- *  forgiven), a safe integer. Anything else is null, never NaN. */
-export function parseRunId(s: string | null | undefined): number | null {
+/** A run id from a route param or a "jump to run" field: the server's opaque public id (11 base64url
+ *  characters), or a legacy all-digit id the default workspace still accepts (an optional leading "#" or spaces
+ *  are forgiven). Anything else is null. The id is passed back to the server as-is: only it can decode it. */
+export function parseRunId(s: string | null | undefined): string | null {
 	const v = (s ?? '').trim().replace(/^#/, '');
-	if (!/^\d{1,16}$/.test(v)) return null;
-	const n = Number(v);
-	return Number.isSafeInteger(n) ? n : null;
+	if (/^[A-Za-z0-9_-]{11}$/.test(v)) return v;
+	if (/^\d{1,16}$/.test(v) && Number.isSafeInteger(Number(v))) return v;
+	return null;
 }
 
-export function runHref(id: number): string {
-	return `#/runs/${id}`;
+export function runHref(id: string): string {
+	return `#/runs/${encodeURIComponent(id)}`;
 }

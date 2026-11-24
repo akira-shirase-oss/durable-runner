@@ -48,3 +48,28 @@ jobs:
 
       - name: Gate
         run: scripts/check.sh
+
+  # The dynamic pentest suite is its own job so a red gate step can never
+  # hide it: real attack requests against a running durable-server, then
+  # the mutation proof that each attack fails without its protection.
+  attacks:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install the pinned Rust toolchain (rust-toolchain.toml)
+        run: |
+          rustup --version
+          rustup toolchain install || rustup show
+          cargo --version
+
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+
+      - name: Attack suite (real instances)
+        run: tests/attacks/run.sh
+
+      - name: Mutation proof (each attack must go red without its protection)
+        run: tests/attacks/prove-attacks.sh

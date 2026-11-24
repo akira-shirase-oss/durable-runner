@@ -6,6 +6,224 @@ versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+S2-1 + S2-2: the account graph and the workspace-scoped API. With
+`DATABASE_URL` set, API keys minted per workspace authenticate into that
+workspace and nothing else; without it the server behaves as v1.0.1
+(every key lands in workspace 0 — which still accepts v1.0.1's bare
+numeric run ids, though every id it issues is now opaque). The journal
+remains the sole
+authority for jobs — the account store is consulted at ingress only,
+never inside the commit path, and already-accepted runs keep executing
+through a store outage.
+
+S2-3: the writer now emits **v3** journal envelopes (`v:3` + `ws` on
+every record, including compat-mode workspace 0). v1.0.1 — shipped one
+release early per D-056 — is the rollback floor: v1.0.0's reader refuses
+a v3 journal cleanly, v1.0.1 replays mixed v2/v3 history and discards
+only demonstrably incomplete torn tails.
+
+S2-4: the **per-workspace handler registry**. A step's `handler` now
+resolves only inside the submitting workspace — a spec naming an
+unregistered or foreign-workspace handler fails admission as
+`unregistered_handler` before anything is journaled.
+
+S2-5: the **SSRF guard**. No handler call may reach a non-global
+address — enforced where enforcement cannot be bypassed.
+
+S2-6: **signed handler calls**. Every call a store-registered handler
+receives carries `x-durable-timestamp` + `x-durable-signature`
+(HMAC-SHA256 under the workspace's secret over the newline-joined
+`ts\nmethod\nauthority\npath\nrun\nstep\nattempt\nidem_key\nSHA256(body)` —
+`authority` is the handler's configured authority — never the
+received `Host`, which a replayer controls — `run` the opaque
+public id); `POST /handler-secret`
+rotates and re-arms the engine in the same request; the handler-side
+contract + reference verifier ship in `docs/HANDLERS.md`.
+
+### Added
+
+- **`durable-accounts`**: the `AccountStore` trait over Postgres (sqlx,
+  `sslmode=verify-full`-capable) and an in-memory implementation for
+  tests. Schema `0001_init.sql`: workspaces (internal `u64` + external
+  `public_id` UUIDv7), accounts, members, api_keys (SHA-256 digests,
+  never plaintext), handler_registrations; the default workspace 0 is
+  seeded by migration.
+- **Keyring authentication**: bearer digests verify against the store
+  with a bounded write-through cache (60 s positive / 5 s negative TTL,
+  10k entries). Store-backed revocation invalidates the cache instantly;
+  an unreachable store answers `503 accounts_unavailable` for uncached
+  keys while cached grants keep working. `DURABLE_API_KEY` /
+  `DURABLE_READ_KEY` are unchanged and always land in workspace 0.
+- **Workspace-scoped API**: every `/jobs` route resolves the workspace
+  from the authenticated key — list, inspect, spec and cancel see only
+  that workspace's runs. A run id from another workspace answers `404`,
+  identical to a missing run (no existence oracle). Idempotency dedups
+  per `(workspace, op_key)` — the same key under two workspaces is two
+  runs.
+- **Workspace management routes** (`/admin/workspaces…`, workspace-0
+  admin only): create/list/get workspaces by `public_id` (UUIDv7); mint,
+  list and revoke API keys — minted `dr_…` plaintext is returned exactly
+  once, at creation. `GET /whoami` reports the caller's `public_id` and
+  permission.
+- **`Diagnostics.workspaces_active`**: distinct workspaces holding live
+  runs, as a count only — diagnostics never carries a workspace id.
+- **Record format v3 writer** (S2-3): every committed record now carries
+  `ws`. Journals written by this build refuse the v1.0.0 binary (reader
+  to v2) and remain readable by v1.0.1 — the rollback floor D-056 kept.
+  Mixed v2/v3 journals replay each run into its own workspace; a torn
+  v3 tail is discarded exactly as a torn v2 tail was.
+- **Neon CI workflow** (`.github/workflows/neon.yml`): the Postgres
+  store's contract tests run against real Neon behind a secret; absent,
+  the job skips with a visible notice rather than silently passing.
+- **`GET/PUT/DELETE /handlers`** (S2-4): workspace-scoped registration
+  routes backed by the account store (`handler_registrations`); each
+  workspace is bounded at 256 handlers, checked before the store write.
+- **Engine `(workspace, name)` registry**: registrations reach the
+  engine over the same bounded command channel as submits — dispatch
+  never performs a store read. Compat `--handler` flags are workspace
+  0's registrations, shadowed by same-name store rows.
+- **Last-known-good snapshot** (`<journal>/handlers.json`, temp-file +
+  rename): loaded before serving at startup, refreshed by a 30 s
+  reconciler. A store outage keeps the in-memory set dispatching and
+  raises `registry_stale` in `/admin/diagnostics`; mutation and
+  reconciler writes to the file are serialized.
+- **SSRF guard** (`ssrf.rs`, S2-5): a `PolicyResolver` inside the
+  handler client's DNS path refuses every resolution containing a
+  non-global address — the check *is* the resolution, so a DNS answer
+  that flips local after registration sends zero packets (tested: a
+  loopback listener counts connections on a refused call). Literal
+  local targets — including parser-normalized decimal/hex/mapped-v6
+  forms — refuse at registration as `422 local_target_forbidden`; a
+  refused call is a failed attempt, never "unknown".
+  `--allow-local-handlers` is the explicit dev/fixture opt-out.
+- **Signed handler calls** (S2-6): store-registered handlers carry
+  `x-durable-timestamp` + `x-durable-signature` — hex HMAC-SHA256 under
+  the workspace's 32-byte secret over the newline-joined
+  `ts\nmethod\nauthority\npath\nrun\nstep\nattempt\nidem_key\nSHA256(body)`
+  (`authority` is the handler's configured authority, `run` the opaque
+  public id); probes sign the empty-digest form.
+  The secret rides `handlers.json` so a restart during a store outage
+  still signs. `--handler` flags and compat mode stay unsigned.
+- **`POST /handler-secret`** (S2-6): draws a fresh workspace secret,
+  returns it exactly once, retires the old one immediately — the
+  engine's registrations are re-armed in the same request and
+  in-flight old-secret calls fail honestly at the handler. Workspace
+  creation (`POST /admin/workspaces`) also returns `handler_secret`
+  once; no `GET`, list or diagnostics endpoint ever carries it.
+- **`docs/HANDLERS.md`**: the handler contract — call, probe, the
+  canonical string, verification order (freshness ±300 s → recompute →
+  a signature seen before is replay) and rotation semantics. `verify_sig` in
+  the server's test module is the reference check; `spawn_verifier` is
+  the live fixture.
+- **Per-workspace live-run quota** (`--max-live-runs-per-ws`, default
+  20,000 — a fifth of the global pool, so four full tenants leave a
+  fifth able to admit): a tenant at its share is
+  refused `429 workspace_quota` — distinct from the global
+  `503 at_capacity`, which the rest of the pool still admits under —
+  so one tenant can never fill every live slot. Compat mode (no
+  account store) exempts workspace 0 and admits to the global bounds
+  exactly as v1.0.x did. The accounting is rebuilt from the index on
+  replay like the global counters.
+- **Per-workspace run index**: `GET /jobs` pages read a `ws → run ids`
+  index instead of scanning the global index — a tenant's list cost is
+  its own size, and a page never touches another workspace's runs.
+- **Store-enforced handler bound** (S2 review #6): the 256-per-workspace
+  limit is now enforced inside the write itself — Postgres conditional
+  `INSERT … WHERE`, memory under the same lock — so a racing pair of
+  PUTs cannot both fit; the loser gets `409 registry_full`. Updating an
+  existing name at the bound stays legal.
+- **Opaque public run ids** (S2 #7): every run id crossing the API —
+  `run_id`, list `id`s, `next_after`/`next_before` cursors, and the
+  `/jobs/{id}` path — is a keyed 64-bit permutation (four-round Feistel
+  over HMAC-SHA256) of the internal sequence, rendered base64url.
+  Per run it is deterministic, storage-free and needs no journal
+  change; across runs it is uncorrelated — two submits from one
+  workspace reveal nothing about other workspaces' volume, and a
+  numeric guess, a truncated id or a forged string answers `404`
+  exactly like a missing run. The 32-byte key lives at
+  `<journal>/public_id.key` (mode 0600, generated on first boot);
+  losing it orphans every public id — never the runs.
+- **Backups carry the journal-dir flats** (`journal.shape`,
+  `public_id.key`), checksummed and owner-only (D-057): a restore
+  keeps the sidecar's forward claims and decodes every public id the
+  install issued — without the key they all orphaned to 404. The file
+  set is one agreed contract across versions — v1.0.2's restore
+  accepts this build's backup *files* — while the journal inside must
+  still be record-v2 to open there: a backup taken before the first
+  v3 write rolls back cleanly (the upgrade-then-rollback-before-
+  traffic floor), one taken after is refused by the format guard.
+  Fixture: `restore_accepts_the_s2_backup_set` in durable-journal
+  restores this build's backup under v1.0.2's reader.
+
+### Security
+
+- **One IPv6 /48 can no longer pin its own cap.** A /48 whose 256 /64
+  entries went idle frees them for newcomers instead of sending every
+  new /64 in it to one shared bucket until restart (D-062).
+- **A failed registry save never turns the retry into a no-op.** The
+  armed view behind the `unchanged` PUT answer is set only after the
+  snapshot write is acknowledged (PUT, secret rotation, reconcile), and
+  forgotten before DELETE's write (D-062).
+- **The deploy refuses a lab build.** `install.sh` and `upgrade.sh` stop
+  on a binary built with `--features lab` (its `--help` lists
+  `--allow-local-tenant-handlers`); `smoke.sh` fails one (D-062).
+- Internal sequential workspace ids never appear in routes, response
+  bodies, tokens or headers — workspaces cannot be enumerated or
+  counted. A regression test scans every affected response for the u64.
+  The same now holds for internal run ids: only the permuted public id
+  ever leaves the process, so a tenant cannot read everyone else's
+  submission volume off a sequence gap (regression-tested end to end).
+- Handler-call signatures bind the run, step, attempt, idempotency key
+  and exact body to the workspace's secret — a tampered body, stale
+  timestamp, wrong-secret signature or a signature already seen fails
+  the handler's own check (each rejection class regression-tested).
+- **Handler calls can no longer reach this host through its own
+  address** (D-061). The SSRF guard now also refuses every address on
+  the host's interfaces — the droplet's public IPv4 and IPv6 included,
+  which Linux delivers over loopback to anything listening on all
+  addresses — at registration, at call time and inside the resolver.
+  `--deny-cidr ADDR[/PREFIX]` (repeatable; `/etc/durable/deny-cidrs` on
+  the droplet) adds ranges such as a reserved IP, refused even with
+  `--allow-local-handlers`. The server refuses to start if it cannot
+  list its interfaces. The deploy guide adds an nftables egress firewall
+  for the server's user as a second layer.
+- **Visitors behind Caddy are no longer all one rate bucket** (D-061).
+  The server sees only Caddy's loopback connections; `durable-run` now
+  trusts that hop for `CF-Connecting-IP`, and the Caddyfile overwrites
+  the header with the client Caddy resolved from Cloudflare, so the
+  per-address limits key each visitor (IPv6 by /64) and nobody can pick
+  their own bucket. A dual-stack listener's `::ffff:a.b.c.d` peers are
+  treated as the IPv4 clients they are. `smoke.sh` checks both halves.
+
+- **Handler registries can't be churned into the disk** (re-review
+  S2-4): registry changes are limited per workspace (2 per second, burst
+  20, `429 registry_rate_limited`), a `PUT` that changes nothing does no
+  store or disk work, and `handlers.json` is saved once per batch of
+  queued changes.
+- **One IPv6 /48 can't fill the rate-limit table** (re-review S2-2): the
+  /48 aggregate is judged before a /64 bucket exists, a /48 keeps at most
+  256 /64 buckets, refused requests don't keep a bucket alive, and the
+  idle scan runs at most once a second.
+- **`--allow-local-handlers` no longer reaches API-registered handlers**
+  (re-review S1-1): it opens the operator's own `--handler` flags only;
+  every tenant (and workspace 0's API) registration stays under the full
+  SSRF policy. Only a `--features lab` build can open tenant handlers.
+
+### Load evidence
+
+- `cargo test --workspace`: 198 tests green including the isolation
+  matrix (cross-workspace inspect/spec/cancel/list → 404), the key
+  lifecycle over HTTP (mint → submit → revoke → immediate 401), the
+  no-u64 leak scan, ops-scope refusal, outage semantics and
+  restart-preserved workspace tags.
+- `load.mjs workspaces`: every workspace registers `step` through the
+  route, then 120 submits across 2 workspaces run concurrent with 1,213
+  register→delete churn ops — all admitted, all drained
+  (`perf/results/`).
+- `ssrf.rs` overhead test: 200 real resolve+validate passes plus a
+  10k-iteration `is_local` scan — the guard costs one OS lookup per new
+  connection and nanoseconds per check (keep-alive calls pay nothing).
+
 ### Added
 
 - **Observability reads for the dashboard** (D-058), each taking the read
@@ -16,17 +234,32 @@ versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   timeline in commit order, with a derived `finished` event and an honest
   `complete`/`reason` when compaction, eviction or the per-run cap
   shortened it), and `GET /events?limit=` (the activity feed across runs,
-  newest first). Everything is derived in memory with fixed caps (about
-  65 MiB at worst plus 0.4 MiB per handler); timelines and the feed are
-  rebuilt from journal replay at startup, metrics start empty. Nothing
-  shown is ever a job's input, a checkpoint's output, or a record whose
-  fsync has not returned.
+  newest first). Everything is derived in memory with fixed caps;
+  timelines and the feed are rebuilt from journal replay at startup,
+  metrics start empty. Nothing shown is ever a job's input, a
+  checkpoint's output, or a record whose fsync has not returned.
+- **The observability reads answer the caller's workspace** (D-060). A
+  tenant key's `/jobs/{id}/events` shows only its own runs (another
+  workspace's run is the same 404 as `GET /jobs/{id}`), its `/events` is
+  its own activity feed, and its `/metrics` carries only its own
+  counters, latencies, gauges, state counts and registered handlers. A
+  workspace-0 key (the operator's env keys) keeps the global `/metrics`,
+  with workspace 0's handlers; its event views show workspace 0's runs.
+  Run ids in both event views are the opaque public ids. Per-workspace
+  views are kept for workspace 0 and up to 256 tenants at once, each
+  small (5-minute buckets over a day, `bucket_ms` 300,000; stats for its
+  16 most recently called handlers in hour buckets, `resolution_ms`);
+  past 256 the least active go first, one-shot tenants before returning
+  ones. Memory at every cap: about 110 MiB by size (~125 MiB measured),
+  plus 0.4 MiB per workspace-0 handler.
 - `durable-cli metrics` and `durable-cli events [--run N]`.
 
 ### Changed
 
 - Diagnostics' `states` counts are kept incrementally instead of by a scan
   of every run per request (same output).
+- The activity feed keeps 200 events per workspace (one full page) instead
+  of 1,000 across runs: no page could ever read past 200.
 
 ## [1.0.2] - 2026-11-20
 

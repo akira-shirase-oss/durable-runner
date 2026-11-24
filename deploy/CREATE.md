@@ -13,11 +13,31 @@ are typed only on the droplet, into root-only files.
    Origin Server → Create Certificate → save `origin.pem`/`origin.key`
    for DEPLOY.md step 4 (15-year, hostnames `durable.404human.dev`).
 
-3. **Authenticated Origin Pulls.** SSL/TLS → Origin Server →
-   Authenticated Origin Pulls → **On** for the zone (or hostname). Download
-   the origin-pull CA certificate it links
-   (`cloudflare-origin-pull-ca.pem`) — Caddy requires it, so a direct hit
-   on the droplet fails the TLS handshake even before the range check.
+3. **Authenticated Origin Pulls, zone-level, with OUR certificate.**
+   Cloudflare's global origin-pull certificate is the same for every
+   Cloudflare customer: an origin that trusts it lets anyone point their
+   own Cloudflare zone at this droplet. Use a zone-level certificate from
+   a CA we control instead (on your laptop, not the droplet):
+
+   ```sh
+   openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes -days 3650 \
+     -subj '/CN=durable origin-pull CA' -keyout aop-ca.key -out aop-zone-ca.pem
+   openssl req -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes \
+     -subj '/CN=cloudflare origin pull durable.404human.dev' -keyout aop-client.key -out aop-client.csr
+   openssl x509 -req -in aop-client.csr -CA aop-zone-ca.pem -CAkey aop-ca.key \
+     -CAcreateserial -days 825 -out aop-client.pem
+   ```
+
+   Upload `aop-client.pem` + `aop-client.key` to the zone (SSL/TLS →
+   Origin Server → Authenticated Origin Pulls → upload a certificate; or
+   `POST /zones/{zone_id}/origin_tls_client_auth` with `certificate` and
+   `private_key`), then turn zone-level AOP **On** (`PATCH
+   /zones/{zone_id}/settings/tls_client_auth` `{"value":"on"}`). The client
+   key lives only at Cloudflare; the CA key stays offline (it re-signs the
+   client certificate before it expires); `aop-zone-ca.pem` — public —
+   goes to the droplet in DEPLOY.md step 2. Caddy requires a client
+   certificate it signed, so a direct hit, or another Cloudflare zone,
+   fails the TLS handshake.
 
 4. **R2 bucket.** R2 → Create bucket `durable-backups`: **enable object
    lock, 7-day retention** (the point: a stolen API key or a fat-finger

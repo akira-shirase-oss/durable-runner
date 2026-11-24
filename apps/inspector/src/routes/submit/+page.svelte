@@ -12,7 +12,7 @@
 	let notBefore = $state('');
 	let sending = $state(false);
 	let error = $state<string | null>(null);
-	let accepted = $state<{ id: number; key: string } | null>(null);
+	let accepted = $state<{ id: string; key: string } | null>(null);
 	let successHeading: HTMLElement | undefined = $state();
 
 	const ready = $derived(!!session.apiKey && !!opKey && steps.every((s) => s.name && s.handler));

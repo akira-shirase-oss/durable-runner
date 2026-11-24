@@ -19,6 +19,47 @@ import { fileURLToPath } from 'node:url';
 
 const ROOT = path.dirname(path.dirname(fileURLToPath(import.meta.url)));
 const SRV = `${ROOT}/target/release/durable-server`;
+
+// One heavy run per machine (S2 re-review F4): the slot is an flock(2)
+// on a fixed path — the git common dir, the one path every worktree of
+// this clone resolves identically — held by perf/heavy.sh on fd 9 and
+// inherited under it. The fd is the proof — DR_HEAVY_HELD is
+// informational only. A bare run re-execs under heavy.sh, which
+// refuses a contended slot with exit 3.
+const HEAVY_LOCK = process.env.DR_HEAVY_LOCK ??
+  path.resolve(ROOT,
+    execFileSync('git', ['rev-parse', '--git-common-dir'], { cwd: ROOT, encoding: 'utf8' }).trim(),
+    'durable-runner-heavy.lock');
+{
+  let held = false;
+  try {
+    const fd9 = fs.fstatSync(9);
+    const lock = fs.statSync(HEAVY_LOCK);
+    // The fd is the proof, and the proof is the LOCK: flock(9, EX|NB)
+    // on the inherited description succeeds only because this
+    // description already holds it — a merely-open fd on a contended
+    // lock fails (S2 re-review N5).
+    if (fd9.ino === lock.ino && fd9.dev === lock.dev) {
+      const r = spawnSync('python3',
+        ['-c', 'import fcntl; fcntl.flock(9, fcntl.LOCK_EX | fcntl.LOCK_NB)'],
+        { stdio: ['ignore','ignore','inherit','ignore','ignore','ignore','ignore','ignore','ignore', 9] });
+      held = r.status === 0;
+    }
+  } catch { held = false; }
+  if (!held) {
+    const r = spawnSync(path.join(ROOT, 'perf', 'heavy.sh'),
+      [process.execPath, import.meta.filename, ...process.argv.slice(2)],
+      { stdio: 'inherit' });
+    process.exit(r.status ?? (r.error ? 1 : 0));
+  }
+}
+
+// A spawned workload child must NOT hold the slot: this run's leader
+// holds fd 9 — a child that still has it wedges the lock if the leader
+// is SIGKILLed (S2 re-review N5). exec 9>&- strips it before exec.
+const spawnUnlocked = (argv0, argv, opts = {}) =>
+  spawn('bash', ['-c', 'exec 9>&- 2>/dev/null; exec "$@"', 'spawnUnlocked', argv0, ...argv], opts);
+
 const API_KEY = process.env.DURABLE_API_KEY ?? (await import('node:crypto')).randomBytes(32).toString('hex');
 const args = {};
 for (const a of process.argv.slice(2).filter((a) => a.startsWith('--'))) {
@@ -127,7 +168,7 @@ function startHandler() {
       });
     }).listen(${HPORT}, '127.0.0.1');
   `;
-  return track(spawn('node', ['-e', src], { stdio: 'ignore' }), `drload-handler-${HPORT}`, `node -e <handler fixture> on 127.0.0.1:${HPORT}`, HPORT);
+  return track(spawnUnlocked('node', ['-e', src], { stdio: 'ignore' }), `drload-handler-${HPORT}`, `node -e <handler fixture> on 127.0.0.1:${HPORT}`, HPORT);
 }
 
 // Fill `dir` with `runs` queued runs through the engine probe (in-process
@@ -140,7 +181,8 @@ function fill(dir, runs) {
     PROBE_RUNS: String(runs),
     PATH: `/opt/homebrew/opt/rustup/bin:${process.env.PATH}`,
   };
-  const r = spawnSync('cargo', ['test', '--release', '-p', 'durable-engine', '--', '--ignored', 'restart_probe_fill', '--nocapture'],
+  const r = spawnSync('bash', ['-c', 'exec 9>&- 2>/dev/null; exec "$@"', 'spawnUnlocked',
+      'cargo', 'test', '--release', '-p', 'durable-engine', '--', '--ignored', 'restart_probe_fill', '--nocapture'],
     { env, cwd: ROOT, encoding: 'utf8', stdio: ['ignore', 'pipe', 'inherit'] });
   if (r.status !== 0) throw new Error(`probe fill failed (exit ${r.status})`);
   console.log((r.stdout || '').split('\n').filter((l) => l.includes('FILLED')).join('\n'));
@@ -157,7 +199,7 @@ async function runSize(runs) {
   // deploy's restart costs at this size.
   const errLog = `${dir}/server.err.log`;
   const s = track(
-    spawn(SRV, ['--journal', journal, '--listen', `127.0.0.1:${PORT}`,
+    spawnUnlocked(SRV, ['--journal', journal, '--listen', `127.0.0.1:${PORT}`,
       '--handler', `step=http://127.0.0.1:${HPORT}/step`,
       '--rate-limit-per-addr', '100000', '--max-conns-per-addr', '0',
       '--max-live-runs', String(runs * 2), '--max-index-bytes', '8589934592'],

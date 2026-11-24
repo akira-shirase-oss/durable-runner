@@ -6,6 +6,8 @@ members = [
     "crates/durable-engine",
     "crates/durable-server",
     "crates/durable-cli",
+    "crates/durable-accounts",
+    "tests/attacks",
 ]
 
 [workspace.package]

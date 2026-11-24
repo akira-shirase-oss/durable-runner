@@ -1,0 +1,65 @@
+# The real-Neon job for the S2 account store: the `pg_` tests in
+# crates/durable-accounts run against the scratch Neon database named by
+# the NEON_TEST_DATABASE_URL secret (sslmode=verify-full). When the
+# secret is absent the job still runs the memory-store suite and prints
+# a visible notice — a skipped integration is announced, never a silent
+# pass.
+name: neon
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: neon-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  account-store:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      DURABLE_TEST_DATABASE_URL: ${{ secrets.NEON_TEST_DATABASE_URL }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install the pinned Rust toolchain (rust-toolchain.toml)
+        run: |
+          rustup --version
+          rustup toolchain install || rustup show
+          cargo --version
+
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+
+      - name: Account-store tests (memory always; Postgres when the secret is set)
+        run: |
+          if [ -z "${DURABLE_TEST_DATABASE_URL:-}" ]; then
+            echo "::notice title=Neon secret absent::NEON_TEST_DATABASE_URL is not set; \
+              the pg_* integration tests self-skip. Set the secret to a scratch Neon \
+              database (sslmode=verify-full) to run them for real."
+          fi
+          cargo test -p durable-accounts
+
+      - name: Fail loudly if the secret exists but the pg tests still skipped
+        if: env.DURABLE_TEST_DATABASE_URL != ''
+        run: |
+          if cargo test -p durable-accounts pg_ -- --nocapture 2>&1 \
+              | grep -q "skipping Postgres-backed"; then
+            echo "::error::NEON_TEST_DATABASE_URL is set but the pg tests still skipped"
+            exit 1
+          fi
+
+      - name: Release build for the workspace battery
+        run: cargo build --release -p durable-server
+
+      - name: Workspace battery against Neon (visible skip without the secret)
+        env:
+          DATABASE_URL: ${{ secrets.NEON_TEST_DATABASE_URL }}
+        # Every load entry point goes through the machine-wide heavy slot.
+        run: perf/heavy.sh node perf/load.mjs workspaces --smoke --workspaces=2 --per=50
