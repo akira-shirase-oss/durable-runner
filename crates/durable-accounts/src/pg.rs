@@ -5,9 +5,35 @@ use sqlx::postgres::{PgConnectOptions, PgPoolOptions, PgSslMode};
 use sqlx::{PgPool, Row};
 
 use crate::{
-    AccountError, AccountStore, ApiKeyInfo, HandlerRegistration, KeyGrant, Permission, Workspace,
-    STORE_DEADLINE,
+    Account, AccountError, AccountStore, ApiKeyInfo, HandlerRegistration, KeyGrant, Mail,
+    MailOutcome, Permission, SessionGrant, SignupOutcome, Workspace, STORE_DEADLINE,
 };
+
+/// Unix-millis ↔ TIMESTAMPTZ. The trait speaks millis so the store
+/// keeps the clock out of its signatures; a value outside TIMESTAMPTZ's
+/// range saturates rather than erroring (deadline arithmetic overflow
+/// is a config bug, not an outage).
+fn ts(ms: i64) -> time::OffsetDateTime {
+    time::OffsetDateTime::from_unix_timestamp_nanos(ms as i128 * 1_000_000).unwrap_or(
+        time::OffsetDateTime::new_utc(time::Date::MAX, time::Time::MAX),
+    )
+}
+
+fn ms(t: time::OffsetDateTime) -> i64 {
+    (t.unix_timestamp_nanos() / 1_000_000) as i64
+}
+
+fn account_from(row: &sqlx::postgres::PgRow) -> Result<Account, AccountError> {
+    Ok(Account {
+        id: to_u64(row.try_get("id")?, "account")?,
+        public_id: row.try_get("public_id")?,
+        email: row.try_get("email")?,
+        email_verified: row
+            .try_get::<Option<time::OffsetDateTime>, _>("email_verified_at")?
+            .is_some(),
+        password_hash: row.try_get("password_hash")?,
+    })
+}
 
 const POOL_SIZE: u32 = 5;
 const ACQUIRE_TIMEOUT: Duration = Duration::from_secs(5);
@@ -382,6 +408,365 @@ impl AccountStore for Pg {
         .await?;
         Ok((done.rows_affected() > 0).then_some(secret))
     }
+
+    async fn signup(
+        &self,
+        email: &str,
+        password_hash: &str,
+        token_hash: &[u8; 32],
+        token_expires_at_ms: i64,
+        verify_mail: &Mail,
+        notice_mail: &Mail,
+    ) -> Result<SignupOutcome, AccountError> {
+        // One transaction = the plan's atomicity rule: an account is
+        // never committed without the token and mail it needs. The
+        // advisory lock serializes signups for the same address so the
+        // verify-token supersede and the outbox cap cannot race.
+        let mut tx = bounded(self.pool.begin()).await?;
+        bounded(
+            sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
+                .bind(email)
+                .execute(&mut *tx),
+        )
+        .await?;
+        let created = bounded(
+            sqlx::query(
+                "INSERT INTO accounts (public_id, email, password_hash) \
+                 VALUES ($2, $1, $3) ON CONFLICT (email) DO NOTHING \
+                 RETURNING id",
+            )
+            .bind(email)
+            .bind(uuid::Uuid::now_v7())
+            .bind(password_hash)
+            .fetch_optional(&mut *tx),
+        )
+        .await?;
+        if let Some(row) = created {
+            let account_id: i64 = row.try_get("id")?;
+            let outbox = Self::issue_verify(
+                &mut tx,
+                account_id,
+                email,
+                token_hash,
+                token_expires_at_ms,
+                password_hash,
+                verify_mail,
+            )
+            .await?;
+            bounded(tx.commit()).await?;
+            return Ok(SignupOutcome::Created { outbox });
+        }
+        let existing = bounded(
+            sqlx::query("SELECT id, email_verified_at FROM accounts WHERE email = $1")
+                .bind(email)
+                .fetch_one(&mut *tx),
+        )
+        .await?;
+        let account_id: i64 = existing.try_get("id")?;
+        let verified: Option<time::OffsetDateTime> = existing.try_get("email_verified_at")?;
+        let outcome = if verified.is_some() {
+            SignupOutcome::Taken {
+                outbox: Self::enqueue(&mut tx, notice_mail).await?,
+            }
+        } else {
+            // Re-sign-up of an unverified address (review #2): the new
+            // sign-up's password replaces the pending one and every
+            // live session dies — a pre-registration attacker's
+            // credential and sessions lose here, not at verify.
+            bounded(
+                sqlx::query("UPDATE accounts SET password_hash = $2 WHERE id = $1")
+                    .bind(account_id)
+                    .bind(password_hash)
+                    .execute(&mut *tx),
+            )
+            .await?;
+            bounded(
+                sqlx::query(
+                    "UPDATE sessions SET revoked_at = now() \
+                     WHERE account_id = $1 AND revoked_at IS NULL",
+                )
+                .bind(account_id)
+                .execute(&mut *tx),
+            )
+            .await?;
+            SignupOutcome::VerifyResent {
+                outbox: Self::issue_verify(
+                    &mut tx,
+                    account_id,
+                    email,
+                    token_hash,
+                    token_expires_at_ms,
+                    password_hash,
+                    verify_mail,
+                )
+                .await?,
+            }
+        };
+        bounded(tx.commit()).await?;
+        Ok(outcome)
+    }
+
+    async fn account_by_email(&self, email: &str) -> Result<Option<Account>, AccountError> {
+        let row = bounded(
+            sqlx::query(
+                "SELECT id, public_id, email, email_verified_at, password_hash \
+                 FROM accounts WHERE email = $1",
+            )
+            .bind(email)
+            .fetch_optional(&self.pool),
+        )
+        .await?;
+        row.as_ref().map(account_from).transpose()
+    }
+
+    async fn session_grant(
+        &self,
+        token_hash: &[u8; 32],
+    ) -> Result<Option<SessionGrant>, AccountError> {
+        let row = bounded(
+            sqlx::query(
+                "SELECT s.id AS session_id, s.public_id AS session_public_id, s.csrf_seed, \
+                 s.expires_at, s.idle_expires_at, \
+                 a.id, a.public_id, a.email, a.email_verified_at, a.password_hash \
+                 FROM sessions s JOIN accounts a ON a.id = s.account_id \
+                 WHERE s.token_hash = $1 AND s.revoked_at IS NULL",
+            )
+            .bind(token_hash.as_slice())
+            .fetch_optional(&self.pool),
+        )
+        .await?;
+        let Some(row) = row else {
+            return Ok(None);
+        };
+        let seed: Vec<u8> = row.try_get("csrf_seed")?;
+        let csrf_seed: [u8; 32] = seed.as_slice().try_into().map_err(|_| {
+            AccountError::Store(format!(
+                "sessions.csrf_seed is {} bytes, expected 32",
+                seed.len()
+            ))
+        })?;
+        Ok(Some(SessionGrant {
+            session_id: to_u64(row.try_get("session_id")?, "session")?,
+            public_id: row.try_get("session_public_id")?,
+            csrf_seed,
+            expires_at_ms: ms(row.try_get("expires_at")?),
+            idle_expires_at_ms: ms(row.try_get("idle_expires_at")?),
+            account: account_from(&row)?,
+        }))
+    }
+
+    async fn create_session(&self, session: &crate::NewSession) -> Result<(), AccountError> {
+        // One transaction per sign-in: the LRU eviction and the insert
+        // are serialized per account by the advisory lock, so two
+        // racing logins cannot both keep their extra session (the cap
+        // would overshoot otherwise).
+        let mut tx = bounded(self.pool.begin()).await?;
+        bounded(
+            sqlx::query("SELECT pg_advisory_xact_lock($1)")
+                .bind(to_i64(session.account, "account")?)
+                .execute(&mut *tx),
+        )
+        .await?;
+        bounded(
+            sqlx::query(
+                "UPDATE sessions SET revoked_at = now() WHERE id IN ( \
+                     SELECT id FROM sessions \
+                     WHERE account_id = $1 AND revoked_at IS NULL \
+                     ORDER BY idle_expires_at DESC OFFSET $2 \
+                 )",
+            )
+            .bind(to_i64(session.account, "account")?)
+            .bind((crate::MAX_SESSIONS_PER_ACCOUNT - 1) as i64)
+            .execute(&mut *tx),
+        )
+        .await?;
+        bounded(
+            sqlx::query(
+                "INSERT INTO sessions \
+                 (account_id, token_hash, csrf_seed, expires_at, idle_expires_at, \
+                  last_seen_at, user_agent, ip) \
+                 VALUES ($1, $2, $3, $4, $5, now(), $6, $7::inet)",
+            )
+            .bind(to_i64(session.account, "account")?)
+            .bind(session.token_hash.as_slice())
+            .bind(session.csrf_seed.as_slice())
+            .bind(ts(session.expires_at_ms))
+            .bind(ts(session.idle_expires_at_ms))
+            .bind(session.user_agent.as_deref())
+            .bind(session.ip.map(|a| a.to_string()))
+            .execute(&mut *tx),
+        )
+        .await?;
+        bounded(tx.commit()).await?;
+        Ok(())
+    }
+
+    async fn revoke_session(&self, token_hash: &[u8; 32]) -> Result<bool, AccountError> {
+        let done = bounded(
+            sqlx::query(
+                "UPDATE sessions SET revoked_at = now() \
+                 WHERE token_hash = $1 AND revoked_at IS NULL",
+            )
+            .bind(token_hash.as_slice())
+            .execute(&self.pool),
+        )
+        .await?;
+        Ok(done.rows_affected() > 0)
+    }
+
+    async fn revoke_sessions_for_account(&self, account: u64) -> Result<(), AccountError> {
+        bounded(
+            sqlx::query(
+                "UPDATE sessions SET revoked_at = now() \
+                 WHERE account_id = $1 AND revoked_at IS NULL",
+            )
+            .bind(to_i64(account, "account")?)
+            .execute(&self.pool),
+        )
+        .await?;
+        Ok(())
+    }
+
+    async fn member_role(
+        &self,
+        account: u64,
+        workspace: u64,
+    ) -> Result<Option<crate::Role>, AccountError> {
+        if workspace == 0 {
+            // ws 0 is the ops plane; the CHECK means no row anyway.
+            return Ok(None);
+        }
+        let role: Option<String> = bounded(
+            sqlx::query_scalar(
+                "SELECT role FROM members WHERE workspace_id = $1 AND account_id = $2",
+            )
+            .bind(to_i64(workspace, "workspace")?)
+            .bind(to_i64(account, "account")?)
+            .fetch_optional(&self.pool),
+        )
+        .await?;
+        role.map(|r| {
+            crate::Role::parse(&r).ok_or_else(|| AccountError::Store(format!("bad role {r:?}")))
+        })
+        .transpose()
+    }
+
+    async fn outbox_mark(&self, id: u64, outcome: MailOutcome) -> Result<(), AccountError> {
+        match outcome {
+            MailOutcome::Sent => {
+                bounded(
+                    sqlx::query(
+                        "UPDATE email_outbox SET status = 'sent', sent_at = now(), \
+                         attempts = attempts + 1, last_error = NULL \
+                         WHERE id = $1 AND status = 'pending'",
+                    )
+                    .bind(to_i64(id, "outbox")?)
+                    .execute(&self.pool),
+                )
+                .await?;
+            }
+            MailOutcome::Retry {
+                next_attempt_at_ms,
+                error,
+            } => {
+                bounded(
+                    sqlx::query(
+                        "UPDATE email_outbox SET status = 'pending', \
+                         attempts = attempts + 1, last_error = $2, next_attempt_at = $3 \
+                         WHERE id = $1",
+                    )
+                    .bind(to_i64(id, "outbox")?)
+                    .bind(error)
+                    .bind(ts(next_attempt_at_ms))
+                    .execute(&self.pool),
+                )
+                .await?;
+            }
+        }
+        Ok(())
+    }
+}
+
+impl Pg {
+    /// Supersede pending verify tokens, insert the fresh one, enqueue
+    /// the mail — the unit `signup` runs inside its transaction.
+    async fn issue_verify(
+        tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+        account_id: i64,
+        email: &str,
+        token_hash: &[u8; 32],
+        token_expires_at_ms: i64,
+        password_hash: &str,
+        verify_mail: &Mail,
+    ) -> Result<Option<u64>, AccountError> {
+        bounded(
+            sqlx::query(
+                "UPDATE email_tokens SET superseded_at = now() \
+                 WHERE account_id = $1 AND kind = 'verify' \
+                   AND consumed_at IS NULL AND superseded_at IS NULL",
+            )
+            .bind(account_id)
+            .execute(&mut **tx),
+        )
+        .await?;
+        bounded(
+            sqlx::query(
+                "INSERT INTO email_tokens \
+                 (account_id, kind, token_hash, expires_at, sent_to, password_hash) \
+                 VALUES ($1, 'verify', $2, $3, $4, $5)",
+            )
+            .bind(account_id)
+            .bind(token_hash.as_slice())
+            .bind(ts(token_expires_at_ms))
+            .bind(email)
+            .bind(password_hash)
+            .execute(&mut **tx),
+        )
+        .await?;
+        Self::enqueue(tx, verify_mail).await
+    }
+
+    /// The per-address pending cap, inside the caller's transaction:
+    /// at the cap the mail coalesces into the pending rows it would
+    /// duplicate — `None`, and the outbox stays bounded. The advisory
+    /// lock `signup` already took on the address serializes this count.
+    async fn enqueue(
+        tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+        mail: &Mail,
+    ) -> Result<Option<u64>, AccountError> {
+        if mail.subject.len() > crate::mail::MAX_MAIL_SUBJECT
+            || mail.text.len() > crate::mail::MAX_MAIL_BODY
+            || mail.html.len() > crate::mail::MAX_MAIL_BODY
+        {
+            return Err(AccountError::Store(
+                "mail exceeds the outbox size bound".to_string(),
+            ));
+        }
+        let row = bounded(
+            sqlx::query(
+                "INSERT INTO email_outbox \
+                 (kind, send_to, subject, text, html, idempotency_key) \
+                 SELECT $1, $2, $3, $4, $5, $6 \
+                 WHERE (SELECT count(*) FROM email_outbox \
+                        WHERE send_to = $2 AND status = 'pending') < $7 \
+                 RETURNING id",
+            )
+            .bind(mail.kind)
+            .bind(&mail.send_to)
+            .bind(&mail.subject)
+            .bind(&mail.text)
+            .bind(&mail.html)
+            .bind(&mail.idempotency_key)
+            .bind(crate::mail::MAX_PENDING_PER_ADDR)
+            .fetch_optional(&mut **tx),
+        )
+        .await?;
+        let Some(row) = row else {
+            return Ok(None);
+        };
+        let id: i64 = row.try_get("id")?;
+        Ok(Some(to_u64(id, "outbox")?))
+    }
 }
 
 /// Postgres-backed tests run only when `DURABLE_TEST_DATABASE_URL` points
@@ -478,7 +863,7 @@ mod tests {
             .await
             .unwrap_or_else(|e| panic!("ws: {e}"));
         let info = store
-            .create_key(ws.id, "ci", Permission::Admin, &hash(11), "dr_pg")
+            .create_key(ws.id, "ci", Permission::Write, &hash(11), "dr_pg")
             .await
             .unwrap_or_else(|e| panic!("key: {e}"));
         let grant = store
@@ -489,7 +874,7 @@ mod tests {
             grant,
             Some(KeyGrant {
                 workspace: ws.id,
-                permission: Permission::Admin
+                permission: Permission::Write
             })
         );
         assert!(store

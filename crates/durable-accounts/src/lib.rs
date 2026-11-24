@@ -9,31 +9,44 @@
 //! caller fails closed — new submissions answer `accounts_unavailable`
 //! while already-accepted runs keep executing.
 
+mod mail;
 mod memory;
+pub mod password;
 mod pg;
 
+pub use mail::{LogMailer, Mail, MailError, MailOutcome, Mailer, MemoryMailer};
 pub use memory::Memory;
 pub use pg::Pg;
 
 /// What an authenticated bearer may do, mirroring the env-key split that
 /// existed before S2: `admin` submits and cancels, `read` only inspects.
+/// The Rust name is `Write`; `admin` stays the stored string (ruling 3).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Permission {
-    Admin,
+    Write,
     Read,
 }
 
 impl Permission {
+    /// The stored value — what rows and comparisons use.
     pub fn as_str(self) -> &'static str {
         match self {
-            Self::Admin => "admin",
+            Self::Write => "admin",
+            Self::Read => "read",
+        }
+    }
+
+    /// The API/UI word — `write` out, `admin` still accepted in.
+    pub fn api_str(self) -> &'static str {
+        match self {
+            Self::Write => "write",
             Self::Read => "read",
         }
     }
 
     fn parse(raw: &str) -> Result<Self, AccountError> {
         match raw {
-            "admin" => Ok(Self::Admin),
+            "admin" | "write" => Ok(Self::Write),
             "read" => Ok(Self::Read),
             other => Err(AccountError::Store(format!(
                 "unknown api_keys.permission {other:?}"
@@ -82,6 +95,104 @@ pub struct HandlerRegistration {
     pub url: String,
 }
 
+/// An account row. `id` is the internal join key — never external;
+/// `public_id` (UUIDv7) is the only id allowed on external surfaces.
+/// `password_hash` is the argon2id PHC the credential check needs — it
+/// is never serialized into a response.
+#[derive(Debug, Clone)]
+pub struct Account {
+    pub id: u64,
+    pub public_id: uuid::Uuid,
+    pub email: String,
+    pub email_verified: bool,
+    pub password_hash: Option<String>,
+}
+
+/// A live session row joined to its account — the auth boundary's one
+/// round trip. Deadlines are unix millis: the store keeps the clock
+/// out of the trait and the caller decides liveness.
+#[derive(Debug, Clone)]
+pub struct SessionGrant {
+    pub session_id: u64,
+    /// The opaque id the API exposes (`sessions.public_id`) — the
+    /// internal id never crosses the boundary.
+    pub public_id: uuid::Uuid,
+    pub csrf_seed: [u8; 32],
+    /// Absolute expiry (`sessions.expires_at`) — never slides.
+    pub expires_at_ms: i64,
+    /// Idle expiry — slid forward on use (the flush task, D-067).
+    pub idle_expires_at_ms: i64,
+    pub account: Account,
+}
+
+/// Everything `create_session` needs — one bundle so the trait stays
+/// readable as the audit fields grow.
+#[derive(Debug, Clone)]
+pub struct NewSession {
+    pub account: u64,
+    pub token_hash: [u8; 32],
+    pub csrf_seed: [u8; 32],
+    /// Absolute expiry (`sessions.expires_at`) — unix millis.
+    pub expires_at_ms: i64,
+    /// Idle expiry — unix millis; slid forward on use.
+    pub idle_expires_at_ms: i64,
+    /// Truncated by the caller (the boundary owns string bounds).
+    pub user_agent: Option<String>,
+    pub ip: Option<std::net::IpAddr>,
+}
+
+/// What `signup` decided — the three outcomes the API deliberately
+/// cannot distinguish. `outbox` is the inserted mail row the caller may
+/// try to deliver now, or `None` when the per-address pending cap
+/// coalesced the mail (the fact — account, token — still stands).
+#[derive(Debug)]
+pub enum SignupOutcome {
+    /// A new unverified account + a fresh verify token + verify mail.
+    Created { outbox: Option<u64> },
+    /// The address existed unverified: the pending verify token was
+    /// superseded and a fresh token + mail issued.
+    VerifyResent { outbox: Option<u64> },
+    /// The address has a verified account: the notice mail was queued
+    /// (no token — the account's sign-in state is untouched).
+    Taken { outbox: Option<u64> },
+}
+
+/// Workspace membership roles — the session side of the authorization
+/// matrix. Stored strings; `owner` sits above `admin`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Role {
+    Viewer,
+    Member,
+    Admin,
+    Owner,
+}
+
+impl Role {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Role::Viewer => "viewer",
+            Role::Member => "member",
+            Role::Admin => "admin",
+            Role::Owner => "owner",
+        }
+    }
+
+    pub fn parse(raw: &str) -> Option<Self> {
+        Some(match raw {
+            "viewer" => Role::Viewer,
+            "member" => Role::Member,
+            "admin" => Role::Admin,
+            "owner" => Role::Owner,
+            _ => return None,
+        })
+    }
+
+    /// Writes allowed: owner/admin/member mutate; viewer is read-only.
+    pub fn may_write(self) -> bool {
+        self >= Role::Member
+    }
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum AccountError {
     /// The store could not be reached or answered in time. Callers treat
@@ -127,6 +238,11 @@ pub const STORE_DEADLINE: std::time::Duration = std::time::Duration::from_secs(5
 /// store itself so a racing pair of PUTs cannot both fit (the engine's
 /// registry enforces the same bound independently).
 pub const MAX_HANDLERS_PER_WS: usize = 256;
+
+/// Live sessions one account may hold. Past it, sign-in evicts the
+/// least-idle live session in the same transaction — a cap that evicts
+/// is honest; a cap that refuses is a self-DoS (D-060).
+pub const MAX_SESSIONS_PER_ACCOUNT: usize = 20;
 
 /// The account graph. Implemented by `Pg` (Neon) and `Memory` (tests and
 /// dialect-free fixtures). Every method is bounded by `STORE_DEADLINE` in
@@ -192,6 +308,69 @@ pub trait AccountStore: Send + Sync {
     /// this returns; in-flight calls signed with it fail honestly.
     async fn rotate_handler_secret(&self, workspace: u64)
         -> Result<Option<[u8; 32]>, AccountError>;
+
+    // --- S3: accounts, sessions, mail ----------------------------------
+
+    /// Sign up `email` (already lower-cased and policy-checked by the
+    /// caller) — one transaction, so a crash can never leave an account
+    /// with no way to verify:
+    /// - new address → account row (unverified) + verify token + the
+    ///   `verify` mail row;
+    /// - existing *unverified* address → the pending verify token is
+    ///   superseded and a fresh token + `verify` mail row written;
+    /// - existing verified address → only the `notice` mail row.
+    /// `token_hash` is sha256 of the mailed value; `mail` rows whose
+    /// address already sits at the pending cap are coalesced (`outbox:
+    /// None`) — the fact still commits.
+    async fn signup(
+        &self,
+        email: &str,
+        password_hash: &str,
+        token_hash: &[u8; 32],
+        token_expires_at_ms: i64,
+        verify_mail: &Mail,
+        notice_mail: &Mail,
+    ) -> Result<SignupOutcome, AccountError>;
+
+    /// The account for `email`, or `None`. The row carries
+    /// `password_hash` for the credential check — read paths that
+    /// serialize must never expose it.
+    async fn account_by_email(&self, email: &str) -> Result<Option<Account>, AccountError>;
+
+    /// Resolve a live (non-revoked) session by its token sha256, joined
+    /// to its account. `Ok(None)` is a verified negative — unknown or
+    /// revoked; expiry is the caller's check (it owns the clock).
+    async fn session_grant(
+        &self,
+        token_hash: &[u8; 32],
+    ) -> Result<Option<SessionGrant>, AccountError>;
+
+    /// Record a new session, evicting the least-idle live sessions past
+    /// `MAX_SESSIONS_PER_ACCOUNT` in the same transaction (LRU, never a
+    /// refusal).
+    async fn create_session(&self, session: &NewSession) -> Result<(), AccountError>;
+
+    /// Revoke the session behind `token_hash`. Returns whether a live
+    /// session existed — logout is idempotent either way.
+    async fn revoke_session(&self, token_hash: &[u8; 32]) -> Result<bool, AccountError>;
+
+    /// Revoke every live session of `account`. Email verify and
+    /// re-sign-up of an unverified address both call it (review #2):
+    /// the verify link's sign-up wins, and any session minted before
+    /// the mailbox owner proved ownership dies.
+    async fn revoke_sessions_for_account(&self, account: u64) -> Result<(), AccountError>;
+
+    /// The member row's role for `account` in `workspace`, or `None`.
+    /// ws 0 can never answer: the `workspace_id <> 0` CHECK means no
+    /// row exists, and the impls short-circuit it regardless (the ops
+    /// plane is key-only).
+    async fn member_role(&self, account: u64, workspace: u64)
+        -> Result<Option<Role>, AccountError>;
+
+    /// Bookkeep a delivery attempt the caller just made for an outbox
+    /// row: `Sent` closes it (only from `pending`, so a double mark is
+    /// a no-op); `Retry` stamps the error and the next-attempt time.
+    async fn outbox_mark(&self, id: u64, outcome: MailOutcome) -> Result<(), AccountError>;
 }
 
 /// Never-panics fuzzing for outside input this crate parses: the

@@ -34,9 +34,13 @@ export CARGO_TARGET_DIR="$here/target/prove"
 # marked line; the pattern may itself contain | and =>, so it goes last
 # and the in-field delimiter is ~~>)
 mutations=(
-  "auth|crates/durable-server/src/main.rs|auth_bypass|a_garbage_bearer_is_refused_and_nothing_is_recorded|app\.keyring\.verify\(key\)\.await~~>Verified::Granted(Auth { ws: 0, permission: Permission::Admin })"
-  "tenant-scope|crates/durable-server/src/main.rs|cross_tenant|a_second_workspace_cannot_read_anothers_run|Some\(run\) if run\.ws == auth\.ws => Ok\(run\)~~>Some(run) => Ok(run)"
-  "ops-scope|crates/durable-server/src/main.rs|cross_tenant|a_tenant_admin_cannot_reach_ops_routes|auth\.ws != 0 \|\| auth\.permission != Permission::Admin~~>false"
+  "auth|crates/durable-server/src/main.rs|auth_bypass|a_garbage_bearer_is_refused_and_nothing_is_recorded|app\.keyring\.verify\(key\)\.await~~>Verified::Granted(Principal::OpsKey)"
+  "tenant-scope|crates/durable-server/src/main.rs|cross_tenant|a_second_workspace_cannot_read_anothers_run|Some\(run\) if run\.ws == auth\.ws\(\) => Ok\(run\)~~>Some(run) => Ok(run)"
+  "ops-scope|crates/durable-server/src/main.rs|cross_tenant|a_tenant_admin_cannot_reach_ops_routes|!matches!\(auth, Principal::OpsKey\)~~>false"
+  "session-forge|crates/durable-server/src/main.rs|unit:durable-server|s30_session_forge_dies_before_the_store|!bool::from\(subtle::ConstantTimeEq::ct_eq~~>bool::from(subtle::ConstantTimeEq::ct_eq"
+  "csrf|crates/durable-server/src/main.rs|unit:durable-server|s30_signup_login_session_round_trip|csrf_token\(seed\)~~>csrf_token(&[0; 32])"
+  "csrf-open-post|crates/durable-server/src/main.rs|unit:durable-server|s30_csrf_open_post|site != \"same-origin\" && site != \"none\"~~>false"
+  "cookie-attrs|crates/durable-server/src/main.rs|unit:durable-server|s30_cookie_attributes|session_set_cookie\(&token\)~~>String::from(\"x\")"
   "rate-limit|crates/durable-server/src/main.rs|rate_limit|the_bucket_refuses_after_its_tokens|limits\.rate_per_addr > 0\.0~~>false"
   "cf-header|crates/durable-server/src/addr_limits.rs|header_spoof|spoofed_client_header_does_not_evade_the_bucket|trusted\.trusts\(peer\)~~>peer == peer"
   "ssrf-register|crates/durable-server/src/main.rs|ssrf|local_handler_urls_are_refused_at_registration|, allow_local\)~~>, true)"
