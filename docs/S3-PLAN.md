@@ -43,10 +43,10 @@ shape every auth decision):
    authority for jobs; the store is consulted at ingress and dispatch,
    never in the commit path; accepted runs survive a store outage.
 5. **Same-origin deployment:** durable-server serves the dashboard
-   (`--ui-dir`) and the API on one hostname one level under
-   `404human.dev` — proposed `durablerunnerapp.404human.dev` (the
-   earlier `durable.404human.dev` in DEPLOY.md predates the naming rule;
-   see open questions) — Cloudflare in front, on the shared droplet.
+   (`--ui-dir`) and the API on `durablerunnerapp.404human.dev` —
+   Cloudflare in front, on the shared droplet. One build at `/app`;
+   `/inspector` answers a 308 to `/app` (path tail and query preserved)
+   so old bookmarks keep working.
 6. **Email through Resend**, sending domain `404human.dev` (verified);
    the API key comes from the environment (`RESEND_API_KEY`), is never
    logged, never argv.
@@ -99,9 +99,8 @@ S2 + main merged give us, already built:
 
 ## Decision records to add
 
-Numbered from the next free slot after the merged DECISIONS.md (both
-this branch and main currently consume through **D-058** — the merge
-renumbers one of them; see open questions).
+Numbered from D-059 per ruling 1 (the coordinator renumbers at merge if
+main moves first).
 
 - **D-059 — Open sign-up with email verification; invite-only kill
   switch.** Accounts are created `unverified` and sign in immediately,
@@ -251,6 +250,7 @@ ALTER TABLE accounts ADD CONSTRAINT accounts_email_lc
 -- Sessions become real: opaque token hashed at rest, idle+absolute
 -- expiry, revocation, rotation linkage, CSRF token, bookkeeping.
 ALTER TABLE sessions
+    ADD COLUMN public_id UUID NOT NULL DEFAULT gen_random_uuid(),
     ADD COLUMN csrf_seed BYTEA NOT NULL DEFAULT '\x00',
     ADD COLUMN last_seen_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     ADD COLUMN idle_expires_at TIMESTAMPTZ NOT NULL DEFAULT now(),
@@ -258,6 +258,7 @@ ALTER TABLE sessions
     ADD COLUMN replaced_by BIGINT REFERENCES sessions (id),
     ADD COLUMN user_agent TEXT,
     ADD COLUMN ip INET;
+CREATE UNIQUE INDEX sessions_public_id ON sessions (public_id);
 CREATE INDEX sessions_account_live ON sessions (account_id)
     WHERE revoked_at IS NULL;
 
@@ -523,12 +524,12 @@ in front of all of it.
 ## The authorization matrix
 
 Principal kinds: **ops key** (`DURABLE_API_KEY`, ws-0 admin),
-**write key** / **read key** (per-workspace store keys; `admin`
-permission is surfaced as `write` in UI text — the stored value stays
-`admin`; translation at the boundary is a decision to confirm),
-**session role** (owner/admin/member/viewer, resolved per
-`x-durable-workspace`). `—` = route unreachable for that principal;
-`404*` = foreign-workspace id answers 404, never 403 (no oracle).
+**write key** / **read key** (per-workspace store keys; `admin` stays
+the stored value, `write` is the API/UI word — boundary translation
+per ruling 3, no data migration), **session role**
+(owner/admin/member/viewer, resolved per `x-durable-workspace`).
+`—` = route unreachable for that principal; `404*` = foreign-workspace
+id answers 404, never 403 (no oracle).
 
 | Route | Ops key | Write key | Read key | Owner | Admin | Member | Viewer |
 |---|---|---|---|---|---|---|---|
@@ -660,7 +661,7 @@ Changes to the flat route's behaviour:
 | `DELETE /workspaces/{pid}/workflows/{wid}` | archive (`archived_at`); list/get omit it |
 | `POST /workspaces/{pid}/workflows/{wid}/run` | `{input_b64?}` (override default) → `engine.submit_scoped(ws, "wfr_<uuidv7>", spec)` → `{run_id, version}`; `workflow_runs` row |
 | `GET /workspaces/{pid}/workflows/{wid}/runs` | page of `workflow_runs` joined to engine `inspect` (≤50/page) → `[{run_id,submitted_at,state,finished_at}]` |
-| `POST /echo` | `{any small JSON}` → echoes it; `GET /echo?idem_key=` → 404. Open, address-rate-limited (30/min), body ≤ 8 KiB — the sample handler for onboarding; see open questions |
+| `POST /echo` | `{any small JSON}` → echoes it; `GET /echo?idem_key=` → 404. Ruling 5: JSON only (`Content-Type: application/json` in and out, `X-Content-Type-Options: nosniff`, `Content-Security-Policy: default-src 'none'`), body ≤ 8 KiB, address-rate-limited (30/min), and it **requires the signed-call header shape** (`x-durable-timestamp` + `x-durable-signature` present) else `401 unsigned` — never an open reflector; it does not need the workspace secret. Dispatch reaches it through the public origin like any customer handler — no SSRF exception, no loopback shortcut |
 
 Errors: `plan_limit` 429 carries `{limit,plan,used,cap}` + `Retry-After`
 for rate kinds; `unregistered_handler` 409; `workspace_closed` 410;
@@ -670,8 +671,10 @@ for rate kinds; `unregistered_handler` 409; `workspace_closed` 410;
 
 ## Plans and limits
 
-`plans.limits` keys (the Free row's **proposed** values — confirmed by
-S4 measurement; labelled proposals in UI copy):
+`plans.limits` keys — the Free row's values below are **accepted as the
+v1 defaults** (ruling 4), labelled proposals in UI copy; S4 measurement
+confirms or changes them **through a new `plans` row value, never a
+code change**:
 
 | Limit | Free (proposed) | Enforced at | Refusal |
 |---|---|---|---|
@@ -915,51 +918,54 @@ the refusal, not just the happy path).
 
 ## Deploy notes
 
-- Hostname: proposed `durablerunnerapp.404human.dev` → Cloudflare →
+- Hostname: `durablerunnerapp.404human.dev` → Cloudflare →
   Caddy → durable-server on its loopback port (same-origin UI+API; one
-  site file per product on the shared droplet).
-- New env: `RESEND_API_KEY`, `MAIL_FROM` (e.g.
-  `Durable Runner <hello@404human.dev>` — the sender must exist on the
-  verified domain), `--public-origin https://durablerunnerapp.404human.dev`,
-  `DURABLE_INVITE_ONLY` (default off), `DURABLE_MAILER` (default resend
-  when `RESEND_API_KEY` set; `log` allowed only with `--allow-local-handlers`
-  or a dev flag — never silently in deploy).
+  site file per product on the shared droplet). One dashboard build at
+  `/app` (signed-in SaaS mode + compat key-paste mode); `/inspector`
+  308-redirects to `/app` preserving the path tail and query.
+- New env: `RESEND_API_KEY`, `MAIL_FROM` =
+  `Durable Runner <durable-runner@404human.dev>` (ruling 7),
+  `--public-origin https://durablerunnerapp.404human.dev`,
+  `DURABLE_INVITE_ONLY` (default off, env-at-boot only per ruling 9),
+  `DURABLE_MAILER` (default resend when `RESEND_API_KEY` set; `log`
+  allowed only with `--allow-local-handlers` or a dev flag — never
+  silently in deploy).
 - Migrations 0002/0003 through `sqlx::migrate!` at startup as today;
   `scripts/deploy-readiness/neon-sweep.sh` must pass both on real Neon
   before the slices merge (no superuser constructs anywhere above).
-- The ops console (`/inspector` mount, ops key) is unchanged; the
-  product UI mounts at `/app` (or keeps `/inspector` — coordinator's
-  call, flagged below).
 
 ---
 
-## Open questions for the coordinator
+## Rulings (2026-11-24)
 
-1. **D-numbering after the S2-onto-main merge.** Both lines consumed
-   through D-058; this plan numbers from D-059 — renumber to the merged
-   sequence if the merge resolves differently.
-2. **Hostname and mount.** `durablerunnerapp.404human.dev` (the naming
-   rule) vs DEPLOY.md's `durable.404human.dev`; and the dashboard mount —
-   `/app` beside a kept `/inspector` ops mount, or the product UI takes
-   `/inspector` too.
-3. **Key scope naming.** Store keeps `admin|read`; API/UI surface
-   `write|read` via boundary translation (proposed) vs a data migration
-   renaming `admin`→`write`.
-4. **Free-plan numbers** — the table above is proposed; confirm or
-   adjust before S3-4 lands (S4 measurement is the planned confirmation
-   either way).
-5. **`/echo` on the runner origin** for zero-setup onboarding — an
-   unauthenticated bounded route on the product host; acceptable, or
-   should the sample handler live on the docs origin instead?
-6. **Session-authed submits.** The matrix lets member+ `POST /jobs`
-   directly (a session is a first-class principal, not just a dashboard
-   credential). Confirm, or restrict sessions to the workflow-run path
-   for v1.
-7. **Mail sender** — `hello@404human.dev` vs a dedicated
-   `durable-runner@404human.dev`; both need creating on the verified
-   domain (deploy task either way).
-8. **Resend idempotency** — verify `Idempotency-Key` support at
-   implementation; otherwise dedupe is the outbox row plus at-most-once
-   per status transition (`pending→sending` claimed by the worker).
-9. **Invite-only flag granularity** — env-at-boot (proposed) vs also a
-   runtime toggle readable without a restart.
+The coordinator's answers to this plan's open questions, binding for the
+build:
+
+1. **D-numbers** — number from D-059 as planned; the coordinator
+   renumbers at merge if main moves first.
+2. **Hostname and mount** — `durablerunnerapp.404human.dev`. ONE
+   dashboard build (signed-in SaaS mode + the compat key-paste mode for
+   self-hosters) mounted at `/app`; `/inspector` answers 308 → `/app`
+   (same path tail and query) so existing bookmarks keep working. No
+   second UI.
+3. **Key scopes** — boundary translation (`admin` stored, `write` on
+   the API/UI). No data migration.
+4. **Free-plan numbers** — the proposed table stands as the v1
+   defaults, labelled proposals; S4 measurement confirms or changes
+   them through a new `plans` row value, never a code change.
+5. **`/echo` on the runner origin** — accepted, with: JSON in/out only,
+   `Content-Type: application/json`, `X-Content-Type-Options: nosniff`,
+   `Content-Security-Policy: default-src 'none'`, body ≤ 8 KiB,
+   address-rate-limited as planned, and the signed-call header shape is
+   required (`x-durable-timestamp` + `x-durable-signature` present;
+   unsigned calls get `401 unsigned`, so it is not an open reflector —
+   it does not need the workspace secret). Dispatch reaches it through
+   the public origin like any customer handler: no SSRF exception, no
+   loopback shortcut.
+6. **Session-authed submits** — members may `POST /jobs` directly,
+   behind the CSRF layer. Confirmed.
+7. **Mail sender** — `Durable Runner <durable-runner@404human.dev>`.
+8. **Resend idempotency** — check `Idempotency-Key` support at
+   implementation (S3-1); the outbox row claim (`pending→sending`) is
+   the dedupe either way.
+9. **Invite-only** — env-at-boot only for v1.
