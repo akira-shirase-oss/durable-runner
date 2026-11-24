@@ -3,8 +3,9 @@
 //! stopped journal (the same layout backup produces).
 //!
 //! Every command sends `Authorization: Bearer $DURABLE_API_KEY` — the same
-//! variable the server reads its key from. Reads (`inspect`, `list`) fall
-//! back to `$DURABLE_READ_KEY` when no API key is set.
+//! variable the server reads its key from. Reads (`inspect`, `list`,
+//! `metrics`, `events`) fall back to `$DURABLE_READ_KEY` when no API key is
+//! set.
 
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
@@ -63,6 +64,19 @@ enum Cmd {
     },
     /// Bounded diagnostics: generation, records, runs by state kind.
     Diag,
+    /// Metrics over a window (15m, 1h, 6h or 24h; default 1h), as JSON.
+    Metrics {
+        #[arg(long)]
+        window: Option<String>,
+    },
+    /// The activity feed, newest first — or one run's timeline (`--run`).
+    Events {
+        #[arg(long)]
+        run: Option<u64>,
+        /// Feed page size, 1-200 (default 50).
+        #[arg(long)]
+        limit: Option<usize>,
+    },
     /// Compact the journal into a new generation.
     Compact,
     /// Consistent server-side backup into `<server --backup-root>/<name>`.
@@ -213,6 +227,29 @@ async fn main() -> Result<()> {
                     .await?,
             )
             .await?;
+            println!("{v}");
+        }
+        Cmd::Metrics { window } => {
+            let q: Vec<(&str, String)> = window.map(|w| ("window", w)).into_iter().collect();
+            let v = check(
+                read_authed(client.get(format!("{}/metrics", args.server)))
+                    .query(&q)
+                    .send()
+                    .await?,
+            )
+            .await?;
+            println!("{v}");
+        }
+        Cmd::Events { run, limit } => {
+            let url = match run {
+                Some(id) => format!("{}/jobs/{id}/events", args.server),
+                None => format!("{}/events", args.server),
+            };
+            let q: Vec<(&str, String)> = limit
+                .map(|l| ("limit", l.to_string()))
+                .into_iter()
+                .collect();
+            let v = check(read_authed(client.get(url)).query(&q).send().await?).await?;
             println!("{v}");
         }
         Cmd::Compact => {
