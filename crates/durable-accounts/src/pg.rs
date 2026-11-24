@@ -1822,7 +1822,7 @@ impl AccountStore for Pg {
                 bounded(
                     sqlx::query(
                         "UPDATE email_outbox SET status = 'sent', sent_at = now(), \
-                         last_error = NULL \
+                         last_error = NULL, mail_text = '', mail_html = '' \
                          WHERE id = $1 AND status IN ('pending', 'sending')",
                     )
                     .bind(to_i64(id, "outbox")?)
@@ -1850,7 +1850,8 @@ impl AccountStore for Pg {
             MailOutcome::Failed { error } => {
                 bounded(
                     sqlx::query(
-                        "UPDATE email_outbox SET status = 'failed', last_error = $2 \
+                        "UPDATE email_outbox SET status = 'failed', last_error = $2, \
+                         mail_text = '', mail_html = '' \
                          WHERE id = $1 AND status IN ('pending', 'sending')",
                     )
                     .bind(to_i64(id, "outbox")?)

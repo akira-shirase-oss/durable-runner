@@ -1545,6 +1545,10 @@ struct Keyring {
     /// HMAC domain for the `drk_` tag (S2-4): a well-formed but
     /// unminted key dies on the tag before it can cost a store query.
     key_tag: std::sync::Arc<ring::hmac::Key>,
+    /// Generation bumps per workspace (S3 cheap): a revoke/delete
+    /// landing between the store await and the cache fill kills the
+    /// fill — a racing verify can't re-cache a just-dead grant.
+    ws_bumps: Mutex<HashMap<u64, Instant>>,
     cache: Mutex<HashMap<[u8; 32], CacheEntry>>,
     /// key_hash → last-seen unix ms, coalesced between flushes (D-071):
     /// N verifies in a tick land as ONE `last_used_at` UPDATE, so the
@@ -1564,6 +1568,7 @@ impl Keyring {
             read_key,
             store,
             key_tag,
+            ws_bumps: Mutex::new(HashMap::new()),
             cache: Mutex::new(HashMap::new()),
             touches: Mutex::new(HashMap::new()),
         }
@@ -1652,6 +1657,7 @@ impl Keyring {
         let Some(store) = &self.store else {
             return Verified::Denied;
         };
+        let fill_start = Instant::now();
         let verified = match store.verify_key(&hash).await {
             Ok(Some(grant)) => Verified::Granted(Principal::StoreKey {
                 ws: grant.workspace,
@@ -1660,7 +1666,7 @@ impl Keyring {
             Ok(None) => Verified::Denied,
             Err(_) => Verified::Unavailable,
         };
-        self.remember(hash, &verified);
+        self.remember(hash, &verified, fill_start);
         if matches!(verified, Verified::Granted(Principal::StoreKey { .. })) {
             self.touch_key(hash);
         }
@@ -1683,12 +1689,25 @@ impl Keyring {
         })
     }
 
-    fn remember(&self, hash: [u8; 32], verified: &Verified) {
+    fn remember(&self, hash: [u8; 32], verified: &Verified, fill_start: Instant) {
         let outcome = match verified {
             Verified::Granted(auth) => Cached::Granted(*auth),
             Verified::Denied => Cached::Denied,
             Verified::Unavailable => return, // outages are never cached
         };
+        // A revoke/delete that landed during the store await wins:
+        // deny the fill rather than re-cache a dead grant (S3 cheap).
+        if let Cached::Granted(p) = outcome {
+            if self
+                .ws_bumps
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .get(&p.ws())
+                .is_some_and(|b| *b > fill_start)
+            {
+                return;
+            }
+        }
         let mut cache = self.cache.lock().unwrap_or_else(|e| e.into_inner());
         if cache.len() >= KEY_CACHE_CAP {
             let now = Instant::now();
@@ -1729,11 +1748,23 @@ impl Keyring {
 
     /// Write-through invalidation: key revocation performed through this
     /// process takes effect immediately instead of waiting out the TTL.
-    fn invalidate(&self, bearer_hash: [u8; 32]) {
+    fn bump_generation(&self, ws: u64) {
+        let mut bumps = self.ws_bumps.lock().unwrap_or_else(|e| e.into_inner());
+        if bumps.len() >= BUMP_CAP {
+            bumps.retain(|_, at| at.elapsed() < BUMP_TTL);
+            if bumps.len() >= BUMP_CAP {
+                bumps.clear();
+            }
+        }
+        bumps.insert(ws, Instant::now());
+    }
+
+    fn invalidate(&self, bearer_hash: [u8; 32], ws: u64) {
         self.cache
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .remove(&bearer_hash);
+        self.bump_generation(ws);
     }
 
     /// Write-through on workspace delete (D-072): every cached grant of
@@ -1743,6 +1774,7 @@ impl Keyring {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .retain(|_, e| !matches!(e.outcome, Cached::Granted(p) if p.ws() == ws));
+        self.bump_generation(ws);
     }
 }
 
@@ -3286,100 +3318,6 @@ fn lockout_mail_body() -> (String, String) {
     )
 }
 
-/// The session cookie's account — resolved only so a token redeem can
-/// tell "my session" from "someone else's". A dead or forged cookie is
-/// `None`, same as absent.
-async fn cookie_account(
-    app: &App,
-    parts: &Parts,
-    store: &std::sync::Arc<dyn AccountStore>,
-) -> Result<Option<u64>, ApiError> {
-    let Some(token) = session_cookie(parts) else {
-        return Ok(None);
-    };
-    let Some(hash) = session_token_hash(&app.session_key, &token) else {
-        return Ok(None);
-    };
-    let now = app.now_ms();
-    if let Some(grant) = app.sessions.get(&hash, now) {
-        return Ok(Some(grant.account.id));
-    }
-    match store.session_grant(&hash).await {
-        Ok(Some(g)) if g.expires_at_ms > now && g.idle_expires_at_ms > now => {
-            Ok(Some(g.account.id))
-        }
-        Ok(_) => Ok(None),
-        Err(_) => Err(accounts_unavailable()),
-    }
-}
-
-/// Who gets a fresh session cookie after a token redeem (review #2,
-/// #17): verify NEVER sets one — the mailbox owner signs in fresh;
-/// reset sets one only when the requester is signed out or already
-/// signed in as that account (never signs a different browser over).
-enum TokenCookie {
-    Never,
-    UnlessForeignSession,
-}
-
-async fn finish_redeem(
-    parts: &Parts,
-    app: &App,
-    store: &std::sync::Arc<dyn AccountStore>,
-    account: &durable_accounts::Account,
-    policy: TokenCookie,
-    mut res: Response,
-) -> Result<Response, ApiError> {
-    let set_fresh = match policy {
-        TokenCookie::Never => false,
-        TokenCookie::UnlessForeignSession => match cookie_account(app, parts, store).await? {
-            None => true,
-            Some(other) => other == account.id,
-        },
-    };
-    if !set_fresh {
-        return Ok(res);
-    }
-    let addr = client(parts);
-    let token = mint_session_token(&app.session_key);
-    let hash = sha256(token.as_bytes());
-    let mut seed = [0u8; 32];
-    ring::rand::SecureRandom::fill(&ring::rand::SystemRandom::new(), &mut seed)
-        .unwrap_or_else(|_| panic!("rng"));
-    let now = app.now_ms();
-    store
-        .create_session(&durable_accounts::NewSession {
-            account: account.id,
-            token_hash: hash,
-            csrf_seed: seed,
-            expires_at_ms: now + SESSION_ABS_MS,
-            idle_expires_at_ms: now + SESSION_IDLE_MS,
-            replaces: None,
-            user_agent: parts
-                .headers
-                .get(header::USER_AGENT)
-                .and_then(|v| v.to_str().ok())
-                .map(|s| s[..s.len().min(256)].to_string()),
-            ip: Some(addr),
-        })
-        .await
-        .map_err(|_| accounts_unavailable())?;
-    res.headers_mut().append(
-        header::SET_COOKIE,
-        header::HeaderValue::from_str(&session_set_cookie(&token))
-            .unwrap_or_else(|_| header::HeaderValue::from_static("")),
-    );
-    res.headers_mut().append(
-        header::SET_COOKIE,
-        header::HeaderValue::from_str(&known_device_set_cookie(&mint_known_device(
-            &app.session_key,
-            &account.public_id,
-        )))
-        .unwrap_or_else(|_| header::HeaderValue::from_static("")),
-    );
-    Ok(res)
-}
-
 async fn auth_signup(
     parts: Parts,
     State(app): State<App>,
@@ -3609,6 +3547,10 @@ async fn auth_login(
         })
         .await
         .map_err(|_| accounts_unavailable())?;
+    // The 20-seat cap evicts inside create_session — bump the cached
+    // grants of this account so an evicted session dies NOW, not at
+    // grant TTL (S3 cheap).
+    app.sessions.bump_account(account.id);
     let mut res = no_store(
         (
             StatusCode::OK,
@@ -3728,17 +3670,10 @@ async fn auth_verify(
     // The store revoked every session in that transaction — the cache
     // must agree immediately, not at grant TTL.
     app.sessions.bump_account(account.id);
+    // ATTACK(verify-sets-cookie): no fresh cookie — the mailbox owner
+    // signs in fresh.
     Ok(no_store(
-        finish_redeem(
-            &parts,
-            &app,
-            &store,
-            &account,
-            // ATTACK(verify-sets-cookie)
-            TokenCookie::Never,
-            Json(serde_json::json!({"verified": true})).into_response(),
-        )
-        .await?,
+        Json(serde_json::json!({"verified": true})).into_response(),
     ))
 }
 
@@ -3883,16 +3818,10 @@ async fn auth_reset(
     // once, so a just-reset account's stolen cookie dies mid-flight.
     app.sessions.bump_account(account.id);
     app.lockouts.clear_email(&account.email);
+    // S3 cheap: like verify, reset never signs a browser over — the
+    // mailbox owner signs in fresh.
     Ok(no_store(
-        finish_redeem(
-            &parts,
-            &app,
-            &store,
-            &account,
-            TokenCookie::UnlessForeignSession,
-            Json(serde_json::json!({"reset": true})).into_response(),
-        )
-        .await?,
+        Json(serde_json::json!({"reset": true})).into_response(),
     ))
 }
 
@@ -4126,6 +4055,10 @@ async fn me_password(
         })
         .await
         .map_err(|_| accounts_unavailable())?;
+    // The 20-seat cap evicts inside create_session — bump the cached
+    // grants of this account so an evicted session dies NOW, not at
+    // grant TTL (S3 cheap).
+    app.sessions.bump_account(grant.account.id);
     let mut res = no_store(
         Json(serde_json::json!({
             "changed": true,
@@ -5065,7 +4998,7 @@ async fn ws_key_delete(
             "no such key",
         ));
     };
-    app.keyring.invalidate(hash);
+    app.keyring.invalidate(hash, ws.id);
     Ok(no_store(StatusCode::NO_CONTENT.into_response()))
 }
 
@@ -5118,7 +5051,7 @@ async fn ws_key_rotate(
             "no such key",
         ));
     };
-    app.keyring.invalidate(old_hash);
+    app.keyring.invalidate(old_hash, ws.id);
     let mut out = key_json(&new_info);
     out["key"] = serde_json::Value::String(secret);
     Ok(no_store(Json(out).into_response()))
@@ -6346,7 +6279,7 @@ async fn delete_workspace_key(
     let ws = workspace_by_public(store, public_id).await?;
     match store.revoke_key(ws.id, key_id).await.map_err(store_err)? {
         Some(hash) => {
-            app.keyring.invalidate(hash);
+            app.keyring.invalidate(hash, ws.id);
             Ok(Json(serde_json::json!({ "revoked": key_id })))
         }
         None => Err(ApiError::new(
@@ -6787,7 +6720,10 @@ async fn test_call_run(
         name: "test".to_string(),
         handler: name.to_string(),
     };
-    let idem = format!("probe/{ws}/{name}/{}", observe::wall_ms());
+    // The idem key goes to the handler's URL — a hash of the internal
+    // ws id, never the id itself (S3 cheap: the u64 is ours alone).
+    let ws_ref = &hex(&sha256(&ws.to_le_bytes()))[..16];
+    let idem = format!("probe/{ws_ref}/{name}/{}", observe::wall_ms());
     let reply = handler.test_call(&step, &input, &idem).await;
     // The row's test columns update when the registry knows the name —
     // flag-registered names have no store row to write.
@@ -9943,7 +9879,7 @@ mod tests {
             .revoke_key(ws.id, info.id)
             .await
             .unwrap_or_else(|e| panic!("revoke: {e}"));
-        h.keyring.invalidate(sha256(token.as_bytes()));
+        h.keyring.invalidate(sha256(token.as_bytes()), 0);
 
         let (status, _) = call(&h.router, "GET", "/jobs", Some(token), None).await;
         assert_eq!(status, StatusCode::UNAUTHORIZED);
@@ -19654,6 +19590,61 @@ mod tests {
         .await;
         assert_eq!(st, StatusCode::GONE, "{v}");
         assert_eq!(v["code"], "token_gone");
+    }
+
+    /// Cheap S3s: /auth/reset mints no cookie (the mailbox owner signs
+    /// in fresh); a terminal outbox mark blanks the mailed body so the
+    /// token isn't kept past need.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn s3c_reset_sets_no_cookie_and_outbox_blanks() {
+        let store = Arc::new(Memory::new());
+        let h = harness_store(false, None, Some(store.clone()));
+        signup_and_verify(&h.router, &store, "r@r.co", "a-long-enough-passphrase").await;
+        let (st, _, _) = raw(
+            &h.router,
+            "POST",
+            "/auth/forgot",
+            &[],
+            Some(json!({"email": "r@r.co"})),
+        )
+        .await;
+        assert_eq!(st, StatusCode::ACCEPTED);
+        let token = mailed_token(&store, "reset", "r@r.co");
+        let (st, heads, v) = raw(
+            &h.router,
+            "POST",
+            "/auth/reset",
+            &[],
+            Some(json!({"token": token, "password": "a-new-long-passphrase"})),
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK, "{v}");
+        assert!(
+            heads.get(header::SET_COOKIE).is_none(),
+            "reset never signs a browser over"
+        );
+
+        // Terminal marks blank the mailed body (the token inside it).
+        let claimed = store
+            .outbox_claim(unix_ms(), 10, 60_000)
+            .await
+            .unwrap_or_else(|e| panic!("claim: {e}"));
+        let row = claimed
+            .iter()
+            .find(|r| r.mail.kind == "reset")
+            .unwrap_or_else(|| panic!("reset row"));
+        let idem = row.mail.idempotency_key.clone();
+        store
+            .outbox_mark(row.id, durable_accounts::MailOutcome::Sent)
+            .await
+            .unwrap_or_else(|e| panic!("{e}"));
+        let mail = store
+            .outbox()
+            .into_iter()
+            .find(|r| r.mail.idempotency_key == idem)
+            .map(|r| r.mail)
+            .unwrap_or_else(|| panic!("row"));
+        assert!(mail.text.is_empty() && mail.html.is_empty(), "body blanked");
     }
 
     /// S2-5: an account store without --ops-listen refuses boot.

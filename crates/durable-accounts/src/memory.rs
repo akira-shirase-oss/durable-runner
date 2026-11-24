@@ -1443,6 +1443,10 @@ impl AccountStore for Memory {
             MailOutcome::Sent => {
                 if row.status == "pending" || row.status == "sending" {
                     row.status = "sent";
+                    // The body holds the mailed secret — keep it no
+                    // longer than needed (S3 cheap).
+                    row.mail.text.clear();
+                    row.mail.html.clear();
                 }
             }
             MailOutcome::Retry {
@@ -1457,6 +1461,8 @@ impl AccountStore for Memory {
             MailOutcome::Failed { error } => {
                 row.status = "failed";
                 row.last_error = Some(error);
+                row.mail.text.clear();
+                row.mail.html.clear();
             }
         }
         Ok(())
