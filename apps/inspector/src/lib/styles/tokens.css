@@ -75,6 +75,21 @@
   --c-danger: #b42318;
   --c-danger-bg: #fdecea;
   --c-danger-edge: #f1c4be;
+
+  /* inspector only: chart marks. Series pairs validated colour-blind safe (protan/deutan ΔE ≥ 8, OKLab ×100) and
+     ≥ 3:1 on the card, except --c-chart-fail in light (2.98:1), whose values every chart also gives in its legend,
+     tooltip and table view. Outcome stacks put neutral between ok and fail, so red never touches green. */
+  --c-chart-1: #2a78d6;
+  --c-chart-2: #eb6834;
+  --c-chart-ok: #127443;
+  --c-chart-fail: #ee6e66;
+  --c-chart-neutral: #868c95;
+  --c-chart-retry: #c98500;
+  --c-chart-lost: #6d4ad8;
+  --c-grid: #eef0f2;
+  --c-axis: #d3d6db;
+  --c-crosshair: #9aa0a8;
+  --c-hover-band: #0f172a0b;
 }
 
 @media (prefers-color-scheme: dark) {
@@ -133,6 +148,17 @@
     --c-danger: #f97066;
     --c-danger-bg: #3a1715;
     --c-danger-edge: #5c2620;
+    --c-chart-1: #3987e5;
+    --c-chart-2: #d95926;
+    --c-chart-ok: #26a05d;
+    --c-chart-fail: #b93630;
+    --c-chart-neutral: #6b717a;
+    --c-chart-retry: #c98500;
+    --c-chart-lost: #9085e9;
+    --c-grid: #212429;
+    --c-axis: #353940;
+    --c-crosshair: #6b717a;
+    --c-hover-band: #ffffff0f;
   }
 }
 
@@ -191,4 +217,15 @@
   --c-danger: #f97066;
   --c-danger-bg: #3a1715;
   --c-danger-edge: #5c2620;
+  --c-chart-1: #3987e5;
+  --c-chart-2: #d95926;
+  --c-chart-ok: #26a05d;
+  --c-chart-fail: #b93630;
+  --c-chart-neutral: #6b717a;
+  --c-chart-retry: #c98500;
+  --c-chart-lost: #9085e9;
+  --c-grid: #212429;
+  --c-axis: #353940;
+  --c-crosshair: #6b717a;
+  --c-hover-band: #ffffff0f;
 }
