@@ -88,6 +88,9 @@ fi
 step "perf: clean-imports gate (+ known-bad proof)"
 perf/check-clean-imports.sh
 
+step "migrations frozen (checksum manifest + known-bad proof)"
+scripts/check-migrations.sh
+
 step "deploy format guard (D-056)"
 deploy/test-format-guard.sh
 
