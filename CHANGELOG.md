@@ -185,6 +185,20 @@ contract + reference verifier ship in `docs/HANDLERS.md`.
   their own bucket. A dual-stack listener's `::ffff:a.b.c.d` peers are
   treated as the IPv4 clients they are. `smoke.sh` checks both halves.
 
+- **Handler registries can't be churned into the disk** (re-review
+  S2-4): registry changes are limited per workspace (2 per second, burst
+  20, `429 registry_rate_limited`), a `PUT` that changes nothing does no
+  store or disk work, and `handlers.json` is saved once per batch of
+  queued changes.
+- **One IPv6 /48 can't fill the rate-limit table** (re-review S2-2): the
+  /48 aggregate is judged before a /64 bucket exists, a /48 keeps at most
+  256 /64 buckets, refused requests don't keep a bucket alive, and the
+  idle scan runs at most once a second.
+- **`--allow-local-handlers` no longer reaches API-registered handlers**
+  (re-review S1-1): it opens the operator's own `--handler` flags only;
+  every tenant (and workspace 0's API) registration stays under the full
+  SSRF policy. Only a `--features lab` build can open tenant handlers.
+
 ### Load evidence
 
 - `cargo test --workspace`: 198 tests green including the isolation
