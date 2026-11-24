@@ -5,6 +5,9 @@
 set -euo pipefail
 [[ $EUID -eq 0 ]] || { echo "run as root" >&2; exit 1; }
 [[ -f /usr/local/bin/durable-server.prev ]] || { echo "no .prev binary — nothing to roll back to" >&2; exit 1; }
+# Never roll back onto a lab build (S3), and refuse before anything stops.
+"$(dirname "$0")/lab-build-guard.sh" /usr/local/bin/durable-server.prev \
+  || { echo "rollback refused: the saved binary is a LAB build" >&2; exit 1; }
 # D-056: the saved binary must still read what the journal now holds.
 # The journal must be QUIESCENT when judged — a live server can still
 # commit tenant records or finish a compaction between the guard's scan

@@ -39,14 +39,16 @@ enum Cmd {
     },
     /// Show one run's state.
     Inspect {
-        /// The opaque run id the server returned at submit.
-        #[arg(long)]
+        /// The opaque run id the server returned at submit (it may start
+        /// with `-`: URL-safe base64).
+        #[arg(long, allow_hyphen_values = true)]
         run: String,
     },
     /// Cancel a run (stops scheduling; cannot undo remote effects).
     Cancel {
-        /// The opaque run id the server returned at submit.
-        #[arg(long)]
+        /// The opaque run id the server returned at submit (it may start
+        /// with `-`: URL-safe base64).
+        #[arg(long, allow_hyphen_values = true)]
         run: String,
     },
     /// List one page of the live index (ids ascending, or newest first).
@@ -55,10 +57,10 @@ enum Cmd {
         #[arg(long)]
         newest: bool,
         /// Newest first: start before this run id.
-        #[arg(long)]
+        #[arg(long, allow_hyphen_values = true)]
         before: Option<String>,
         /// Start after this run id (the previous page's `next_after`).
-        #[arg(long)]
+        #[arg(long, allow_hyphen_values = true)]
         after: Option<String>,
         /// Page size (server clamps to 1..=1000; default 100).
         #[arg(long)]
@@ -74,7 +76,7 @@ enum Cmd {
     /// The activity feed, newest first — or one run's timeline (`--run`).
     Events {
         /// The opaque run id the server returned at submit.
-        #[arg(long)]
+        #[arg(long, allow_hyphen_values = true)]
         run: Option<String>,
         /// Feed page size, 1-200 (default 50).
         #[arg(long)]
@@ -318,6 +320,30 @@ mod tests {
         j.append(br#"{"run":1}"#).unwrap_or_else(|e| panic!("{e}"));
         j.backup_to(&dest).unwrap_or_else(|e| panic!("{e}"));
         dest
+    }
+
+    /// An opaque run id is URL-safe base64, so one in 64 starts with `-`
+    /// (the pilot drew `-Bm3f20zxwE`): every flag that takes one must read
+    /// it as the value, not as another flag.
+    #[test]
+    fn a_run_id_starting_with_a_dash_is_a_value() {
+        let id = "-Bm3f20zxwE";
+        for argv in [
+            vec!["durable", "inspect", "--run", id],
+            vec!["durable", "cancel", "--run", id],
+            vec!["durable", "events", "--run", id],
+            vec!["durable", "list", "--after", id],
+            vec!["durable", "list", "--newest", "--before", id],
+        ] {
+            let parsed = Args::try_parse_from(&argv).unwrap_or_else(|e| panic!("{argv:?}: {e}"));
+            let got = match parsed.cmd {
+                Cmd::Inspect { run } | Cmd::Cancel { run } => Some(run),
+                Cmd::Events { run, .. } => run,
+                Cmd::List { after, before, .. } => after.or(before),
+                _ => None,
+            };
+            assert_eq!(got.as_deref(), Some(id), "{argv:?}");
+        }
     }
 
     fn log_of(dir: &Path) -> Vec<u8> {
