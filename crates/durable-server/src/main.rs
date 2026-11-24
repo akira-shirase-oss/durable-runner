@@ -3003,6 +3003,13 @@ async fn delete_handler(
     // Finding 4: the delete holds the ws stripe across store + engine +
     // file, so a reconcile pass can never be mid-list for this row.
     let _ws_guard = app.registry_locks.stripe(auth.ws).lock().await;
+    // Forget FIRST — PUT's "drop before anything changes" rule (S3
+    // re-review 2, S2-3): a view kept past a store 404, an engine refusal
+    // or a failed save made the next PUT of that URL answer `unchanged`
+    // over a row the store no longer holds. A missing entry only ever
+    // costs a PUT its no-op skip.
+    // ATTACK(registry-delete-forgets)
+    app.registry.remove(auth.ws, &name);
     let existed = store
         .delete_handler(auth.ws, &name)
         .await
@@ -3015,12 +3022,6 @@ async fn delete_handler(
         ));
     }
     app.engine.delete_handler(auth.ws, &name)?;
-    // Forget BEFORE the save, not after (S3 re-review 2): the engine has
-    // already dropped the handler, so a view kept on a failed save would
-    // make a later PUT of the same URL answer `unchanged` while nothing
-    // is armed. A missing entry only ever costs a PUT its no-op skip.
-    // ATTACK(registry-delete-forgets)
-    app.registry.remove(auth.ws, &name);
     registry_file_remove(&app, auth.ws, &name).await?;
     Ok(Json(serde_json::json!({ "deleted": name })))
 }
@@ -7421,6 +7422,66 @@ mod tests {
             v["unchanged"],
             json!(true),
             "the PUT after a deleted handler was skipped: nothing is armed"
+        );
+    }
+
+    /// Re-review S2-3: a DELETE the store answers not-found (the row went
+    /// behind the API) still forgets the view — the next PUT of the same
+    /// URL writes instead of confirming a registration the store lacks.
+    #[tokio::test]
+    async fn a_delete_the_store_did_not_find_still_forgets_the_view() {
+        let (h, store, key_a, _) = two_tenant_registry().await;
+        let (status, v) = put_h(&h, key_a, "http://127.0.0.1:9/a").await;
+        assert_eq!(status, StatusCode::OK, "{v}");
+        let ws = load_registry_file(&h.app.registry_file)
+            .unwrap_or_else(|e| panic!("{e}"))
+            .into_iter()
+            .find(|e| e.name == "h")
+            .map(|e| e.ws)
+            .unwrap_or_else(|| panic!("the PUT saved its row"));
+        assert!(store
+            .delete_handler(ws, "h")
+            .await
+            .unwrap_or_else(|e| panic!("{e}")));
+        let (status, v) = call(&h.router, "DELETE", "/handlers/h", Some(key_a), None).await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{v}");
+        let (status, v) = put_h(&h, key_a, "http://127.0.0.1:9/a").await;
+        assert_eq!(status, StatusCode::OK, "{v}");
+        assert_ne!(
+            v["unchanged"],
+            json!(true),
+            "the PUT was skipped on the view a 404 DELETE left behind"
+        );
+        let rows = store
+            .list_handlers(ws)
+            .await
+            .unwrap_or_else(|e| panic!("{e}"));
+        assert!(
+            rows.iter().any(|r| r.name == "h"),
+            "the API confirmed a registration the store does not hold"
+        );
+    }
+
+    /// Re-review S2-3: a DELETE whose engine call failed after the store
+    /// row went still forgets the view — a later PUT of the same URL is
+    /// never a no-op over a row the store no longer has.
+    #[tokio::test]
+    async fn a_delete_the_engine_refused_still_forgets_the_view() {
+        let (h, _store, key_a, _) = two_tenant_registry().await;
+        let (status, v) = put_h(&h, key_a, "http://127.0.0.1:9/a").await;
+        assert_eq!(status, StatusCode::OK, "{v}");
+        h.app
+            .engine
+            .shutdown(Duration::from_secs(5))
+            .await
+            .unwrap_or_else(|e| panic!("{e}"));
+        let (status, v) = call(&h.router, "DELETE", "/handlers/h", Some(key_a), None).await;
+        assert_ne!(status, StatusCode::OK, "control: the engine refused: {v}");
+        let (_, v) = put_h(&h, key_a, "http://127.0.0.1:9/a").await;
+        assert_ne!(
+            v["unchanged"],
+            json!(true),
+            "the PUT was skipped on the view a failed DELETE left behind"
         );
     }
 

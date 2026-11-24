@@ -183,6 +183,42 @@ enum LimitKey {
     V6Shared(u128),
 }
 
+/// One /48's own /64 entries: the count its cap reads, the list it
+/// reclaims from, and when it last did.
+#[derive(Debug, Default)]
+struct AggKeys {
+    /// The entries' address keys (`LimitKey::Addr` bits), sorted.
+    keys: Vec<u128>,
+    /// When this /48 last scanned its keys for idle ones.
+    scanned: Option<Instant>,
+}
+
+impl AggKeys {
+    fn insert(&mut self, key: u128) {
+        if let Err(i) = self.keys.binary_search(&key) {
+            self.keys.insert(i, key);
+        }
+    }
+
+    fn remove(&mut self, key: u128) {
+        if let Ok(i) = self.keys.binary_search(&key) {
+            self.keys.remove(i);
+            self.trim();
+        }
+    }
+
+    /// Give memory back after removals (re-review S2-2): a /48 that grew to
+    /// its cap and trimmed to one key kept the cap's capacity, ~22k such
+    /// /48s plateaued near 200 MiB. Capacity stays within 4x the keys
+    /// (Vec growth doubles, so only removals can break that); each shrink
+    /// halves it at least, so the cost is amortized O(1) per removal.
+    fn trim(&mut self) {
+        if self.keys.capacity() > 4 * self.keys.len().max(1) {
+            self.keys.shrink_to(self.keys.len() * 2);
+        }
+    }
+}
+
 /// A bounded token-bucket table: one bucket per normalized client
 /// address, plus one per IPv6 /48 aggregate.
 #[derive(Debug)]
@@ -194,15 +230,17 @@ pub struct RateLimit {
     v6_prefix: u8,
     max_addrs: usize,
     addrs: HashMap<LimitKey, Bucket>,
-    /// How many `Addr` (/64) entries each /48 holds now.
-    /// Each /48's own /64 entries (their address keys): the count the cap
-    /// reads, and the list a full /48 is reclaimed from.
-    per_agg: HashMap<u128, std::collections::HashSet<IpAddr>>,
+    /// Each /48's own /64 entries. Bounded by the table: every key here is
+    /// an entry of `addrs`, and an empty /48 is removed.
+    per_agg: HashMap<u128, AggKeys>,
     /// When the full table was last scanned for idle entries.
     last_reclaim: Option<Instant>,
     /// Scans run so far (tests: the scan is rate-limited).
     #[cfg(test)]
     reclaims: u64,
+    /// Per-/48 scans run so far (tests: rate-limited per /48 too).
+    #[cfg(test)]
+    agg_scans: u64,
     /// Every key that cannot get its own entry shares this one: a spray
     /// of distinct addresses limits itself, never evicts hot entries.
     overflow: Bucket,
@@ -226,6 +264,8 @@ impl RateLimit {
             last_reclaim: None,
             #[cfg(test)]
             reclaims: 0,
+            #[cfg(test)]
+            agg_scans: 0,
             overflow: Bucket::full(rate.max(1.0), Instant::now()),
         }
     }
@@ -293,10 +333,12 @@ impl RateLimit {
             // ATTACK(limiter-idle-clock)
             let keep = idle.is_none_or(|i| b.active > i);
             if !keep {
-                if let (Some(agg), LimitKey::Addr(a)) = (Self::agg_of_key(k, v6_prefix), k) {
+                if let (Some(agg), LimitKey::Addr(IpAddr::V6(a))) =
+                    (Self::agg_of_key(k, v6_prefix), k)
+                {
                     if let Some(set) = per_agg.get_mut(&agg) {
-                        set.remove(a);
-                        if set.is_empty() {
+                        set.remove(a.to_bits());
+                        if set.keys.is_empty() {
                             per_agg.remove(&agg);
                         }
                     }
@@ -309,24 +351,39 @@ impl RateLimit {
     /// A /48 at its cap drops its OWN minute-idle /64 entries (S3 re-review
     /// 1: the table-wide scan runs only on a full table, so a /48 filled
     /// once by one-off /64s stayed capped for good and its never-seen
-    /// /64s shared one bucket until restart). O(cap) for that /48 only.
+    /// /64s shared one bucket until restart). O(cap) for that /48 only,
+    /// and at most once per `RECLAIM_EVERY` for it: a flood refused at the
+    /// shared bucket never spends the aggregate, so without its own clock
+    /// every refused request re-ran the scan (re-review S2-1).
     fn reclaim_agg(&mut self, agg: u128, now: Instant) {
-        let Some(idle) = now.checked_sub(IDLE_EVICT) else {
-            return;
-        };
         let Some(set) = self.per_agg.get_mut(&agg) else {
             return;
         };
+        if set
+            .scanned
+            .is_some_and(|t| now.saturating_duration_since(t) < RECLAIM_EVERY)
+        {
+            return;
+        }
+        set.scanned = Some(now);
+        #[cfg(test)]
+        {
+            self.agg_scans += 1;
+        }
+        let Some(idle) = now.checked_sub(IDLE_EVICT) else {
+            return;
+        };
         let addrs = &mut self.addrs;
-        set.retain(|a| {
-            let key = LimitKey::Addr(*a);
+        set.keys.retain(|k| {
+            let key = LimitKey::Addr(IpAddr::V6(Ipv6Addr::from_bits(*k)));
             let gone = addrs.get(&key).is_none_or(|b| b.active <= idle);
             if gone {
                 addrs.remove(&key);
             }
             !gone
         });
-        if set.is_empty() {
+        set.trim();
+        if set.keys.is_empty() {
             self.per_agg.remove(&agg);
         }
     }
@@ -339,10 +396,10 @@ impl RateLimit {
             self.reclaim(now);
             if self.addrs.len() < self.max_addrs {
                 self.addrs.insert(key, Bucket::full(burst, now));
-                if let (Some(agg), LimitKey::Addr(a)) =
+                if let (Some(agg), LimitKey::Addr(IpAddr::V6(a))) =
                     (Self::agg_of_key(&key, self.v6_prefix), key)
                 {
-                    self.per_agg.entry(agg).or_default().insert(a);
+                    self.per_agg.entry(agg).or_default().insert(a.to_bits());
                 }
             }
         }
@@ -392,7 +449,7 @@ impl RateLimit {
         }
         let mut addr_key = self.addr_key(addr);
         if let Some(p) = agg {
-            let at_cap = |l: &Self| l.per_agg.get(&p).map_or(0, |s| s.len()) >= MAX_V6_PER_AGG;
+            let at_cap = |l: &Self| l.per_agg.get(&p).map_or(0, |s| s.keys.len()) >= MAX_V6_PER_AGG;
             if !self.addrs.contains_key(&addr_key) && at_cap(self) {
                 // ATTACK(v6-agg-idle-reclaim)
                 self.reclaim_agg(p, now);
@@ -821,7 +878,7 @@ mod tests {
         }
         // DECISIVE(v6-per-agg-cap)
         assert_eq!(
-            lim.per_agg.values().map(|s| s.len()).max(),
+            lim.per_agg.values().map(|s| s.keys.len()).max(),
             Some(MAX_V6_PER_AGG)
         );
         assert!(lim.tracked() <= MAX_V6_PER_AGG + 2, "{}", lim.tracked());
@@ -841,7 +898,10 @@ mod tests {
         }
         let p = slash64(0);
         let agg = lim.agg_prefix(p).unwrap_or_else(|| panic!("a /48"));
-        assert_eq!(lim.per_agg.get(&agg).map(|s| s.len()), Some(MAX_V6_PER_AGG));
+        assert_eq!(
+            lim.per_agg.get(&agg).map(|s| s.keys.len()),
+            Some(MAX_V6_PER_AGG)
+        );
         // An hour later every one of them is idle; the table is far from full.
         let later = t0 + Duration::from_secs(3_600);
         let fresh = slash64(60_000);
@@ -854,7 +914,144 @@ mod tests {
         assert!(lim
             .per_agg
             .get(&agg)
-            .is_some_and(|s| s.len() < MAX_V6_PER_AGG));
+            .is_some_and(|s| s.keys.len() < MAX_V6_PER_AGG));
+    }
+
+    /// Re-review S2-1: a /48 holding its cap of ACTIVE /64s and a flood
+    /// from one more /64 — every flood request finds the /48 at its cap,
+    /// but the /48's own scan runs at most once per second, not per request.
+    #[test]
+    fn a_flood_past_a_full_slash48_scans_it_at_most_once_a_second() {
+        let mut lim = RateLimit::new(1_000.0, MAX_LIMITED_ADDRS, 64);
+        let t0 = Instant::now();
+        for i in 0..MAX_V6_PER_AGG as u32 {
+            assert!(lim.check(slash64(i), t0).is_ok());
+        }
+        // 10,000 requests over two seconds from a 257th /64.
+        let flood = slash64(60_000);
+        for j in 0..10_000u64 {
+            let _ = lim.check(flood, t0 + Duration::from_micros(1_000 + j * 200));
+        }
+        assert!(
+            lim.agg_scans <= 3,
+            "the /48 scan ran {} times for a two-second flood",
+            lim.agg_scans
+        );
+        assert!(
+            !lim.addrs.contains_key(&lim.addr_key(flood)),
+            "control: the /48 stayed at its cap"
+        );
+    }
+
+    /// Re-review S2-2: a /48 that grew to its cap and trimmed to a couple
+    /// of keys gives the capacity back — through its own scan and through
+    /// the table-wide one.
+    #[test]
+    fn a_trimmed_slash48_gives_its_capacity_back() {
+        let bounded = |s: &AggKeys| s.keys.capacity() <= 4 * s.keys.len().max(1);
+        // Its own scan: 256 /64s, one kept active, a newcomer after the
+        // rest went idle.
+        let mut lim = RateLimit::new(1_000.0, MAX_LIMITED_ADDRS, 64);
+        let t0 = Instant::now();
+        for i in 0..MAX_V6_PER_AGG as u32 {
+            assert!(lim
+                .check(slash64(i), t0 + Duration::from_millis(u64::from(i)))
+                .is_ok());
+        }
+        assert!(lim.check(slash64(0), t0 + Duration::from_secs(50)).is_ok());
+        assert!(lim
+            .check(slash64(60_000), t0 + Duration::from_secs(70))
+            .is_ok());
+        let agg = lim
+            .agg_prefix(slash64(0))
+            .unwrap_or_else(|| panic!("a /48"));
+        let set = lim.per_agg.get(&agg).unwrap_or_else(|| panic!("the /48"));
+        assert_eq!(set.keys.len(), 2, "control: the idle 255 were trimmed");
+        assert!(
+            bounded(set),
+            "{} keys kept a capacity of {}",
+            set.keys.len(),
+            set.keys.capacity()
+        );
+        // The table-wide scan: a full table drops the /48's idle keys one
+        // at a time; the capacity follows them down.
+        let mut lim = RateLimit::new(1_000.0, MAX_V6_PER_AGG + 8, 64);
+        for i in 0..MAX_V6_PER_AGG as u32 {
+            assert!(lim.check(slash64(i), t0).is_ok());
+        }
+        let t1 = t0 + Duration::from_secs(50);
+        assert!(lim.check(slash64(0), t1).is_ok());
+        for i in 0..8u8 {
+            let v4 = IpAddr::V4(std::net::Ipv4Addr::new(192, 0, 2, i));
+            assert!(lim.check(v4, t1).is_ok());
+        }
+        let t2 = t0 + Duration::from_secs(70);
+        let _ = lim.check(IpAddr::V4(std::net::Ipv4Addr::new(198, 51, 100, 1)), t2);
+        let set = lim.per_agg.get(&agg).unwrap_or_else(|| panic!("the /48"));
+        assert_eq!(set.keys.len(), 1, "control: the table-wide scan trimmed it");
+        assert!(
+            bounded(set),
+            "{} keys kept {}",
+            set.keys.len(),
+            set.keys.capacity()
+        );
+    }
+
+    /// Re-review S2-2, the memory figure: the trim attack — grow a fresh
+    /// /48 to its cap, keep one /64 active, let the rest idle, send one
+    /// newcomer into it (its scan trims it), and repeat with the next /48
+    /// for 40,000 /48s. Prints `per_agg`'s peak, computed from capacities
+    /// (allocator overhead excluded).
+    /// `cargo test --release -p durable-server -- --ignored limiter_per_agg_memory`
+    #[test]
+    #[ignore = "a probe: prints the per-/48 bookkeeping under the trim attack"]
+    fn limiter_per_agg_memory_under_the_trim_attack() {
+        let mut lim = RateLimit::new(1_000.0, MAX_LIMITED_ADDRS, 64);
+        let mut now = Instant::now();
+        let bytes = |l: &RateLimit| {
+            l.per_agg.capacity() * (std::mem::size_of::<(u128, AggKeys)>() + 1)
+                + l.per_agg
+                    .values()
+                    .map(|s| s.keys.capacity() * 16)
+                    .sum::<usize>()
+        };
+        let addr = |agg: u32, i: u16| {
+            IpAddr::V6(Ipv6Addr::new(
+                0x2001,
+                (agg >> 16) as u16,
+                agg as u16,
+                i,
+                0,
+                0,
+                0,
+                1,
+            ))
+        };
+        let (mut peak, mut peak_aggs) = (0usize, 0usize);
+        for agg in 0..40_000u32 {
+            for i in 0..MAX_V6_PER_AGG as u16 {
+                let _ = lim.check(addr(agg, i), now);
+            }
+            let _ = lim.check(addr(agg, 0), now + Duration::from_secs(50));
+            now += Duration::from_secs(70);
+            let _ = lim.check(addr(agg, 60_000), now);
+            if agg % 256 == 0 {
+                let b = bytes(&lim);
+                if b > peak {
+                    (peak, peak_aggs) = (b, lim.per_agg.len());
+                }
+            }
+        }
+        let mib = |b: usize| b as f64 / 1_048_576.0;
+        eprintln!(
+            "per_agg under the trim attack: peak {:.1} MiB at {} /48s; now {} /48s, {} keys, {:.1} MiB",
+            mib(peak),
+            peak_aggs,
+            lim.per_agg.len(),
+            lim.per_agg.values().map(|s| s.keys.len()).sum::<usize>(),
+            mib(bytes(&lim))
+        );
+        assert!(mib(peak) < 16.0, "per_agg peaked at {:.1} MiB", mib(peak));
     }
 
     /// A refused flood never keeps its entry young: past a minute of only
