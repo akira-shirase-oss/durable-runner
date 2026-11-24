@@ -1517,12 +1517,12 @@ enum Cached {
     Denied,
 }
 
-/// The only shapes a store key can have (`new_key_secret`): `drk_` plus
-/// 48 lowercase hex — 52 chars (legacy `dr_` keys, 51 chars, keep
-/// verifying until their owners rotate them). Non-conforming bearers
-/// deny cheaply.
+/// The only shapes a store key can have (`Keyring::mint_secret`):
+/// `drk_` + 64 lowercase hex — 24 B random and an 8 B HMAC tag, 68
+/// chars (legacy `dr_` keys, 51 chars, keep verifying until their
+/// owners rotate them). Non-conforming bearers deny cheaply.
 fn store_key_shape(bearer: &str) -> bool {
-    let hex = if bearer.len() == 52 && bearer.starts_with("drk_") {
+    let hex = if bearer.len() == 68 && bearer.starts_with("drk_") {
         &bearer[4..]
     } else if bearer.len() == 51 && bearer.starts_with("dr_") {
         &bearer[3..]
@@ -1542,6 +1542,9 @@ struct Keyring {
     api_key: ApiKey,
     read_key: Option<ApiKey>,
     store: Option<Arc<dyn AccountStore>>,
+    /// HMAC domain for the `drk_` tag (S2-4): a well-formed but
+    /// unminted key dies on the tag before it can cost a store query.
+    key_tag: std::sync::Arc<ring::hmac::Key>,
     cache: Mutex<HashMap<[u8; 32], CacheEntry>>,
     /// key_hash → last-seen unix ms, coalesced between flushes (D-071):
     /// N verifies in a tick land as ONE `last_used_at` UPDATE, so the
@@ -1554,13 +1557,55 @@ impl Keyring {
         api_key: ApiKey,
         read_key: Option<ApiKey>,
         store: Option<Arc<dyn AccountStore>>,
+        key_tag: std::sync::Arc<ring::hmac::Key>,
     ) -> Self {
         Self {
             api_key,
             read_key,
             store,
+            key_tag,
             cache: Mutex::new(HashMap::new()),
             touches: Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// Shape + tag check on a presented store key: `drk_` must carry a
+    /// valid `HMAC(key_tag, random)[..8]`; legacy `dr_` is shape-only.
+    fn store_key_ok(&self, bearer: &str) -> bool {
+        if !store_key_shape(bearer) {
+            return false;
+        }
+        let Some(body) = bearer.strip_prefix("drk_") else {
+            return true; // dr_ legacy — no tag to check
+        };
+        let Some(raw) = unhex_any(&body[..48]) else {
+            return false;
+        };
+        let Some(tag) = unhex_any(&body[48..]) else {
+            return false;
+        };
+        if tag.len() != 8 {
+            return false;
+        }
+        let computed = ring::hmac::sign(&self.key_tag, &raw);
+        // ATTACK(key-forge)
+        bool::from(subtle::ConstantTimeEq::ct_eq(
+            &computed.as_ref()[..8],
+            tag.as_slice(),
+        ))
+    }
+
+    /// Mint a store key: `drk_` + hex of 24 random bytes and the
+    /// 8-byte tag that makes it self-authenticating.
+    fn mint_secret(&self) -> String {
+        let mut raw = [0u8; 24];
+        use ring::rand::SecureRandom as _;
+        match ring::rand::SystemRandom::new().fill(&mut raw) {
+            Ok(()) => {
+                let tag = ring::hmac::sign(&self.key_tag, &raw);
+                format!("drk_{}{}", hex(&raw), hex(&tag.as_ref()[..8]))
+            }
+            Err(_) => String::new(),
         }
     }
 
@@ -1589,11 +1634,12 @@ impl Keyring {
         if self.read_key.as_ref().is_some_and(|k| k.verify(bearer)) {
             return Verified::Granted(Principal::OpsRead);
         }
-        // Store keys have exactly one shape — `dr_` + 48 hex. Anything
-        // else can never verify, so it is denied here without spending
-        // a store query (S2 review #6): an arbitrary-bearer flood used
-        // to price itself in Neon round-trips.
-        if !store_key_shape(bearer) {
+        // Store keys have exactly one shape. `drk_` also carries an
+        // 8-byte HMAC tag over its random half (S2-4): a random
+        // `drk_<hex>` dies here before it can spend a store query —
+        // well-formed-key floods used to price themselves in Neon
+        // round-trips.
+        if !self.store_key_ok(bearer) {
             return Verified::Denied;
         }
         let hash = sha256(bearer.as_bytes());
@@ -1741,6 +1787,8 @@ struct App {
     sessions: std::sync::Arc<SessionCache>,
     /// The generation-checked member-role cache (D-066).
     members: std::sync::Arc<MemberCache>,
+    /// The generation-checked public-id → workspace cache (S2-4).
+    ws_cache: std::sync::Arc<WsPidCache>,
     /// D-070 probe budgets: 30/hour per workspace (the Free plan's
     /// bound; S3-4 makes it plan-read) + 10/minute per client address.
     test_calls_ws: std::sync::Arc<Mutex<HashMap<u64, std::collections::VecDeque<Instant>>>>,
@@ -1906,6 +1954,7 @@ fn test_app(
         session_key: std::sync::Arc::new(pubid.derive_key(b"session-token-v1")),
         sessions: std::sync::Arc::new(SessionCache::new()),
         members: std::sync::Arc::new(MemberCache::new()),
+        ws_cache: std::sync::Arc::new(WsPidCache::new()),
         test_calls_ws: std::sync::Arc::new(Mutex::new(HashMap::new())),
         test_calls_addr: std::sync::Arc::new(Mutex::new(SlidingWindow::new(
             10,
@@ -2687,6 +2736,105 @@ impl MemberCache {
     }
 }
 
+const WS_PID_TTL: Duration = Duration::from_secs(30);
+const WS_PID_CAP: usize = 4_096;
+
+/// public-id → workspace view cache (S2-4): a `/workspaces/*` flood on
+/// real pids answers from memory instead of the 5-connection pool.
+/// Generation-checked like MemberCache — a bump on the ws (rename,
+/// delete, member change) kills entries and in-flight fills; misses
+/// cache too (the flood case is usually valid-but-unknown pids).
+struct WsPidCache {
+    views: Mutex<HashMap<uuid::Uuid, WsPidEntry>>,
+    bumps: Mutex<HashMap<u64, Instant>>,
+}
+
+struct WsPidEntry {
+    ws: Option<durable_accounts::Workspace>,
+    at: Instant,
+}
+
+impl WsPidCache {
+    fn new() -> Self {
+        Self {
+            views: Mutex::new(HashMap::new()),
+            bumps: Mutex::new(HashMap::new()),
+        }
+    }
+
+    fn get(&self, pid: uuid::Uuid) -> Option<Option<durable_accounts::Workspace>> {
+        let views = self.views.lock().unwrap_or_else(|e| e.into_inner());
+        let e = views.get(&pid)?;
+        (e.at.elapsed() < WS_PID_TTL).then(|| e.ws.clone())
+    }
+
+    fn put(
+        &self,
+        pid: uuid::Uuid,
+        ws: Option<durable_accounts::Workspace>,
+        fill_start: Instant,
+    ) -> bool {
+        if let Some(w) = &ws {
+            if self
+                .bumps
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .get(&w.id)
+                .is_some_and(|b| *b > fill_start)
+            {
+                return false;
+            }
+        }
+        let mut views = self.views.lock().unwrap_or_else(|e| e.into_inner());
+        if views.len() >= WS_PID_CAP {
+            views.retain(|_, e| e.at.elapsed() < WS_PID_TTL);
+            if views.len() >= WS_PID_CAP {
+                views.clear();
+            }
+        }
+        views.insert(
+            pid,
+            WsPidEntry {
+                ws,
+                at: Instant::now(),
+            },
+        );
+        true
+    }
+
+    /// Every cached view of `ws` dies now; in-flight fills that began
+    /// earlier die on `put`.
+    fn bump_ws(&self, ws: u64) {
+        self.views
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .retain(|_, e| e.ws.as_ref().is_none_or(|w| w.id != ws));
+        let mut bumps = self.bumps.lock().unwrap_or_else(|e| e.into_inner());
+        if bumps.len() >= BUMP_CAP {
+            bumps.retain(|_, at| at.elapsed() < BUMP_TTL);
+            if bumps.len() >= BUMP_CAP {
+                bumps.clear();
+            }
+        }
+        bumps.insert(ws, Instant::now());
+    }
+}
+
+/// Resolve public_id through the cache; store only on miss.
+async fn ws_by_pid(
+    app: &App,
+    store: &Arc<dyn AccountStore>,
+    pid: uuid::Uuid,
+) -> Result<Option<durable_accounts::Workspace>, ApiError> {
+    if let Some(hit) = app.ws_cache.get(pid) {
+        return Ok(hit);
+    }
+    let fill_start = Instant::now();
+    let ws = store.workspace_by_public_id(pid).await.map_err(store_err)?;
+    app.ws_cache.put(pid, ws.clone(), fill_start);
+    Ok(ws)
+}
+
 /// The bounded argon2 queue (review #9): the job permit is acquired on
 /// the async side before `spawn_blocking` — blocking-pool threads never
 /// park on auth work. Waiters are bounded and timed out; one job per
@@ -2753,7 +2901,7 @@ impl ArgonQueue {
                     .remove(&self.1);
             }
         }
-        let _addr = AddrGuard(self, addr);
+        let _addr = AddrGuard(self, client_prefix(addr));
         let _ticket = self.tickets.try_acquire().map_err(|_| Self::busy())?;
         let _permit = match tokio::time::timeout(ARGON_WAIT, self.jobs.acquire()).await {
             Ok(Ok(permit)) => permit,
@@ -3353,6 +3501,9 @@ async fn auth_login(
             "no account store is configured",
         ));
     };
+    // The per-address sliding window runs BEFORE the store lookup
+    // (S2-4): a login flood costs a mutex, never a pool checkout.
+    AuthLimits::check(&app.auth_limits.login, client_prefix(addr))?;
     let account = store
         .account_by_email(&email)
         .await
@@ -3379,7 +3530,6 @@ async fn auth_login(
             return Err(e);
         }
     }
-    AuthLimits::check(&app.auth_limits.login, client_prefix(addr))?;
     // Unknown address: verify the dummy PHC — identical work, no oracle.
     let phc = account
         .as_ref()
@@ -3995,20 +4145,15 @@ async fn member_access(
         }
     }
     let store = accounts(app)?;
-    let Some(ws) = store.workspace_by_public_id(pid).await.map_err(store_err)? else {
+    let Some(ws) = ws_by_pid(app, store, pid).await? else {
         return Err(ApiError::new(
             StatusCode::NOT_FOUND,
             "not_found",
             "no such workspace",
         ));
     };
-    if ws.deleted_at_ms.is_some() {
-        return Err(ApiError::new(
-            StatusCode::GONE,
-            "workspace_closed",
-            "this workspace is deleted",
-        ));
-    }
+    // Membership before the 410 (S3 cheap): a non-member poking a
+    // deleted workspace learns "not_found", never that it existed.
     let account = grant.account.id;
     let role = match app.members.get(account, ws.id) {
         Some(role) => role,
@@ -4025,6 +4170,13 @@ async fn member_access(
             role
         }
     };
+    if ws.deleted_at_ms.is_some() {
+        return Err(ApiError::new(
+            StatusCode::GONE,
+            "workspace_closed",
+            "this workspace is deleted",
+        ));
+    }
     if role < need {
         return Err(ApiError::new(
             StatusCode::FORBIDDEN,
@@ -4063,20 +4215,15 @@ async fn flat_member(
         )
     })?;
     let store = accounts(app)?;
-    let Some(ws) = store.workspace_by_public_id(pid).await.map_err(store_err)? else {
+    let Some(ws) = ws_by_pid(app, store, pid).await? else {
         return Err(ApiError::new(
             StatusCode::NOT_FOUND,
             "not_found",
             "no such workspace",
         ));
     };
-    if ws.deleted_at_ms.is_some() {
-        return Err(ApiError::new(
-            StatusCode::GONE,
-            "workspace_closed",
-            "this workspace is deleted",
-        ));
-    }
+    // Membership before the 410 (S3 cheap): a non-member poking a
+    // deleted workspace learns "not_found", never that it existed.
     let account = grant.account.id;
     let role = match app.members.get(account, ws.id) {
         Some(role) => role,
@@ -4093,6 +4240,13 @@ async fn flat_member(
             role
         }
     };
+    if ws.deleted_at_ms.is_some() {
+        return Err(ApiError::new(
+            StatusCode::GONE,
+            "workspace_closed",
+            "this workspace is deleted",
+        ));
+    }
     if role < need {
         return Err(ApiError::new(
             StatusCode::FORBIDDEN,
@@ -4408,6 +4562,7 @@ async fn ws_patch(
         .rename_workspace(ws.id, name.trim())
         .await
         .map_err(store_err)?;
+    app.ws_cache.bump_ws(ws.id);
     Ok(no_store(
         Json(serde_json::json!({ "public_id": ws.public_id, "name": name.trim() })).into_response(),
     ))
@@ -4441,6 +4596,7 @@ async fn ws_delete(
     // grant of this workspace, then every cached member role in it.
     app.keyring.invalidate_ws(ws.id);
     app.members.bump_ws(ws.id);
+    app.ws_cache.bump_ws(ws.id);
     // Live runs are cancelled, finished history untouched (D-072).
     if let Ok(page) = app
         .engine
@@ -4640,6 +4796,7 @@ async fn ws_member_patch(
     {
         durable_accounts::MemberChange::Changed => {
             app.members.bump_ws(ws.id);
+            app.ws_cache.bump_ws(ws.id);
             Ok(no_store(
                 Json(serde_json::json!({ "account": { "public_id": account_pid }, "role": role.as_str() }))
                     .into_response(),
@@ -4684,6 +4841,7 @@ async fn ws_member_remove(
     {
         durable_accounts::MemberChange::Changed => {
             app.members.bump_ws(ws.id);
+            app.ws_cache.bump_ws(ws.id);
             Ok(no_store(StatusCode::NO_CONTENT.into_response()))
         }
         durable_accounts::MemberChange::NotFound => Err(ApiError::new(
@@ -4818,7 +4976,7 @@ async fn ws_key_create(
             "name must be 1..=128 characters",
         ));
     }
-    let secret = new_key_secret();
+    let secret = app.keyring.mint_secret();
     if secret.is_empty() {
         return Err(ApiError::new(
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -4886,7 +5044,7 @@ async fn ws_key_rotate(
     parts: Parts,
 ) -> Result<Response, ApiError> {
     let (ws, _) = member_access(&app, &grant, pid, &parts, Role::Admin).await?;
-    let secret = new_key_secret();
+    let secret = app.keyring.mint_secret();
     if secret.is_empty() {
         return Err(ApiError::new(
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -4989,6 +5147,7 @@ async fn invite_accept(
         ));
     };
     app.members.bump_ws(ws);
+    app.ws_cache.bump_ws(ws);
     let ws = store
         .workspace_by_id(ws)
         .await
@@ -5916,6 +6075,28 @@ fn hex(bytes: &[u8]) -> String {
 /// Parse hex back into bytes — `None` on odd length, bad chars or a
 /// wrong size, so a corrupt snapshot entry degrades to "unsigned"
 /// rather than panicking startup.
+/// Variable-length hex parse — the `drk_` tag halves use sizes
+/// `unhex`'s fixed 32 B cannot.
+fn unhex_any(s: &str) -> Option<Vec<u8>> {
+    fn nib(c: u8) -> Option<u8> {
+        match c {
+            b'0'..=b'9' => Some(c - b'0'),
+            b'a'..=b'f' => Some(c - b'a' + 10),
+            _ => None,
+        }
+    }
+    let b = s.as_bytes();
+    if !b.len().is_multiple_of(2) {
+        return None;
+    }
+    let (pairs, _) = b.as_chunks::<2>();
+    let mut out = Vec::with_capacity(pairs.len());
+    for pair in pairs {
+        out.push((nib(pair[0])? << 4) | nib(pair[1])?);
+    }
+    Some(out)
+}
+
 fn unhex(s: &str) -> Option<[u8; 32]> {
     fn nib(c: u8) -> Option<u8> {
         match c {
@@ -5938,17 +6119,6 @@ fn unhex(s: &str) -> Option<[u8; 32]> {
 
 /// A fresh API key: `dr_` + 48 hex chars of CSPRNG. Only its sha256 is
 /// stored; the plaintext crosses exactly one boundary — this response.
-fn new_key_secret() -> String {
-    let mut b = [0u8; 24];
-    use ring::rand::SecureRandom as _;
-    // SystemRandom::fill only fails on catastrophic RNG loss; map it to a
-    // zeroed buffer refusal rather than issuing a weak key.
-    match ring::rand::SystemRandom::new().fill(&mut b) {
-        Ok(()) => format!("drk_{}", hex(&b)),
-        Err(_) => String::new(),
-    }
-}
-
 /// Who the caller is, as externals see it: the workspace's public id and
 /// the key's permission. No store configured (compat mode) means
 /// workspace 0 — the nil UUID.
@@ -6098,7 +6268,7 @@ async fn create_workspace_key(
             "name must be 1..=128 characters",
         ));
     }
-    let secret = new_key_secret();
+    let secret = app.keyring.mint_secret();
     if secret.is_empty() {
         return Err(ApiError::new(
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -7186,7 +7356,12 @@ async fn main() -> Result<()> {
     let obs = engine.observer().clone();
     let app = App {
         engine,
-        keyring: Arc::new(Keyring::new(api_key, read_key, store.clone())),
+        keyring: Arc::new(Keyring::new(
+            api_key,
+            read_key,
+            store.clone(),
+            std::sync::Arc::new(pubid.derive_key(b"store-key-tag-v1")),
+        )),
         ops_gate: args.ops_listen.is_some(),
         open_reads: args.open_reads,
         backup_root,
@@ -7201,6 +7376,7 @@ async fn main() -> Result<()> {
         session_key: std::sync::Arc::new(pubid.derive_key(b"session-token-v1")),
         sessions: std::sync::Arc::new(SessionCache::new()),
         members: std::sync::Arc::new(MemberCache::new()),
+        ws_cache: std::sync::Arc::new(WsPidCache::new()),
         test_calls_ws: std::sync::Arc::new(Mutex::new(HashMap::new())),
         test_calls_addr: std::sync::Arc::new(Mutex::new(SlidingWindow::new(
             10,
@@ -8470,6 +8646,10 @@ mod tests {
             ApiKey::new(KEY),
             Some(ApiKey::new(READ_KEY)),
             store,
+            std::sync::Arc::new(ring::hmac::Key::new(
+                ring::hmac::HMAC_SHA256,
+                b"test-key-tag",
+            )),
         ));
         let app = test_app(
             engine,
@@ -8587,7 +8767,15 @@ mod tests {
         let r = router(
             test_app(
                 engine,
-                Arc::new(Keyring::new(ApiKey::new(KEY), None, None)),
+                Arc::new(Keyring::new(
+                    ApiKey::new(KEY),
+                    None,
+                    None,
+                    std::sync::Arc::new(ring::hmac::Key::new(
+                        ring::hmac::HMAC_SHA256,
+                        b"test-key-tag",
+                    )),
+                )),
                 true,
                 None,
                 journal.path(),
@@ -10644,7 +10832,15 @@ mod tests {
             },
         )
         .unwrap_or_else(|e| panic!("{e}"));
-        let keyring = Arc::new(Keyring::new(ApiKey::new(KEY), None, Some(store)));
+        let keyring = Arc::new(Keyring::new(
+            ApiKey::new(KEY),
+            None,
+            Some(store),
+            std::sync::Arc::new(ring::hmac::Key::new(
+                ring::hmac::HMAC_SHA256,
+                b"test-key-tag",
+            )),
+        ));
         // The shipped store policy: strict.
         let app = test_app(engine, keyring, false, None, journal.path(), false, false);
         (app.clone(), router(app, None), key, a, journal)
@@ -12663,7 +12859,15 @@ mod tests {
         )
         .unwrap_or_else(|e| panic!("{e}"));
         // The strict app — allow_local false, as the shipped default runs.
-        let keyring = Arc::new(Keyring::new(ApiKey::new(KEY), None, Some(store)));
+        let keyring = Arc::new(Keyring::new(
+            ApiKey::new(KEY),
+            None,
+            Some(store),
+            std::sync::Arc::new(ring::hmac::Key::new(
+                ring::hmac::HMAC_SHA256,
+                b"test-key-tag",
+            )),
+        ));
         let r = router(
             test_app(engine, keyring, false, None, journal.path(), false, false),
             None,
@@ -12724,7 +12928,15 @@ mod tests {
         let r = router(
             test_app(
                 engine,
-                Arc::new(Keyring::new(ApiKey::new(KEY), None, None)),
+                Arc::new(Keyring::new(
+                    ApiKey::new(KEY),
+                    None,
+                    None,
+                    std::sync::Arc::new(ring::hmac::Key::new(
+                        ring::hmac::HMAC_SHA256,
+                        b"test-key-tag",
+                    )),
+                )),
                 true,
                 None,
                 journal.path(),
@@ -13461,7 +13673,15 @@ mod tests {
         let r = router(
             test_app(
                 engine,
-                Arc::new(Keyring::new(ApiKey::new(KEY), None, None)),
+                Arc::new(Keyring::new(
+                    ApiKey::new(KEY),
+                    None,
+                    None,
+                    std::sync::Arc::new(ring::hmac::Key::new(
+                        ring::hmac::HMAC_SHA256,
+                        b"test-key-tag",
+                    )),
+                )),
                 false,
                 None,
                 journal.path(),
@@ -13606,7 +13826,15 @@ mod tests {
         let r = router(
             test_app(
                 engine,
-                Arc::new(Keyring::new(ApiKey::new(KEY), None, None)),
+                Arc::new(Keyring::new(
+                    ApiKey::new(KEY),
+                    None,
+                    None,
+                    std::sync::Arc::new(ring::hmac::Key::new(
+                        ring::hmac::HMAC_SHA256,
+                        b"test-key-tag",
+                    )),
+                )),
                 false,
                 None,
                 journal.path(),
@@ -14986,7 +15214,15 @@ mod tests {
         let r = router(
             test_app(
                 engine,
-                Arc::new(Keyring::new(ApiKey::new(KEY), None, None)),
+                Arc::new(Keyring::new(
+                    ApiKey::new(KEY),
+                    None,
+                    None,
+                    std::sync::Arc::new(ring::hmac::Key::new(
+                        ring::hmac::HMAC_SHA256,
+                        b"test-key-tag",
+                    )),
+                )),
                 false,
                 None,
                 journal.path(),
@@ -15022,7 +15258,15 @@ mod tests {
         let r = router(
             test_app(
                 engine,
-                Arc::new(Keyring::new(ApiKey::new(KEY), None, None)),
+                Arc::new(Keyring::new(
+                    ApiKey::new(KEY),
+                    None,
+                    None,
+                    std::sync::Arc::new(ring::hmac::Key::new(
+                        ring::hmac::HMAC_SHA256,
+                        b"test-key-tag",
+                    )),
+                )),
                 false,
                 None,
                 journal.path(),
@@ -16025,7 +16269,15 @@ mod tests {
                 .unwrap_or_else(|e| panic!("{e}"));
             let app = test_app(
                 engine,
-                Arc::new(Keyring::new(ApiKey::new(KEY), None, None)),
+                Arc::new(Keyring::new(
+                    ApiKey::new(KEY),
+                    None,
+                    None,
+                    std::sync::Arc::new(ring::hmac::Key::new(
+                        ring::hmac::HMAC_SHA256,
+                        b"test-key-tag",
+                    )),
+                )),
                 false,
                 None,
                 journal.path(),
@@ -19540,9 +19792,15 @@ mod tests {
     /// reset-kind mail deliverable through a verify flood.
     #[test]
     fn s2d_prefix_keyed_limits_and_mail_reserve() {
-        let a1: std::net::IpAddr = "2001:db8:ffff:aaaa::1".parse().unwrap_or_else(|e| panic!("{e}"));
-        let a2: std::net::IpAddr = "2001:db8:ffff:aaaa::2".parse().unwrap_or_else(|e| panic!("{e}"));
-        let b: std::net::IpAddr = "2001:db8:ffff:bbbb::1".parse().unwrap_or_else(|e| panic!("{e}"));
+        let a1: std::net::IpAddr = "2001:db8:ffff:aaaa::1"
+            .parse()
+            .unwrap_or_else(|e| panic!("{e}"));
+        let a2: std::net::IpAddr = "2001:db8:ffff:aaaa::2"
+            .parse()
+            .unwrap_or_else(|e| panic!("{e}"));
+        let b: std::net::IpAddr = "2001:db8:ffff:bbbb::1"
+            .parse()
+            .unwrap_or_else(|e| panic!("{e}"));
         assert_eq!(client_prefix(a1), client_prefix(a2), "same /64");
         assert_ne!(client_prefix(a1), client_prefix(b), "different /64");
         let v4a: std::net::IpAddr = "203.0.113.7".parse().unwrap_or_else(|e| panic!("{e}"));
@@ -19572,6 +19830,110 @@ mod tests {
         assert!(!budget.open("verify", now), "verify hit cap-reserve");
         assert!(budget.open("reset", now), "the reserve kept a slot");
         assert!(budget.open("invite", now));
+    }
+
+    /// S2-4: a well-formed `drk_` with no valid HMAC tag is denied
+    /// before the store; a minted key still verifies. The ws-by-pid
+    /// cache invalidates on rename, and a deleted workspace answers
+    /// non-members 404 (membership checked before the 410).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn s2d_drk_tag_cache_and_404_before_410() {
+        let store = Arc::new(Memory::new());
+        let h = harness_store(false, None, Some(store.clone()));
+        signup_and_verify(
+            &h.router,
+            &store,
+            "s2d4@example.com",
+            "a-long-enough-passphrase",
+        )
+        .await;
+        let (cookie, csrf) =
+            login_only(&h.router, "s2d4@example.com", "a-long-enough-passphrase").await;
+        let pid = make_ws(&h.router, &cookie, "s2d4-ws").await;
+
+        // A minted key round-trips; a same-shape forgery does not.
+        let (_, key) = make_key(&h.router, &cookie, &csrf, &pid, "read").await;
+        assert_eq!(key.len(), 68, "drk_ + 64 hex (rand+tag)");
+        let (st, _, _) = raw(
+            &h.router,
+            "GET",
+            "/whoami",
+            &[("authorization", format!("Bearer {key}"))],
+            None,
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK, "minted key verifies");
+        let mut forged: String = key[..60].to_string();
+        forged.push_str("00000000");
+        let (st, _, _) = raw(
+            &h.router,
+            "GET",
+            "/whoami",
+            &[("authorization", format!("Bearer {forged}"))],
+            None,
+        )
+        .await;
+        assert_eq!(st, StatusCode::UNAUTHORIZED, "bad tag → 401");
+
+        // ws cache invalidation: rename lands immediately even though
+        // the pid view was just served from cache.
+        let (st, _, _) = raw(
+            &h.router,
+            "GET",
+            &format!("/workspaces/{pid}"),
+            &session_headers(&cookie, &csrf),
+            None,
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK);
+        let (st, _, v) = raw(
+            &h.router,
+            "PATCH",
+            &format!("/workspaces/{pid}"),
+            &session_headers(&cookie, &csrf),
+            Some(json!({"name": "s2d4-renamed"})),
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK, "{v}");
+        let (st, _, v) = raw(
+            &h.router,
+            "GET",
+            &format!("/workspaces/{pid}"),
+            &session_headers(&cookie, &csrf),
+            None,
+        )
+        .await;
+        assert_eq!(v["name"], "s2d4-renamed", "bump killed the stale view");
+
+        // Deleted ws: a non-member session gets 404, not the 410 that
+        // would admit the workspace exists.
+        let (st, _, _) = raw(
+            &h.router,
+            "DELETE",
+            &format!("/workspaces/{pid}"),
+            &session_headers(&cookie, &csrf),
+            Some(json!({"confirm": "delete s2d4-renamed"})),
+        )
+        .await;
+        assert_eq!(st, StatusCode::NO_CONTENT);
+        signup_and_verify(
+            &h.router,
+            &store,
+            "s2d4-b@example.com",
+            "a-long-enough-passphrase",
+        )
+        .await;
+        let (cookie_b, csrf_b) =
+            login_only(&h.router, "s2d4-b@example.com", "a-long-enough-passphrase").await;
+        let (st, _, v) = raw(
+            &h.router,
+            "GET",
+            &format!("/workspaces/{pid}/members"),
+            &session_headers(&cookie_b, &csrf_b),
+            None,
+        )
+        .await;
+        assert_eq!(st, StatusCode::NOT_FOUND, "non-member → 404: {v}");
     }
 
     /// S2-2 stopgaps, each with its named envelope: ≤3 owned
