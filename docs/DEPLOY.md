@@ -158,8 +158,14 @@ nft add rule inet durable_egress out meta skuid durable drop
 (`fib daddr type local` matches every address of this host, the public
 ones included. Order matters: the drops come before the port accept, or
 port 80 would reach the metadata service. A handler on another port needs
-its own accept, and a `--handler` on this host needs
-`--allow-local-handlers` *and* its own rule. The backup unit uploads to
+its own accept, and a `--handler` flag on this host needs
+`--allow-local-handlers` *and* its own rule. That flag opens the
+operator's own `--handler` flags (workspace 0) only: a handler registered
+through the API — any tenant, and workspace 0's store rows too — is always
+checked against the full SSRF policy (local blocks, this host's addresses,
+`/etc/durable/deny-cidrs`), whatever the flag says. A same-host handler is
+therefore a `--handler` line in `/etc/durable/handlers`, never an API
+registration. The backup unit uploads to
 R2 over 443. This is deploy guidance, not applied by `install.sh`, and it
 was not exercised on a droplet when written: after applying it, check
 `nft list ruleset`, a handler call, and that

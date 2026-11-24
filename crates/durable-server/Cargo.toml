@@ -35,6 +35,12 @@ hyper = { version = "1", features = ["server", "http1"] }
 hyper-util = { version = "0.1", features = ["server", "http1", "tokio"] }
 tower = { version = "0.5", default-features = false, features = ["util"] }
 
+[features]
+# Lab builds only: adds --allow-local-tenant-handlers so the workspace load
+# scenario and pilot can register loopback fixtures through the API.
+# check.sh refuses a shipped build with it (re-review S1-1).
+lab = []
+
 [dev-dependencies]
 durable-journal = { path = "../durable-journal", features = ["fault-injection"] }
 http-body = "1"

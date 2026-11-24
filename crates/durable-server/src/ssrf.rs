@@ -97,6 +97,16 @@ impl Policy {
         Ok(Self::new(allow_local, host_addresses()?, deny))
     }
 
+    /// The same sets with `allow_local` replaced (one interface scan,
+    /// two policies: the store's and the `--handler` flags').
+    pub(crate) fn with_allow_local(&self, allow_local: bool) -> Self {
+        Self {
+            allow_local,
+            host: Arc::clone(&self.host),
+            deny: Arc::clone(&self.deny),
+        }
+    }
+
     /// The flag set: `--allow-local-handlers`, no host list, no extra
     /// ranges (tests and fixtures).
     #[cfg(test)]

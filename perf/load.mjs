@@ -477,6 +477,20 @@ function startHandler(mode, stallMs = 0) {
   return p;
 }
 
+// Whether SRV is a lab build (it has --allow-local-tenant-handlers): asked
+// once, of the binary itself.
+let labTenantsMemo;
+function labTenants() {
+  if (labTenantsMemo === undefined) {
+    try {
+      labTenantsMemo = /--allow-local-tenant-handlers/.test(execFileSync(SRV, ['--help'], { encoding: 'utf8' }));
+    } catch {
+      labTenantsMemo = false;
+    }
+  }
+  return labTenantsMemo;
+}
+
 async function startServer(journalDir, extra = [], listen = `127.0.0.1:${PORT}`, connsPerAddr = 0) {
   // The battery measures the engine's bounds, not the per-address
   // limiter's (that has its own tests): the request-rate path stays on at
@@ -487,8 +501,12 @@ async function startServer(journalDir, extra = [], listen = `127.0.0.1:${PORT}`,
   const argv = ['--journal', journalDir, '--listen', listen,
     '--handler', `step=http://127.0.0.1:${HPORT}/step`,
     // The fixture handler lives on loopback — the S2-5 opt-out, always
-    // visible in argv.
+    // visible in argv. It opens the --handler flags only; the workspaces
+    // scenario's tenants register the same fixture through the API, which
+    // only a LAB build allows (`cargo build --release --features lab`,
+    // re-review S1-1).
     '--allow-local-handlers',
+    ...(labTenants() ? ['--allow-local-tenant-handlers'] : []),
     '--rate-limit-per-addr', '100000', '--max-conns-per-addr', String(connsPerAddr), ...extra];
   const p = track(
     // DR_LOAD_SRV_STDIO=inherit surfaces the server's stderr (e.g. the

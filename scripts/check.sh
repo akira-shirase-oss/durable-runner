@@ -70,6 +70,21 @@ for bin in durable-server durable-cli; do
   fi
 done
 
+step "architecture: the lab-only tenant opt-out is absent from the shipped server"
+# --allow-local-tenant-handlers exists only with `--features lab` (re-review
+# S1-1): a default build must not enable it. Known-bad proof: with the
+# feature the same probe must see it, or the check could never go red.
+shipped=$(cargo tree --locked -p durable-server -e features -i durable-server 2>/dev/null || true)
+labbed=$(cargo tree --locked -p durable-server -e features -i durable-server --features durable-server/lab 2>/dev/null || true)
+if [[ "$shipped" == *'feature "lab"'* ]]; then
+  echo "the default durable-server build enables the lab feature" >&2
+  exit 1
+fi
+if [[ "$labbed" != *'feature "lab"'* ]]; then
+  echo "the lab-feature probe cannot see the feature: the check above could never fail" >&2
+  exit 1
+fi
+
 step "cargo deny (advisories, licenses, bans, sources)"
 cargo deny --locked check
 

@@ -54,12 +54,22 @@ struct Args {
     /// HTTP handler registrations: name=URL (repeatable).
     #[arg(long = "handler", value_parser = parse_handler)]
     handlers: Vec<(String, String)>,
-    /// Permit handler URLs that target loopback/private/link-local
-    /// addresses — development and fixtures only. Without it, literal
-    /// local targets are refused at registration and any name that
-    /// resolves to one is refused before a packet leaves (S2-5).
+    /// Permit the operator's own `--handler` flag URLs (workspace 0) to
+    /// target loopback/private/link-local addresses — a handler on this
+    /// host, development and fixtures. It never applies to handlers
+    /// registered through the API (any workspace, the store): those are
+    /// always checked against the full policy, whatever this flag says
+    /// (re-review S1-1). Without it, literal local targets are refused at
+    /// startup and any name that resolves to one is refused before a
+    /// packet leaves (S2-5).
     #[arg(long)]
     allow_local_handlers: bool,
+    /// LAB BUILDS ONLY (`--features lab`; shipped binaries have no such
+    /// flag): let API-registered (tenant) handlers target local addresses,
+    /// so the workspace load scenario and pilot can use loopback fixtures.
+    #[cfg(feature = "lab")]
+    #[arg(long)]
+    allow_local_tenant_handlers: bool,
     /// Address range (repeatable, `ADDR/PREFIX` or one address) a handler
     /// call never dials, on top of the local blocks and this host's own
     /// interface addresses (which are refused automatically). List the
@@ -289,6 +299,7 @@ impl HttpHandler {
     /// nothing sent — mirroring `ssrf::refused`'s classification.
     fn policy_ok(&self) -> bool {
         match &self.policy_url {
+            // ATTACK(call-time-literal)
             Some(u) => ssrf::check_url(u, &self.policy).is_ok(),
             None => false,
         }
@@ -552,29 +563,67 @@ struct HandlerFactory {
     client: reqwest::Client,
     timeout: Duration,
     max_output: usize,
-    /// The SSRF policy shared by the registration check, every built
-    /// handler's call-time check and the client's resolver.
-    policy: ssrf::Policy,
+    /// The SSRF policy for API-registered handlers (every workspace, the
+    /// store): the registration check, each built handler's call-time
+    /// check, and `client`'s resolver. Strict in every shipped build —
+    /// `--allow-local-handlers` never reaches it (re-review S1-1).
+    store_policy: ssrf::Policy,
+    /// The operator's `--handler` flags (workspace 0): `--allow-local-handlers`
+    /// applies here only, with its own client and resolver.
+    flag_policy: ssrf::Policy,
+    flag_client: reqwest::Client,
     /// The run-id encoder every built handler signs its headers with.
     pubid: pubid::PubId,
 }
 
 impl HandlerFactory {
-    /// Compat-mode and flag registrations — unsigned.
-    fn make(&self, url: &str) -> Arc<HttpHandler> {
-        self.make_signed(url, None)
+    /// The factory with one client per policy (each client's resolver
+    /// enforces its own policy at dial time).
+    fn new(
+        store_policy: ssrf::Policy,
+        flag_policy: ssrf::Policy,
+        timeout: Duration,
+        max_output: usize,
+        pubid: pubid::PubId,
+    ) -> Result<Self> {
+        Ok(Self {
+            client: handler_client(&store_policy)?,
+            flag_client: handler_client(&flag_policy)?,
+            timeout,
+            max_output,
+            store_policy,
+            flag_policy,
+            pubid,
+        })
     }
 
-    /// A registered handler that signs with the workspace's secret.
+    /// A `--handler` flag registration (workspace 0) — unsigned, under the
+    /// flag policy.
+    fn make(&self, url: &str) -> Arc<HttpHandler> {
+        self.build(url, None, &self.flag_client, &self.flag_policy)
+    }
+
+    /// An API-registered handler that signs with the workspace's secret,
+    /// under the store policy.
     fn make_signed(&self, url: &str, secret: Option<Arc<[u8; 32]>>) -> Arc<HttpHandler> {
+        self.build(url, secret, &self.client, &self.store_policy)
+    }
+
+    fn build(
+        &self,
+        url: &str,
+        secret: Option<Arc<[u8; 32]>>,
+        client: &reqwest::Client,
+        policy: &ssrf::Policy,
+    ) -> Arc<HttpHandler> {
         Arc::new(HttpHandler {
-            client: self.client.clone(),
+            client: client.clone(),
             url: url.to_string(),
             timeout: self.timeout,
             max_output: self.max_output,
             secret,
             policy_url: reqwest::Url::parse(url).ok(),
-            policy: self.policy.clone(),
+            policy: policy.clone(),
             pubid: self.pubid.clone(),
         })
     }
@@ -896,8 +945,9 @@ async fn registry_sync(
             // --allow-local-handlers process or a direct store edit
             // never reaches the registry (call-time policy still
             // refuses it; dropping it here refuses it *honestly*).
+            // ATTACK(reconcile-recheck)
             let ok = reqwest::Url::parse(&r.url)
-                .map(|u| ssrf::check_url(&u, &factory.policy).is_ok())
+                .map(|u| ssrf::check_url(&u, &factory.store_policy).is_ok())
                 .unwrap_or(false);
             if !ok {
                 refused += 1;
@@ -1251,6 +1301,68 @@ struct App {
     obs: Arc<Observer>,
 }
 
+/// Arm the last-known-good snapshot rows at startup (before the first
+/// reconcile). Every row is re-checked against the store policy — the file
+/// may have been written by another build or edited offline, so a local
+/// target never enters the registry — and a tenant row with no usable
+/// secret is refused rather than armed unsigned. Returns how many armed.
+async fn arm_snapshot(
+    entries: Vec<RegistryEntry>,
+    factory: &HandlerFactory,
+    engine: &Engine,
+) -> usize {
+    let mut armed = 0;
+    for entry in entries {
+        // ATTACK(startup-recheck)
+        let ok = reqwest::Url::parse(&entry.url)
+            .map(|u| ssrf::check_url(&u, &factory.store_policy).is_ok())
+            .unwrap_or(false);
+        if !ok {
+            eprintln!(
+                "durable-server: snapshot handler {:?} ({:?}) refused by the \
+                 SSRF policy at startup",
+                entry.name, entry.url
+            );
+            continue;
+        }
+        let secret = entry.secret.as_deref().and_then(unhex).map(Arc::new);
+        // A tenant handler with no usable secret must not arm
+        // *unsigned* — that is the S3 hole (a corrupt entry would
+        // silently downgrade to trust-anyone). ws 0 stays honest:
+        // its flag handlers are unsigned by design.
+        if entry.ws != 0 && secret.is_none() {
+            eprintln!(
+                "durable-server: snapshot handler {:?} (ws {}) has no usable \
+                 secret; refusing it rather than arming unsigned",
+                entry.name, entry.ws
+            );
+            continue;
+        }
+        let h = factory.make_signed(&entry.url, secret);
+        match engine.put_handler(entry.ws, &entry.name, h).await {
+            Ok(()) => armed += 1,
+            Err(e) => eprintln!(
+                "durable-server: snapshot handler {:?} refused at startup: {e}",
+                entry.name
+            ),
+        }
+    }
+    armed
+}
+
+/// `--allow-local-tenant-handlers`, which exists only in a lab build.
+fn lab_local_tenant_handlers(args: &Args) -> bool {
+    #[cfg(feature = "lab")]
+    {
+        args.allow_local_tenant_handlers
+    }
+    #[cfg(not(feature = "lab"))]
+    {
+        let _ = args;
+        false
+    }
+}
+
 /// Tests' SSRF policy: open for fixtures, else the IANA blocks only (a
 /// test that needs this host's addresses builds `Policy::boot` itself).
 #[cfg(test)]
@@ -1287,9 +1399,12 @@ fn test_app(
         backup_root,
         handler_factory: Arc::new(HandlerFactory {
             client: handler_client(&test_policy(allow_local)).unwrap_or_else(|e| panic!("{e}")),
+            flag_client: handler_client(&test_policy(allow_local))
+                .unwrap_or_else(|e| panic!("{e}")),
             timeout: Duration::from_secs(2),
             max_output: 1024 * 1024,
-            policy: test_policy(allow_local),
+            store_policy: test_policy(allow_local),
+            flag_policy: test_policy(allow_local),
             pubid: pubid.clone(),
         }),
         flag_handlers: Arc::new(Vec::new()),
@@ -2488,7 +2603,8 @@ async fn put_handler(
             "handler name must be 1-128 chars with no control characters",
         ));
     }
-    let url = valid_handler_url(body.url.trim(), &app.handler_factory.policy)?;
+    // ATTACK(tenant-register-policy)
+    let url = valid_handler_url(body.url.trim(), &app.handler_factory.store_policy)?;
     // Finding 4: the bound check, the store write, the engine update and
     // the snapshot send are one critical section per workspace — a
     // reconcile's list+apply cannot interleave between them.
@@ -3024,22 +3140,28 @@ async fn main() -> Result<()> {
     // addresses join the refused set — a handler URL naming the droplet's
     // public address would otherwise be delivered over lo to anything
     // listening on 0.0.0.0. Listing them fails closed: no start.
-    let policy = ssrf::Policy::boot(args.allow_local_handlers, args.deny_cidrs.clone())
+    let policy = ssrf::Policy::boot(false, args.deny_cidrs.clone())
         .context("list this host's interface addresses for the SSRF guard")?;
-    let client = handler_client(&policy)?;
+    // Two policies (re-review S1-1): `--allow-local-handlers` opens the
+    // operator's own `--handler` flags only. Every API-registered handler
+    // — any workspace — is checked against the full policy whatever that
+    // flag says; only a lab build can open it, with its own flag.
+    // ATTACK(tenant-strict-ssrf)
+    let store_policy = policy.with_allow_local(lab_local_tenant_handlers(&args));
+    let flag_policy = policy.with_allow_local(args.allow_local_handlers);
     let pubid =
         pubid::PubId::load_or_generate(&args.journal).with_context(|| "load public-id key")?;
-    let factory = Arc::new(HandlerFactory {
-        client,
-        timeout: Duration::from_millis(args.step_timeout_ms),
-        max_output: cfg.limits.max_output_bytes,
-        policy: policy.clone(),
-        pubid: pubid.clone(),
-    });
-    // A `--handler` flag URL obeys the same registration rule as the
-    // route: literal-local refused unless --allow-local-handlers.
+    let factory = Arc::new(HandlerFactory::new(
+        store_policy.clone(),
+        flag_policy.clone(),
+        Duration::from_millis(args.step_timeout_ms),
+        cfg.limits.max_output_bytes,
+        pubid.clone(),
+    )?);
+    // A `--handler` flag URL: literal-local refused unless
+    // --allow-local-handlers.
     for (_, url) in &args.handlers {
-        valid_handler_url(url, &policy)
+        valid_handler_url(url, &flag_policy)
             .map_err(|e| anyhow::anyhow!("--handler {url}: {}", e.message))?;
     }
     let mut flag_handlers: Vec<(String, Arc<dyn StepHandler>)> = Vec::new();
@@ -3070,44 +3192,9 @@ async fn main() -> Result<()> {
         }
     }
     if store.is_some() {
-        for entry in load_registry_file(&registry_file)
-            .with_context(|| format!("loading {registry_file:?}"))?
-        {
-            // Re-check the snapshot URL: the file may have been written
-            // under --allow-local-handlers or edited offline — a literal
-            // local target never enters the registry.
-            let ok = reqwest::Url::parse(&entry.url)
-                .map(|u| ssrf::check_url(&u, &policy).is_ok())
-                .unwrap_or(false);
-            if !ok {
-                eprintln!(
-                    "durable-server: snapshot handler {:?} ({:?}) refused by the \
-                     SSRF policy at startup",
-                    entry.name, entry.url
-                );
-                continue;
-            }
-            let secret = entry.secret.as_deref().and_then(unhex).map(Arc::new);
-            // A tenant handler with no usable secret must not arm
-            // *unsigned* — that is the S3 hole (a corrupt entry would
-            // silently downgrade to trust-anyone). ws 0 stays honest:
-            // its flag handlers are unsigned by design.
-            if entry.ws != 0 && secret.is_none() {
-                eprintln!(
-                    "durable-server: snapshot handler {:?} (ws {}) has no usable \
-                     secret; refusing it rather than arming unsigned",
-                    entry.name, entry.ws
-                );
-                continue;
-            }
-            let h = factory.make_signed(&entry.url, secret);
-            if let Err(e) = engine.put_handler(entry.ws, &entry.name, h).await {
-                eprintln!(
-                    "durable-server: snapshot handler {:?} refused at startup: {e}",
-                    entry.name
-                );
-            }
-        }
+        let entries = load_registry_file(&registry_file)
+            .with_context(|| format!("loading {registry_file:?}"))?;
+        arm_snapshot(entries, &factory, &engine).await;
     }
     let stopped = engine.clone();
     let registry_stale = Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -3139,8 +3226,15 @@ async fn main() -> Result<()> {
     if args.allow_local_handlers {
         // A visible opt-out must be visible at startup too.
         eprintln!(
-            "durable-server: --allow-local-handlers set — handler URLs may \
-             target local/private addresses"
+            "durable-server: --allow-local-handlers set — the --handler flag \
+             URLs may target local/private addresses; API-registered handlers \
+             stay under the full SSRF policy"
+        );
+    }
+    if lab_local_tenant_handlers(&args) {
+        eprintln!(
+            "durable-server: LAB BUILD with --allow-local-tenant-handlers — \
+             API-registered handlers may target local addresses; never deploy this"
         );
     }
     let (own, denied) = policy.sizes();
@@ -6397,6 +6491,122 @@ mod tests {
         assert_eq!(epoch() - e0, 3, "PUT + DELETE + rotate each bump once");
     }
 
+    /// A strict app over a Memory store holding one tenant whose store rows
+    /// were planted directly (no route check): `evil` names a local
+    /// target, `good` a public one. Returns the app, the router, the
+    /// tenant's key and its workspace.
+    async fn planted_rows_app() -> (
+        App,
+        Router,
+        &'static str,
+        durable_accounts::Workspace,
+        tempfile::TempDir,
+    ) {
+        use durable_accounts::Memory;
+        let store = Arc::new(Memory::new());
+        let a = store
+            .create_workspace("planted")
+            .await
+            .unwrap_or_else(|e| panic!("{e}"));
+        let key = "dr_9ab19ab19ab19ab19ab19ab19ab19ab19ab19ab19ab19ab1";
+        store
+            .create_key(
+                a.id,
+                "k",
+                Permission::Admin,
+                &sha256(key.as_bytes()),
+                "dr_9",
+            )
+            .await
+            .unwrap_or_else(|e| panic!("{e}"));
+        for (name, url) in [
+            ("evil", "http://127.0.0.1:9/h"),
+            ("good", "http://8.8.8.8/h"),
+        ] {
+            store
+                .put_handler(a.id, name, url)
+                .await
+                .unwrap_or_else(|e| panic!("{e}"));
+        }
+        let journal = tempfile::tempdir().unwrap_or_else(|e| panic!("{e}"));
+        let engine = spawn(
+            journal.path(),
+            Registry::default(),
+            ShellConfig {
+                tick_ms: 5,
+                ..Default::default()
+            },
+        )
+        .unwrap_or_else(|e| panic!("{e}"));
+        let keyring = Arc::new(Keyring::new(ApiKey::new(KEY), None, Some(store)));
+        // The shipped store policy: strict.
+        let app = test_app(engine, keyring, false, None, journal.path(), false);
+        (app.clone(), router(app, None), key, a, journal)
+    }
+
+    /// Submit `handler` as the tenant (a far `not_before`: admission only).
+    async fn admits(r: &Router, key: &str, handler: &str) -> StatusCode {
+        let mut b = submit_body(&format!("admit-{handler}"));
+        b["spec"]["steps"][0]["handler"] = json!(handler);
+        b["not_before"] = json!(9_999_999_999_999u64);
+        call(r, "POST", "/jobs", Some(key), Some(b)).await.0
+    }
+
+    /// Re-review #10: the reconcile pass re-checks every stored URL — a
+    /// row planted past the route (a direct store edit, another build)
+    /// never arms; a public row does.
+    #[tokio::test]
+    async fn reconcile_never_arms_a_planted_local_row() {
+        let (app, r, key, _ws, _j) = planted_rows_app().await;
+        registry_sync(
+            &app.keyring.store.clone().unwrap_or_else(|| panic!("store")),
+            &app.engine,
+            &app.handler_factory,
+            &app.flag_handlers,
+            &app.registry_tx,
+            &app.registry_epoch,
+            &app.registry_locks,
+        )
+        .await
+        .unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(admits(&r, key, "good").await, StatusCode::OK, "control");
+        assert_eq!(
+            admits(&r, key, "evil").await,
+            StatusCode::CONFLICT,
+            "a planted local row was armed by the reconcile pass"
+        );
+    }
+
+    /// Re-review #10: the startup snapshot is re-checked the same way —
+    /// handlers.json may come from another build or an offline edit.
+    #[tokio::test]
+    async fn the_startup_snapshot_never_arms_a_planted_local_row() {
+        let (app, r, key, ws, _j) = planted_rows_app().await;
+        let secret = Some(hex(&ws.handler_secret));
+        let entry = |name: &str, url: &str| RegistryEntry {
+            ws: ws.id,
+            name: name.to_string(),
+            url: url.to_string(),
+            secret: secret.clone(),
+        };
+        let armed = arm_snapshot(
+            vec![
+                entry("evil", "http://169.254.169.254/latest"),
+                entry("good", "http://8.8.8.8/h"),
+            ],
+            &app.handler_factory,
+            &app.engine,
+        )
+        .await;
+        assert_eq!(admits(&r, key, "good").await, StatusCode::OK, "control");
+        assert_eq!(
+            admits(&r, key, "evil").await,
+            StatusCode::CONFLICT,
+            "a planted local snapshot row was armed at startup"
+        );
+        assert_eq!(armed, 1);
+    }
+
     /// The reconciler's outage path: with the store down the engine keeps
     /// the last-known-good set — submits still admit and diagnostics says
     /// `registry_stale` (the loop sets the flag on the same error).
@@ -6987,12 +7197,15 @@ mod tests {
             name: "s".into(),
             handler: "h".into(),
         };
-        let factory = |policy: &ssrf::Policy| HandlerFactory {
-            client: handler_client(policy).unwrap_or_else(|e| panic!("{e}")),
-            timeout: Duration::from_secs(2),
-            max_output: 1024,
-            policy: policy.clone(),
-            pubid: pubid::PubId::ephemeral(),
+        let factory = |policy: &ssrf::Policy| {
+            HandlerFactory::new(
+                policy.clone(),
+                policy.clone(),
+                Duration::from_secs(2),
+                1024,
+                pubid::PubId::ephemeral(),
+            )
+            .unwrap_or_else(|e| panic!("{e}"))
         };
         let quiet = |l: tokio::net::TcpListener| async move {
             tokio::time::timeout(Duration::from_millis(400), l.accept())

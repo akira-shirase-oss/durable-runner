@@ -2,7 +2,9 @@
 # Workspace crash drill — two workspaces submit through the memory account
 # backend, the server is kill -9'd, restarted on the same journal, and
 # isolation + the handlers.json snapshot must hold across the replay:
-#   cargo build --release -p durable-server && examples/pilot/run-workspaces.sh
+#   cargo build --release -p durable-server --features lab && examples/pilot/run-workspaces.sh
+# (a LAB build: its tenants register the loopback fixture handler, which a
+# shipped build refuses — re-review S1-1)
 # Requires: python3, curl. Exits non-zero on the first check that fails.
 #
 # Port: DURABLE_PILOT_PORT (default 58340) for the server.
@@ -31,7 +33,7 @@ step "build"
 if command -v brew >/dev/null 2>&1; then
   export PATH="$(brew --prefix rustup)/bin:$PATH" # the pinned toolchain on macOS
 fi
-if ! BUILD=$(cargo build --release --locked -p durable-server 2>&1); then
+if ! BUILD=$(cargo build --release --locked -p durable-server --features lab 2>&1); then
   printf '%s\n' "$BUILD" >&2
   fail "the release build failed (full output above)"
 fi
@@ -49,7 +51,7 @@ JQ() { python3 -I -c "import json,sys; d=json.load(sys.stdin); print($1)"; }
 
 start() {
   "$SRV" --journal "$WORK/journal" --listen "127.0.0.1:$SRV_PORT" \
-    --allow-local-handlers --drain-timeout-secs 2 \
+    --allow-local-handlers --allow-local-tenant-handlers --drain-timeout-secs 2 \
     >"$WORK/server-$1.log" 2>&1 &
   healthy
 }

@@ -189,9 +189,15 @@ target/release/durable-server \
   link-local or other non-global addresses are refused — literal forms
   at registration, and any name that *resolves* to one at call time,
   inside the client's DNS resolver (a DNS answer that flips local after
-  registration still sends zero packets; `--allow-local-handlers` opts
-  out for development and fixtures — every loopback example here needs
-  it). **This host's own addresses are refused too** (D-061): at startup
+  registration still sends zero packets). `--allow-local-handlers` opts
+  out **for the operator's own `--handler` flags only** (workspace 0;
+  development, fixtures, a same-host handler — every loopback example here
+  needs it). A handler registered through the API, by any workspace, is
+  always checked against the full policy whatever that flag says
+  (re-review S1-1): it has its own client and resolver. Only a lab build
+  (`cargo build --features lab`) has `--allow-local-tenant-handlers`, for
+  the workspace load scenario's loopback fixtures; `scripts/check.sh`
+  refuses a default build that enables it. **This host's own addresses are refused too** (D-061): at startup
   the server lists every interface address, both families — the
   droplet's public IPv4/IPv6 included — and refuses them with the local
   blocks, because Linux delivers a connection to the host's own public
