@@ -2584,6 +2584,78 @@ mod tests {
         );
     }
 
+    /// A workflow's versions on the real dialect: each patch appends a
+    /// row, the list answers them newest first with the spec each was
+    /// written with, the latest is the list's head, and another
+    /// workflow's versions never appear.
+    #[tokio::test]
+    #[ignore = "needs DURABLE_TEST_DATABASE_URL (CI: neon job runs --include-ignored)"]
+    async fn pg_workflow_versions_list_newest_first() {
+        let Some(store) = store().await else { return };
+        let ws = store
+            .create_workspace("pg-wf")
+            .await
+            .unwrap_or_else(|e| panic!("workspace: {e}"));
+        let wf = store
+            .create_workflow(ws.id, "nightly", None)
+            .await
+            .unwrap_or_else(|e| panic!("workflow: {e}"));
+        let other = store
+            .create_workflow(ws.id, "weekly", None)
+            .await
+            .unwrap_or_else(|e| panic!("other workflow: {e}"));
+        assert!(
+            store
+                .workflow_versions(wf.id)
+                .await
+                .unwrap_or_else(|e| panic!("empty list: {e}"))
+                .is_empty(),
+            "no version yet"
+        );
+        let spec = |steps: u64| serde_json::json!({"version": 1, "steps": steps, "input_b64": ""});
+        for steps in 1..=3u64 {
+            let v = store
+                .add_workflow_version(ws.id, wf.id, &spec(steps))
+                .await
+                .unwrap_or_else(|e| panic!("version {steps}: {e}"));
+            assert_eq!(v.version, steps);
+        }
+        store
+            .add_workflow_version(ws.id, other.id, &spec(9))
+            .await
+            .unwrap_or_else(|e| panic!("other version: {e}"));
+        let versions = store
+            .workflow_versions(wf.id)
+            .await
+            .unwrap_or_else(|e| panic!("list: {e}"));
+        assert_eq!(
+            versions.iter().map(|v| v.version).collect::<Vec<_>>(),
+            vec![3, 2, 1],
+            "newest first, this workflow's only"
+        );
+        for v in &versions {
+            assert_eq!(
+                v.spec,
+                spec(v.version),
+                "version {} keeps its spec",
+                v.version
+            );
+            assert!(v.created_at_ms > 0);
+        }
+        let latest = store
+            .latest_workflow_version(wf.id)
+            .await
+            .unwrap_or_else(|e| panic!("latest: {e}"));
+        assert_eq!(latest.as_ref(), versions.first());
+        assert_eq!(
+            store
+                .count_live_workflows(ws.id)
+                .await
+                .unwrap_or_else(|e| panic!("count: {e}")),
+            2
+        );
+    }
+
     #[tokio::test]
     #[ignore = "needs DURABLE_TEST_DATABASE_URL (CI: neon job runs --include-ignored)"]
     async fn pg_handlers_upsert_and_scope_per_workspace() {
