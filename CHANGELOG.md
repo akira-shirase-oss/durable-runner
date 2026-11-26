@@ -6,6 +6,16 @@ versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+S3-4 + S3-7 meet the dashboard: plans and usage, saved workflows and the
+setup checklist are served (`GET /workspaces/{id}/usage`, `/onboarding`,
+`/workflows…`), and the dashboard's Workflows, Usage and Overview pages
+read them. A workflow's detail now lists every version newest first with
+the spec it was saved with; the list and the detail carry when the newest
+version was written (`updated_at_ms`) and the newest run (`last_run`);
+the usage meter counts live workflows (it answered 0). The dashboard
+sends Run now to `POST …/workflows/{id}/runs` and reads the checklist's
+four facts.
+
 S2-1 + S2-2: the account graph and the workspace-scoped API. With
 `DATABASE_URL` set, API keys minted per workspace authenticate into that
 workspace and nothing else; without it the server behaves as v1.0.1

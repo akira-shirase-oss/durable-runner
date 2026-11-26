@@ -5281,6 +5281,7 @@ async fn ws_usage(
     let keys_n = store.list_keys(ws.id).await.map_err(store_err)?.len() as u64;
     let members_n = store.list_members(ws.id).await.map_err(store_err)?.len() as u64;
     let invites_n = store.list_invites(ws.id).await.map_err(store_err)?.len() as u64;
+    let workflows_n = store.count_live_workflows(ws.id).await.map_err(store_err)?;
     let tests_hour = {
         let per = app.test_calls_ws.lock().unwrap_or_else(|e| e.into_inner());
         let now = Instant::now();
@@ -5321,7 +5322,7 @@ async fn ws_usage(
                 "api_keys": keys_n,
                 "members": members_n,
                 "invites": invites_n,
-                "workflows": 0,
+                "workflows": workflows_n,
                 "test_calls_hour": tests_hour,
                 "retained_bytes": d.index_bytes,
             },
@@ -5380,6 +5381,50 @@ fn workflow_json(wf: &durable_accounts::Workflow, version: Option<u64>) -> serde
     })
 }
 
+/// One "run now" acceptance as the listings answer it: the public run
+/// id, the run's state now (`unknown` once the journal has expired it),
+/// the version it ran and when it was accepted.
+async fn workflow_run_json(
+    app: &App,
+    ws: u64,
+    r: &durable_accounts::WorkflowRun,
+) -> serde_json::Value {
+    let state = match scoped_run(app, ws, r.run_id).await {
+        Ok(run) => state_name(&run.state),
+        Err(_) => "unknown".to_string(),
+    };
+    serde_json::json!({
+        "id": app.pubid.encode(RunId(r.run_id)),
+        "state": state,
+        "version": r.version,
+        "op_key": r.op_key,
+        "created_at_ms": r.created_at_ms,
+    })
+}
+
+/// A workflow row for the list and the detail: `workflow_json` plus
+/// when its newest version was written (`updated_at_ms`) and its newest
+/// run (`last_run`, null before the first), so the list needs no second
+/// request per row.
+async fn workflow_view(
+    app: &App,
+    ws: u64,
+    wf: &durable_accounts::Workflow,
+    latest: Option<&durable_accounts::WorkflowVersion>,
+) -> Result<serde_json::Value, ApiError> {
+    let mut out = workflow_json(wf, latest.map(|v| v.version));
+    out["updated_at_ms"] = serde_json::json!(latest.map_or(wf.created_at_ms, |v| v.created_at_ms));
+    let newest = accounts(app)?
+        .workflow_runs(wf.id, 1)
+        .await
+        .map_err(store_err)?;
+    out["last_run"] = match newest.first() {
+        Some(r) => workflow_run_json(app, ws, r).await,
+        None => serde_json::Value::Null,
+    };
+    Ok(out)
+}
+
 /// `POST /workspaces/{pid}/workflows` — member+. Creates the workflow
 /// and its immutable version 1.
 async fn workflow_create(
@@ -5430,7 +5475,8 @@ async fn workflow_create(
 }
 
 /// `GET /workspaces/{pid}/workflows` — viewer+. Live workflows, newest
-/// first, each carrying its latest version number.
+/// first, each carrying its latest version number, when that version
+/// was written and its newest run.
 async fn workflow_list(
     SessionAuth(grant): SessionAuth,
     State(app): State<App>,
@@ -5445,17 +5491,17 @@ async fn workflow_list(
         let v = store
             .latest_workflow_version(wf.id)
             .await
-            .map_err(store_err)?
-            .map(|v| v.version);
-        list.push(workflow_json(wf, v));
+            .map_err(store_err)?;
+        list.push(workflow_view(&app, ws.id, wf, v.as_ref()).await?);
     }
     Ok(no_store(
         Json(serde_json::json!({ "workflows": list })).into_response(),
     ))
 }
 
-/// `GET /workspaces/{pid}/workflows/{wid}` — viewer+. The row plus its
-/// latest immutable version's spec; archived stays readable.
+/// `GET /workspaces/{pid}/workflows/{wid}` — viewer+. The row, its
+/// latest immutable version's spec, and every version newest first
+/// (at most `MAX_WORKFLOW_VERSIONS`); archived stays readable.
 async fn workflow_get(
     SessionAuth(grant): SessionAuth,
     State(app): State<App>,
@@ -5464,14 +5510,24 @@ async fn workflow_get(
 ) -> Result<Response, ApiError> {
     let (ws, _) = member_access(&app, &grant, pid, &parts, Role::Viewer).await?;
     let wf = workflow_of(&app, ws.id, wid).await?;
-    let v = accounts(&app)?
-        .latest_workflow_version(wf.id)
+    let versions = accounts(&app)?
+        .workflow_versions(wf.id)
         .await
         .map_err(store_err)?;
+    let latest = versions.first();
+    let view = workflow_view(&app, ws.id, &wf, latest).await?;
     Ok(no_store(
         Json(serde_json::json!({
-            "workflow": workflow_json(&wf, v.as_ref().map(|v| v.version)),
-            "spec": v.map(|v| v.spec),
+            "workflow": view,
+            "spec": latest.map(|v| &v.spec),
+            "versions": versions
+                .iter()
+                .map(|v| serde_json::json!({
+                    "version": v.version,
+                    "spec": v.spec,
+                    "created_at_ms": v.created_at_ms,
+                }))
+                .collect::<Vec<_>>(),
         }))
         .into_response(),
     ))
@@ -5678,18 +5734,8 @@ async fn workflow_runs_list(
         .await
         .map_err(store_err)?;
     let mut runs = Vec::with_capacity(rows.len());
-    for r in rows {
-        let state = match scoped_run(&app, ws.id, r.run_id).await {
-            Ok(run) => state_name(&run.state).to_string(),
-            Err(_) => "unknown".to_string(),
-        };
-        runs.push(serde_json::json!({
-            "id": app.pubid.encode(RunId(r.run_id)),
-            "state": state,
-            "version": r.version,
-            "op_key": r.op_key,
-            "created_at_ms": r.created_at_ms,
-        }));
+    for r in &rows {
+        runs.push(workflow_run_json(&app, ws.id, r).await);
     }
     Ok(no_store(
         Json(serde_json::json!({ "runs": runs })).into_response(),
@@ -12106,6 +12152,12 @@ mod tests {
         ) -> Result<Option<durable_accounts::WorkflowVersion>, AccountError> {
             self.inner.latest_workflow_version(workflow_id).await
         }
+        async fn workflow_versions(
+            &self,
+            workflow_id: u64,
+        ) -> Result<Vec<durable_accounts::WorkflowVersion>, AccountError> {
+            self.inner.workflow_versions(workflow_id).await
+        }
 
         async fn archive_workflow(
             &self,
@@ -12611,6 +12663,12 @@ mod tests {
             workflow_id: u64,
         ) -> Result<Option<durable_accounts::WorkflowVersion>, AccountError> {
             self.inner.latest_workflow_version(workflow_id).await
+        }
+        async fn workflow_versions(
+            &self,
+            workflow_id: u64,
+        ) -> Result<Vec<durable_accounts::WorkflowVersion>, AccountError> {
+            self.inner.workflow_versions(workflow_id).await
         }
 
         async fn archive_workflow(
@@ -21863,6 +21921,127 @@ mod tests {
         let runs = v["runs"].as_array().cloned().unwrap_or_default();
         assert_eq!(runs.len(), 2, "two accepted runs recorded: {v}");
         assert_eq!(runs[0]["id"], v2["run_id"], "newest first");
+    }
+
+    /// What the dashboard's workflow pages read: the detail lists every
+    /// version newest first with its own spec, the list and the detail
+    /// carry when the newest version was written and the newest run
+    /// (null before the first), and the usage meter counts live
+    /// workflows.
+    #[tokio::test]
+    async fn s37_detail_lists_versions_and_rows_carry_last_run() {
+        let store = Arc::new(Memory::new());
+        let h = harness_store(false, None, Some(store.clone()));
+        signup_and_verify(&h.router, &store, "o@o.co", "a-long-enough-passphrase").await;
+        let (oc, ocsrf) = login_only(&h.router, "o@o.co", "a-long-enough-passphrase").await;
+        let pid = make_ws(&h.router, &oc, "alpha").await;
+        let (st, _, v) = raw(
+            &h.router,
+            "PUT",
+            "/handlers/builtin:echo",
+            &ws_headers(&oc, &ocsrf, &pid),
+            Some(json!({"url": "builtin:echo"})),
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK, "{v}");
+        let wid = make_workflow(&h.router, &oc, &ocsrf, &pid).await;
+        let cookie = [("cookie", oc.clone())];
+        // Before any run: no last run, and the meter counts the workflow.
+        let (st, _, v) = raw(
+            &h.router,
+            "GET",
+            &format!("/workspaces/{pid}/workflows"),
+            &cookie,
+            None,
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK, "{v}");
+        let row = &v["workflows"][0];
+        assert!(row["last_run"].is_null(), "never run: {row}");
+        // Version 1 is written just after the row, so not before it.
+        assert!(
+            row["updated_at_ms"].as_i64() >= row["created_at_ms"].as_i64(),
+            "{row}"
+        );
+        assert!(row["updated_at_ms"].is_number(), "{row}");
+        let (st, _, v) = raw(
+            &h.router,
+            "GET",
+            &format!("/workspaces/{pid}/usage"),
+            &cookie,
+            None,
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK, "{v}");
+        assert_eq!(v["used"]["workflows"], 1, "{v}");
+        // A spec patch is version 2; the detail lists both, newest
+        // first, each with the spec it was written with.
+        let v1_spec = wf_body("nightly")["spec"].clone();
+        let mut v2_spec = v1_spec.clone();
+        v2_spec["steps"] = json!([
+            { "name": "a", "handler": "builtin:echo" },
+            { "name": "b", "handler": "builtin:echo" },
+        ]);
+        let (st, _, v) = raw(
+            &h.router,
+            "PATCH",
+            &format!("/workspaces/{pid}/workflows/{wid}"),
+            &session_headers(&oc, &ocsrf),
+            Some(json!({"spec": v2_spec})),
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK, "{v}");
+        let (st, _, v) = raw(
+            &h.router,
+            "GET",
+            &format!("/workspaces/{pid}/workflows/{wid}"),
+            &cookie,
+            None,
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK, "{v}");
+        let versions = v["versions"].as_array().cloned().unwrap_or_default();
+        assert_eq!(versions.len(), 2, "{v}");
+        assert_eq!(versions[0]["version"], 2);
+        assert_eq!(versions[0]["spec"], v2_spec);
+        assert_eq!(versions[1]["version"], 1);
+        assert_eq!(versions[1]["spec"], v1_spec, "version 1 is untouched");
+        assert_eq!(v["spec"], v2_spec, "the top-level spec is the latest");
+        assert_eq!(v["workflow"]["version"], 2);
+        assert_eq!(
+            v["workflow"]["updated_at_ms"], versions[0]["created_at_ms"],
+            "updated when the newest version was written"
+        );
+        // Run now: the list and the detail name that run.
+        let (st, _, run) = raw(
+            &h.router,
+            "POST",
+            &format!("/workspaces/{pid}/workflows/{wid}/runs"),
+            &[
+                ("cookie", oc.clone()),
+                ("x-durable-csrf", ocsrf.clone()),
+                ("idempotency-key", "run-1".to_string()),
+            ],
+            Some(json!({})),
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK, "{run}");
+        for uri in [
+            format!("/workspaces/{pid}/workflows"),
+            format!("/workspaces/{pid}/workflows/{wid}"),
+        ] {
+            let (st, _, v) = raw(&h.router, "GET", &uri, &cookie, None).await;
+            assert_eq!(st, StatusCode::OK, "{v}");
+            let row = if v["workflows"].is_array() {
+                &v["workflows"][0]
+            } else {
+                &v["workflow"]
+            };
+            assert_eq!(row["last_run"]["id"], run["run_id"], "{uri}: {row}");
+            assert_eq!(row["last_run"]["version"], 2, "{uri}: {row}");
+            assert!(row["last_run"]["state"].is_string(), "{uri}: {row}");
+            assert!(row["last_run"]["created_at_ms"].is_number(), "{uri}: {row}");
+        }
     }
 
     /// Viewer cannot run now (member+ only); an archived workflow

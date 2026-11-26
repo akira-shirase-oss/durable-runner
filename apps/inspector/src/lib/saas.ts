@@ -280,7 +280,7 @@ export function normWorkflow(raw: unknown): WorkflowRow | null {
 		name: str(o.name) ?? '',
 		currentVersion: num(first(o, 'current_version', 'version')),
 		updatedAt: toMs(first(o, 'updated_at_ms', 'updated_at')),
-		lastRun: lr && runId ? { runId, at: toMs(first(lr, 'at_ms', 'at', 'submitted_at')), state: str(lr.state) } : null,
+		lastRun: lr && runId ? { runId, at: toMs(first(lr, 'created_at_ms', 'at_ms', 'at', 'submitted_at')), state: str(lr.state) } : null,
 	};
 }
 
@@ -317,6 +317,10 @@ export function normWorkflowDetail(raw: unknown): WorkflowDetail | null {
 		})
 		.filter((v): v is WorkflowVersion => v !== null)
 		.sort((a, b) => b.version - a.version);
+	// A server that answers only `{workflow, spec}` (the latest version's spec): that one version is still known.
+	if (versions.length === 0 && base.currentVersion !== null && o.spec !== undefined && o.spec !== null) {
+		versions.push({ version: base.currentVersion, spec: normSpec(o.spec), createdAt: base.updatedAt });
+	}
 	return { ...base, currentVersion: base.currentVersion ?? versions[0]?.version ?? null, versions };
 }
 
@@ -331,7 +335,7 @@ export function normWorkflowRun(raw: unknown): WorkflowRun | null {
 	const o = obj(raw);
 	const runId = str(first(o, 'run_id', 'pubid', 'id'));
 	if (!runId) return null;
-	return { runId, submittedAt: toMs(first(o, 'submitted_at_ms', 'submitted_at')), state: str(o.state), finishedAt: toMs(first(o, 'finished_at_ms', 'finished_at')) };
+	return { runId, submittedAt: toMs(first(o, 'created_at_ms', 'submitted_at_ms', 'submitted_at')), state: str(o.state), finishedAt: toMs(first(o, 'finished_at_ms', 'finished_at')) };
 }
 
 /** The dashboard link for an invite: the server's `invite_url` may be its own API path
@@ -409,8 +413,14 @@ export interface OnboardingStep {
 	detail: string | null;
 }
 
-/** The server's checklist (`GET …/onboarding`), in the page's order; a step it does not list is not done. */
+/** The fact the server's `GET …/onboarding` names for each step. */
+const STEP_FACT: Record<StepId, string> = { api_key: 'has_key', handler: 'has_handler', test_call: 'test_call_ok', first_run: 'first_job_finished' };
+
+/** The server's checklist (`GET …/onboarding`), in the page's order. It answers four facts (`has_key`,
+ *  `has_handler`, `test_call_ok`, `first_job_finished`); a `steps` list is read too. A step neither names is not
+ *  done, and only `true` counts. */
 export function normOnboarding(body: unknown): OnboardingStep[] {
+	const facts = obj(body);
 	const byId = new Map<string, Obj>();
 	for (const s of listOf(body, 'steps')) {
 		const o = obj(s);
@@ -419,7 +429,7 @@ export function normOnboarding(body: unknown): OnboardingStep[] {
 	}
 	return STEP_ORDER.map((id) => {
 		const o = byId.get(id);
-		return { id, done: o?.done === true, detail: o ? str(o.detail) : null };
+		return { id, done: o ? o.done === true : facts[STEP_FACT[id]] === true, detail: o ? str(o.detail) : null };
 	});
 }
 

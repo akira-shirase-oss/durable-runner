@@ -508,17 +508,18 @@ export function saasMock({
         s.versions[id] = [{ version: 1, spec: body.spec, created_at_ms: Date.now() }];
         return ok({ public_id: id, name: body.name, current_version: 1 });
       }
-      m = rest.match(/^\/workflows\/([^/]+)(\/run|\/runs)?$/);
+      m = rest.match(/^\/workflows\/([^/]+)(\/runs)?$/);
       if (m) {
         const id = decodeURIComponent(m[1]);
         const wf = s.workflows.find((w) => w.public_id === id);
         if (!wf) return E(404, 'not_found', 'no such workflow');
-        if (m[2] === '/runs') return ok({ runs: [
+        // POST …/runs is Run now, GET …/runs the list (the server's routes)
+        if (m[2] === '/runs' && method === 'GET') return ok({ runs: [
           { run_id: '10416', submitted_at_ms: NOW - 72_400, state: 'done', finished_at_ms: NOW - 60_000 },
           { run_id: '10413', submitted_at_ms: NOW - 364_000, state: 'failed:step:2', finished_at_ms: NOW - 300_000 },
           { run_id: '10412', submitted_at_ms: NOW - 912_000, state: 'cancelled', finished_at_ms: NOW - 900_000 },
         ] });
-        if (m[2] === '/run') {
+        if (m[2] === '/runs' && method === 'POST') {
           const f = need('member'); if (f) return f;
           if (!headers['idempotency-key']) s.violations.push('Run now without an Idempotency-Key');
           wf.last_run = { pubid: '10416', at: Date.now(), state: 'queued' };

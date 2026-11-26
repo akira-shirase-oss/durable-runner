@@ -565,7 +565,7 @@ export async function archiveWorkflow(cred: SessionCred, pid: string, id: string
 /** Run now. `idempotencyKey` is minted once per click, so a retried request is the same run, never a second one. */
 export async function runWorkflow(cred: SessionCred, pid: string, id: string, inputB64: string | null, idempotencyKey: string): Promise<{ run_id: string; version?: number }> {
 	return req(
-		ws(pid, `/workflows/${encodeURIComponent(id)}/run`),
+		ws(pid, `/workflows/${encodeURIComponent(id)}/runs`),
 		cred,
 		jsonInit('POST', inputB64 === null ? {} : { input_b64: inputB64 }, { 'idempotency-key': idempotencyKey }),
 	);

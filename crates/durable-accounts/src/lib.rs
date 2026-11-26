@@ -976,6 +976,14 @@ pub trait AccountStore: Send + Sync {
         workflow_id: u64,
     ) -> Result<Option<WorkflowVersion>, AccountError>;
 
+    /// Every version row of `workflow_id`, newest first (ws-bound via
+    /// the caller's lookup). Bounded by `MAX_WORKFLOW_VERSIONS`: a
+    /// workflow never holds more.
+    async fn workflow_versions(
+        &self,
+        workflow_id: u64,
+    ) -> Result<Vec<WorkflowVersion>, AccountError>;
+
     /// Rename a live workflow row (ws-bound). `Ok(false)` = missing or
     /// archived — rename never revives history.
     async fn rename_workflow(

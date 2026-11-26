@@ -2159,6 +2159,31 @@ impl AccountStore for Pg {
         .transpose()
     }
 
+    async fn workflow_versions(
+        &self,
+        workflow_id: u64,
+    ) -> Result<Vec<crate::WorkflowVersion>, AccountError> {
+        let rows = bounded(
+            sqlx::query(
+                "SELECT version, spec, created_at FROM workflow_versions \
+                 WHERE workflow_id = $1 ORDER BY version DESC LIMIT $2",
+            )
+            .bind(to_i64(workflow_id, "workflow")?)
+            .bind(to_i64(crate::MAX_WORKFLOW_VERSIONS, "limit")?)
+            .fetch_all(&self.pool),
+        )
+        .await?;
+        rows.into_iter()
+            .map(|r| {
+                Ok(crate::WorkflowVersion {
+                    version: to_u64(r.try_get::<i32, _>("version")? as i64, "version")?,
+                    spec: r.try_get("spec")?,
+                    created_at_ms: ms(r.try_get("created_at")?),
+                })
+            })
+            .collect()
+    }
+
     async fn rename_workflow(
         &self,
         workspace: u64,

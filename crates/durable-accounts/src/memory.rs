@@ -1761,6 +1761,29 @@ impl AccountStore for Memory {
             }))
     }
 
+    async fn workflow_versions(
+        &self,
+        workflow_id: u64,
+    ) -> Result<Vec<crate::WorkflowVersion>, AccountError> {
+        self.check_up()?;
+        let inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        Ok(inner
+            .workflow_versions
+            .get(&workflow_id)
+            .map(|vs| {
+                vs.iter()
+                    .rev()
+                    .take(crate::MAX_WORKFLOW_VERSIONS as usize)
+                    .map(|(version, row)| crate::WorkflowVersion {
+                        version: *version,
+                        spec: row.spec.clone(),
+                        created_at_ms: row.created_at_ms,
+                    })
+                    .collect()
+            })
+            .unwrap_or_default())
+    }
+
     async fn rename_workflow(
         &self,
         workspace: u64,

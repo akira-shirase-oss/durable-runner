@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import {
 	allowances, can, deriveOnboarding, deviceName, finishedFromStates, isSample, listOf, meters, normHandler, normInvite, normKey, normMe, normMember,
-	normOnboarding, normSession, normWorkflow, normWorkflowDetail, normWorkspace, onboardingDone, STEP_ORDER, toMs,
+	normOnboarding, normSession, normWorkflow, normWorkflowDetail, normWorkflowRun, normWorkspace, onboardingDone, STEP_ORDER, toMs,
 } from '../src/lib/saas.ts';
 
 test('roles: the matrix, used to hide controls', () => {
@@ -98,6 +98,27 @@ test('onboarding from the server: page order, unknown steps dropped, missing = n
 	assert.deepEqual(s.map((x) => x.done), [false, true, false, true]);
 	assert.equal(s[1]?.detail, 'charge');
 	assert.ok(!onboardingDone(s));
+});
+
+test('onboarding from the server\'s four facts: only true counts', () => {
+	const s = normOnboarding({ has_key: true, has_handler: true, test_call_ok: false, first_job_finished: 'yes' });
+	assert.deepEqual(s.map((x) => x.id), [...STEP_ORDER]);
+	assert.deepEqual(s.map((x) => x.done), [true, true, false, false]);
+	assert.ok(onboardingDone(normOnboarding({ has_key: true, has_handler: true, test_call_ok: true, first_job_finished: true })));
+});
+
+test('workflows as the server answers them: last run, versions, and a detail with only the latest spec', () => {
+	const row = { public_id: 'w', name: 'demo', version: 2, archived: false, created_at_ms: 1, updated_at_ms: 5, last_run: { id: 'WBwXuaDUPWc', state: 'done', version: 2, op_key: 'k', created_at_ms: 9 } };
+	assert.deepEqual(normWorkflow(row), { id: 'w', name: 'demo', currentVersion: 2, updatedAt: 5, lastRun: { runId: 'WBwXuaDUPWc', at: 9, state: 'done' } });
+	assert.equal(normWorkflow({ ...row, last_run: null })?.lastRun, null);
+	const spec = { version: 1, steps: [{ name: 'a', handler: 'x' }], input_b64: 'aA==' };
+	const full = normWorkflowDetail({ workflow: row, spec, versions: [{ version: 2, spec, created_at_ms: 5 }, { version: 1, spec: { steps: [] }, created_at_ms: 1 }] });
+	assert.deepEqual(full?.versions.map((v) => [v.version, v.createdAt]), [[2, 5], [1, 1]]);
+	const latestOnly = normWorkflowDetail({ workflow: row, spec });
+	assert.deepEqual(latestOnly?.versions, [{ version: 2, spec: { steps: [{ name: 'a', handler: 'x' }], input_b64: 'aA==' }, createdAt: 5 }]);
+	assert.deepEqual(normWorkflowRun({ id: 'WBwXuaDUPWc', state: 'running:step:1:attempt:1', version: 2, op_key: 'k', created_at_ms: 9 }), {
+		runId: 'WBwXuaDUPWc', submittedAt: 9, state: 'running:step:1:attempt:1', finishedAt: null,
+	});
 });
 
 test('onboarding from facts: done only when a fact proves it', () => {
