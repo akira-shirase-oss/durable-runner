@@ -220,6 +220,9 @@ pub struct WorkspaceDiagnostics {
     pub active_runs: u64,
     /// Run counts by state kind, this workspace only.
     pub states: std::collections::BTreeMap<&'static str, u64>,
+    /// The workspace's share of the retained index, bytes — the
+    /// `retained_bytes` plan check reads it (D-067).
+    pub index_bytes: u64,
 }
 
 /// The index as snapshots before D-021 carried it (JSON, inputs as number
@@ -1493,6 +1496,7 @@ impl EngineCore {
             live_runs: self.ws_index.get(&ws).map_or(0, |s| s.len() as u64),
             active_runs: self.ws_live.get(&ws).copied().unwrap_or(0) as u64,
             states: self.ws_state_counts.get(&ws).cloned().unwrap_or_default(),
+            index_bytes: self.ws_index_bytes.get(&ws).copied().unwrap_or(0),
         }
     }
 

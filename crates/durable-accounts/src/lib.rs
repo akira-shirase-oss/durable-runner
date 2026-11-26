@@ -66,6 +66,123 @@ pub struct KeyGrant {
 /// A workspace row. `id` is the internal join key used in journal records
 /// and index structures; `public_id` (UUIDv7) is the only id allowed on
 /// external surfaces so sequential ids stay unguessable.
+/// A plan's parsed limits — `plans.limits` jsonb (D-067). A missing key
+/// falls back to the Free row's v1 value so a hand-edited row can never
+/// silently uncap a meter; unknown keys are ignored (forward compat —
+/// a newer build can write a key an older one still serves).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+#[serde(default)]
+pub struct PlanLimits {
+    /// Admitted submits per minute per workspace (token bucket, burst 10).
+    pub jobs_per_min: u64,
+    /// Accepted-not-finished runs held at once (index count).
+    pub live_runs: u64,
+    /// Concurrent dispatches — fairness, not admission (recorded, not
+    /// enforced by `admit`; the engine's per-ws bound stays the backstop).
+    pub in_flight: u64,
+    /// Registered handlers per workspace.
+    pub handlers: u64,
+    /// Max submit input bytes.
+    pub max_input_bytes: u64,
+    /// Terminal-run retention — informational (the engine's expiry owns it).
+    pub retention_days: u64,
+    /// Members per workspace, owner included.
+    pub members: u64,
+    /// Live API keys per workspace.
+    pub api_keys: u64,
+    /// Workflows per workspace.
+    pub workflows: u64,
+    /// Handler test calls per hour per workspace.
+    pub test_calls_per_hour: u64,
+    /// Workspaces one account may own, soft-deleted counted until purged.
+    pub workspaces_per_account: u64,
+    /// Per-workspace share of the retained index, bytes.
+    pub retained_bytes: u64,
+    /// Invites one workspace may mint per day (pending or accepted —
+    /// the day window counts the mail, not the seat).
+    pub invites_per_day: u64,
+    /// How far ahead `not_before` may park a run, days.
+    pub not_before_days: u64,
+}
+
+impl Default for PlanLimits {
+    fn default() -> Self {
+        Self {
+            jobs_per_min: 60,
+            live_runs: 500,
+            in_flight: 8,
+            handlers: 16,
+            max_input_bytes: 64 * 1024,
+            retention_days: 7,
+            members: 5,
+            api_keys: 10,
+            workflows: 20,
+            test_calls_per_hour: 30,
+            workspaces_per_account: 3,
+            retained_bytes: 16 * 1024 * 1024,
+            invites_per_day: 20,
+            not_before_days: 30,
+        }
+    }
+}
+
+/// One `plans` row, parsed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Plan {
+    pub id: String,
+    pub name: String,
+    pub limits: PlanLimits,
+}
+
+/// One workflow row (S3-7) — a named, versioned spec a workspace runs
+/// on demand. `public_id` is the only id external surfaces see.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Workflow {
+    pub id: u64,
+    pub public_id: uuid::Uuid,
+    pub workspace: u64,
+    pub name: String,
+    /// Soft archive (D-072 parallel): set, "run now" refuses and the
+    /// list hides it; history stays readable.
+    pub archived_at_ms: Option<i64>,
+    /// The member account's public id, when a session created it.
+    pub created_by: Option<uuid::Uuid>,
+    pub created_at_ms: i64,
+}
+
+/// One immutable workflow version — there is no update path; a patch
+/// writes the next row.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkflowVersion {
+    pub version: u64,
+    /// The stored spec document (`{version, steps, input_b64}`), kept
+    /// verbatim so the journal's replay reads exactly what ran.
+    pub spec: serde_json::Value,
+    pub created_at_ms: i64,
+}
+
+/// Bookkeeping for one "run now" acceptance — the listing's source;
+/// the run itself lives in the engine journal.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkflowRun {
+    /// The engine's internal run id — never leaves the store; handlers
+    /// encode through the public id mapping.
+    pub run_id: u64,
+    pub version: u64,
+    pub op_key: String,
+    pub created_at_ms: i64,
+}
+
+/// What one `purge` pass removed — counts only.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct PurgeStats {
+    pub workflow_runs: u64,
+    pub sessions: u64,
+    pub tokens: u64,
+    pub invites: u64,
+    pub outbox: u64,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Workspace {
     pub id: u64,
@@ -330,12 +447,16 @@ pub enum AccountError {
     PlanLimit(&'static str),
 }
 
-/// Pre-deploy S2-2 stopgap caps — S3-4's `plans` rows replace them
-/// with plan-shaped numbers; until then these are the same edges the
-/// Free row will carry.
-pub const STOPGAP_WS_PER_ACCOUNT: u64 = 3;
-pub const STOPGAP_KEYS_PER_WS: u64 = 10;
-pub const STOPGAP_INVITES_PER_WS_DAY: u64 = 20;
+/// The plan id every new workspace lands on — the only row the launch
+/// ships; the caps read it so the numbers live in `plans`, not code.
+pub const DEFAULT_PLAN: &str = "free";
+
+/// S3-7 hard bounds — fixed, never plan-read: at most 50 immutable
+/// versions per workflow and 96 KiB per stored spec document.
+pub const MAX_WORKFLOW_VERSIONS: u64 = 50;
+pub const MAX_WORKFLOW_SPEC_BYTES: usize = 96 * 1024;
+/// `workflow_runs` bookkeeping retention — the purge's horizon (7 d).
+pub const WORKFLOW_RUNS_RETENTION_MS: i64 = 7 * 86_400_000;
 
 impl From<sqlx::Error> for AccountError {
     fn from(err: sqlx::Error) -> Self {
@@ -610,6 +731,31 @@ pub trait AccountStore: Send + Sync {
         account: u64,
     ) -> Result<Vec<(Workspace, Role)>, AccountError>;
 
+    /// Workspaces `account` OWNS, soft-deleted included (D-072's "counted
+    /// until purged": a delete+recreate cycle must not dodge
+    /// `workspaces_per_account`). Owner member rows only — invites and
+    /// non-owner seats never inflate the count.
+    async fn count_owned_workspaces(&self, account: u64) -> Result<u64, AccountError>;
+
+    /// One `plans` row by id — `None` when no row has that id.
+    async fn plan(&self, id: &str) -> Result<Option<Plan>, AccountError>;
+
+    /// The plan `workspace`'s row names (join on `plan_id`; every ws
+    /// carries the default 'free' since 0002). Missing plan or ws rows
+    /// answer `None`.
+    async fn plan_for_workspace(&self, workspace: u64) -> Result<Option<Plan>, AccountError>;
+
+    /// Upsert a `plans` row — a plan change is a row write, never a
+    /// deploy (D-067). `limits` is the raw jsonb; it must parse into
+    /// `PlanLimits` or the write is refused (a bad row would uncap or
+    /// cap everything wrongly).
+    async fn put_plan(
+        &self,
+        id: &str,
+        name: &str,
+        limits: &serde_json::Value,
+    ) -> Result<Plan, AccountError>;
+
     async fn list_members(&self, workspace: u64) -> Result<Vec<MemberInfo>, AccountError>;
 
     /// Set `account`'s role in `workspace`. `Role::Owner` is refused by
@@ -783,6 +929,102 @@ pub trait AccountStore: Send + Sync {
     /// is a no-op); `Retry` stamps the error and the next-attempt time
     /// back to `pending`; `Failed` dead-letters it.
     async fn outbox_mark(&self, id: u64, outcome: MailOutcome) -> Result<(), AccountError>;
+
+    // --- S3-7: workflows + the purge ----------------------------------
+
+    /// Create a workflow row in `workspace` (live `workflows` cap is
+    /// the ws's plan row, checked inside the same lock/transaction —
+    /// D-067's single source). `created_by` is the member account id
+    /// when a session created it.
+    async fn create_workflow(
+        &self,
+        workspace: u64,
+        name: &str,
+        created_by: Option<u64>,
+    ) -> Result<Workflow, AccountError>;
+
+    /// Live workflows of `workspace` (archived rows are hidden — they
+    /// stay addressable by id for history).
+    async fn workflows_for(&self, workspace: u64) -> Result<Vec<Workflow>, AccountError>;
+
+    /// Live rows count only — the `workflows` plan meter.
+    async fn count_live_workflows(&self, workspace: u64) -> Result<u64, AccountError>;
+
+    /// A workflow addressed under its own workspace — a foreign
+    /// workspace's id answers `None` (child-idor: never another
+    /// tenant's row).
+    async fn workflow_by_public_id(
+        &self,
+        workspace: u64,
+        public_id: uuid::Uuid,
+    ) -> Result<Option<Workflow>, AccountError>;
+
+    /// Append the next version — immutable rows only. More than
+    /// `MAX_WORKFLOW_VERSIONS` refuses `PlanLimit("workflow_versions")`;
+    /// `spec` size is the caller's bound (it owns the 400 envelope).
+    async fn add_workflow_version(
+        &self,
+        workspace: u64,
+        workflow_id: u64,
+        spec: &serde_json::Value,
+    ) -> Result<WorkflowVersion, AccountError>;
+
+    /// The latest version row of `workflow_id` (ws-bound via the
+    /// caller's lookup), or `None` if none exists.
+    async fn latest_workflow_version(
+        &self,
+        workflow_id: u64,
+    ) -> Result<Option<WorkflowVersion>, AccountError>;
+
+    /// Rename a live workflow row (ws-bound). `Ok(false)` = missing or
+    /// archived — rename never revives history.
+    async fn rename_workflow(
+        &self,
+        workspace: u64,
+        workflow_id: u64,
+        name: &str,
+    ) -> Result<bool, AccountError>;
+
+    /// Soft-archive (D-072 parallel): `archived_at` set once — a
+    /// second archive is `Ok(false)`, the route answers `gone`.
+    async fn archive_workflow(
+        &self,
+        workspace: u64,
+        workflow_id: u64,
+    ) -> Result<bool, AccountError>;
+
+    /// Record one accepted "run now" — deduplicated submits write no
+    /// row (the original already recorded).
+    async fn record_workflow_run(
+        &self,
+        workspace: u64,
+        workflow_id: u64,
+        version: u64,
+        op_key: &str,
+        run_id: u64,
+    ) -> Result<(), AccountError>;
+
+    /// The dedup anchor for "run now": the recorded row for an op key,
+    /// if one was accepted. A replay checks this before admit() so a
+    /// retried submit does not spend the rate bucket again.
+    async fn workflow_run_by_op(
+        &self,
+        workflow_id: u64,
+        op_key: &str,
+    ) -> Result<Option<WorkflowRun>, AccountError>;
+
+    /// Newest-first run bookkeeping for one workflow, bounded.
+    async fn workflow_runs(
+        &self,
+        workflow_id: u64,
+        limit: u64,
+    ) -> Result<Vec<WorkflowRun>, AccountError>;
+
+    /// The bounded sweep (S3-7): workflow_runs older than 7 days,
+    /// revoked or expired sessions, consumed/superseded or expired
+    /// email tokens, closed or expired invites, terminal outbox rows
+    /// past their retention. Returns what each table gave up.
+    async fn purge(&self, now_ms: i64) -> Result<PurgeStats, AccountError>;
 }
 
 /// Never-panics fuzzing for outside input this crate parses: the

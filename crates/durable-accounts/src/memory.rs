@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Mutex;
 
@@ -30,6 +30,8 @@ pub struct Memory {
     next_token: AtomicU64,
     next_invite: AtomicU64,
     next_outbox: AtomicU64,
+    next_workflow: AtomicU64,
+    next_workflow_run: AtomicU64,
     unavailable: AtomicBool,
 }
 
@@ -46,6 +48,37 @@ struct Inner {
     email_tokens: HashMap<u64, EmailTokenRow>,
     invites: HashMap<u64, InviteRow>,
     outbox: HashMap<u64, OutboxRow>,
+    /// plan id -> (name, limits jsonb) — `plans` (D-067). Seeded with
+    /// the 'free' row so a fresh Memory looks like a migrated database.
+    plans: HashMap<String, (String, serde_json::Value)>,
+    /// ws -> plan_id (every workspace 'free' until a row says otherwise).
+    ws_plan: HashMap<u64, String>,
+    /// S3-7: workflow id -> row.
+    workflows: HashMap<u64, WorkflowRow>,
+    /// workflow id -> (version -> row); versions are append-only.
+    workflow_versions: HashMap<u64, BTreeMap<u64, WorkflowVersionRow>>,
+    /// workflow_runs bookkeeping row id -> row.
+    workflow_runs: HashMap<u64, WorkflowRunRow>,
+}
+
+impl Inner {
+    /// The limits a plan row carries — Free defaults when the row or
+    /// its parse is missing, so a fixture store behaves like the
+    /// migrated 'free' seed.
+    fn plan_limits(&self, plan_id: &str) -> crate::PlanLimits {
+        self.plans
+            .get(plan_id)
+            .and_then(|(_, l)| serde_json::from_value(l.clone()).ok())
+            .unwrap_or_default()
+    }
+
+    /// The limits governing `workspace` — the ws's own plan row.
+    fn ws_limits(&self, workspace: u64) -> crate::PlanLimits {
+        match self.ws_plan.get(&workspace) {
+            Some(pid) => self.plan_limits(pid),
+            None => self.plan_limits(crate::DEFAULT_PLAN),
+        }
+    }
 }
 
 struct HandlerRow {
@@ -137,6 +170,28 @@ struct InviteRow {
     revoked: bool,
 }
 
+struct WorkflowRow {
+    public_id: uuid::Uuid,
+    workspace: u64,
+    name: String,
+    archived_at_ms: Option<i64>,
+    created_by: Option<u64>,
+    created_at_ms: i64,
+}
+
+struct WorkflowVersionRow {
+    spec: serde_json::Value,
+    created_at_ms: i64,
+}
+
+struct WorkflowRunRow {
+    workflow: u64,
+    version: u64,
+    op_key: String,
+    run_id: u64,
+    created_at_ms: i64,
+}
+
 #[derive(Debug, Clone)]
 pub struct OutboxRow {
     pub kind: &'static str,
@@ -171,6 +226,20 @@ impl Memory {
     fn seed_default(&self) {
         let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         let secret = Self::draw_secret().unwrap_or_else(|e| panic!("{e}"));
+        inner
+            .plans
+            .entry(crate::DEFAULT_PLAN.into())
+            .or_insert_with(|| {
+                (
+                    "Free".into(),
+                    serde_json::to_value(crate::PlanLimits::default())
+                        .unwrap_or_else(|e| panic!("{e}")),
+                )
+            });
+        inner
+            .ws_plan
+            .entry(0)
+            .or_insert_with(|| crate::DEFAULT_PLAN.into());
         inner.workspaces.entry(0).or_insert_with(|| Workspace {
             id: 0,
             public_id: uuid::Uuid::nil(),
@@ -318,6 +387,7 @@ impl AccountStore for Memory {
             handler_secret: Self::draw_secret()?,
             deleted_at_ms: None,
         };
+        inner.ws_plan.insert(id, crate::DEFAULT_PLAN.into());
         inner.workspaces.insert(id, workspace.clone());
         Ok(workspace)
     }
@@ -361,7 +431,7 @@ impl AccountStore for Memory {
             .values()
             .filter(|k| k.workspace == workspace && !k.revoked)
             .count() as u64;
-        if live >= crate::STOPGAP_KEYS_PER_WS {
+        if live >= inner.ws_limits(workspace).api_keys {
             return Err(AccountError::PlanLimit("api_keys"));
         }
         let id = self.next_key.fetch_add(1, Ordering::Relaxed);
@@ -887,7 +957,11 @@ impl AccountStore for Memory {
                 .iter()
                 .filter(|((_, acc), m)| *acc == account && m.role == crate::Role::Owner)
                 .count() as u64;
-            if owned >= crate::STOPGAP_WS_PER_ACCOUNT {
+            if owned
+                >= inner
+                    .plan_limits(crate::DEFAULT_PLAN)
+                    .workspaces_per_account
+            {
                 return Err(AccountError::PlanLimit("workspaces_per_account"));
             }
         }
@@ -950,6 +1024,70 @@ impl AccountStore for Memory {
             .collect();
         out.sort_by_key(|(ws, _)| ws.id);
         Ok(out)
+    }
+
+    async fn count_owned_workspaces(&self, account: u64) -> Result<u64, AccountError> {
+        self.check_up()?;
+        let inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        let n = inner
+            .members
+            .iter()
+            .filter(|((_, acc), m)| *acc == account && m.role == crate::Role::Owner)
+            .count() as u64;
+        Ok(n)
+    }
+
+    async fn plan(&self, id: &str) -> Result<Option<crate::Plan>, AccountError> {
+        self.check_up()?;
+        let inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        Ok(inner.plans.get(id).map(|(name, limits)| crate::Plan {
+            id: id.to_string(),
+            name: name.clone(),
+            limits: serde_json::from_value(limits.clone()).unwrap_or_default(),
+        }))
+    }
+
+    async fn plan_for_workspace(
+        &self,
+        workspace: u64,
+    ) -> Result<Option<crate::Plan>, AccountError> {
+        self.check_up()?;
+        let (pid, (name, limits)) = {
+            let inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+            match inner
+                .ws_plan
+                .get(&workspace)
+                .and_then(|pid| inner.plans.get(pid).map(|r| (pid.clone(), r.clone())))
+            {
+                Some(t) => t,
+                None => return Ok(None),
+            }
+        };
+        Ok(Some(crate::Plan {
+            id: pid,
+            name,
+            limits: serde_json::from_value(limits).unwrap_or_default(),
+        }))
+    }
+
+    async fn put_plan(
+        &self,
+        id: &str,
+        name: &str,
+        limits: &serde_json::Value,
+    ) -> Result<crate::Plan, AccountError> {
+        self.check_up()?;
+        let parsed: crate::PlanLimits = serde_json::from_value(limits.clone())
+            .map_err(|e| AccountError::Store(format!("plan limits do not parse: {e}")))?;
+        let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        inner
+            .plans
+            .insert(id.to_string(), (name.to_string(), limits.clone()));
+        Ok(crate::Plan {
+            id: id.to_string(),
+            name: name.to_string(),
+            limits: parsed,
+        })
     }
 
     async fn list_members(&self, workspace: u64) -> Result<Vec<crate::MemberInfo>, AccountError> {
@@ -1045,7 +1183,7 @@ impl AccountStore for Memory {
             .values()
             .filter(|i| i.workspace == workspace && i.created_at_ms > day_ago)
             .count() as u64;
-        if today >= crate::STOPGAP_INVITES_PER_WS_DAY {
+        if today >= inner.ws_limits(workspace).invites_per_day {
             return Err(AccountError::PlanLimit("invites_per_day"));
         }
         let invite = crate::WorkspaceInvite {
@@ -1466,6 +1604,302 @@ impl AccountStore for Memory {
             }
         }
         Ok(())
+    }
+
+    // --- S3-7: workflows + the purge ---------------------------------
+
+    async fn create_workflow(
+        &self,
+        workspace: u64,
+        name: &str,
+        created_by: Option<u64>,
+    ) -> Result<crate::Workflow, AccountError> {
+        self.check_up()?;
+        let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        if !inner.workspaces.contains_key(&workspace) {
+            return Err(AccountError::Store(format!(
+                "workspace {workspace} does not exist"
+            )));
+        }
+        let live = inner
+            .workflows
+            .values()
+            .filter(|w| w.workspace == workspace && w.archived_at_ms.is_none())
+            .count() as u64;
+        if live >= inner.ws_limits(workspace).workflows {
+            return Err(AccountError::PlanLimit("workflows"));
+        }
+        let wf = crate::Workflow {
+            id: self.next_workflow.fetch_add(1, Ordering::Relaxed),
+            public_id: uuid::Uuid::now_v7(),
+            workspace,
+            name: name.to_string(),
+            archived_at_ms: None,
+            created_by: created_by.and_then(|a| inner.accounts.get(&a).map(|acc| acc.public_id)),
+            created_at_ms: now_ms(),
+        };
+        inner.workflows.insert(
+            wf.id,
+            WorkflowRow {
+                public_id: wf.public_id,
+                workspace,
+                name: wf.name.clone(),
+                archived_at_ms: None,
+                created_by,
+                created_at_ms: wf.created_at_ms,
+            },
+        );
+        Ok(wf)
+    }
+
+    async fn workflows_for(&self, workspace: u64) -> Result<Vec<crate::Workflow>, AccountError> {
+        self.check_up()?;
+        let inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        Ok(inner
+            .workflows
+            .iter()
+            .filter(|(_, w)| w.workspace == workspace && w.archived_at_ms.is_none())
+            .map(|(id, w)| crate::Workflow {
+                id: *id,
+                public_id: w.public_id,
+                workspace: w.workspace,
+                name: w.name.clone(),
+                archived_at_ms: w.archived_at_ms,
+                created_by: w
+                    .created_by
+                    .and_then(|a| inner.accounts.get(&a).map(|acc| acc.public_id)),
+                created_at_ms: w.created_at_ms,
+            })
+            .collect())
+    }
+
+    async fn count_live_workflows(&self, workspace: u64) -> Result<u64, AccountError> {
+        self.check_up()?;
+        let inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        Ok(inner
+            .workflows
+            .values()
+            .filter(|w| w.workspace == workspace && w.archived_at_ms.is_none())
+            .count() as u64)
+    }
+
+    async fn workflow_by_public_id(
+        &self,
+        workspace: u64,
+        public_id: uuid::Uuid,
+    ) -> Result<Option<crate::Workflow>, AccountError> {
+        self.check_up()?;
+        let inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        Ok(inner
+            .workflows
+            .iter()
+            .find(|(_, w)| w.public_id == public_id && w.workspace == workspace)
+            .map(|(id, w)| crate::Workflow {
+                id: *id,
+                public_id: w.public_id,
+                workspace: w.workspace,
+                name: w.name.clone(),
+                archived_at_ms: w.archived_at_ms,
+                created_by: w
+                    .created_by
+                    .and_then(|a| inner.accounts.get(&a).map(|acc| acc.public_id)),
+                created_at_ms: w.created_at_ms,
+            }))
+    }
+
+    async fn add_workflow_version(
+        &self,
+        workspace: u64,
+        workflow_id: u64,
+        spec: &serde_json::Value,
+    ) -> Result<crate::WorkflowVersion, AccountError> {
+        self.check_up()?;
+        let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(w) = inner.workflows.get(&workflow_id) else {
+            return Err(AccountError::Store(format!(
+                "workflow {workflow_id} does not exist"
+            )));
+        };
+        if w.workspace != workspace {
+            return Err(AccountError::Store(format!(
+                "workflow {workflow_id} is not in workspace {workspace}"
+            )));
+        }
+        let versions = inner.workflow_versions.entry(workflow_id).or_default();
+        if versions.len() as u64 >= crate::MAX_WORKFLOW_VERSIONS {
+            return Err(AccountError::PlanLimit("workflow_versions"));
+        }
+        let version = versions.keys().next_back().map(|v| v + 1).unwrap_or(1);
+        versions.insert(
+            version,
+            WorkflowVersionRow {
+                spec: spec.clone(),
+                created_at_ms: now_ms(),
+            },
+        );
+        Ok(crate::WorkflowVersion {
+            version,
+            spec: spec.clone(),
+            created_at_ms: now_ms(),
+        })
+    }
+
+    async fn latest_workflow_version(
+        &self,
+        workflow_id: u64,
+    ) -> Result<Option<crate::WorkflowVersion>, AccountError> {
+        self.check_up()?;
+        let inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        Ok(inner
+            .workflow_versions
+            .get(&workflow_id)
+            .and_then(|vs| vs.iter().next_back())
+            .map(|(version, row)| crate::WorkflowVersion {
+                version: *version,
+                spec: row.spec.clone(),
+                created_at_ms: row.created_at_ms,
+            }))
+    }
+
+    async fn rename_workflow(
+        &self,
+        workspace: u64,
+        workflow_id: u64,
+        name: &str,
+    ) -> Result<bool, AccountError> {
+        self.check_up()?;
+        let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(w) = inner.workflows.get_mut(&workflow_id) else {
+            return Ok(false);
+        };
+        if w.workspace != workspace || w.archived_at_ms.is_some() {
+            return Ok(false);
+        }
+        w.name = name.to_string();
+        Ok(true)
+    }
+
+    async fn archive_workflow(
+        &self,
+        workspace: u64,
+        workflow_id: u64,
+    ) -> Result<bool, AccountError> {
+        self.check_up()?;
+        let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(w) = inner.workflows.get_mut(&workflow_id) else {
+            return Ok(false);
+        };
+        if w.workspace != workspace || w.archived_at_ms.is_some() {
+            return Ok(false);
+        }
+        w.archived_at_ms = Some(now_ms());
+        Ok(true)
+    }
+
+    async fn record_workflow_run(
+        &self,
+        _workspace: u64,
+        workflow_id: u64,
+        version: u64,
+        op_key: &str,
+        run_id: u64,
+    ) -> Result<(), AccountError> {
+        self.check_up()?;
+        let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        // (workflow, op_key) is unique — a replayed submit never
+        // records twice.
+        if inner
+            .workflow_runs
+            .values()
+            .any(|r| r.workflow == workflow_id && r.op_key == op_key)
+        {
+            return Ok(());
+        }
+        let id = self.next_workflow_run.fetch_add(1, Ordering::Relaxed);
+        inner.workflow_runs.insert(
+            id,
+            WorkflowRunRow {
+                workflow: workflow_id,
+                version,
+                op_key: op_key.to_string(),
+                run_id,
+                created_at_ms: now_ms(),
+            },
+        );
+        Ok(())
+    }
+
+    async fn workflow_run_by_op(
+        &self,
+        workflow_id: u64,
+        op_key: &str,
+    ) -> Result<Option<crate::WorkflowRun>, AccountError> {
+        self.check_up()?;
+        let inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        Ok(inner
+            .workflow_runs
+            .values()
+            .find(|r| r.workflow == workflow_id && r.op_key == op_key)
+            .map(|r| crate::WorkflowRun {
+                run_id: r.run_id,
+                version: r.version,
+                op_key: r.op_key.clone(),
+                created_at_ms: r.created_at_ms,
+            }))
+    }
+
+    async fn workflow_runs(
+        &self,
+        workflow_id: u64,
+        limit: u64,
+    ) -> Result<Vec<crate::WorkflowRun>, AccountError> {
+        self.check_up()?;
+        let inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        let mut rows: Vec<_> = inner
+            .workflow_runs
+            .values()
+            .filter(|r| r.workflow == workflow_id)
+            .collect();
+        rows.sort_by_key(|b| std::cmp::Reverse(b.created_at_ms));
+        Ok(rows
+            .into_iter()
+            .take(limit as usize)
+            .map(|r| crate::WorkflowRun {
+                run_id: r.run_id,
+                version: r.version,
+                op_key: r.op_key.clone(),
+                created_at_ms: r.created_at_ms,
+            })
+            .collect())
+    }
+
+    async fn purge(&self, now_ms: i64) -> Result<crate::PurgeStats, AccountError> {
+        self.check_up()?;
+        let mut stats = crate::PurgeStats::default();
+        {
+            let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+            let cutoff = now_ms - crate::WORKFLOW_RUNS_RETENTION_MS;
+            let before = inner.workflow_runs.len();
+            inner.workflow_runs.retain(|_, r| r.created_at_ms > cutoff);
+            stats.workflow_runs = (before - inner.workflow_runs.len()) as u64;
+            let before = inner.sessions.len();
+            inner.sessions.retain(|_, r| {
+                !r.revoked && r.expires_at_ms > now_ms && r.idle_expires_at_ms > now_ms
+            });
+            stats.sessions = (before - inner.sessions.len()) as u64;
+            let before = inner.email_tokens.len();
+            inner
+                .email_tokens
+                .retain(|_, r| !r.consumed && !r.superseded && r.expires_at_ms > now_ms);
+            stats.tokens = (before - inner.email_tokens.len()) as u64;
+            let before = inner.invites.len();
+            inner
+                .invites
+                .retain(|_, r| !(r.accepted || r.revoked || r.expires_at_ms <= now_ms));
+            stats.invites = (before - inner.invites.len()) as u64;
+        }
+        stats.outbox = self.outbox_purge(now_ms).await?;
+        Ok(stats)
     }
 }
 

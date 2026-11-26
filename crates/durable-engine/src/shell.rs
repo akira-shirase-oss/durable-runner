@@ -333,6 +333,9 @@ pub struct Engine {
     admin_timeout: Duration,
     /// Metrics, timelines and the activity feed (D-058).
     obs: Arc<Observer>,
+    /// The per-workspace in-flight dispatch counts — read off the shared
+    /// map for the `/usage` meter (D-067), no actor hop.
+    inflight: WsInflight,
 }
 
 /// Why the engine stopped.
@@ -635,6 +638,13 @@ impl Engine {
         answer(rx, self.reply_timeout).await
     }
 
+    /// Live in-flight dispatch count for `ws` — the fairness counter,
+    /// read off the shared map; no actor hop (the `/usage` meter reads
+    /// it, D-067).
+    pub fn in_flight(&self, ws: u64) -> u32 {
+        self.inflight.count(ws)
+    }
+
     /// Readiness: false once the actor has stopped or while free space is
     /// below the journal reserve (submits would be refused `NoSpace`).
     pub fn readiness(&self) -> Readiness {
@@ -891,6 +901,8 @@ pub fn spawn(dir: &Path, registry: Registry, mut cfg: ShellConfig) -> Result<Eng
     let (drain, drain_rx) = watch::channel(false);
     let (reply_timeout, admin_timeout) = (cfg.reply_timeout, cfg.admin_timeout);
     let actor_obs = obs.clone();
+    let inflight = WsInflight::default();
+    let actor_inflight = inflight.clone();
     tokio::spawn(async move {
         // Every return path of the actor joins the writer first.
         let reason = actor(
@@ -901,6 +913,7 @@ pub fn spawn(dir: &Path, registry: Registry, mut cfg: ShellConfig) -> Result<Eng
             mon,
             writer,
             actor_obs,
+            actor_inflight,
         )
         .await;
         stopped_tx.send_replace(Some(reason));
@@ -916,6 +929,7 @@ pub fn spawn(dir: &Path, registry: Registry, mut cfg: ShellConfig) -> Result<Eng
         reply_timeout,
         admin_timeout,
         obs,
+        inflight,
     })
 }
 
@@ -1408,6 +1422,7 @@ async fn drain(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn actor(
     mut core: EngineCore,
     mut registry: Registry,
@@ -1420,13 +1435,13 @@ async fn actor(
     mut mon: Monitor,
     writer: Writer,
     obs: Arc<Observer>,
+    inflight: WsInflight,
 ) -> StopReason {
     let mut ticker = tokio::time::interval(Duration::from_millis(cfg.tick_ms));
     let mut attempts: JoinSet<AttemptJoin> = JoinSet::new();
     let mut probes: JoinSet<ProbeJoin> = JoinSet::new();
     let mut live: HashMap<(RunId, StepIndex), AbortHandle> = HashMap::new();
     let mut waiting_probes = ProbeQueue::default();
-    let inflight = WsInflight::default();
     // The scheduler's per-workspace due queues: `pop_due` drains the
     // time-ordered index into these once, `due_order` rotates the
     // workspaces so a tick round-robins fairly, and a workspace at its
